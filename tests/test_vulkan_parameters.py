@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from mlir_gpu import FrameParameters, Pipeline, Target, Vertex, compile_pipeline, fragment, fullscreen_vertex, vec4, vertex
 from mlir_gpu.viewer import ViewerError, _Vulkan, _binding, _frame_data, _time_value, load_program, main, render_offscreen, show_window
-from test_native_ir import ROOT, TOOLS
+from test_support import ROOT, TOOLS
 
 
 @fragment

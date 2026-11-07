@@ -1,0 +1,77 @@
+# RUN: %python %S/Inputs/generate.py unknown_operand %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=OPERAND
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py wrong_args_shape %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=ARGS
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py duplicate_result %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=RESULT
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py unknown_op %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=OP
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py unknown_property %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=PROPERTY
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py missing_property %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=MISSING-PROPERTY
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py wrong_property_type %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=PROPERTY-TYPE
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py wrong_call_type %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=CALL-TYPE
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py missing_callee %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=CALLEE
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py wrong_loop_state %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=LOOP
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py wrong_condition %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=CONDITION
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py wrong_yield %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=YIELD
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py wrong_if_yield %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=IF-YIELD
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py escaped_region_value %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=OPERAND
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py wrong_region_shape %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=REGION
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py nonterminator_successor %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=SUCCESSOR
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py bad_dense_shape %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=DENSE
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py bad_enum %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=ENUM
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+# RUN: %python %S/Inputs/generate.py bad_location %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=LOCATION
+# RUN: %python %S/Inputs/summarize.py exists %t.bin | %FileCheck %s --check-prefix=ABSENT
+
+# OPERAND: loc("malformed.json":37:1): error: operand must reference a visible earlier SSA value
+# ARGS: loc("malformed.json":37:1): error: operation args must be an array
+# RESULT: loc("malformed.json":37:1): error: result requires a unique SSA name and supported type
+# OP: loc("malformed.json":37:1): error: operation must name a registered non-function MLIR op
+# PROPERTY: loc("malformed.json":37:1): error: unknown property for registered operation
+# MISSING-PROPERTY: loc("malformed.json":37:1): error: 'arith.constant' op requires attribute 'value'
+# PROPERTY-TYPE: loc("malformed.json":37:1): error: invalid operation properties: Invalid attribute `static_position`
+# CALL-TYPE: loc("malformed.json":37:1): error: 'func.call' op operand type mismatch
+# CALLEE: loc("malformed.json":37:1): error: 'func.call' op 'missing' does not reference a valid function
+# LOOP: loc("malformed.json":37:1): error: 'scf.while' op along control flow edge from parent to Region #0: region branch point has 4 operands, but region successor needs 5 inputs
+# CONDITION: loc("malformed.json":37:1): error: 'scf.condition' op operand #0 must be 1-bit signless integer
+# YIELD: loc("malformed.json":37:1): error: 'scf.while' op along control flow edge from Operation scf.yield to Region #0
+# IF-YIELD: loc("malformed.json":37:1): error: 'scf.if' op along control flow edge from Operation scf.yield to Operation scf.if: successor operand type #0 'vector<3xf32>' should match successor input type #0 'f32'
+# REGION: loc("malformed.json":37:1): error: region must be an object
+# SUCCESSOR: loc("malformed.json":37:1): error: only terminators can have successor blocks
+# DENSE: loc("malformed.json":37:1): error: dense attribute requires one splat or matching vector components
+# ENUM: loc("malformed.json":37:1): error: unknown attribute kind or enum value
+# LOCATION: loc("malformed.json":37:1): error: source location requires a file and positive 32-bit source_line
+# ABSENT: artifact exists: False

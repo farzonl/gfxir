@@ -1,0 +1,18 @@
+# REQUIRES: llc, dxv, metal-shaderconverter
+# RUN: rm -rf %t.triangle %t.arithmetic
+# RUN: %python %S/../Inputs/pipeline.py triangle metal %t.triangle | %FileCheck %s
+# RUN: %python %S/../Inputs/pipeline.py arithmetic metal %t.arithmetic | %FileCheck %s
+# RUN: %dxv %t.triangle/vertex.dxil -o %t.vertex.dxil
+# RUN: %dxv %t.triangle/fragment.dxil -o %t.fragment.dxil
+# RUN: %dxv %t.arithmetic/vertex.dxil -o %t.arithmetic.vertex.dxil
+# RUN: %dxv %t.arithmetic/fragment.dxil -o %t.arithmetic.fragment.dxil
+# RUN: %python %S/../Inputs/artifacts.py %t.triangle | %FileCheck %s --check-prefix=BINARY
+# RUN: %python %S/../Inputs/artifacts.py %t.arithmetic | %FileCheck %s --check-prefix=BINARY
+# CHECK: "target": "metal"
+# CHECK: .metallib"
+# CHECK: "runtime_verified": false
+# BINARY: entry count: 2
+# BINARY: vertex magic: 4d544c42
+# BINARY-NEXT: vertex DXIL digest: {{[0-9a-f]*[1-9a-f][0-9a-f]*$}}
+# BINARY-NEXT: fragment magic: 4d544c42
+# BINARY-NEXT: fragment DXIL digest: {{[0-9a-f]*[1-9a-f][0-9a-f]*$}}

@@ -1,0 +1,9 @@
+# REQUIRES: dxv, dxil-assemble
+# RUN: %python -c "from pathlib import Path; Path(r'%t.dxil').write_bytes(b'DXBC' + bytes(28))"
+# RUN: not %dxv %t.dxil -o %t.out 2>&1 | %FileCheck %s --check-prefix=VALIDATOR
+# RUN: not test -e %t.out
+# RUN: echo "not LLVM IR" > %t.ll
+# RUN: not %dxil-assemble %t.ll -o %t.out 2>&1 | %FileCheck %s --check-prefix=ASSEMBLER
+# RUN: not test -e %t.out
+# VALIDATOR: {{.+}}
+# ASSEMBLER: {{.+}}

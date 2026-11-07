@@ -49,7 +49,8 @@ def main():
         sdk = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True).strip()
         configuration.extend([f"-DCMAKE_OSX_SYSROOT={sdk}", "-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"])
     run(*configuration)
-    run("cmake", "--build", build, "--parallel", args.jobs, "--target", "gfx-opt", "gfx-compile", "llc", "llvm-config")
+    run("cmake", "--build", build, "--parallel", args.jobs, "--target",
+        "gfx-opt", "gfx-compile", "llc", "llvm-config", "FileCheck", "split-file")
     print(f"Compiler tools: {build / 'bin'}")
 
 

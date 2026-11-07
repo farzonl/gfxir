@@ -1,0 +1,30 @@
+# RUN: %python %S/Inputs/generate.py missing %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=BLOCK
+# RUN: %python %S/Inputs/generate.py bad_block %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=BLOCK
+# RUN: %python %S/Inputs/generate.py bad_field %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=FIELD
+# RUN: %python %S/Inputs/generate.py bad_type %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=TYPE
+# RUN: %python %S/Inputs/generate.py duplicate %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=DUPLICATE
+# RUN: %python %S/Inputs/generate.py unsupported %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=UNSUPPORTED-TYPE
+# RUN: %python %S/Inputs/generate.py oversized %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=SIZE
+# RUN: %python %S/Inputs/generate.py authored_offset %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=OFFSET
+# RUN: %python %S/Inputs/generate.py authored_binding %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=BINDING
+# RUN: %python %S/Inputs/generate.py stale %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=SCHEMA
+
+# BLOCK: error: 'gfx.parameter' op requires a matching declared parameter block
+# FIELD: error: 'gfx.parameter' op unknown parameter field
+# TYPE: error: 'gfx.parameter' op parameter result type does not match its field
+# DUPLICATE: error: parameter fields must be typed and uniquely named
+# UNSUPPORTED-TYPE: error: parameter fields currently support f32 and f32x2/3/4
+# SIZE: error: read-only parameter blocks currently fit within 128 bytes
+# OFFSET: error: parameter field requires only a name and supported type
+# BINDING: error: parameters requires a name and fields, not authored offsets or backend bindings
+# SCHEMA: error: parameter blocks require structured input schema version 2

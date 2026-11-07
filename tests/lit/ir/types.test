@@ -1,0 +1,5 @@
+# RUN: %gfx-opt %repo/tests/ir/types.mlir | %FileCheck %s
+# CHECK: !gfx.ptr<f32, global>
+# CHECK: !gfx.ptr<vector<4xf32>, workgroup>
+# CHECK: !gfx.handle<texture_2d>
+# CHECK: !gfx.handle<sampler>

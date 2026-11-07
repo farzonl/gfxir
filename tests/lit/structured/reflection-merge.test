@@ -1,0 +1,11 @@
+# RUN: %python %S/Inputs/generate.py merge %t.json
+# RUN: %gfx-compile %t.json --target vulkan --output %t.spv --reflection %t.reflection
+# RUN: %python %S/Inputs/summarize.py reflection %t.reflection | %FileCheck %s
+# RUN: %gfx-compile %t.json --target directx --output %t.ll --reflection %t.reflection
+# RUN: %python %S/Inputs/summarize.py reflection %t.reflection | %FileCheck %s
+# RUN: %python %S/Inputs/generate.py conflict %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bad --reflection %t.bad-reflection 2>&1 | %FileCheck %s --check-prefix=CONFLICT
+
+# CHECK: name: julia
+# CHECK-NEXT: inputs: [{"interpolation": "perspective", "location": 3, "name": "uv", "type": "f32x2"}]
+# CONFLICT: error: {{.*}}conflicting declarations

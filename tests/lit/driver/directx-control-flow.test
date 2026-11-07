@@ -1,0 +1,11 @@
+# REQUIRES: llc, dxv
+# RUN: rm -rf %t.sphere %t.bands
+# RUN: %python %S/../Inputs/pipeline.py sphere_march directx %t.sphere > %t.sphere.json
+# RUN: %python %S/../Inputs/pipeline.py loop_bands directx %t.bands > %t.bands.json
+# RUN: %FileCheck %s --check-prefix=SPHERE --implicit-check-not=@sphere_distance < %t.sphere/fragment.ll
+# RUN: %FileCheck %s --check-prefix=BANDS --implicit-check-not=@tint < %t.bands/fragment.ll
+# SPHERE: phi
+# SPHERE: br i1
+# SPHERE: "hlsl.shader"=
+# SPHERE-NOT: "hlsl.shader"=
+# BANDS: phi

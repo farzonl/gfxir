@@ -38,3 +38,9 @@ add_llvm_executable(gfx-opt tools/gfx-opt.cpp)
 target_link_libraries(gfx-opt PRIVATE GfxCompiler MLIROptLib)
 add_llvm_executable(gfx-compile tools/gfx-compile.cpp)
 target_link_libraries(gfx-compile PRIVATE GfxCompiler)
+
+option(GFX_INCLUDE_TESTS "Enable the GfxIR lit/FileCheck test suite" ON)
+if(GFX_INCLUDE_TESTS)
+  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../tests/lit"
+    "${CMAKE_CURRENT_BINARY_DIR}/tests")
+endif()

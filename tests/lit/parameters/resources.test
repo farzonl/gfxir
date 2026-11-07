@@ -1,0 +1,15 @@
+# RUN: %python %S/Inputs/generate.py limit %t.limit.json
+# RUN: %gfx-compile %t.limit.json --target directx --output %t.limit.ll --reflection %t.limit.reflection
+# RUN: %python %S/Inputs/summarize.py reflection %t.limit.reflection | %FileCheck %s --check-prefix=LIMIT
+# RUN: %python %S/Inputs/generate.py unreachable %t.unreachable.json
+# RUN: %gfx-compile %t.unreachable.json --target vulkan --output %t.unreachable.spv --reflection %t.unreachable.reflection
+# RUN: %python %S/Inputs/summarize.py reflection %t.unreachable.reflection | %FileCheck %s --check-prefix=DEAD
+
+# LIMIT: parameters:
+# LIMIT-SAME: "num32bit_constants": 32
+# LIMIT-SAME: "size": 128
+# LIMIT-SAME: "fields":
+# LIMIT-SAME: "name": "v7", "offset": 112
+# LIMIT-SAME: "name": "limit"
+# LIMIT-SAME: "size": 128, "stages": ["fragment"]
+# DEAD: parameters: null

@@ -1,0 +1,17 @@
+# RUN: %python %S/Inputs/pipeline.py frame vulkan %t.frame-vulkan | %FileCheck %s --check-prefixes=COMMON,FRAME
+# RUN: %python %S/Inputs/pipeline.py material vulkan %t.material-vulkan | %FileCheck %s --check-prefixes=COMMON,MATERIAL
+# RUN: %python %S/Inputs/pipeline.py visibility vulkan %t.visibility | %FileCheck %s --check-prefix=VISIBILITY
+# RUN: %python %S/Inputs/pipeline.py mismatch vulkan %t.mismatch | %FileCheck %s --check-prefix=MISMATCH
+
+# COMMON: manifest schema: 4
+# COMMON-NEXT: visibility: ['fragment']
+# COMMON-NEXT: fragment reflection matches: True
+# FRAME-NEXT: viewer parameters match: True
+# MATERIAL-NEXT: viewer: {{.*}}FrameParameters only
+# COMMON-NEXT: invalid binding: {{.*}}target bindings
+# COMMON-NEXT: old schema: {{.*}}schema version 4
+# VISIBILITY: manifest schema: 4
+# VISIBILITY-NEXT: visibility: ['vertex', 'fragment']
+# VISIBILITY-NEXT: fragment reflection matches: False
+# MISMATCH: layout mismatch: {{.*}}matching parameter block
+# MISMATCH-NEXT: published output exists: False

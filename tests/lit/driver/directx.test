@@ -1,0 +1,36 @@
+# REQUIRES: llc, dxv
+# RUN: rm -rf %t.triangle %t.arithmetic %t.expanded %t.math
+# RUN: %python %S/../Inputs/pipeline.py triangle directx %t.triangle | %FileCheck %s --check-prefix=MANIFEST
+# RUN: %FileCheck %s --check-prefix=IR --implicit-check-not=dx.op.storeOutput --implicit-check-not=!dx.entryPoints < %t.triangle/vertex.ll
+# RUN: %FileCheck %s --check-prefix=IR --implicit-check-not=dx.op.storeOutput --implicit-check-not=!dx.entryPoints < %t.triangle/fragment.ll
+# RUN: %python %S/../Inputs/pipeline.py arithmetic directx %t.arithmetic | %FileCheck %s --check-prefix=MANIFEST
+# RUN: %FileCheck %s --check-prefix=IR --implicit-check-not=dx.op.storeOutput --implicit-check-not=!dx.entryPoints < %t.arithmetic/vertex.ll
+# RUN: %FileCheck %s --check-prefix=IR --implicit-check-not=dx.op.storeOutput --implicit-check-not=!dx.entryPoints < %t.arithmetic/fragment.ll
+# RUN: %dxv %t.triangle/vertex.dxil -o %t.vertex.dxil
+# RUN: %dxv %t.triangle/fragment.dxil -o %t.fragment.dxil
+# RUN: %dxv %t.arithmetic/vertex.dxil -o %t.arithmetic.vertex.dxil
+# RUN: %dxv %t.arithmetic/fragment.dxil -o %t.arithmetic.fragment.dxil
+# RUN: %python %S/../Inputs/artifacts.py %t.triangle | %FileCheck %s --check-prefix=BINARY
+# RUN: %python %S/../Inputs/artifacts.py %t.arithmetic | %FileCheck %s --check-prefix=BINARY
+# RUN: %python %S/../Inputs/pipeline.py expanded directx %t.expanded | %FileCheck %s --check-prefix=MANIFEST
+# RUN: %python %S/../Inputs/pipeline.py math directx %t.math | %FileCheck %s --check-prefix=MANIFEST
+# RUN: %FileCheck %s --check-prefix=MATH --implicit-check-not=" fast " --implicit-check-not=contract < %t.math/fragment.ll
+# MANIFEST: "target": "directx"
+# MANIFEST: "runtime_verified": false
+# BINARY: entry count: 2
+# BINARY: vertex magic: 44584243
+# BINARY-NEXT: vertex DXIL digest: {{[0-9a-f]*[1-9a-f][0-9a-f]*$}}
+# BINARY-NEXT: fragment magic: 44584243
+# BINARY-NEXT: fragment DXIL digest: {{[0-9a-f]*[1-9a-f][0-9a-f]*$}}
+# IR: <4 x float>
+# IR: llvm.dx.store.output
+# IR: !dx.semantic.signatures
+# MATH-DAG: llvm.sin.
+# MATH-DAG: llvm.cos.
+# MATH-DAG: llvm.sqrt.
+# MATH-DAG: llvm.exp.
+# MATH-DAG: llvm.exp2.
+# MATH-DAG: llvm.log.
+# MATH-DAG: llvm.log2.
+# MATH-DAG: llvm.floor.
+# MATH-DAG: llvm.pow.

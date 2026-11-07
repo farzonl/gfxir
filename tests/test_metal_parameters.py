@@ -12,7 +12,7 @@ from mlir_gpu.viewer import (
     ViewerError, _metal_libraries, _metal_run, convert_dxil_to_metallib, export_mp4, load_program,
     render_metal_offscreen, show_metal_window,
 )
-from test_native_ir import ROOT, TOOLS
+from test_support import ROOT, TOOLS
 from test_vulkan_parameters import both_stages, frame_diagnostic, frame_vertex
 
 

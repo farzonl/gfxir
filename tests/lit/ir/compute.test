@@ -1,0 +1,9 @@
+# RUN: %gfx-opt %repo/tests/ir/compute.mlir --gfx-verify | %FileCheck %s --check-prefix=VERIFY
+# RUN: not %gfx-opt %repo/tests/ir/compute.mlir --convert-gfx-to-spirv 2>&1 | %FileCheck %s --check-prefix=COMPUTE-ERROR
+# RUN: not %gfx-opt %repo/tests/ir/compute.mlir --gfx-to-directx 2>&1 | %FileCheck %s --check-prefix=COMPUTE-ERROR
+# RUN: sed 's/8, 8, 1/0, 8, 1/' %repo/tests/ir/compute.mlir > %t
+# RUN: not %gfx-opt %t --gfx-verify 2>&1 | %FileCheck %s --check-prefix=INVALID
+# VERIFY: #gfx.stage<compute>
+# VERIFY: gfx.workgroup_size = array<i32: 8, 8, 1>
+# COMPUTE-ERROR: graphics-first
+# INVALID: three positive dimensions
