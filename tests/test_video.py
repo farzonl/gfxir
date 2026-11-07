@@ -210,6 +210,19 @@ class VideoTests(unittest.TestCase):
                     main()
                 self.assertEqual(error.exception.code, 2)
 
+    def test_directx_video_preserves_metal_routing_and_rejects_unsupported_windows_export(self):
+        program = GraphicsProgram(self.program.vertex, self.program.fragment, target="directx")
+        with patch("mlir_gpu.viewer.sys.platform", "win32"), patch("mlir_gpu.viewer._video_encoder") as encoder:
+            with self.assertRaisesRegex(ViewerError, "Native DirectX 12 MP4"):
+                export_mp4(program, self.path, 16, 12)
+            encoder.assert_not_called()
+        with patch("mlir_gpu.viewer.sys.platform", "darwin"):
+            with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):
+                with patch("mlir_gpu.viewer._metal_offscreen_renderer", side_effect=self.renderer) as render:
+                    self.assertEqual(export_mp4(program, self.path, 16, 12, duration=0.5, fps=4, start_time=1.25), 2)
+                    render.assert_called_once_with(program, 16, 12, False)
+        self.assertEqual(self.times, [1.25, 1.5])
+
 
 @unittest.skipUnless(os.environ.get("MLIR_GPU_TEST_VULKAN") == "1" and encoder_available(),
                      "Enable Vulkan tests and install FFmpeg or the video extra")
