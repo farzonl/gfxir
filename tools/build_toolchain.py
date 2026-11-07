@@ -129,6 +129,7 @@ def main():
         "-DLLVM_INCLUDE_BENCHMARKS=OFF", "-DLLVM_ENABLE_ZSTD=OFF", "-DLLVM_ENABLE_ZLIB=OFF",
         "-DLLVM_PARALLEL_LINK_JOBS=1", "-DLLVM_EXTERNAL_PROJECTS=gfx",
         f"-DLLVM_EXTERNAL_GFX_SOURCE_DIR={ROOT / 'native/compiler'}",
+        f"-DLLVM_EXTERNAL_LIT={source / 'llvm/utils/lit/lit.py'}",
         *_darwin_cmake_flags(),
     ]
     run(*configuration)

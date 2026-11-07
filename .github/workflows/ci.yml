@@ -30,6 +30,11 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
+      - name: Install Python package and viewer dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e '.[viewer]' lit
+
       - name: Install system packages (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -113,6 +118,8 @@ jobs:
             .toolchains/llvm-project
             .toolchains/llvm-build
           key: llvm-toolchain-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/llvm-revision.txt') }}
+          restore-keys: |
+            llvm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/llvm-revision.txt') }}
 
       - name: Build pinned LLVM/MLIR toolchain and gfx compiler
         if: steps.cache-compiler-binaries.outputs.cache-hit != 'true' && steps.cache-llvm.outputs.cache-hit != 'true'
@@ -148,11 +155,6 @@ jobs:
             "${EXTRA_ARGS[@]}"
           cmake --build build/native
           cmake --install build/native
-
-      - name: Install Python package and viewer dependencies
-        run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install -e '.[viewer]' lit
 
       - name: Run unit, compiler integration, and Vulkan rendering tests (Linux)
         if: runner.os == 'Linux'
