@@ -74,8 +74,6 @@ def load_program(manifest: Path) -> GraphicsProgram:
                 raise ValueError("Manifest parameters must match complete stage reflection.")
         except ValueError as error:
             raise ViewerError(f"Invalid parameter resource manifest: {error}") from error
-        if data["target"] != "vulkan":
-            raise ViewerError("Metal parameter resources require the runtime binding adapters in #10.")
         _frame_parameters(parameters)
     reflected = data.get("interface")
     has_parameters = isinstance(reflected, dict) and any(
@@ -192,8 +190,7 @@ def _metal_libraries(program: GraphicsProgram, toolchain: Toolchain):
         raise ViewerError("DXIL-to-Metal preview requires macOS. This is not a DirectX runtime renderer.")
     if program.target not in ("directx", "metal"):
         raise ViewerError("The Metal viewer requires DirectX or Metal artifacts.")
-    if program.parameters is not None:
-        raise ViewerError("Metal parameter resources require the runtime binding adapters in #10.")
+    _frame_parameters(program.parameters)
     with tempfile.TemporaryDirectory(prefix="mlir-gpu-metal-") as work:
         directory = Path(work)
         libraries = []
@@ -208,8 +205,12 @@ def _metal_libraries(program: GraphicsProgram, toolchain: Toolchain):
             else:
                 library.write_bytes(shader.code)
             libraries.extend([f"--{stage}", str(library), f"--{stage}-entry", shader.entry_point])
-        yield directory, [toolchain.find("mlir-gpu-metal-view"), *libraries,
-                          "--vertex-count", str(program.draw.vertex_count)]
+        arguments = [toolchain.find("mlir-gpu-metal-view"), *libraries, "--vertex-count", str(program.draw.vertex_count)]
+        if program.parameters is not None:
+            layout = directory / "frame-layout.json"
+            layout.write_text(json.dumps(program.parameters, allow_nan=False))
+            arguments.extend(["--frame-layout", str(layout)])
+        yield directory, arguments
 
 
 def _metal_run(arguments: list[str], validation: bool, capture: bool) -> str:
@@ -233,37 +234,50 @@ def _preview_toolchain() -> Toolchain:
 
 def render_metal_offscreen(
     program: GraphicsProgram, width: int = 640, height: int = 480,
-    validation: bool = False, toolchain: Toolchain | None = None,
+    validation: bool = False, toolchain: Toolchain | None = None, time: float = 0.0,
 ) -> RenderedImage:
+    elapsed = _time_value(time)
+    with _metal_offscreen_renderer(program, width, height, validation, toolchain) as render:
+        return render(elapsed)
+
+
+@contextmanager
+def _metal_offscreen_renderer(
+    program: GraphicsProgram, width: int, height: int, validation: bool, toolchain: Toolchain | None = None,
+):
     _dimensions(width, height)
     with _metal_libraries(program, toolchain or _preview_toolchain()) as (directory, arguments):
         output = directory / "readback.rgba"
-        text = _metal_run(
-            [*arguments, "--width", str(width), "--height", str(height), "--readback", str(output)],
-            validation, True,
-        )
-        report = json.loads(text)
-        if (
-            not isinstance(report, dict) or report.get("width") != width or report.get("height") != height
-            or not isinstance(report.get("device"), str) or not report["device"]
-        ):
-            raise ViewerError("The native Metal renderer returned an invalid render report.")
-        rgba = output.read_bytes()
-        if len(rgba) != width * height * 4:
-            raise ViewerError("Metal RGBA readback size does not match the requested dimensions.")
-        return RenderedImage(width, height, rgba, report["device"])
+        def render(elapsed: float) -> RenderedImage:
+            timing = ["--time", str(_time_value(elapsed))] if elapsed != 0 else []
+            text = _metal_run(
+                [*arguments, "--width", str(width), "--height", str(height), "--readback", str(output), *timing],
+                validation, True,
+            )
+            report = json.loads(text)
+            if (
+                not isinstance(report, dict) or report.get("width") != width or report.get("height") != height
+                or not isinstance(report.get("device"), str) or not report["device"]
+            ):
+                raise ViewerError("The native Metal renderer returned an invalid render report.")
+            rgba = output.read_bytes()
+            if len(rgba) != width * height * 4:
+                raise ViewerError("Metal RGBA readback size does not match the requested dimensions.")
+            return RenderedImage(width, height, rgba, report["device"])
+        yield render
 
 
 def show_metal_window(
     program: GraphicsProgram, width: int = 800, height: int = 600, frames: int = 0,
-    validation: bool = False, toolchain: Toolchain | None = None,
+    validation: bool = False, toolchain: Toolchain | None = None, time: float | None = None,
 ) -> None:
     _dimensions(width, height)
     if type(frames) is not int or frames < 0:
         raise ViewerError("Frame count must be a nonnegative integer (0 means until closed).")
+    timing = ["--time", str(_time_value(time))] if time is not None else []
     with _metal_libraries(program, toolchain or _preview_toolchain()) as (_, arguments):
         _metal_run(
-            [*arguments, "--width", str(width), "--height", str(height), "--frames", str(frames)],
+            [*arguments, "--width", str(width), "--height", str(height), "--frames", str(frames), *timing],
             validation, False,
         )
 
@@ -669,8 +683,8 @@ def export_mp4(program: GraphicsProgram, path: Path, width: int = 640, height: i
     start = _time_value(start_time)
     count = math.ceil(Fraction(str(seconds)) * fps)
     _time_value(start + (count - 1) / fps)
-    if program.target != "vulkan":
-        raise ViewerError("MP4 export currently requires Vulkan artifacts; Metal frame resources remain #10.")
+    if program.target not in ("vulkan", "directx", "metal"):
+        raise ViewerError("MP4 export requires Vulkan, DirectX, or Metal artifacts.")
     _frame_parameters(program.parameters)
     path = Path(path).absolute()
     if path.suffix.lower() != ".mp4":
@@ -700,7 +714,8 @@ def export_mp4(program: GraphicsProgram, path: Path, width: int = 640, height: i
             raise ViewerError(f"Cannot start the MP4 encoder: {error}") from error
         with encoder:
             try:
-                with _offscreen_renderer(program, width, height, validation) as render:
+                renderer = _offscreen_renderer if program.target == "vulkan" else _metal_offscreen_renderer
+                with renderer(program, width, height, validation) as render:
                     for index in range(count):
                         image = render(start + index / fps)
                         if (image.width, image.height, len(image.rgba)) != (width, height, width * height * 4):
@@ -900,10 +915,10 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=600)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--output", type=Path, help="Render an offscreen PNG instead of opening a window (new file)")
-    mode.add_argument("--video", type=Path, help="Export a fixed-time Vulkan animation to MP4 (new file)")
+    mode.add_argument("--video", type=Path, help="Export a fixed-time GPU animation to MP4 (new file)")
     mode.add_argument("--frames", "-frames", type=int, default=0, help="Live window: close after N frames; 0 stays open")
     parser.add_argument("--validation", action="store_true", help="Enable Vulkan validation or Metal API/GPU validation")
-    parser.add_argument("--time", type=float, help="Vulkan: fixed snapshot/live time or MP4 start time (seconds)")
+    parser.add_argument("--time", type=float, help="Fixed snapshot/live time or MP4 start time (seconds)")
     parser.add_argument("--duration", type=float, help="MP4 duration in seconds (default 4)")
     parser.add_argument("--fps", type=int, help="MP4 frames per second, 1-240 (default 30)")
     args = parser.parse_args()
@@ -912,8 +927,6 @@ def main() -> int:
     try:
         program = load_program(args.manifest)
         timing = {"time": args.time} if args.time is not None else {}
-        if timing and program.target != "vulkan":
-            raise ViewerError("--time for Metal previews requires the runtime adapter in #10.")
         if args.video:
             fps = args.fps if args.fps is not None else 30
             count = export_mp4(program, args.video, args.width, args.height,
@@ -931,7 +944,7 @@ def main() -> int:
             count = show_window(program, args.width, args.height, args.frames, args.validation, **timing)
             print(f"Presented {count} Vulkan frames.")
         else:
-            show_metal_window(program, args.width, args.height, args.frames, args.validation)
+            show_metal_window(program, args.width, args.height, args.frames, args.validation, **timing)
     except (ViewerError, CompileError, OSError, ValueError) as error:
         print(f"mlir-gpu-view: {error}", file=sys.stderr)
         return 1
