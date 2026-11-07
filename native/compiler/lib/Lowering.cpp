@@ -2,6 +2,8 @@
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ArithToSPIRV/ArithToSPIRV.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/MathToSPIRV/MathToSPIRV.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
 #include "mlir/Conversion/VectorToSPIRV/VectorToSPIRV.h"
@@ -168,6 +170,7 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
     SPIRVTypeConverter converter(target);
     RewritePatternSet patterns(context);
     arith::populateArithToSPIRVPatterns(converter, patterns);
+    populateMathToSPIRVPatterns(converter, patterns);
     populateVectorToSPIRVPatterns(converter, patterns);
     patterns.add<ReturnToSPIRV>(context);
     auto legality = SPIRVConversionTarget::get(target);
@@ -241,6 +244,7 @@ std::unique_ptr<Pass> createGfxToLLVMPass() {
 void buildDirectXPipeline(OpPassManager &manager) {
   manager.addPass(createGfxToLLVMPass());
   manager.addPass(createConvertVectorToLLVMPass());
+  manager.addPass(createConvertMathToLLVMPass());
   manager.addPass(createArithToLLVMConversionPass());
   manager.addPass(createConvertFuncToLLVMPass());
   manager.addPass(createReconcileUnrealizedCastsPass());

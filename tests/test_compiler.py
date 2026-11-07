@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mlir_gpu import CompileError, Pipeline, Target, Toolchain, Vertex, fragment, select, vec3, vec4, vertex
+from mlir_gpu import CompileError, Pipeline, Target, Toolchain, Vertex, fragment, i32, maximum, minimum, select, u32, vec3, vec4, vertex
 from mlir_gpu.__main__ import main
 from mlir_gpu.compiler import PIPELINE_SCHEMA_VERSION, RASTER_CONVENTION, _check_binary, _run
 from mlir_gpu.compiler import compile_pipeline
@@ -56,6 +56,44 @@ def unused_varying_pipeline():
         return quad.fragment.function(uv)
 
     return Pipeline(extra_vertex, extra_fragment, draw=quad.draw)
+
+
+def expanded_arithmetic_pipeline():
+    quad = runpy.run_path(str(ROOT / "examples/quad.py"))["pipeline"]
+
+    @vertex
+    def expanded_vertex(index):
+        result = quad.vertex.function(index)
+        unsigned = index + 2**31
+        signed = i32(unsigned)
+        absolute_ok = select(index == 0, abs(signed) == signed, abs(signed) >= 0)
+        flag = (
+            (signed < 0) & (unsigned >= 2**31) & (signed <= i32(index) + (-2**31))
+            & (minimum(signed, 0) == signed) & (maximum(signed, 0) == 0)
+            & (minimum(unsigned, 0) == 0) & (maximum(unsigned, 0) == unsigned)
+            & ((-signed) == (0 - signed)) & (u32(signed) == unsigned) & absolute_ok
+        )
+        return Vertex(result.position, varyings={
+            "uv": result.varyings["uv"], "integer_ok": select(flag, 1.0, 0.0),
+        })
+
+    @fragment
+    def expanded_fragment(uv, integer_ok):
+        point = vec3(uv * 2 - 1, -uv.x)
+        surface = minimum(maximum(abs(-point), 0.0), 1.0).with_components(z=minimum(uv.x, uv.y))
+        value = maximum(surface.xy, 0.125) / 2 + 0.125 / maximum(surface.xy, 0.5)
+        predicate = (point.x < 0) & ~(point.y >= 0)
+        zero = uv.x - uv.x
+        nan = zero / zero
+        numeric_ok = (
+            (minimum(nan, 0.5) == 0.5) & (maximum(0.25, nan) == 0.25)
+            & (minimum(nan, nan) != nan) & (abs(-zero) == 0)
+        )
+        color = vec4(value.x * integer_ok * select(numeric_ok, 1.0, 0.0),
+                     surface.z, select(predicate | False, 0.25, 0.75), 1)
+        return minimum(maximum(abs(-color), 0.0), 1.0)
+
+    return Pipeline(expanded_vertex, expanded_fragment, draw=quad.draw)
 
 
 def available(*names):
@@ -264,6 +302,29 @@ class LLVMIntegrationTests(unittest.TestCase):
 
 
 class NativeTargetIntegrationTests(unittest.TestCase):
+    def test_expanded_arithmetic_validates_and_executes_on_all_targets(self):
+        for target in Target:
+            with self.subTest(target=target.value), tempfile.TemporaryDirectory() as work:
+                try:
+                    TOOLS.preflight(target)
+                except CompileError as error:
+                    self.skipTest(str(error))
+                manifest = compile_pipeline(expanded_arithmetic_pipeline(), target, Path(work) / "out", TOOLS)
+                flag = "MLIR_GPU_TEST_VULKAN" if target == Target.VULKAN else "MLIR_GPU_TEST_METAL"
+                if os.environ.get(flag) == "1":
+                    from mlir_gpu.viewer import load_program, render_metal_offscreen, render_offscreen
+
+                    program = load_program(manifest)
+                    validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
+                    image = (
+                        render_offscreen(program, 63, 47, validation)
+                        if target == Target.VULKAN else
+                        render_metal_offscreen(program, 63, 47, validation, TOOLS)
+                    )
+                    center = (23 * 63 + 31) * 4
+                    for actual, expected in zip(image.rgba[center:center + 4], (80, 128, 191, 255)):
+                        self.assertAlmostEqual(actual, expected, delta=2)
+
     def test_unused_input_preserves_location_and_renumbers_live_signature(self):
         for target in Target:
             with self.subTest(target=target.value), tempfile.TemporaryDirectory() as work:
