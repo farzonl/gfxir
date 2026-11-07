@@ -725,6 +725,33 @@ For example, export `build/pulse-rings-metal/pipeline.json` with
 `--video build/pulse-rings.mp4 --duration 3 --fps 24 --width 320 --height 240`.
 Existing PNG and persistent-window behavior is unchanged.
 
+### Original ray-marched beacon gallery
+
+[Beacon gallery](examples/beacon_gallery.py) combines repeated sphere/box
+geometry inside a room, a moving camera, a **72-step GPU loop**, distance/hit
+termination, loop-carried glow, four-sample SDF normals, lighting, analytically
+filtered procedural lines, fog, and tone mapping. It is an original scene,
+not a translation of an attributed third-party shader. Geometry and effects are
+ordinary Python helpers built from the shared device library.
+
+```sh
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/python -m mlir_gpu examples/beacon_gallery.py \
+  --target vulkan --output build/beacon-gallery-vulkan
+DYLD_LIBRARY_PATH=/usr/local/lib .venv/bin/mlir-gpu-view \
+  build/beacon-gallery-vulkan/pipeline.json --width 320 --height 240 \
+  --video build/beacon-gallery.mp4 --duration 4 --fps 24 --validation
+```
+
+Compile the same source with `--target directx` or `--target metal` into fresh
+directories. All previews support fixed-time PNG/MP4 and live animation.
+Start at **320x240** for interactive use. `MAX_STEPS` and `MAX_DISTANCE` are
+compile-time workload controls; exhausting either bound is a miss, not a surface.
+Increasing the step cap changes the loop bound, not the number of cloned bodies.
+Normals are evaluated only on a confirmed hit; glow integrates along the ray.
+Use `--time 0.25 --output build/gallery.png` for a deterministic snapshot,
+or omit output/time for a persistent, resize-aware window.
+
 ### Arithmetic and vectors
 
 Device values support `+`, `-`, `*`, floating-point `/`, unary negation, `abs`,
