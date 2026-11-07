@@ -55,6 +55,8 @@ void registerGfxDialects(DialectRegistry &registry);
 LogicalResult verifyShaderModule(ModuleOp module);
 Type parseShaderType(MLIRContext &context, StringRef name);
 bool isShaderSymbolName(StringRef name);
+Value buildPortablePow(OpBuilder &builder, Location location, Value base,
+                       Value exponent);
 OwningOpRef<ModuleOp> importShader(MLIRContext &context,
                                    const llvm::json::Object &source);
 OwningOpRef<ModuleOp> importStructuredShader(MLIRContext &context,

@@ -1,6 +1,8 @@
 #include "Gfx/Gfx.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Verifier.h"
 #include "llvm/ADT/StringMap.h"
 #include <cmath>
 #include <limits>
@@ -33,14 +35,20 @@ private:
 
   FailureOr<Location> location(const llvm::json::Object &object,
                                Location parent) {
-    if (!object.get("source_file") && !object.get("source_line"))
+    if (!object.get("source_file") && !object.get("source_line") &&
+        !object.get("source_column"))
       return parent;
     auto file = object.getString("source_file");
     auto line = object.getInteger("source_line");
+    auto column = object.getInteger("source_column");
     if (!file || !line || *line < 1 || *line > UINT32_MAX)
       return error(parent, "source location requires a file and positive "
                            "32-bit source_line");
-    return Location(FileLineColLoc::get(builder.getContext(), *file, *line, 1));
+    if (object.get("source_column") &&
+        (!column || *column < 1 || *column > UINT32_MAX))
+      return error(parent, "source_column must be a positive 32-bit integer");
+    return Location(FileLineColLoc::get(builder.getContext(), *file, *line,
+                                        column ? *column : 1));
   }
 
   FailureOr<TypedAttr> literal(Type type, const llvm::json::Value &value,
@@ -244,8 +252,17 @@ StructuredImporter::operation(const llvm::json::Object &description,
       if (failed(region(*object, op->getRegion(index), values, *loc)))
         return failure();
     }
-  for (auto [index, name] : llvm::enumerate(resultNames))
-    values.try_emplace(name, op->getResult(index));
+  if (auto power = dyn_cast<math::PowFOp>(op)) {
+    if (failed(verify(op)))
+      return failure();
+    Value value =
+        buildPortablePow(builder, *loc, power.getLhs(), power.getRhs());
+    values.try_emplace(resultNames.front(), value);
+    power.erase();
+  } else {
+    for (auto [index, name] : llvm::enumerate(resultNames))
+      values.try_emplace(name, op->getResult(index));
+  }
   return success();
 }
 

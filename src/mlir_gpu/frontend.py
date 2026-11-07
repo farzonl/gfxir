@@ -380,8 +380,11 @@ class Stage:
     output_interface: tuple[ShaderIO, ...]
     source_file: str
     source_line: int
+    structured_input: dict | None = None
 
     def to_dict(self) -> dict:
+        if self.structured_input is not None:
+            return self.structured_input
         nodes: list[dict] = []
         ids: dict[int, int] = {}
         input_ids = {id(node): index for index, node in enumerate(self.inputs)}
@@ -460,7 +463,9 @@ class Entry:
         if len(coordinate_parameters) > 1:
             raise TypeError("A fragment entry point may declare FragmentCoord only once.")
         input_nodes = tuple(Node("input", interface.type, literal=interface.name) for interface in interfaces)
-        result = self.function(*(Value(node) for node in input_nodes))
+        from .ast_frontend import ASTLowering
+        lowering = ASTLowering(self.function, input_nodes, interfaces)
+        result = lowering.result
         if self.kind == "vertex":
             if not isinstance(result, Vertex):
                 raise TypeError("A vertex entry point must return Vertex(position, color=..., varyings=...).")
@@ -503,15 +508,19 @@ class Entry:
                 "eq", "cmp", "add", "sub", "mul", "div", "neg", "abs", "min", "max",
                 "and", "or", "xor", "cast", "broadcast",
                 "sin", "cos", "sqrt", "exp", "exp2", "log", "log2", "floor", "pow",
+                "ssa",
             }:
                 raise ValueError(f"Unsupported device operation: {node.op}.")
+            if node.op == "ssa" and id(node) not in lowering.owned:
+                raise ValueError("A stage cannot capture another stage's device SSA value.")
             for arg in node.args:
                 validate(arg)
 
         for output in outputs:
             validate(output)
+        structured = lowering.module(name, self.kind, outputs, output_interface) if lowering.structured else None
         return Stage(name, self.kind, input_nodes, outputs, interfaces, output_interface,
-                     self.function.__code__.co_filename, self.function.__code__.co_firstlineno)
+                     self.function.__code__.co_filename, self.function.__code__.co_firstlineno, structured)
 
 
 def vertex(function: Callable) -> Entry:
