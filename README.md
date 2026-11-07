@@ -478,6 +478,57 @@ PATH="$PWD/.tools/bin:$PATH" \
   .venv/bin/mlir-gpu-view build/coordinates-metal/pipeline.json -frames 0
 ```
 
+### Reusable shader and distance-field helpers
+
+`shader_math` also provides `dot`, `cross`, `length`, `normalize`, `rotate2`,
+`clamp`, `mix`, `smoothstep`, `fract`, and floor-based `mod`.
+These are small pure device-expression helpers composed from the existing
+arithmetic/vector/math primitives, not new `gfx` operations. `rotate2` is a
+counterclockwise mathematical rotation; use an explicit Y-up coordinate
+conversion if starting from framebuffer pixels.
+
+`from mlir_gpu import sdf` exposes `sphere`, `box`, `box2`, centered `repeat`,
+`fold_square`, and tetrahedral finite-difference `normal`. Box sizes are
+half-extents. For example:
+
+```python
+point = vec3(0.5, 0.25, 0.75)
+distance = sdf.box(point, vec3(0.4))
+normal = sdf.normal(lambda p: sdf.sphere(p, 1.0), point)
+```
+
+`normalize` returns zero for a zero vector. Flat distance gradients likewise
+produce a zero normal, rather than silently choosing a direction. Nonzero
+lengths must be representable in the bounded f32 domain; singular SDF points,
+underflow/overflow, and nondifferentiable corners do not guarantee a unit
+geometric normal. Normal epsilon and modulo/repetition periods must be
+positive, sphere radii and box half-extents nonnegative, and smoothstep edges
+strictly increasing. Known literal-domain errors are rejected; dynamic
+domain validity remains the shader author's responsibility.
+
+`mod(x, period)` uses `x - period * floor(x / period)`, including for negative
+coordinates. It is not truncating remainder: `mod(-0.25, 2) = 1.75` and centered
+`repeat(-0.25, 2) = -0.25`. `mix` permits extrapolation; clamp bounds must be
+ordered. These helpers preserve the numerical/NaN policy of their primitives.
+
+[Distance fields](examples/distance_fields.py) shows rotated, repeated box
+slices with smooth edges and glow. [Surface normals](examples/surface_normals.py)
+shows sphere normals as RGB. Both are visual helper demonstrations, not a
+ray marcher yet:
+
+```sh
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/python -m mlir_gpu examples/distance_fields.py \
+  --target metal --output build/distance-fields-metal
+PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/mlir-gpu-view build/distance-fields-metal/pipeline.json -frames 0
+```
+
+Compile `examples/surface_normals.py` into another fresh directory for the
+second example. The current frontend deliberately inlines these small pure
+helpers, including four fixed normal samples, during tracing. It does not
+unroll a ray-marching loop; GPU loops/functions remain separate pending work.
+
 Python executes once during tracing. Python `if`/loops cannot branch on device
 values: use `select` for now. Host-side loops and metaprogramming can construct
 expressions. This is not a compiler for arbitrary Python, dynamic GPU function
