@@ -409,7 +409,10 @@ mlir::gfx::importShader(MLIRContext &context,
 }
 
 ShaderInterface mlir::gfx::reflectShader(ModuleOp module) {
-  auto function = *module.getOps<func::FuncOp>().begin();
+  func::FuncOp function;
+  for (auto candidate : module.getOps<func::FuncOp>())
+    if (candidate->hasAttr("gfx.stage"))
+      function = candidate;
   ShaderInterface result{
       function.getSymName().str(),
       function->getAttrOfType<StageAttr>("gfx.stage").getValue(),
