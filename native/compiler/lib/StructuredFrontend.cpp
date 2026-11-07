@@ -329,6 +329,40 @@ StructuredImporter::import(const llvm::json::Object &source) {
     return {};
   }
   auto module = OwningOpRef<ModuleOp>(ModuleOp::create(*loc));
+  if (auto description = source.get("parameters")) {
+    auto object = description->getAsObject();
+    auto name = object ? object->getString("name") : std::nullopt;
+    auto fields = object ? object->getArray("fields") : nullptr;
+    if (!name || !fields || object->size() != 2) {
+      emitError(*loc, "parameters requires a name and fields, not authored "
+                      "offsets or backend bindings");
+      return {};
+    }
+    SmallVector<Attribute> attributes;
+    for (const auto &item : *fields) {
+      auto field = item.getAsObject();
+      auto name = field ? field->getString("name") : std::nullopt;
+      auto typeName = field ? field->getString("type") : std::nullopt;
+      auto parsedType = typeName ? type(*typeName) : Type{};
+      if (!name || !parsedType || field->size() != 2) {
+        emitError(*loc,
+                  "parameter field requires only a name and supported type");
+        return {};
+      }
+      auto attribute = ParameterFieldAttr::getChecked(
+          [&] { return emitError(*loc); }, builder.getContext(), *name,
+          parsedType);
+      if (!attribute)
+        return {};
+      attributes.push_back(attribute);
+    }
+    auto block = ParameterBlockAttr::getChecked(
+        [&] { return emitError(*loc); }, builder.getContext(), *name,
+        builder.getArrayAttr(attributes));
+    if (!block)
+      return {};
+    (*module)->setAttr("gfx.parameters", block);
+  }
   llvm::StringMap<func::FuncOp> symbols;
   for (const auto &item : *functions) {
     auto object = item.getAsObject();

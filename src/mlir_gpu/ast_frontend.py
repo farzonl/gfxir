@@ -12,6 +12,7 @@ from typing import Callable
 from . import sdf, shader_math
 from .frontend import Entry, Node, Pipeline, Type, Value, Vertex, _node, maximum, minimum, select
 from .frontend import i32, u32, vec2, vec3, vec4
+from .parameters import _ParameterValues
 
 
 _INTRINSICS = {Node, Value, Vertex, i32, u32, vec2, vec3, vec4, select, maximum, minimum}
@@ -120,7 +121,7 @@ class _Builder:
 
 
 class ASTLowering:
-    def __init__(self, function, inputs, interfaces):
+    def __init__(self, function, inputs, interfaces, parameters=None):
         self.serial = 0
         self.owned = set()
         self.nodes = {id(node): node for node in inputs}
@@ -143,7 +144,27 @@ class ASTLowering:
             ref, = self.root.raw("gfx.builtin" if interface.builtin else "gfx.input",
                                  types=[node.type.schema_name], attributes=attrs)
             self.root.cache[id(node)] = ref
-        self.result = self.call(function, [Value(node) for node in inputs], {})
+        parameters = parameters or {}
+        blocks = list(parameters.values())
+        if blocks and any(block != blocks[0] for block in blocks):
+            self.fail("This parameter ABI supports one matching block per shader module.")
+        self.parameters = blocks[0] if blocks else None
+        arguments = []
+        raster = iter(inputs)
+        for parameter in inspect.signature(function).parameters.values():
+            if parameter.name not in parameters:
+                arguments.append(Value(next(raster)))
+                continue
+            block = parameters[parameter.name]
+            values = {}
+            for name, typ in block.fields:
+                values[name] = self.root.value("gfx.parameter", [], typ, {
+                    "block": {"kind": "string", "value": block.name},
+                    "field": {"kind": "string", "value": name},
+                })
+            arguments.append(_ParameterValues(values))
+            self.structured = True
+        self.result = self.call(function, arguments, {})
 
     def name(self):
         result = f"v{self.serial}"
@@ -410,7 +431,7 @@ class ASTLowering:
             if node.attr.startswith("_"):
                 self.fail("Private attributes and Python introspection are unsupported in device source.")
             owner = self.expression(node.value, env)
-            if not isinstance(owner, (Value, Node, ModuleType, Type, Vertex, Entry, Pipeline)) and owner is not Type:
+            if not isinstance(owner, (Value, Node, ModuleType, Type, Vertex, Entry, Pipeline, _ParameterValues)) and owner is not Type:
                 self.fail("Dynamic attributes on arbitrary Python objects are unsupported.")
             return getattr(owner, node.attr)
         if isinstance(node, (ast.Tuple, ast.List)):
@@ -747,10 +768,13 @@ class ASTLowering:
                     "interpolation": {"kind": "interpolation", "value": interface.interpolation},
                 })
         self.root.raw("func.return")
-        return {"schema_version": 2, "functions": [{
+        result = {"schema_version": 2, **self.location(), "functions": [{
             "name": name, "stage": kind, "results": [],
             "body": {"blocks": [self.root.block]}, **self.location(),
         }]}
+        if self.parameters:
+            result["parameters"] = self.parameters.to_dict()
+        return result
 
 
 @dataclass(frozen=True, eq=False)

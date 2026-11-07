@@ -13,6 +13,7 @@
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
@@ -81,12 +82,87 @@ LogicalResult GfxDialect::verifyOperationAttribute(Operation *op,
         }))
       return op->emitOpError("gfx.workgroup_size requires three positive "
                              "dimensions on a compute entry point");
+  } else if (attribute.getName() == "gfx.parameters") {
+    if (!isa<ModuleOp>(op) || !isa<ParameterBlockAttr>(attribute.getValue()))
+      return op->emitOpError("gfx.parameters requires a typed parameter block "
+                             "on the shader module");
   } else {
     return op->emitOpError("unknown gfx attribute: ") << attribute.getName();
   }
   return success();
 }
 
+LogicalResult
+ParameterFieldAttr::verify(llvm::function_ref<InFlightDiagnostic()> error,
+                           StringRef name, Type type) {
+  if (!isShaderSymbolName(name))
+    return error() << "parameter field requires a valid name";
+  if (type.isF32())
+    return success();
+  auto vector = dyn_cast<VectorType>(type);
+  if (!vector || vector.getRank() != 1 || !vector.getElementType().isF32() ||
+      vector.getNumElements() < 2 || vector.getNumElements() > 4)
+    return error() << "parameter fields currently support f32 and f32x2/3/4";
+  return success();
+}
+
+static ParameterLayout layoutFields(ArrayAttr fields) {
+  ParameterLayout layout{{}, 0};
+  for (auto attribute : fields) {
+    auto field = cast<ParameterFieldAttr>(attribute);
+    auto vector = dyn_cast<VectorType>(field.getType());
+    uint32_t components = vector ? vector.getNumElements() : 1;
+    uint32_t alignment = components == 3 ? 16 : components * 4;
+    uint32_t offset = (layout.size + alignment - 1) / alignment * alignment;
+    layout.fields.push_back({field, offset, components * 4, alignment});
+    layout.size = offset + components * 4;
+  }
+  layout.size = (layout.size + 15) / 16 * 16;
+  return layout;
+}
+
+ParameterLayout mlir::gfx::parameterLayout(ParameterBlockAttr block) {
+  return layoutFields(block.getFields());
+}
+
+LogicalResult
+ParameterBlockAttr::verify(llvm::function_ref<InFlightDiagnostic()> error,
+                           StringRef name, ArrayAttr fields) {
+  if (!isShaderSymbolName(name) || fields.empty() || fields.size() > 32)
+    return error() << "parameter block requires a valid name and 1-32 fields";
+  llvm::StringSet<> names;
+  for (auto attribute : fields) {
+    auto field = dyn_cast<ParameterFieldAttr>(attribute);
+    if (!field || !names.insert(field.getName()).second)
+      return error() << "parameter fields must be typed and uniquely named";
+    if (failed(ParameterFieldAttr::verify(error, field.getName(),
+                                          field.getType())))
+      return failure();
+  }
+  if (layoutFields(fields).size > 128)
+    return error()
+           << "read-only parameter blocks currently fit within 128 bytes";
+  return success();
+}
+
+LogicalResult ParameterOp::verify() {
+  auto module = (*this)->getParentOfType<ModuleOp>();
+  auto block = module
+                   ? module->getAttrOfType<ParameterBlockAttr>("gfx.parameters")
+                   : ParameterBlockAttr{};
+  if (!(*this)->getParentOfType<func::FuncOp>() || !block ||
+      block.getName() != getBlock())
+    return emitOpError("requires a matching declared parameter block");
+  for (auto attribute : block.getFields()) {
+    auto field = cast<ParameterFieldAttr>(attribute);
+    if (field.getName() == getField())
+      return field.getType() == getValue().getType()
+                 ? success()
+                 : emitOpError(
+                       "parameter result type does not match its field");
+  }
+  return emitOpError("unknown parameter field");
+}
 static bool interfaceType(Type type) {
   if (auto vector = dyn_cast<VectorType>(type)) {
     if (vector.getRank() != 1 || vector.getNumElements() < 1 ||

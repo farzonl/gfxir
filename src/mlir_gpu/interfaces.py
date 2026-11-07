@@ -1,6 +1,7 @@
 import re
 
 from .frontend import Type
+from .parameters import verify_parameters
 
 
 def verify_graphics_interface(interface: object, *, preview: bool = False) -> None:
@@ -11,6 +12,10 @@ def verify_graphics_interface(interface: object, *, preview: bool = False) -> No
         reflection = interface[stage]
         if not isinstance(reflection, dict) or reflection.get("stage") != stage:
             raise ValueError(f"Invalid {stage} reflection.")
+        if "parameters" in reflection:
+            verify_parameters(reflection["parameters"])
+            if reflection["parameters"]["stages"] != [stage]:
+                raise ValueError("Parameter visibility does not match the reflected stage.")
         name = reflection.get("name")
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise ValueError(f"Invalid reflected {stage} entry-point name.")
@@ -61,3 +66,17 @@ def verify_graphics_interface(interface: object, *, preview: bool = False) -> No
         outputs = ports["fragment", "outputs"]
         if set(outputs) != {0} or outputs[0]["type"] != "f32x4":
             raise ValueError("The preview currently supports one f32x4 render target at location 0.")
+
+
+def reflect_pipeline_parameters(interface: dict) -> dict | None:
+    blocks = [interface[stage]["parameters"] for stage in ("vertex", "fragment")
+              if "parameters" in interface[stage]]
+    if not blocks:
+        return None
+    for block in blocks:
+        verify_parameters(block)
+        if {key: value for key, value in block.items() if key != "stages"} != {
+            key: value for key, value in blocks[0].items() if key != "stages"
+        }:
+            raise ValueError("Graphics stages require one matching parameter block layout and bindings.")
+    return {**blocks[0], "stages": [stage for block in blocks for stage in block["stages"]]}

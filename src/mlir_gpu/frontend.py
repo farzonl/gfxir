@@ -424,6 +424,15 @@ class Entry:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise ValueError(f"Invalid entry-point name: {name!r}.")
         parameters = list(inspect.signature(self.function).parameters.values())
+        from .parameters import ParameterBlock
+        parameter_blocks = {}
+        for parameter in parameters:
+            annotation = parameter.annotation
+            if isinstance(annotation, str):
+                annotation = self.function.__globals__.get(annotation, annotation)
+            if isinstance(annotation, ParameterBlock):
+                parameter_blocks[parameter.name] = annotation
+        raster_parameters = [parameter for parameter in parameters if parameter.name not in parameter_blocks]
         if any(parameter.kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
                for parameter in parameters):
             raise TypeError("Entry points require positional device arguments.")
@@ -434,27 +443,27 @@ class Entry:
         if self.kind == "vertex":
             if coordinate_parameters:
                 raise TypeError("FragmentCoord parameters require a fragment entry point.")
-            if len(parameters) != 1:
+            if len(raster_parameters) != 1:
                 raise TypeError("A vertex entry point must take one positional vertex-index argument.")
             interfaces = (ShaderIO("vertex_index", Type.U32, builtin="vertex_index"),)
         elif varying_interface is None:
-            if sum(parameter.name not in coordinate_parameters for parameter in parameters) > 1:
+            if sum(parameter.name not in coordinate_parameters for parameter in raster_parameters) > 1:
                 raise TypeError("Trace multi-input fragment shaders through Pipeline to resolve their interfaces.")
             interfaces = tuple(
                 ShaderIO(parameter.name, Type.VEC2, builtin="fragment_coord")
                 if parameter.name in coordinate_parameters else
                 ShaderIO(parameter.name, Type.VEC4, location=0)
-                for parameter in parameters
+                for parameter in raster_parameters
             )
         else:
             available = {interface.name: interface for interface in varying_interface}
             resolved = []
-            for parameter in parameters:
+            for parameter in raster_parameters:
                 if parameter.name in coordinate_parameters:
                     resolved.append(ShaderIO(parameter.name, Type.VEC2, builtin="fragment_coord"))
                     continue
                 interface = available.get(parameter.name)
-                if interface is None and len(parameters) == 1 and len(available) == 1:
+                if interface is None and len(raster_parameters) == 1 and len(available) == 1:
                     interface = next(iter(available.values()))
                 if interface is None:
                     raise ValueError(f"Fragment input {parameter.name!r} has no matching vertex varying.")
@@ -464,7 +473,7 @@ class Entry:
             raise TypeError("A fragment entry point may declare FragmentCoord only once.")
         input_nodes = tuple(Node("input", interface.type, literal=interface.name) for interface in interfaces)
         from .ast_frontend import ASTLowering
-        lowering = ASTLowering(self.function, input_nodes, interfaces)
+        lowering = ASTLowering(self.function, input_nodes, interfaces, parameter_blocks)
         result = lowering.result
         if self.kind == "vertex":
             if not isinstance(result, Vertex):

@@ -24,6 +24,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Frontend/HLSL/RootSignatureMetadata.h"
 #include "llvm/Frontend/HLSL/SemanticSignatures.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Module.h"
@@ -141,6 +142,46 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
          llvm::make_early_inc_range(module.getOps<func::FuncOp>()))
       helper.erase();
     SymbolTable symbols(shader);
+    auto parameters =
+        module->getAttrOfType<ParameterBlockAttr>("gfx.parameters");
+    spirv::GlobalVariableOp parameterVariable;
+    bool readsParameters = false;
+    shader.walk([&](ParameterOp) { readsParameters = true; });
+    if (readsParameters) {
+      auto layout = parameterLayout(parameters);
+      SmallVector<Type> types;
+      SmallVector<uint32_t> offsets;
+      for (const auto &field : layout.fields) {
+        types.push_back(field.field.getType());
+        offsets.push_back(field.offset);
+      }
+      auto structure = spirv::StructType::get(types, offsets);
+      auto pointer =
+          spirv::PointerType::get(structure, spirv::StorageClass::PushConstant);
+      builder.setInsertionPoint(function);
+      parameterVariable = spirv::GlobalVariableOp::create(
+          builder, location, pointer, "parameters");
+      symbols.insert(parameterVariable);
+      SmallVector<ParameterOp> reads;
+      shader.walk([&](ParameterOp op) { reads.push_back(op); });
+      for (auto op : reads) {
+        auto field = llvm::find_if(layout.fields, [&](const auto &field) {
+          return field.field.getName() == op.getField();
+        });
+        builder.setInsertionPoint(op);
+        auto address =
+            spirv::AddressOfOp::create(builder, op.getLoc(), parameterVariable);
+        auto index = spirv::ConstantOp::create(
+            builder, op.getLoc(), builder.getI32Type(),
+            builder.getI32IntegerAttr(field - layout.fields.begin()));
+        auto member = spirv::AccessChainOp::create(builder, op.getLoc(),
+                                                   address, ValueRange{index});
+        auto value = spirv::LoadOp::create(builder, op.getLoc(), member);
+        op.getValue().replaceAllUsesWith(value);
+        op.erase();
+      }
+    }
+    module->removeAttr("gfx.parameters");
     SmallVector<Attribute> interface;
     SmallVector<Operation *> operations;
     function.walk([&](Operation *op) {
@@ -262,6 +303,59 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
       if (helper != function)
         helper.setPrivate();
     OpBuilder builder(module.getContext());
+    auto parameters =
+        module->getAttrOfType<ParameterBlockAttr>("gfx.parameters");
+    SmallVector<ParameterOp> reads;
+    module.walk([&](ParameterOp op) { reads.push_back(op); });
+    if (!reads.empty()) {
+      auto layout = parameterLayout(parameters);
+      SmallVector<Type> members;
+      uint32_t offset = 0;
+      for (const auto &field : layout.fields) {
+        while (offset < field.offset) {
+          members.push_back(builder.getF32Type());
+          offset += 4;
+        }
+        members.push_back(field.field.getType());
+        offset += field.size;
+      }
+      while (offset < layout.size) {
+        members.push_back(builder.getF32Type());
+        offset += 4;
+      }
+      auto structure =
+          LLVM::LLVMStructType::getLiteral(module.getContext(), members, true);
+      auto handleType = LLVM::LLVMTargetExtType::get(
+          module.getContext(), "dx.CBuffer", ArrayRef<Type>{structure}, {});
+      for (auto op : reads) {
+        auto field = llvm::find_if(layout.fields, [&](const auto &field) {
+          return field.field.getName() == op.getField();
+        });
+        builder.setInsertionPoint(op);
+        auto integer = [&](uint32_t value) -> Value {
+          return LLVM::ConstantOp::create(builder, op.getLoc(),
+                                          builder.getI32Type(),
+                                          builder.getI32IntegerAttr(value));
+        };
+        auto pointerType = LLVM::LLVMPointerType::get(module.getContext());
+        auto null = LLVM::ZeroOp::create(builder, op.getLoc(), pointerType);
+        auto handle = LLVM::CallIntrinsicOp::create(
+            builder, op.getLoc(), handleType,
+            builder.getStringAttr("llvm.dx.resource.handlefrombinding"),
+            ValueRange{integer(0), integer(0), integer(1), integer(0), null});
+        auto pointer = LLVM::CallIntrinsicOp::create(
+            builder, op.getLoc(),
+            LLVM::LLVMPointerType::get(module.getContext(), 2),
+            builder.getStringAttr("llvm.dx.resource.getpointer"),
+            ValueRange{handle.getResult(0), integer(field->offset)});
+        auto value =
+            LLVM::LoadOp::create(builder, op.getLoc(), field->field.getType(),
+                                 pointer.getResult(0), field->alignment);
+        op.getValue().replaceAllUsesWith(value);
+        op.erase();
+      }
+    }
+    module->removeAttr("gfx.parameters");
     SmallVector<Operation *> operations;
     function.walk([&](Operation *op) {
       if (isa<BuiltinOp, InputOp, OutputOp, PositionOp>(op))
@@ -358,6 +452,21 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
   }
   bool vertex = reflection.stage == Stage::Vertex;
   function->addFnAttr("hlsl.shader", vertex ? "vertex" : "pixel");
+  if (reflection.parameters) {
+    namespace rootsig = llvm::hlsl::rootsig;
+    rootsig::RootConstants constants{
+        parameterLayout(reflection.parameters).size / 4,
+        {rootsig::RegisterType::BReg, 0}};
+    SmallVector<rootsig::RootElement> elements{constants};
+    auto signature =
+        rootsig::MetadataBuilder(*translated, elements).BuildRootSignature();
+    auto version = llvm::ConstantAsMetadata::get(
+        llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 2));
+    translated->getOrInsertNamedMetadata("dx.rootsignatures")
+        ->addOperand(
+            llvm::MDNode::get(context, {llvm::ValueAsMetadata::get(function),
+                                        signature, version}));
+  }
   SmallVector<llvm::Metadata *> inputs, outputs;
   auto signatures = [&](ArrayRef<InterfaceElement> descriptions,
                         SmallVectorImpl<llvm::Metadata *> &elements,

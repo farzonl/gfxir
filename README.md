@@ -546,6 +546,77 @@ state. Do not place function returns or stage writes inside SCF regions.
 The Julia example demonstrates an escape check that freezes coordinates while
 still retaining the counter/glow updates performed in the terminating iteration.
 
+### Read-only frame parameters (compiler-only)
+
+[Frame bands](examples/frame_bands.py) reads elapsed time and framebuffer-pixel
+resolution through a typed, immutable parameter block, not interpolated inputs:
+
+```python
+from mlir_gpu import FrameParameters, FragmentCoord, fragment, vec4
+
+@fragment
+def diagnostic(pixel: FragmentCoord, frame: FrameParameters):
+    uv = pixel / frame.resolution
+    return vec4(uv, frame.time, 1)
+```
+
+`ParameterBlock(name, ((field_name, Type), ...))` also declares reusable blocks.
+The current portable slice supports one matching block per pipeline, with f32
+scalars and f32x2/3/4 fields, at most 128 bytes. There are no authored register,
+descriptor-set, or Metal-buffer numbers. Unsupported types, duplicate fields,
+oversized layouts, and mismatched stage declarations fail explicitly.
+Read fields through parameters and ordinary helpers; writes, field pointers,
+general heaps, and writable/array resources are not implemented.
+
+The compiler owns layout: scalar/vector sizes are 4/8/12/16 bytes; alignments
+are 4/8/16/16 bytes. Each field starts at the next aligned offset; the block
+is rounded to 16 bytes. This places a scalar after a vec3 at byte 12, while a
+following vec2 starts at an 8-byte boundary. Host packing is little-endian f32,
+including zero-filled internal/trailing padding. The frame layout is:
+
+| Field | Type | Offset | Size | Alignment |
+|-------|------|--------|------|-----------|
+| time | f32 | 0 | 4 | 4 |
+| padding | - | 4 | 4 | - |
+| resolution | f32x2 | 8 | 8 | 8 |
+
+Total size/alignment: **16 bytes**. `pack_parameters(reflected_block, values)`
+validates the complete reflected layout/bindings and exact supplied fields;
+it returns owned immutable bytes and rejects non-finite/out-of-range f32 values.
+Packing does not establish resource lifetimes or make zero framebuffer dimensions
+valid; frame validation/update policies belong to the runtime adapters.
+
+Native authoring uses TableGen `#gfx.parameter_field`, `#gfx.parameter_block`,
+and `gfx.parameter`. Structured JSON adds a module-level `parameters` object
+containing only `name` and typed `fields`. Backend bindings and offsets are
+synthesized, not accepted from authored JSON.
+
+Vulkan emits a PushConstant struct with explicit member offsets. DirectX uses
+upstream LLVM `dx.CBuffer` handles and resource-pointer loads with an explicitly
+padded packed struct; LLVM performs resource access legalization. A version-1.1
+root signature with root constants is built using LLVM's typed metadata API and
+embedded in DXIL. Metal Shader Converter consumes that embedded signature; its
+runtime argument-buffer binding and byte layout are persisted in reflection.
+Parameters are host-owned, read-only during invocation, and not addressable.
+
+Resource pipelines use **manifest schema 4** with complete fields, byte layout,
+stage visibility, and Vulkan/DirectX/Metal bindings. Resource-free pipelines
+continue emitting schema 3; existing schema-2/3 previews remain supported.
+Stale schemas, incomplete layouts, and mismatched bindings are rejected.
+
+```sh
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/python -m mlir_gpu examples/frame_bands.py \
+  --target metal --output build/frame-bands-metal
+```
+
+Also compile with `--target vulkan` or `--target directx` into fresh directories.
+This milestone deliberately provides a **compile-only** example: validated
+binaries and host/device ABI checks, not GPU execution of frame data.
+The viewer rejects these resource artifacts until the Vulkan/Metal binding
+adapters land; it never silently substitutes zero time/resolution. Live updates,
+resize, synchronization, and deterministic snapshots are separate milestones.
+
 ### Arithmetic and vectors
 
 Device values support `+`, `-`, `*`, floating-point `/`, unary negation, `abs`,

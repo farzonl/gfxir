@@ -41,7 +41,19 @@ struct ShaderInterface {
   Stage stage;
   SmallVector<InterfaceElement> inputs;
   SmallVector<InterfaceElement> outputs;
+  ParameterBlockAttr parameters;
 };
+
+struct ParameterFieldLayout {
+  ParameterFieldAttr field;
+  uint32_t offset, size, alignment;
+};
+struct ParameterLayout {
+  SmallVector<ParameterFieldLayout> fields;
+  uint32_t size;
+};
+ParameterLayout parameterLayout(ParameterBlockAttr block);
+llvm::json::Object serializeParameters(ParameterBlockAttr block, Stage stage);
 
 std::unique_ptr<Pass> createGfxToSPIRVPass();
 std::unique_ptr<Pass> createGfxToLLVMPass();

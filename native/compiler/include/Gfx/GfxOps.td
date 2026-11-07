@@ -34,4 +34,12 @@ def Gfx_PositionOp : Gfx_Op<"position", [MemoryEffects<[MemWrite]>]> {
   let assemblyFormat = "$value attr-dict `:` type($value)";
   let hasVerifier = 1;
 }
+
+def Gfx_ParameterOp : Gfx_Op<"parameter", [Pure]> {
+  let summary = "Read an immutable field of a compiler-laid-out parameter block";
+  let arguments = (ins StrAttr:$block, StrAttr:$field);
+  let results = (outs AnyType:$value);
+  let assemblyFormat = "$block $field attr-dict `:` type($value)";
+  let hasVerifier = 1;
+}
 #endif
