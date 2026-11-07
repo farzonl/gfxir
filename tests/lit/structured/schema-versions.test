@@ -1,0 +1,16 @@
+# RUN: %python %S/Inputs/generate.py schema-absent %t.json
+# RUN: %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection
+# RUN: %python %S/Inputs/generate.py schema-1 %t.json
+# RUN: %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection
+# RUN: %python %S/Inputs/generate.py schema-2 %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bad --reflection %t.bad-reflection 2>&1 | %FileCheck %s --check-prefix=STRUCTURED
+# RUN: %python %S/Inputs/generate.py schema-3 %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bad --reflection %t.bad-reflection 2>&1 | %FileCheck %s --check-prefix=MIGRATE
+# RUN: %python %S/Inputs/generate.py schema-true %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bad --reflection %t.bad-reflection 2>&1 | %FileCheck %s --check-prefix=MIGRATE
+# RUN: %python %S/Inputs/generate.py schema-\"2\" %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bad --reflection %t.bad-reflection 2>&1 | %FileCheck %s --check-prefix=MIGRATE
+
+# STRUCTURED: error:
+# STRUCTURED-SAME: functions
+# MIGRATE: migrate

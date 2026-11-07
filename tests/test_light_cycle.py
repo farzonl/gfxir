@@ -7,7 +7,7 @@ from pathlib import Path
 
 from mlir_gpu import FrameParameters, FragmentCoord, Pipeline, Target, compile_pipeline, fragment, fullscreen_vertex, vec3, vec4
 from mlir_gpu.viewer import load_program, render_metal_offscreen, render_offscreen, show_metal_window, show_window
-from test_native_ir import ROOT, TOOLS
+from test_support import ROOT, TOOLS
 
 
 SOURCE = ROOT / "examples/light_cycle.py"

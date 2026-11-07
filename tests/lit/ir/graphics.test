@@ -1,0 +1,13 @@
+# RUN: %gfx-opt %repo/tests/ir/graphics.mlir --gfx-verify > %t
+# RUN: %gfx-opt %t --gfx-verify > %t.again
+# RUN: diff %t %t.again
+# RUN: %FileCheck %s --check-prefix=VERIFY < %t
+# RUN: %gfx-opt %repo/tests/ir/graphics.mlir --convert-gfx-to-spirv | %FileCheck %s --check-prefix=SPIRV --implicit-check-not=gfx.output --implicit-check-not=arith.
+# RUN: %gfx-opt %repo/tests/ir/graphics.mlir --gfx-to-directx | %FileCheck %s --check-prefix=DX --implicit-check-not=dx.op. --implicit-check-not=gfx.output
+# VERIFY: #gfx.stage<vertex>
+# VERIFY: vector<2xf32>
+# SPIRV: spirv.module
+# SPIRV: built_in("Position")
+# SPIRV: spirv.FNegate
+# DX: llvm.dx.load.input
+# DX: llvm.dx.store.output

@@ -1,0 +1,18 @@
+# REQUIRES: spirv-val
+# RUN: rm -rf %t.triangle %t.arithmetic %t.expanded %t.math
+# RUN: %python %S/../Inputs/pipeline.py triangle vulkan %t.triangle | %FileCheck %s
+# RUN: %spirv-val --target-env vulkan1.0 %t.triangle/vertex.spv
+# RUN: %spirv-val --target-env vulkan1.0 %t.triangle/fragment.spv
+# RUN: %python %S/../Inputs/pipeline.py arithmetic vulkan %t.arithmetic | %FileCheck %s
+# RUN: %spirv-val --target-env vulkan1.0 %t.arithmetic/vertex.spv
+# RUN: %spirv-val --target-env vulkan1.0 %t.arithmetic/fragment.spv
+# RUN: %python %S/../Inputs/artifacts.py %t.triangle | %FileCheck %s --check-prefix=BINARY
+# RUN: %python %S/../Inputs/artifacts.py %t.arithmetic | %FileCheck %s --check-prefix=BINARY
+# RUN: %python %S/../Inputs/pipeline.py expanded vulkan %t.expanded | %FileCheck %s
+# RUN: %python %S/../Inputs/pipeline.py math vulkan %t.math | %FileCheck %s
+# CHECK: "target": "vulkan"
+# CHECK: "runtime_verified": false
+# CHECK: "backend_status": "validated-binary"
+# BINARY: entry count: 2
+# BINARY-NEXT: vertex magic: 03022307
+# BINARY-NEXT: fragment magic: 03022307

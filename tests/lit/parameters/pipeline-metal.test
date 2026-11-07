@@ -1,0 +1,3 @@
+# REQUIRES: llc, dxv, metal-shaderconverter
+# RUN: %python %S/Inputs/pipeline.py frame metal %t.frame-metal | %FileCheck %S/pipeline.test --check-prefixes=COMMON,FRAME
+# RUN: %python %S/Inputs/pipeline.py material metal %t.material-metal | %FileCheck %S/pipeline.test --check-prefixes=COMMON,MATERIAL

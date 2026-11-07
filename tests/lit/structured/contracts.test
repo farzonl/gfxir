@@ -1,0 +1,22 @@
+# RUN: %python %S/Inputs/generate.py stage-write %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=STAGE
+# RUN: %python %S/Inputs/generate.py cfg %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --ir-output %t.mlir --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=CFG
+# RUN: %gfx-opt %t.mlir --gfx-verify | %FileCheck %s --check-prefix=VERIFY
+# RUN: %python %S/Inputs/generate.py compute %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=COMPUTE
+# RUN: %python %S/Inputs/generate.py compute-invalid %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=SIZE
+# RUN: %python %S/Inputs/generate.py dominance %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=DOMINANCE
+# RUN: %python %S/Inputs/generate.py recursive %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=RECURSION
+# RUN: not %gfx-compile %t.json --target directx --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=RECURSION
+
+# STAGE: stage IO must be in the entry block
+# CFG: structured body
+# VERIFY: cf.cond_br
+# COMPUTE: graphics-first
+# SIZE: three positive
+# DOMINANCE: loc("dominance.json":19:1): error: {{.*}}does not dominate
+# RECURSION: recursive shader calls

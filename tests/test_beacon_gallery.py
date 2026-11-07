@@ -6,21 +6,11 @@ from pathlib import Path
 
 from mlir_gpu import Target, compile_pipeline
 from mlir_gpu.viewer import load_program, render_metal_offscreen, render_offscreen
-from test_native_ir import ROOT, TOOLS
-import test_structured_input as structured
+from test_support import ROOT, TOOLS
 
 
 def gallery_pipeline():
     return runpy.run_path(str(ROOT / "examples/beacon_gallery.py"))["pipeline"]
-
-
-class GalleryAuthoringTests(unittest.TestCase):
-    def test_scene_has_a_device_loop_and_reachable_parameter_reads(self):
-        shader = gallery_pipeline().trace()[1].to_dict()
-        operations = [op for function in shader["functions"] for op in structured.operations(function)]
-        self.assertTrue(any(op["op"] == "scf.while" for op in operations))
-        self.assertTrue(any(op["op"] == "gfx.parameter" for op in operations))
-        self.assertEqual(shader["parameters"]["name"], "frame")
 
 
 @unittest.skipUnless(

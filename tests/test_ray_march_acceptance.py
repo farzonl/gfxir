@@ -1,8 +1,6 @@
-import collections
 import json
 import math
 import os
-import re
 import runpy
 import subprocess
 import tempfile
@@ -13,7 +11,7 @@ from pathlib import Path
 from mlir_gpu import Pipeline, Target, compile_pipeline, fullscreen_vertex
 from mlir_gpu.viewer import _metal_libraries, _metal_run, load_program, render_metal_offscreen, render_offscreen
 from test_beacon_gallery import gallery_pipeline
-from test_native_ir import ROOT, TOOLS, available
+from test_support import ROOT, TOOLS
 from test_vulkan_parameters import both_stages, frame_vertex
 
 
@@ -40,30 +38,6 @@ def budget_reference(x, y, width, height, seconds):
     return (round(used / 64 * 255), 255 if hit else 0, 255 if escaped else 38, 255), margin
 
 
-@unittest.skipUnless(available(), "Build pinned native compiler for loop-size acceptance")
-class LoopSizeAcceptanceTests(unittest.TestCase):
-    def test_fourfold_cap_changes_the_bound_not_the_body(self):
-        with tempfile.TemporaryDirectory() as work:
-            for target in (Target.VULKAN, Target.DIRECTX):
-                counts, sizes = [], []
-                for cap in (72, 288):
-                    pipeline = gallery_pipeline()
-                    pipeline.fragment.function.__globals__["MAX_STEPS"] = cap
-                    directory = Path(work) / f"{target.value}-{cap}"
-                    compile_pipeline(pipeline, target, directory, TOOLS)
-                    original = (directory / "fragment.mlir").read_text()
-                    self.assertEqual(original.count("scf.while"), 1)
-                    self.assertRegex(original, rf"arith.constant {cap} : i32")
-                    counts.append(collections.Counter(re.findall(
-                        r"^\s*(?:%.*?=\s*)?([a-z]+\.[\w]+)", original, re.MULTILINE)))
-                    if target == Target.VULKAN:
-                        self.assertIn("spirv.mlir.loop", (directory / "fragment.lowered.mlir").read_text())
-                    else:
-                        self.assertIn("phi <3 x float>", (directory / "fragment.ll").read_text())
-                    sizes.append((directory / ("fragment.spv" if target == Target.VULKAN else "fragment.dxil")).stat().st_size)
-                self.assertEqual(counts[0], counts[1])
-                self.assertLessEqual(abs(sizes[0] - sizes[1]), 128)
-                print(f"Loop-size acceptance {target.value}: caps 72/288, bytes {sizes}")
 
 
 @unittest.skipUnless(

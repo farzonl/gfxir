@@ -1,0 +1,38 @@
+# RUN: %python %S/Inputs/generate.py frame %t.frame.json
+# RUN: %gfx-compile %t.frame.json --target vulkan --output %t.frame.spv --reflection %t.frame.reflection
+# RUN: %python %S/Inputs/summarize.py reflection %t.frame.reflection | %FileCheck %s --check-prefix=FRAME
+# RUN: %python %S/Inputs/summarize.py spirv %t.frame.spv | %FileCheck %s --check-prefix=FRAME-SPIRV
+# RUN: %gfx-compile %t.frame.json --target directx --output %t.frame.ll --reflection %t.frame.reflection
+# RUN: %python %S/Inputs/summarize.py reflection %t.frame.reflection | %FileCheck %s --check-prefix=FRAME
+# RUN: %FileCheck %s --check-prefix=FRAME-DX < %t.frame.ll
+# RUN: %python %S/Inputs/generate.py material %t.material.json
+# RUN: %gfx-compile %t.material.json --target vulkan --output %t.material.spv --reflection %t.material.reflection
+# RUN: %python %S/Inputs/summarize.py reflection %t.material.reflection | %FileCheck %s --check-prefix=MATERIAL
+# RUN: %python %S/Inputs/summarize.py spirv %t.material.spv | %FileCheck %s --check-prefix=MATERIAL-SPIRV
+# RUN: %gfx-compile %t.material.json --target directx --output %t.material.ll --reflection %t.material.reflection
+# RUN: %python %S/Inputs/summarize.py reflection %t.material.reflection | %FileCheck %s --check-prefix=MATERIAL
+# RUN: %FileCheck %s --check-prefix=MATERIAL-DX < %t.material.ll
+
+# FRAME: parameters: {"access": "read-only", "addressable": false, "alignment": 16,
+# FRAME-SAME: "bindings": {"directx": {"num32bit_constants": 4, "parameter_index": 0, "register": 0, "root_signature_version": "1.1", "space": 0, "storage": "root_constants", "visibility": "all"}, "metal": {"buffer_index": 2, "offset": 0, "size": 16, "storage": "converter_argument_buffer"}, "vulkan": {"offset": 0, "storage": "push_constant"}}
+# FRAME-SAME: "fields": [{"alignment": 4, "name": "time", "offset": 0, "size": 4, "type": "f32"}, {"alignment": 8, "name": "resolution", "offset": 8, "size": 8, "type": "f32x2"}]
+# FRAME-SAME: "layout": "gfx-root-f32-v1", "name": "frame", "ownership": "host", "schema_version": 1
+# FRAME-SAME: "size": 16, "stages": ["fragment"]
+# FRAME-SPIRV: SPIR-V member offsets: [0, 8]
+# FRAME-DX: target("dx.CBuffer"
+# FRAME-DX-DAG: getpointer{{[^\n]*}}i32 0)
+# FRAME-DX-DAG: getpointer{{[^\n]*}}i32 8)
+# FRAME-DX: !dx.rootsignatures
+
+# MATERIAL: parameters: {"access": "read-only", "addressable": false, "alignment": 16,
+# MATERIAL-SAME: "bindings": {"directx": {"num32bit_constants": 8, "parameter_index": 0, "register": 0, "root_signature_version": "1.1", "space": 0, "storage": "root_constants", "visibility": "all"}, "metal": {"buffer_index": 2, "offset": 0, "size": 32, "storage": "converter_argument_buffer"}, "vulkan": {"offset": 0, "storage": "push_constant"}}
+# MATERIAL-SAME: "fields": [{"alignment": 16, "name": "normal", "offset": 0, "size": 12, "type": "f32x3"}, {"alignment": 4, "name": "roughness", "offset": 12, "size": 4, "type": "f32"}, {"alignment": 8, "name": "pair", "offset": 16, "size": 8, "type": "f32x2"}, {"alignment": 4, "name": "weight", "offset": 24, "size": 4, "type": "f32"}]
+# MATERIAL-SAME: "layout": "gfx-root-f32-v1", "name": "material", "ownership": "host", "schema_version": 1
+# MATERIAL-SAME: "size": 32, "stages": ["fragment"]
+# MATERIAL-SPIRV: SPIR-V member offsets: [0, 12, 16, 24]
+# MATERIAL-DX: target("dx.CBuffer"
+# MATERIAL-DX-DAG: getpointer{{[^\n]*}}i32 0)
+# MATERIAL-DX-DAG: getpointer{{[^\n]*}}i32 12)
+# MATERIAL-DX-DAG: getpointer{{[^\n]*}}i32 16)
+# MATERIAL-DX-DAG: getpointer{{[^\n]*}}i32 24)
+# MATERIAL-DX: !dx.rootsignatures

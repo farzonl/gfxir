@@ -1,0 +1,12 @@
+# RUN: %gfx-opt %repo/tests/ir/fragment_coordinates.mlir --gfx-verify | %FileCheck %s --check-prefix=VERIFY
+# RUN: %gfx-opt %repo/tests/ir/fragment_coordinates.mlir --convert-gfx-to-spirv | %FileCheck %s --check-prefix=SPIRV
+# RUN: %gfx-opt %repo/tests/ir/fragment_coordinates.mlir --gfx-to-directx | %FileCheck %s --check-prefix=DX
+# RUN: sed 's/#gfx.stage<fragment>/#gfx.stage<vertex>/' %repo/tests/ir/fragment_coordinates.mlir > %t
+# RUN: not %gfx-opt %t --gfx-verify 2>&1 | %FileCheck %s --check-prefix=INVALID
+# RUN: sed 's/vector<2xf32>/vector<3xf32>/g' %repo/tests/ir/fragment_coordinates.mlir > %t
+# RUN: not %gfx-opt %t --gfx-verify 2>&1 | %FileCheck %s --check-prefix=INVALID
+# VERIFY: fragment_coord
+# SPIRV: built_in("FragCoord")
+# SPIRV: vector<4xf32>
+# DX: llvm.dx.load.input
+# INVALID: fragment entry point and vector<2xf32>

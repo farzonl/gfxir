@@ -13,7 +13,7 @@ from mlir_gpu.viewer import (
     GraphicsProgram, RenderedImage, Shader, ViewerError, _Vulkan, _video_encoder,
     export_mp4, load_program, main, render_offscreen,
 )
-from test_native_ir import ROOT, TOOLS
+from test_support import ROOT, TOOLS
 
 
 def encoder_available():

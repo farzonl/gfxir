@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from mlir_gpu import FragmentCoord, Pipeline, Target, fragment, fullscreen_vertex, select, shader_math as sm, vec3, vec4, compile_pipeline
-from test_native_ir import TOOLS
+from test_support import TOOLS
 import test_structured_input as structured_input
 
 
@@ -22,22 +22,6 @@ def count_ops(value, operation):
 
 
 class ASTFrontendTests(unittest.TestCase):
-    def test_default_ast_loop_serialization_does_not_expand_iteration_count(self):
-        lengths = []
-        for limit in (1, 64, 1024):
-            @fragment
-            def loop(pixel: FragmentCoord):
-                value = 0.0
-                for i in range(limit):
-                    value += pixel.x * 0.001
-                return vec4(value, 0, 0, 1)
-            stage = Pipeline(fullscreen_vertex, loop).trace()[1]
-            module = stage.to_dict()
-            self.assertEqual(module["schema_version"], 2)
-            self.assertEqual(count_ops(module, "scf.while"), 1)
-            lengths.append(len(json.dumps(module)))
-        self.assertLessEqual(max(lengths) - min(lengths), 32)
-
     def test_default_ast_does_not_execute_entry_side_effects(self):
         effects = [0]
         @fragment
@@ -95,18 +79,6 @@ class ASTFrontendTests(unittest.TestCase):
             return vec4(helper(pixel.x), 0, 0, 1)
         stage = Pipeline(fullscreen_vertex, shader).trace()[1]
         self.assertEqual(stage.outputs[0].args[0].args[1].literal, constant)
-
-    def test_device_short_circuit_places_unsafe_operation_inside_selection(self):
-        @fragment
-        def shader(pixel: FragmentCoord):
-            x = pixel.x - 0.5
-            safe = x > 0.0 and sm.log(x) > 0.0
-            return vec4(select(safe, 1.0, 0.0), 0, 0, 1)
-        module = Pipeline(fullscreen_vertex, shader).trace()[1].to_dict()
-        root = module["functions"][0]["body"]["blocks"][0]["operations"]
-        self.assertFalse(any(op["op"] == "math.log" for op in root))
-        self.assertEqual(count_ops(module, "math.log"), 1)
-        self.assertGreaterEqual(count_ops(module, "scf.if"), 1)
 
     def test_static_local_helpers_capture_values_and_support_comprehensions(self):
         @fragment

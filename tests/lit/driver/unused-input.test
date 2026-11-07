@@ -1,0 +1,14 @@
+# REQUIRES: spirv-val, llc, dxv
+# RUN: rm -rf %t.vulkan %t.directx
+# RUN: %python %S/../Inputs/pipeline.py unused vulkan %t.vulkan | %FileCheck %s
+# RUN: %python %S/../Inputs/pipeline.py unused directx %t.directx | %FileCheck %s
+# CHECK: "fragment": {
+# CHECK-NEXT: "inputs": [
+# CHECK-NEXT: {
+# CHECK-NEXT: "interpolation": "perspective",
+# CHECK-NEXT: "location": 1
+# CHECK-NEXT: "name": "uv",
+# CHECK-NEXT: "type": "f32x2"
+# CHECK-NEXT: }
+# CHECK-NEXT: ],
+# CHECK: "vertex_count": 6

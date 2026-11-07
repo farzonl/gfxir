@@ -1,0 +1,28 @@
+# RUN: %gfx-compile %repo/examples/ir/julia.json --target vulkan --output %t.spv --ir-output %t.mlir --reflection %t.reflection
+# RUN: %FileCheck %s --check-prefix=IR < %t.mlir
+# RUN: %python %S/Inputs/summarize.py reflection %t.reflection | %FileCheck %s --check-prefix=REFLECT
+# RUN: %gfx-compile %repo/examples/ir/julia.json --target directx --output %t.ll --ir-output %t.mlir --reflection %t.reflection
+# RUN: %FileCheck %s --check-prefix=IR < %t.mlir
+# RUN: %FileCheck %s --check-prefix=DX < %t.ll
+# RUN: %python %S/Inputs/summarize.py reflection %t.reflection | %FileCheck %s --check-prefix=REFLECT
+# RUN: %python %S/Inputs/generate.py reverse %t.json
+# RUN: %gfx-compile %t.json --target vulkan --output %t.spv --ir-output %t.mlir --reflection %t.reflection
+# RUN: %FileCheck %s --check-prefix=IR < %t.mlir
+# RUN: %python %S/Inputs/summarize.py reflection %t.reflection | %FileCheck %s --check-prefix=REFLECT
+# RUN: %gfx-compile %t.json --target directx --output %t.ll --ir-output %t.mlir --reflection %t.reflection
+# RUN: %FileCheck %s --check-prefix=IR < %t.mlir
+# RUN: %FileCheck %s --check-prefix=DX < %t.ll
+# RUN: %python %S/Inputs/summarize.py reflection %t.reflection | %FileCheck %s --check-prefix=REFLECT
+
+# IR: scf.while
+# IR: i32, f32, f32, i1, vector<3xf32>
+# IR: scf.condition
+# IR: scf.if
+# IR: scf.yield
+# IR: scf.yield
+# IR: call @palette
+# REFLECT: name: julia
+# REFLECT-NEXT: inputs: [{"builtin": "fragment_coord"
+# DX-NOT: @palette
+# DX: define
+# DX-NOT: @palette

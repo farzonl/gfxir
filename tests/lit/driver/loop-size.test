@@ -1,0 +1,25 @@
+# REQUIRES: spirv-val, llc, dxv
+# RUN: rm -rf %t.v72 %t.v288 %t.d72 %t.d288
+# RUN: %python %S/../Inputs/pipeline.py beacon_gallery vulkan %t.v72 --cap 72 > %t.v72.json
+# RUN: %python %S/../Inputs/pipeline.py beacon_gallery vulkan %t.v288 --cap 288 > %t.v288.json
+# RUN: %python %S/../Inputs/pipeline.py beacon_gallery directx %t.d72 --cap 72 > %t.d72.json
+# RUN: %python %S/../Inputs/pipeline.py beacon_gallery directx %t.d288 --cap 288 > %t.d288.json
+# RUN: %FileCheck %s --check-prefix=CAP72 < %t.v72/fragment.mlir
+# RUN: %FileCheck %s --check-prefix=CAP288 < %t.v288/fragment.mlir
+# RUN: %FileCheck %s --check-prefix=CAP72 < %t.d72/fragment.mlir
+# RUN: %FileCheck %s --check-prefix=CAP288 < %t.d288/fragment.mlir
+# RUN: %FileCheck %s --check-prefix=SPIRV < %t.v288/fragment.lowered.mlir
+# RUN: %FileCheck %s --check-prefix=DX < %t.d288/fragment.ll
+# RUN: %python %S/../Inputs/loop-size.py %t.v72 %t.v288 spv | %FileCheck %s --check-prefix=SIZE
+# RUN: diff %t.v72/counts.txt %t.v288/counts.txt
+# RUN: %python %S/../Inputs/loop-size.py %t.d72 %t.d288 dxil | %FileCheck %s --check-prefix=SIZE
+# RUN: diff %t.d72/counts.txt %t.d288/counts.txt
+# CAP72: arith.constant 72 : i32
+# CAP72: scf.while
+# CAP72-NOT: scf.while
+# CAP288: arith.constant 288 : i32
+# CAP288: scf.while
+# CAP288-NOT: scf.while
+# SPIRV: spirv.mlir.loop
+# DX: phi <3 x float>
+# SIZE: size delta: {{([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$}}

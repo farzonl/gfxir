@@ -1,57 +1,14 @@
 import os
 import runpy
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from mlir_gpu import MLIRPipeline, Target, Toolchain, compile_pipeline
 from mlir_gpu.viewer import load_program, render_metal_offscreen, render_offscreen
-from test_native_ir import available
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-@unittest.skipUnless(available(), "Build native gfx tools for DirectX control-flow verification")
-class DirectXControlFlowIRTests(unittest.TestCase):
-    def test_native_loops_lower_to_llvm_branches_without_vector_helper_boundaries(self):
-        tools = Toolchain(Path(os.environ["LLVM_BIN"]) if "LLVM_BIN" in os.environ else None)
-        for source in ("tests/ir/structured_graphics.mlir", "examples/ir/sphere_march.mlir"):
-            result = subprocess.run(
-                [tools.find("gfx-opt"), str(ROOT / source), "--gfx-to-directx"],
-                text=True, capture_output=True, check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("llvm.cond_br", result.stdout)
-            self.assertNotIn("scf.", result.stdout)
-            self.assertNotIn("func.call", result.stdout)
-            self.assertNotIn("llvm.func @contribution", result.stdout)
-            self.assertNotIn("llvm.func @sphere_distance", result.stdout)
-
-    def test_recursive_helpers_are_rejected_before_inlining(self):
-        text = """module {
-          func.func private @helper() -> f32 {
-            %value = func.call @helper() : () -> f32
-            return %value : f32
-          }
-          func.func @entry() attributes {gfx.stage = #gfx.stage<fragment>} {
-            %value = func.call @helper() : () -> f32
-            %color = vector.broadcast %value : f32 to vector<4xf32>
-            gfx.output %color 0 "color" <perspective> : vector<4xf32>
-            return
-          }
-        }"""
-        tools = Toolchain(Path(os.environ["LLVM_BIN"]) if "LLVM_BIN" in os.environ else None)
-        with tempfile.TemporaryDirectory() as work:
-            source = Path(work) / "recursive.mlir"
-            source.write_text(text)
-            result = subprocess.run([tools.find("gfx-opt"), str(source), "--gfx-to-directx"],
-                                    text=True, capture_output=True, check=False)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("recursive shader calls", result.stderr)
-
-
 @unittest.skipUnless(
     os.environ.get("MLIR_GPU_TEST_VULKAN") == "1" and os.environ.get("MLIR_GPU_TEST_METAL") == "1",
     "Enable Vulkan and Metal GPU tests for DirectX loop comparisons",

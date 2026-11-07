@@ -1,0 +1,36 @@
+# RUN: %python %S/../Inputs/graph.py broadcast > %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=BROADCAST
+# RUN: %python %S/../Inputs/graph.py cast > %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=CAST
+# RUN: %python %S/../Inputs/graph.py literal > %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=LITERAL
+# RUN: %python %S/../Inputs/graph.py float-predicate > %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=FLOAT
+# RUN: %python %S/../Inputs/graph.py integer-predicate > %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=INTEGER
+# RUN: %python %S/../Inputs/graph.py bool-predicate > %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=INTEGER
+# RUN: %python %S/../Inputs/graph.py div > %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=DIV
+# RUN: %python %S/../Inputs/graph.py neg > %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=NEG
+# RUN: %python %S/../Inputs/graph.py sin > %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=MATH
+# RUN: %python %S/../Inputs/graph.py sqrt > %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=SQRT
+# RUN: %python %S/../Inputs/graph.py pow > %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=MATH
+# RUN: %python %S/../Inputs/graph.py reference --stage 0 > %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=REFERENCE
+# RUN: not test -e %t.bin
+# RUN: not test -e %t.reflection
+# BROADCAST: one matching scalar
+# CAST: i32/u32 scalars
+# LITERAL: literal
+# FLOAT: floating-point comparison predicate
+# INTEGER: integer/boolean comparison predicate
+# DIV: floating-point
+# NEG: floating-point or signed
+# MATH: f32 scalar/vector
+# SQRT: matching f32
+# REFERENCE: earlier nodes

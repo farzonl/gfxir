@@ -86,7 +86,7 @@ capability boundaries.
 
 ## Try it
 
-Python 3.11+ is sufficient for the authoring API and unit tests; the core
+Python 3.11+ is sufficient for the authoring API and host unit tests; the core
 Python package has no mandatory Python dependencies. Compilation requires the
 native compiler and a matching LLVM/MLIR toolchain. The installed Homebrew LLVM
 21 does not contain the DirectX backend. Build a separate pinned main checkout:
@@ -110,6 +110,7 @@ Run from this directory:
 ```sh
 export PYTHONPATH="$PWD/src"
 
+cmake --build .toolchains/llvm-build --target check-gfx
 python3 -m unittest discover -s tests -v
 python3 -m mlir_gpu examples/triangle.py \
   --target vulkan --output build/triangle-vulkan
@@ -117,8 +118,9 @@ python3 -m mlir_gpu examples/triangle.py \
 
 Install SPIRV-Tools separately. Vulkan compilation requires the built
 `gfx-compile` and `spirv-val`; DirectX additionally requires the matching `llc`
-and the native `dxv` helper below. Integration tests explicitly
-skip when their tools are unavailable; inspect the test report for skips.
+and the native `dxv` helper below. Compiler-output tests use LLVM lit and
+FileCheck; optional binary-validation/converter tests are marked unsupported
+when their tools are unavailable. Inspect the lit report for unsupported tests.
 The output directory must not already exist. Compilation is staged in a
 temporary sibling directory and published only after both stages succeed.
 
@@ -223,6 +225,37 @@ Existing artifact directories and PNGs are not rewritten.
 Frame-resource pipelines use **schema version 4** with complete reflected
 layout/bindings; earlier resource schemas are rejected rather than guessed.
 
+### Compiler tests
+
+The [lit suite](tests/lit) checks IR verification and round trips, diagnostics,
+structured input, target lowering, reflection/parameter ABIs, native artifact
+validation, and bounded loop sizes without executing GPU code. Tests use
+`RUN` commands and FileCheck patterns; malformed inputs also check failure
+status and absence of output artifacts.
+
+The toolchain builder builds LLVM's `FileCheck` and `split-file` utilities.
+`gfx-opt`, `gfx-compile`, `FileCheck`, and `split-file` are mandatory: missing
+core tools fail suite configuration rather than silently skipping compiler
+coverage. Optional tools (`spirv-val`, `llc`, `dxv`, `dxil-assemble`, and
+`metal-shaderconverter`) gate only the tests that need them via `REQUIRES`.
+No Python FileCheck replacement is used.
+
+```sh
+cmake --build .toolchains/llvm-build --target check-gfx
+# Run a focused suite directly:
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" \
+  .toolchains/llvm-build/bin/llvm-lit -sv tests/lit/ir
+```
+
+The native compiler's CMake configuration enables `GFX_INCLUDE_TESTS` by
+default and supplies a build-tree lit site configuration. Direct lit invocation
+uses `LLVM_BIN` (or the project-local toolchain) and `PATH`; `GPU_TOOLS_BIN`
+can explicitly select the native adapter tools. Temporary test artifacts live
+in the build tree, not next to source fixtures.
+
+Python unittest remains for host API/numerical evaluation, command wiring,
+viewer/video behavior, and explicitly opted-in GPU execution.
+
 ### Rendering tests
 
 Regular unit tests do not require a GPU or open windows. To additionally compile
@@ -238,8 +271,8 @@ presentation and resizing. Keep `DYLD_LIBRARY_PATH` set as above on macOS.
 The pixel test checks background pixels, interpolated vertex colors, and
 triangle coverage (17.5%–18.5% of the image), not just successful API calls.
 Opting into rendering tests makes missing runtime/compiler dependencies a
-failure rather than a silent skip. DirectX/Metal native compilation tests remain
-separate and skip when their toolchains are unavailable. Set
+failure rather than a silent skip. DirectX/Metal compiler-only checks live in
+the lit suite and are independent of rendering opt-ins. Set
 `MLIR_GPU_TEST_METAL=1` to also test actual DXIL-to-Metal pixels; with
 `MLIR_GPU_TEST_WINDOW=1`, this includes a bounded native window and a test that
 the default native window stays open. Metal API/GPU validation uses the same
@@ -895,7 +928,9 @@ bound: four iterations on the left and 64 on the right. Red encodes iterations
 used, green a confirmed hit, and bright blue a distance-limit miss; dark blue
 indicates budget exhaustion. It animates using the standard frame block.
 
-The focused suite is `tests/test_ray_march_acceptance.py`. On Apple M3 Max,
+The focused GPU suite is [tests/test_ray_march_acceptance.py](tests/test_ray_march_acceptance.py);
+compiler-only cap/body/size checks are in [the lit loop-size test](tests/lit/driver/loop-size.test).
+On Apple M3 Max,
 with the pinned LLVM main build and Vulkan/Metal API validation enabled:
 
 | Gallery target | Compile wall time (warm tools) | Fragment binary |

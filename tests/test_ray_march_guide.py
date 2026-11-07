@@ -6,7 +6,7 @@ from pathlib import Path
 
 from mlir_gpu import Target, compile_pipeline
 from mlir_gpu.viewer import load_program, render_metal_offscreen, render_offscreen
-from test_native_ir import ROOT, TOOLS
+from test_support import ROOT, TOOLS
 
 
 @unittest.skipUnless(
