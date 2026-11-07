@@ -118,7 +118,7 @@ class VulkanControlFlowRenderingTests(unittest.TestCase):
             self.assertEqual(image.rgba, bytes(3 * 3 * 4))
 
     def test_sphere_march_hits_misses_early_termination_and_cap_do_not_unroll(self):
-        pipeline = runpy.run_path(str(ROOT / "examples/vulkan_loops.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples/sphere_march.py"))["pipeline"]
         with tempfile.TemporaryDirectory() as work:
             directory = Path(work)
             manifest = compile_pipeline(pipeline, Target.VULKAN, directory / "out", self.tools())
