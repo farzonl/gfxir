@@ -53,8 +53,12 @@ void registerGfxPipelines();
 
 void registerGfxDialects(DialectRegistry &registry);
 LogicalResult verifyShaderModule(ModuleOp module);
+Type parseShaderType(MLIRContext &context, StringRef name);
+bool isShaderSymbolName(StringRef name);
 OwningOpRef<ModuleOp> importShader(MLIRContext &context,
                                    const llvm::json::Object &source);
+OwningOpRef<ModuleOp> importStructuredShader(MLIRContext &context,
+                                             const llvm::json::Object &source);
 ShaderInterface reflectShader(ModuleOp module);
 llvm::json::Object serializeReflection(const ShaderInterface &reflection);
 std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,

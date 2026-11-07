@@ -17,7 +17,7 @@ generate shading-language source.
 
 | Path | Implementation | Verification |
 | --- | --- | --- |
-| Python → structured graph → native `gfx` MLIR | Implemented | TableGen/ODS operations, types, attributes, native builders and verifiers |
+| Python graph / typed structured JSON → native `gfx` MLIR | Implemented | Compatible flat graphs plus versioned function/block/region/SSA input; upstream ODS verification |
 | `gfx` → upstream MLIR SPIR-V → `.spv` | Implemented | Upstream arithmetic/vector/math/function/SCF conversion and binary serializer; Vulkan 1.0 validation |
 | `gfx` → MLIR LLVM → LLVM DirectX backend | Implemented | LLVM main/24.0.0git, modern DirectX intrinsics, upstream signature helpers and DXIL/container emission |
 | DXIL validation/signing | Microsoft native validator API | The compiler validates/signs LLVM-produced containers; no HLSL parser or textual IR patching |
@@ -44,11 +44,14 @@ varying inputs/outputs, and clip-position writes. Entry points are standard
 count or the triangle example. Arithmetic and vector construction/extraction
 use upstream `arith` and `vector` operations.
 
-The Python frontend sends a typed, indexed JSON graph to `gfx-compile`, which
+The Python tracer sends a typed, indexed JSON graph to `gfx-compile`, which
 constructs real MLIR operations through C++ builders. It does not generate
 textual MLIR, LLVM assembly, or SSA variable names. Textual IR is an inspectable
 compiler output and a native-tool input format, not a string-based lowering
-implementation.
+implementation. The compiler also accepts version-2 structured JSON: typed
+functions, blocks, operations, regions, and SSA references. It constructs
+registered upstream operations directly and uses their ODS/SSA verifiers;
+there is no custom `gfx` arithmetic or loop dialect.
 
 - `gfx-opt`: parse, verify and round-trip IR; run `--gfx-verify`,
   `--convert-gfx-to-spirv`, or `--gfx-to-directx`.
@@ -353,7 +356,8 @@ interfaces from native reflection; the preview currently supports one `f32x4` ta
 
 ### Native MLIR and device loops
 
-`MLIRPipeline` accepts vertex/fragment MLIR files and their declared entry names,
+`MLIRPipeline` accepts vertex/fragment textual MLIR or structured `.json` files
+and their declared entry names,
 using the same validated artifact, reflection, and viewer pipeline as Python
 authoring. Entry names/stages must match native reflection. Missing files,
 malformed IR, unsupported target operations, and interface mismatches fail
@@ -371,7 +375,11 @@ SCF-to-CF and CF/function-to-LLVM conversion. Its profile-6.6 legalization
 inlines ordinary helpers with upstream MLIR, then removes unused helpers,
 before LLVM handles instruction scalarization. This avoids unsupported vector
 values crossing helper-call boundaries in DXIL; it does not unroll loops.
-Only the marked entry receives shader attributes/signature metadata.
+Only the marked entry receives shader attributes/signature metadata. Builtins,
+varying reads, and stage writes must be in its entry block, outside nested
+regions. Compute values conditionally, merge them with SSA, then write the
+stage interface unconditionally. Repeated identical input reads are allowed
+and merge under CSE; conflicting declarations at a location are rejected.
 
 [The sphere march example](examples/sphere_march.py) loads a native
 [sphere marcher](examples/ir/sphere_march.mlir). It executes a bounded GPU while
@@ -407,8 +415,88 @@ PATH="$PWD/.tools/bin:$PATH" .venv/bin/mlir-gpu-view \
 
 Use `--target metal` and a fresh directory for preconverted metallibs. On macOS
 the DirectX artifact is rendered through Metal, not a native DirectX device.
-Python `if`/loops on device values and the extended JSON region/function
-importer remain separate pending work.
+Python `if`/loops on device values remain pending AST frontend work.
+
+### Typed structured input
+
+[The Julia example](examples/julia.py) loads [version-2 JSON](examples/ir/julia.json).
+It renders Julia-set escape iterations with a vector-return helper, a nested
+selection, and a GPU while loop carrying a counter, two coordinates, escape
+state, and accumulated color:
+
+```sh
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/python -m mlir_gpu examples/julia.py \
+  --target metal --output build/julia-metal
+PATH="$PWD/.tools/bin:$PATH" .venv/bin/mlir-gpu-view \
+  build/julia-metal/pipeline.json --width 128 --height 128 -frames 0 --validation
+```
+
+The same source supports `--target vulkan` and `--target directx`. This example
+uses a fixed 128-pixel camera and at most 32 iterations; frame resources are
+still needed for resize-aware animation.
+
+Shader input versions are independent of the output pipeline-manifest schema:
+
+- Unversioned input and `schema_version: 1` retain the existing flat graph.
+- `schema_version: 2` contains `functions`. Each function has a unique `name`,
+  result type names in `results`, and a `body` region. Its first block's typed
+  arguments define the function parameters. The unique entry has `stage`;
+  compute entries additionally require `workgroup_size`. Other functions are
+  private helpers; definitions may precede or follow the entry.
+- Each region contains `blocks`. A block has a unique `name`, typed
+  `arguments` (`name`/`type`), and ordered `operations`.
+- Operations use registered MLIR names such as `arith.addf`, `func.call`,
+  `scf.if`, or `scf.while`; `func.func` is represented by the function envelope,
+  not a nested operation. Optional `args` reference SSA names, `results`
+  declare typed SSA names, `regions` describe nested bodies, and
+  `successors` reference blocks in the same region.
+- SSA names must be unique within a region and cannot shadow captured names.
+  All block arguments are declared before operations; operation results must
+  be defined before use in block-list order. Nested regions capture visible
+  enclosing values but cannot leak internal results. A region-bearing
+  operation exposes only its declared results after its regions are built.
+  Upstream MLIR additionally verifies dominance, call signatures, region
+  yields, terminators, and loop-carried types.
+- Types are `f32`, `i32`/`u32` (signless 32-bit storage), `bool`,
+  `f32x2`/`f32x3`/`f32x4`, and `index` for loop induction.
+- `attributes` maps registered property names to typed JSON descriptors:
+  `literal` (`type` and `value`), `dense` (vector `type` and component array,
+  optionally one splat), `string`, `symbol`, `i32_array`, `i64_array`,
+  or enum kinds `builtin`, `interpolation`, `cmpi`, and `cmpf`.
+  Enum values use upstream names, such as `ogt` for a float comparison.
+  Integer literals describe representable 32-bit patterns or signed index
+  values; operation predicates determine signed arithmetic semantics.
+  Unknown properties, invalid types/enums, and malformed shapes fail explicitly.
+- Optional `source_file` and positive `source_line` pairs on the module,
+  function, block, region, or operation give source-located diagnostics;
+  omitted locations inherit from the enclosing object.
+- Unknown versions fail with migration guidance. `cf` constructs can be built
+  and verified, but current graphics target lowering still requires structured
+  single-block function bodies. Recursion, external/indirect calls, and
+  multiple helper results remain explicit target limitations.
+
+#### Structured termination contract
+
+The input represents normalized SSA, not source-language `break`, `continue`,
+or early-return syntax. Frontends must preserve statement order when producing it:
+
+- For `break`, carry a running flag into `scf.while`, clear it at the break,
+  and guard the rest of that iteration with `scf.if`. The condition combines
+  the flag with loop bounds; yield state updates made before the break.
+- For `continue`, merge the updated state and guard only the skipped suffix.
+  A `scf.for` still advances its induction variable; a while loop must retain
+  exactly the source-authored updates, including any intentionally skipped
+  update.
+- For early return, carry the return value and function-active flag through
+  enclosing regions/loops, skip later statements, and emit one `func.return`
+  at the function boundary. Graphics entries similarly merge interface values
+  before their unconditional stage writes.
+
+Use `scf.condition` for while termination and `scf.yield` for region/backedge
+state. Do not place function returns or stage writes inside SCF regions.
+The Julia example demonstrates an escape check that freezes coordinates while
+still retaining the counter/glow updates performed in the terminating iteration.
 
 ### Arithmetic and vectors
 

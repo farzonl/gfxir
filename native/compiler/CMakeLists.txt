@@ -24,11 +24,12 @@ add_subdirectory(include/Gfx)
 add_mlir_library(GfxCompiler
   lib/GfxDialect.cpp
   lib/Frontend.cpp
+  lib/StructuredFrontend.cpp
   lib/Lowering.cpp
   DEPENDS GfxIncGen
   LINK_COMPONENTS FrontendHLSL
   LINK_LIBS PUBLIC
-  MLIRIR MLIRParser MLIRTransforms MLIRArithDialect MLIRFuncDialect MLIRFuncInlinerExtension MLIRVectorDialect MLIRMathDialect MLIRSCFDialect
+  MLIRIR MLIRParser MLIRTransforms MLIRArithDialect MLIRFuncDialect MLIRFuncInlinerExtension MLIRVectorDialect MLIRMathDialect MLIRSCFDialect MLIRControlFlowDialect
   MLIRSPIRVDialect MLIRLLVMDialect MLIRLLVMIRTransforms MLIRArithToSPIRV MLIRVectorToSPIRV
   MLIRSPIRVSerialization MLIRArithToLLVM MLIRFuncToLLVM MLIRVectorToLLVMPass MLIRMathToLLVM MLIRMathToSPIRV MLIRSCFToSPIRV MLIRFuncToSPIRV MLIRSCFToControlFlow MLIRControlFlowToLLVM
   MLIRUBToLLVM MLIRReconcileUnrealizedCasts MLIRBuiltinToLLVMIRTranslation MLIRLLVMToLLVMIRTranslation MLIRTargetLLVMIRExport)

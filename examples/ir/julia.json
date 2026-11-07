@@ -1,0 +1,137 @@
+{
+  "schema_version": 2,
+  "source_file": "examples/ir/julia.json",
+  "source_line": 1,
+  "functions": [
+    {
+      "name": "palette",
+      "results": ["f32x3"],
+      "body": {
+        "blocks": [{
+          "name": "entry",
+          "arguments": [{"name": "level", "type": "f32"}],
+          "operations": [
+            {"op": "arith.mulf", "args": ["level", "level"], "results": [{"name": "green", "type": "f32"}]},
+            {"op": "arith.constant", "results": [{"name": "half", "type": "f32"}], "attributes": {"value": {"kind": "literal", "type": "f32", "value": 0.5}}},
+            {"op": "arith.mulf", "args": ["level", "half"], "results": [{"name": "blue", "type": "f32"}]},
+            {"op": "vector.from_elements", "args": ["level", "green", "blue"], "results": [{"name": "color", "type": "f32x3"}]},
+            {"op": "func.return", "args": ["color"]}
+          ]
+        }]
+      }
+    },
+    {
+      "name": "julia",
+      "stage": "fragment",
+      "results": [],
+      "body": {
+        "blocks": [{
+          "name": "entry",
+          "arguments": [],
+          "operations": [
+            {"op": "gfx.builtin", "results": [{"name": "pixel", "type": "f32x2"}], "attributes": {"kind": {"kind": "builtin", "value": "fragment_coord"}}},
+            {"op": "vector.extract", "args": ["pixel"], "results": [{"name": "px", "type": "f32"}], "attributes": {"static_position": {"kind": "i64_array", "value": [0]}}},
+            {"op": "vector.extract", "args": ["pixel"], "results": [{"name": "py", "type": "f32"}], "attributes": {"static_position": {"kind": "i64_array", "value": [1]}}},
+            {"op": "arith.constant", "results": [{"name": "center", "type": "f32"}], "attributes": {"value": {"kind": "literal", "type": "f32", "value": 64.0}}},
+            {"op": "arith.constant", "results": [{"name": "scale", "type": "f32"}], "attributes": {"value": {"kind": "literal", "type": "f32", "value": 48.0}}},
+            {"op": "arith.subf", "args": ["px", "center"], "results": [{"name": "dx", "type": "f32"}]},
+            {"op": "arith.subf", "args": ["py", "center"], "results": [{"name": "dy", "type": "f32"}]},
+            {"op": "arith.divf", "args": ["dx", "scale"], "results": [{"name": "zx0", "type": "f32"}]},
+            {"op": "arith.divf", "args": ["dy", "scale"], "results": [{"name": "zy0", "type": "f32"}]},
+            {"op": "arith.constant", "results": [{"name": "cr", "type": "f32"}], "attributes": {"value": {"kind": "literal", "type": "f32", "value": -0.7}}},
+            {"op": "arith.constant", "results": [{"name": "ci", "type": "f32"}], "attributes": {"value": {"kind": "literal", "type": "f32", "value": 0.27}}},
+            {"op": "arith.constant", "results": [{"name": "two", "type": "f32"}], "attributes": {"value": {"kind": "literal", "type": "f32", "value": 2.0}}},
+            {"op": "arith.constant", "results": [{"name": "escape_radius", "type": "f32"}], "attributes": {"value": {"kind": "literal", "type": "f32", "value": 4.0}}},
+            {"op": "arith.constant", "results": [{"name": "limit", "type": "i32"}], "attributes": {"value": {"kind": "literal", "type": "i32", "value": 32}}},
+            {"op": "arith.constant", "results": [{"name": "count0", "type": "i32"}], "attributes": {"value": {"kind": "literal", "type": "i32", "value": 0}}},
+            {"op": "arith.constant", "results": [{"name": "one", "type": "i32"}], "attributes": {"value": {"kind": "literal", "type": "i32", "value": 1}}},
+            {"op": "arith.constant", "results": [{"name": "false", "type": "bool"}], "attributes": {"value": {"kind": "literal", "type": "bool", "value": false}}},
+            {"op": "arith.constant", "results": [{"name": "emission", "type": "f32x3"}], "attributes": {"value": {"kind": "dense", "type": "f32x3", "value": [0.0, 0.003, 0.008]}}},
+            {"op": "arith.constant", "results": [{"name": "glow0", "type": "f32x3"}], "attributes": {"value": {"kind": "dense", "type": "f32x3", "value": [0.0]}}},
+            {
+              "op": "scf.while",
+              "args": ["count0", "zx0", "zy0", "false", "glow0"],
+              "results": [
+                {"name": "count", "type": "i32"},
+                {"name": "zx_final", "type": "f32"},
+                {"name": "zy_final", "type": "f32"},
+                {"name": "escaped_final", "type": "bool"},
+                {"name": "glow", "type": "f32x3"}
+              ],
+              "regions": [
+                {
+                  "blocks": [{
+                    "name": "head",
+                    "arguments": [
+                      {"name": "i", "type": "i32"},
+                      {"name": "zx", "type": "f32"},
+                      {"name": "zy", "type": "f32"},
+                      {"name": "escaped", "type": "bool"},
+                      {"name": "accum", "type": "f32x3"}
+                    ],
+                    "operations": [
+                      {"op": "arith.cmpi", "args": ["i", "limit"], "results": [{"name": "within_limit", "type": "bool"}], "attributes": {"predicate": {"kind": "cmpi", "value": "slt"}}},
+                      {"op": "arith.cmpi", "args": ["escaped", "false"], "results": [{"name": "not_escaped", "type": "bool"}], "attributes": {"predicate": {"kind": "cmpi", "value": "eq"}}},
+                      {"op": "arith.andi", "args": ["within_limit", "not_escaped"], "results": [{"name": "running", "type": "bool"}]},
+                      {"op": "scf.condition", "args": ["running", "i", "zx", "zy", "escaped", "accum"]}
+                    ]
+                  }]
+                },
+                {
+                  "blocks": [{
+                    "name": "step",
+                    "arguments": [
+                      {"name": "iteration", "type": "i32"},
+                      {"name": "x", "type": "f32"},
+                      {"name": "y", "type": "f32"},
+                      {"name": "old_escape", "type": "bool"},
+                      {"name": "old_glow", "type": "f32x3"}
+                    ],
+                    "operations": [
+                      {"op": "arith.mulf", "args": ["x", "x"], "results": [{"name": "xx", "type": "f32"}]},
+                      {"op": "arith.mulf", "args": ["y", "y"], "results": [{"name": "yy", "type": "f32"}]},
+                      {"op": "arith.addf", "args": ["xx", "yy"], "results": [{"name": "radius_squared", "type": "f32"}]},
+                      {"op": "arith.cmpf", "args": ["radius_squared", "escape_radius"], "results": [{"name": "new_escape", "type": "bool"}], "attributes": {"predicate": {"kind": "cmpf", "value": "ogt"}}},
+                      {
+                        "op": "scf.if",
+                        "args": ["new_escape"],
+                        "results": [{"name": "next_x", "type": "f32"}],
+                        "regions": [
+                          {"blocks": [{"name": "hit", "arguments": [], "operations": [{"op": "scf.yield", "args": ["x"]}]}]},
+                          {"blocks": [{"name": "advance", "arguments": [], "operations": [
+                            {"op": "arith.subf", "args": ["xx", "yy"], "results": [{"name": "difference", "type": "f32"}]},
+                            {"op": "arith.addf", "args": ["difference", "cr"], "results": [{"name": "updated_x", "type": "f32"}]},
+                            {"op": "scf.yield", "args": ["updated_x"]}
+                          ]}]}
+                        ]
+                      },
+                      {"op": "arith.mulf", "args": ["x", "y"], "results": [{"name": "xy", "type": "f32"}]},
+                      {"op": "arith.mulf", "args": ["xy", "two"], "results": [{"name": "twice_xy", "type": "f32"}]},
+                      {"op": "arith.addf", "args": ["twice_xy", "ci"], "results": [{"name": "updated_y", "type": "f32"}]},
+                      {"op": "arith.select", "args": ["new_escape", "y", "updated_y"], "results": [{"name": "next_y", "type": "f32"}]},
+                      {"op": "arith.addi", "args": ["iteration", "one"], "results": [{"name": "next_i", "type": "i32"}]},
+                      {"op": "arith.addf", "args": ["old_glow", "emission"], "results": [{"name": "next_glow", "type": "f32x3"}]},
+                      {"op": "scf.yield", "args": ["next_i", "next_x", "next_y", "new_escape", "next_glow"]}
+                    ]
+                  }]
+                }
+              ]
+            },
+            {"op": "arith.sitofp", "args": ["count"], "results": [{"name": "count_float", "type": "f32"}]},
+            {"op": "arith.sitofp", "args": ["limit"], "results": [{"name": "limit_float", "type": "f32"}]},
+            {"op": "arith.divf", "args": ["count_float", "limit_float"], "results": [{"name": "level", "type": "f32"}]},
+            {"op": "func.call", "args": ["level"], "results": [{"name": "base_color", "type": "f32x3"}], "attributes": {"callee": {"kind": "symbol", "value": "palette"}}},
+            {"op": "arith.addf", "args": ["base_color", "glow"], "results": [{"name": "lit_color", "type": "f32x3"}]},
+            {"op": "vector.extract", "args": ["lit_color"], "results": [{"name": "red", "type": "f32"}], "attributes": {"static_position": {"kind": "i64_array", "value": [0]}}},
+            {"op": "vector.extract", "args": ["lit_color"], "results": [{"name": "green", "type": "f32"}], "attributes": {"static_position": {"kind": "i64_array", "value": [1]}}},
+            {"op": "vector.extract", "args": ["lit_color"], "results": [{"name": "blue", "type": "f32"}], "attributes": {"static_position": {"kind": "i64_array", "value": [2]}}},
+            {"op": "arith.constant", "results": [{"name": "alpha", "type": "f32"}], "attributes": {"value": {"kind": "literal", "type": "f32", "value": 1.0}}},
+            {"op": "vector.from_elements", "args": ["red", "green", "blue", "alpha"], "results": [{"name": "output", "type": "f32x4"}]},
+            {"op": "gfx.output", "args": ["output"], "attributes": {"location": {"kind": "literal", "type": "i32", "value": 0}, "name": {"kind": "string", "value": "color"}, "interpolation": {"kind": "interpolation", "value": "perspective"}}},
+            {"op": "func.return"}
+          ]
+        }]
+      }
+    }
+  ]
+}
