@@ -11,7 +11,7 @@ def GfxToSPIRV : Pass<"convert-gfx-to-spirv", "::mlir::ModuleOp"> {
 def GfxToLLVM : Pass<"convert-gfx-to-llvm", "::mlir::ModuleOp"> {
   let summary = "Lower graphics interfaces to upstream LLVM DirectX intrinsics";
   let constructor = "::mlir::gfx::createGfxToLLVMPass()";
-  let dependentDialects = ["::mlir::LLVM::LLVMDialect"];
+  let dependentDialects = ["::mlir::LLVM::LLVMDialect", "::mlir::vector::VectorDialect"];
 }
 
 def GfxVerify : Pass<"gfx-verify", "::mlir::ModuleOp"> {

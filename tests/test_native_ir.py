@@ -24,6 +24,32 @@ def available():
 
 @unittest.skipUnless(available(), "Build tools/build_toolchain.py and select its LLVM_BIN for native gfx IR tests")
 class NativeIRTests(unittest.TestCase):
+    def test_fragment_coordinates_are_typed_and_lower_to_position_builtins(self):
+        source = ROOT / "tests/ir/fragment_coordinates.mlir"
+        verified = self.optimize(source, "--gfx-verify")
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertIn("fragment_coord", verified.stdout)
+        spirv = self.optimize(source, "--convert-gfx-to-spirv")
+        self.assertEqual(spirv.returncode, 0, spirv.stderr)
+        self.assertIn('built_in("FragCoord")', spirv.stdout)
+        self.assertIn("vector<4xf32>", spirv.stdout)
+        directx = self.optimize(source, "--gfx-to-directx")
+        self.assertEqual(directx.returncode, 0, directx.stderr)
+        self.assertIn("llvm.dx.load.input", directx.stdout)
+        with tempfile.TemporaryDirectory() as work:
+            invalid = Path(work) / "invalid.mlir"
+            for text in (
+                source.read_text().replace("#gfx.stage<fragment>", "#gfx.stage<vertex>"),
+                source.read_text().replace(
+                    "%xy = gfx.builtin <fragment_coord> : vector<2xf32>",
+                    "%xy = gfx.builtin <fragment_coord> : vector<3xf32>",
+                ).replace("from vector<2xf32>", "from vector<3xf32>"),
+            ):
+                invalid.write_text(text)
+                result = self.optimize(invalid, "--gfx-verify")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("fragment entry point and vector<2xf32>", result.stderr)
+
     def test_invalid_arithmetic_shapes_and_predicates_are_diagnostics(self):
         shader = runpy.run_path(str(ROOT / "examples/triangle.py"))["pipeline"].trace()[1].to_dict()
         shader["nodes"].extend([

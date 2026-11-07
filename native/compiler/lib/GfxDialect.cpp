@@ -98,6 +98,12 @@ LogicalResult BuiltinOp::verify() {
         !getValue().getType().isInteger(32))
       return emitOpError(
           "vertex_index requires a vertex entry point and i32 result");
+  } else if (getKind() == Builtin::FragmentCoord) {
+    if (stage.getValue() != Stage::Fragment ||
+        getValue().getType() !=
+            VectorType::get({2}, Float32Type::get(getContext())))
+      return emitOpError("fragment_coord requires a fragment entry point and "
+                         "vector<2xf32> result");
   } else if (stage.getValue() != Stage::Compute ||
              getValue().getType() !=
                  VectorType::get({3}, IntegerType::get(getContext(), 32))) {

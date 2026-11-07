@@ -438,6 +438,46 @@ PATH="$PWD/.tools/bin:$PATH" \
   .venv/bin/mlir-gpu-view build/math-metal/pipeline.json -frames 0
 ```
 
+### Full-screen drawing and fragment coordinates
+
+`fullscreen_vertex` covers the framebuffer with a single oversized triangle and
+no vertex buffers. Annotate a fragment parameter with `FragmentCoord` to read
+device-provided f32 pixel-center XY, independently of user varying names:
+
+```python
+from mlir_gpu import FragmentCoord, Pipeline, fragment, fullscreen_vertex, vec4
+
+@fragment
+def pixel_coordinates(pixel: FragmentCoord):
+    return vec4(pixel / 256, 0, 1)
+
+pipeline = Pipeline(fullscreen_vertex, pixel_coordinates)
+```
+
+Coordinates have a top-left framebuffer origin, X right, Y down, and pixel
+centers at `(x + 0.5, y + 0.5)`. Units are framebuffer pixels, not logical
+window points. Only XY is exposed; depth and reciprocal clip-W are intentionally
+not part of this API. Native lowering reads SPIR-V `FragCoord` / DXIL
+`SV_Position`, projects XY, and records a distinct builtin in reflection.
+Existing user varying locations and builtin signature IDs stay independent.
+
+For a Y-up camera, explicitly transform pixels using a positive framebuffer
+resolution: `camera = (pixel - resolution * 0.5) / resolution.y`, then
+`camera = camera.with_components(y=-camera.y)`. The resolution can currently
+be a compile-time `vec2(width, height)`; resize-aware reflected frame parameters
+are a separate pending feature, not inferred or baked into this builtin.
+
+[The coordinates example](examples/coordinates.py) shows 32-pixel color cells
+and 128-pixel bands. Their pixel sizes stay constant when the window resizes:
+
+```sh
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/python -m mlir_gpu examples/coordinates.py \
+  --target metal --output build/coordinates-metal
+PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/mlir-gpu-view build/coordinates-metal/pipeline.json -frames 0
+```
+
 Python executes once during tracing. Python `if`/loops cannot branch on device
 values: use `select` for now. Host-side loops and metaprogramming can construct
 expressions. This is not a compiler for arbitrary Python, dynamic GPU function

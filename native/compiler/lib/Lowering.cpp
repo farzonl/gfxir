@@ -114,6 +114,11 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       bool input = isa<BuiltinOp, InputOp>(op);
       Type type =
           input ? op->getResult(0).getType() : op->getOperand(0).getType();
+      bool fragmentCoord =
+          isa<BuiltinOp>(op) &&
+          cast<BuiltinOp>(op).getKind() == Builtin::FragmentCoord;
+      if (fragmentCoord)
+        type = VectorType::get({4}, builder.getF32Type());
       auto pointerType =
           spirv::PointerType::get(type, input ? spirv::StorageClass::Input
                                               : spirv::StorageClass::Output);
@@ -122,7 +127,9 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
           builder, op->getLoc(), pointerType,
           "interface_" + std::to_string(nextSymbol++));
       if (isa<BuiltinOp>(op))
-        variable->setAttr("built_in", builder.getStringAttr("VertexIndex"));
+        variable->setAttr(
+            "built_in",
+            builder.getStringAttr(fragmentCoord ? "FragCoord" : "VertexIndex"));
       else if (isa<PositionOp>(op))
         variable->setAttr("built_in", builder.getStringAttr("Position"));
       else {
@@ -141,7 +148,15 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       auto address =
           spirv::AddressOfOp::create(builder, op->getLoc(), variable);
       if (input) {
-        auto value = spirv::LoadOp::create(builder, op->getLoc(), address);
+        Value value = spirv::LoadOp::create(builder, op->getLoc(), address);
+        if (fragmentCoord) {
+          SmallVector<Value> xy;
+          for (int32_t index : {0, 1})
+            xy.push_back(spirv::CompositeExtractOp::create(
+                builder, op->getLoc(), value, ArrayRef<int32_t>{index}));
+          value = spirv::CompositeConstructOp::create(
+              builder, op->getLoc(), op->getResult(0).getType(), xy);
+        }
         op->getResult(0).replaceAllUsesWith(value);
       } else {
         Value value = op->getOperand(0);
@@ -209,10 +224,20 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
       if (input) {
         arguments.push_back(
             LLVM::UndefOp::create(builder, op->getLoc(), builder.getI32Type()));
+        bool fragmentCoord =
+            isa<BuiltinOp>(op) &&
+            cast<BuiltinOp>(op).getKind() == Builtin::FragmentCoord;
+        Type loadType = fragmentCoord
+                            ? VectorType::get({4}, builder.getF32Type())
+                            : op->getResult(0).getType();
         auto value = LLVM::CallIntrinsicOp::create(
-            builder, op->getLoc(), op->getResult(0).getType(),
+            builder, op->getLoc(), loadType,
             builder.getStringAttr("llvm.dx.load.input"), arguments);
-        op->getResult(0).replaceAllUsesWith(value.getResult(0));
+        Value result = value.getResult(0);
+        if (fragmentCoord)
+          result = vector::ShuffleOp::create(builder, op->getLoc(), result,
+                                             result, ArrayRef<int64_t>{0, 1});
+        op->getResult(0).replaceAllUsesWith(result);
       } else {
         arguments.push_back(op->getOperand(0));
         LLVM::CallIntrinsicOp::create(
@@ -276,7 +301,9 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
                         bool input) {
     unsigned id = 0;
     for (const auto &io : descriptions) {
-      bool position = std::holds_alternative<PositionBinding>(io.binding);
+      auto builtinKind = std::get_if<Builtin>(&io.binding);
+      bool position = std::holds_alternative<PositionBinding>(io.binding) ||
+                      (builtinKind && *builtinKind == Builtin::FragmentCoord);
       bool builtin = position || std::holds_alternative<Builtin>(io.binding);
       auto boundLocation = std::get_if<int32_t>(&io.binding);
       uint32_t location = boundLocation ? *boundLocation : 0;
@@ -292,7 +319,7 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
       auto scalar = vector ? vector.getElementType() : io.type;
       auto component = scalar.isInteger(32) ? llvm::dxil::ElementType::U32
                                             : llvm::dxil::ElementType::F32;
-      uint8_t columns = vector ? vector.getNumElements() : 1;
+      uint8_t columns = position ? 4 : vector ? vector.getNumElements() : 1;
       llvm::hlsl::SemanticSignatureElement element(id++, semantic, component,
                                                    kind, {location}, columns);
       element.StartRow =
