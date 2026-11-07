@@ -22,17 +22,70 @@ def _darwin_cmake_flags():
     return [f"-DCMAKE_OSX_SYSROOT={sdk}", "-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"]
 
 
-def _clean_stale_cmake_cache(build: Path) -> bool:
-    cache_file = build / "CMakeCache.txt"
-    if not cache_file.is_file():
-        return False
-    text = cache_file.read_text(errors="replace")
-    sdk_paths = set(re.findall(r"/Applications/Xcode[^\s:;\"']+\.sdk", text))
-    if any(not Path(sdk_path).exists() for sdk_path in sdk_paths):
-        cache_file.unlink(missing_ok=True)
-        shutil.rmtree(build / "CMakeFiles", ignore_errors=True)
-        return True
-    return False
+def _rewrite_stale_sdk_paths(build: Path) -> None:
+    if platform.system() != "Darwin" or not build.is_dir():
+        return
+    current_sdk = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True).strip()
+    candidates = [build / "CMakeCache.txt", build / "build.ninja"]
+    cmake_dir = build / "lib/cmake"
+    if cmake_dir.is_dir():
+        candidates.extend(cmake_dir.rglob("*.cmake"))
+    pattern = re.compile(r"/Applications/Xcode[^\s:;\"']+\.sdk")
+    for path in candidates:
+        if not path.is_file():
+            continue
+        text = path.read_text(errors="replace")
+        stale = {sdk for sdk in pattern.findall(text) if sdk != current_sdk and not Path(sdk).exists()}
+        if stale:
+            for old_sdk in stale:
+                text = text.replace(old_sdk, current_sdk)
+            path.write_text(text)
+
+
+def _freeze_existing_build_targets(build: Path) -> None:
+    ninja_file = build / "build.ninja"
+    if not ninja_file.is_file():
+        return
+    lines = ninja_file.read_text(errors="replace").splitlines(keepends=True)
+    out = []
+    changed = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("build "):
+            block = [line]
+            while block[-1].rstrip("\r\n").endswith("$") and i + 1 < len(lines):
+                i += 1
+                block.append(lines[i])
+            while i + 1 < len(lines) and (lines[i + 1].startswith("  ") or lines[i + 1].startswith("\t")):
+                i += 1
+                block.append(lines[i])
+            header = "".join(block)
+            match = re.match(r"^build\s+([^:]+):\s+(\S+)", header)
+            if match:
+                targets = match.group(1).replace("$\n", " ").replace("$\r\n", " ").split()
+                rule = match.group(2)
+                if targets == ["build.ninja"] and rule == "RERUN_CMAKE":
+                    out.append("build build.ninja: phony\n")
+                    changed = True
+                    i += 1
+                    continue
+                if (
+                    len(targets) == 1
+                    and rule != "phony"
+                    and (targets[0].startswith("lib/") or targets[0].startswith("bin/"))
+                    and (build / targets[0]).is_file()
+                ):
+                    out.append(f"build {targets[0]}: phony\n")
+                    changed = True
+                    i += 1
+                    continue
+            out.extend(block)
+        else:
+            out.append(line)
+        i += 1
+    if changed:
+        ninja_file.write_text("".join(out))
 
 
 def _llvm_cmake_configuration(source: Path, build: Path):
@@ -74,8 +127,7 @@ def _prune_object_files(build: Path) -> None:
 
 
 def _ensure_toolchain_dependencies(source: Path, build: Path, jobs: int) -> None:
-    if _clean_stale_cmake_cache(build):
-        run(*_llvm_cmake_configuration(source, build))
+    _rewrite_stale_sdk_paths(build)
     cmake_text = (ROOT / "native/compiler/CMakeLists.txt").read_text()
     required_libs = sorted(set(re.findall(r"\bMLIR[A-Za-z0-9_]+\b", cmake_text)))
     missing_targets = [
@@ -87,6 +139,7 @@ def _ensure_toolchain_dependencies(source: Path, build: Path, jobs: int) -> None
         if not (build / "bin" / f"{tool}{exe_suffix}").is_file():
             missing_targets.append(tool)
     if missing_targets:
+        _freeze_existing_build_targets(build)
         run("cmake", "--build", build, "--parallel", jobs, "--target", *missing_targets)
 
 
@@ -101,7 +154,7 @@ def _build_compiler_only(source: Path, build: Path, jobs: int) -> None:
     _ensure_toolchain_dependencies(source, build, jobs)
     _patch_cmake_export_checks(build)
     compiler_build = ROOT / "build/compiler"
-    _clean_stale_cmake_cache(compiler_build)
+    _rewrite_stale_sdk_paths(compiler_build)
     configuration = [
         "cmake", "-S", ROOT / "native/compiler", "-B", compiler_build, "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CXX_FLAGS_RELEASE=-O1 -DNDEBUG",
@@ -154,7 +207,7 @@ def main():
     )
     if changed:
         raise SystemExit("The LLVM checkout has local modifications; preserve them and use a clean pinned checkout.")
-    _clean_stale_cmake_cache(build)
+    _rewrite_stale_sdk_paths(build)
     run(*_llvm_cmake_configuration(source, build))
     run(
         "cmake", "--build", build, "--parallel", args.jobs,
