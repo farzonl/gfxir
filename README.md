@@ -4,15 +4,16 @@ Author GPU programs as a **Python embedded API**, lower them through **MLIR**,
 and target Vulkan, DirectX 12, and Metal without authoring or generating GLSL,
 HLSL, or MSL.
 
-This is a graphics-first **out-of-tree `gfx` MLIR compiler foundation** with
+This is a graphics-first **out-of-tree `gfx` MLIR compiler** with
 Vulkan and DXIL-to-Metal viewers. Python is a bootstrap authoring frontend, not
 the compiler's internal representation or a permanent restriction on frontends.
-The examples define vertex and fragment stages for a triangle and a UV-driven quad.
-Compile them into artifacts, then open a live window or render a PNG through
+Examples range from triangle/quad basics to an original animated ray-marched
+[beacon gallery](examples/beacon_gallery.py). Compile them into artifacts,
+then open a live window or render a PNG through
 Vulkan (MoltenVK on macOS) or native Metal using converted DXIL. The viewer loads
 the actual compiled shaders; it does not redraw the triangle with CPU code or
 generate shading-language source.
-Vulkan artifacts can also be exported to MP4 animation.
+All three preview paths can export deterministic MP4 animation.
 
 ## Status
 
@@ -23,17 +24,22 @@ Vulkan artifacts can also be exported to MP4 animation.
 | `gfx` → MLIR LLVM → LLVM DirectX backend | Implemented | LLVM main/24.0.0git, modern DirectX intrinsics, upstream signature helpers and DXIL/container emission |
 | DXIL validation/signing | Microsoft native validator API | The compiler validates/signs LLVM-produced containers; no HLSL parser or textual IR patching |
 | DXIL → `.metallib` | Metal Shader Converter adapter | Tested with converter 3.0, preserving entry-point names |
-| Vulkan graphics rendering | GLFW window and offscreen PNG readback | Triangle and UV quad tested on macOS/MoltenVK with Vulkan validation, pixel checks, presentation, and window resizing |
+| Vulkan graphics rendering | GLFW window, offscreen PNG and MP4 | Simple graphics and original ray marcher tested with validation, deterministic time, presentation, and resizing |
 | Native Metal rendering of DXIL | MetalKit window and offscreen readback using Apple's converter runtime | Tested on Apple M3 Max with API/GPU validation, pixel checks, and persistent-window tests |
+| Python device control flow / SDF composition | Default AST frontend and upstream SCF | Real bounded GPU loops, branches, early exits, carried scalar/vector state, and finite-difference normals |
+| Read-only frame resources | Reflected f32 root ABI, Vulkan push constants, DXIL root constants, converted Metal argument buffer | Exact time/pixel dimensions in both stages; live clock, frozen snapshots, resize and Retina drawable readback |
 | Native DirectX 12 runtime rendering | Not implemented | DirectX artifacts are previewed through Metal on macOS, not a DirectX device |
 | Compute entry points | IR foundation only | Typed stage, workgroup-size and invocation-ID verification; compute lowering/execution is explicitly rejected for now |
-| Typed pointers / bindless handles | IR foundation only | ODS types parse and round-trip; memory operations, ABI/layout legalization and resource heaps are not implemented yet |
+| Typed pointers / bindless handles | IR foundation only | ODS types parse and round-trip; general pointer/load-store lowering and resource heaps are not implemented yet |
 
 LLVM IR verification is **not** DXIL validation: the native DXC validator also
 checks and signs the actual containers. Real rendering tests cover Vulkan and
 DXIL-to-Metal in addition to mocked command-wiring tests. Native Windows
 DirectX runtime interoperability remains unverified. No path emits fake binaries
 or falls back to shading-language source.
+The completed ray-march stack passed **177 tests** with both GPU paths,
+API validation, and real desktop windows enabled. The measured acceptance
+section records reproducible workload, binary sizes, and numerical thresholds.
 
 ## Compiler architecture
 
@@ -73,8 +79,8 @@ there is no custom `gfx` arithmetic or loop dialect.
 
 This is the graphics-first starting point of the unified-dialect roadmap, not a
 claim that its later milestones are complete. Compute has a distinct entry-point
-contract from day one. Pointer-first/bindless memory lowering, shared host/device
-struct layouts, native host-language frontends, mesh/task
+contract from day one. Beyond the minimal read-only frame ABI, pointer-first/bindless
+memory lowering, general shared host/device struct layouts, native host-language frontends, mesh/task
 execution, ray queries and differentiation remain future work with explicit
 capability boundaries.
 
@@ -209,11 +215,13 @@ both live rendering and PNG export; no target-specific author code or PNG flip
 is involved. The example's blue corner points up and its red/green corners
 remain bottom-left/bottom-right on every implemented runtime.
 
-New manifests use **schema version 3**, with compiler-generated stage reflection,
+Resource-free manifests use **schema version 3**, with compiler-generated stage reflection,
 a separate draw description and `raster_convention`. Corrected version-2
 artifacts remain viewable through a legacy compatibility check. Version-1
 binaries predate normalization and require recompilation into a new directory.
 Existing artifact directories and PNGs are not rewritten.
+Frame-resource pipelines use **schema version 4** with complete reflected
+layout/bindings; earlier resource schemas are rejected rather than guessed.
 
 ### Rendering tests
 
@@ -253,6 +261,12 @@ W, near/far clipping, and the six-vertex UV quad at square, non-square, and odd 
 This tests shared geometry, scale, perspective interpolation, and color placement,
 not just independently plausible images. It does not promise bit-identical
 floating-point results on arbitrary hardware or verify a Windows DirectX runtime.
+The full ray-march acceptance also covers frame resources, device control flow,
+the original scene, MP4 encoding, and live drawable readback. Install the
+`video` extra or supply FFmpeg for movie tests, and provide converter runtime
+headers plus `clang++` for the opted-in Metal window probe. Run window suites
+serially. See the measured ray-march section below for its separate numerical
+thresholds; those do not weaken the exact simple-graphics baselines.
 
 ### Other native targets
 
@@ -463,8 +477,8 @@ PATH="$PWD/.tools/bin:$PATH" .venv/bin/mlir-gpu-view \
 ```
 
 This target-neutral example also supports `--target vulkan` and `--target directx`.
-Its camera is fixed at 128×128; animation and resize-aware frame resources are
-separate upcoming capabilities.
+Its camera is fixed at 128×128; use the frame-aware lit sphere or gallery below
+for animation and resize-aware rendering.
 
 ### Typed structured input
 
@@ -482,8 +496,8 @@ PATH="$PWD/.tools/bin:$PATH" .venv/bin/mlir-gpu-view \
 ```
 
 The same source supports `--target vulkan` and `--target directx`. This example
-uses a fixed 128-pixel camera and at most 32 iterations; frame resources are
-still needed for resize-aware animation.
+uses a fixed 128-pixel camera and at most 32 iterations; unlike the gallery,
+it intentionally does not read the available frame-resource ABI.
 
 Shader input versions are independent of the output pipeline-manifest schema:
 
@@ -616,7 +630,7 @@ Vulkan, Metal, and DXIL-to-Metal previews now bind these resources; they never
 silently substitute zero resolution. Custom parameter blocks compile, but the preview supplies
 only the standard `FrameParameters` profile.
 
-### Animated Vulkan previews and fixed-time snapshots
+### Animated previews and fixed-time snapshots
 
 [Orbiting sphere](examples/orbiting_sphere.py) is a portable Python ray marcher
 with an animated sphere center and a resize-aware camera. It uses the same
@@ -751,6 +765,89 @@ Increasing the step cap changes the loop bound, not the number of cloned bodies.
 Normals are evaluated only on a confirmed hit; glow integrates along the ray.
 Use `--time 0.25 --output build/gallery.png` for a deterministic snapshot,
 or omit output/time for a persistent, resize-aware window.
+
+### Device Python authoring walkthrough
+
+[Lit sphere](examples/lit_sphere.py) is a compact starting point before the
+gallery: a fixed sphere with animated directional lighting, SDF normals, rim
+lighting, fog, and display encoding. The same program runs on every target.
+
+1. `@fragment` declares an entry. `pixel: FragmentCoord` is a two-component
+   raster builtin with top-left origin and pixel centers. `frame: FrameParameters`
+   is host-owned, immutable invocation data, **not** an interpolated varying.
+2. Normalize coordinates by `frame.resolution.y` to retain aspect ratio.
+   Negating camera Y makes scene-space up agree with top-left framebuffer Y.
+   `fullscreen_vertex` supplies the reusable three-vertex full-screen draw.
+3. Define scalar distance and Boolean hit state before the loop. Even
+   `range(64)` is a GPU loop. The hit check happens before advancing; the
+   distance check happens afterward. A cap/distance miss keeps the background.
+   Changing a bound requires compilation; advancing time does not.
+4. `sdf.sphere` and `sdf.normal` compose supported device operations. The
+   normal's lambda is a deliberately inlined helper, not a GPU function pointer.
+   The four normal samples are fixed work, not an unrolled march.
+5. Use `shader_math` for device trigonometry, normalization, dot products,
+   interpolation, and power. Reconstruct vectors with `with_components` rather
+   than mutating swizzles. Return one `vec4` fragment color.
+
+| Value/work | When it runs |
+|------------|--------------|
+| Module constants and pipeline construction | Host Python before compilation |
+| Host-computed constants such as `math.pi` | Captured by compilation; not per-frame device reads |
+| SDK arithmetic/math on pixels or frame values | Native shader instructions |
+| Direct range loops and device-dependent branches | GPU control flow |
+| Literal tuple iteration for four normal samples | Compile-time helper expansion |
+| Seconds/resolution supplied by the preview | Per-frame resource update; no shader recompilation |
+
+Do not use Python `math.sin` on a device value, mutate captured state, or place
+arbitrary Python object operations in a shader. For changing helper state, pass
+it as an explicit argument. Unsupported source/syntax/types report the source
+file, line, and column; source inspection must work, so put shaders in ordinary
+files rather than dynamically generated/unavailable source. There is no host
+execution or old-tracer fallback.
+
+With the pinned compiler, native helper tools, validator, converter prerequisites,
+and optional viewer/video extras installed:
+
+```sh
+export LLVM_BIN="$PWD/.toolchains/llvm-build/bin"
+export PATH="$PWD/.tools/bin:$LLVM_BIN:$PATH"
+export DYLD_LIBRARY_PATH=/usr/local/lib  # macOS Vulkan loader
+
+# Use fresh directories/files; run from the repository root.
+for target in vulkan directx metal; do
+  .venv/bin/python -m mlir_gpu examples/beacon_gallery.py \
+    --target "$target" --output "build/gallery-guide-$target"
+  .venv/bin/mlir-gpu-view "build/gallery-guide-$target/pipeline.json" \
+    --time 0.25 --width 320 --height 240 \
+    --output "build/gallery-guide-$target.png" --validation
+done
+
+# Preconverted Metal needs no converter during preview.
+.venv/bin/mlir-gpu-view build/gallery-guide-metal/pipeline.json \
+  --width 320 --height 240 --validation
+
+# Deterministic animation, independent of export speed.
+.venv/bin/mlir-gpu-view build/gallery-guide-vulkan/pipeline.json \
+  --video build/gallery-guide.mp4 --duration 4 --fps 24 \
+  --width 320 --height 240 --validation
+```
+
+For the tutorial, substitute `examples/lit_sphere.py` and fresh output names.
+For a bounded smoke preview add `--frames 4`; persistent windows otherwise stay
+open until closed or Esc. DXIL preview on macOS performs **launch-time conversion
+and Metal rendering**, not DirectX device execution. `--target metal` performs
+conversion while compiling and previews its existing metallibs directly.
+
+Troubleshooting: install the documented Vulkan loader/layers for Vulkan errors,
+rebuild/install the native Metal viewer after adapter changes, check converter
+runtime tier-2 support for Metal pipeline errors, and use fresh artifact paths.
+Schema-4 parameter reflection must match compiler-owned fields/bindings; do not
+edit byte offsets or invent runtime slots. A custom block requires host values
+not provided by this preview. Non-finite time, zero-sized offscreen output, stale
+resource schemas, and unsupported capabilities fail explicitly. Live minimized
+Vulkan windows pause and resume; Metal draws only when a drawable/pass exists.
+Reduce resolution before increasing `MAX_STEPS`; a larger cap improves grazing
+hits at a cost, but does not add geometry or remove numerical discontinuities.
 
 ### Measured ray-march acceptance
 
@@ -1001,7 +1098,8 @@ Inspired by [Death to Shading Languages](https://xol.io/blah/death-to-shading-la
   tooling, and host-side metaprogramming. Do not copy GLSL's source-level model.
 - **Keep one program and one interface contract.** Stage interfaces live in the
   Python API and artifact manifest, not independently maintained shader files.
-  Rich shared host/device data layouts and buffer arguments are future work;
+  General shared host/device layouts and arbitrary buffer arguments are future work
+  beyond the implemented reflected f32 frame block;
   shader interfaces and runtime draw commands are separate concerns.
 - **Use MLIR as compiler infrastructure.** Traced typed expressions lower to
   a TableGen-defined `gfx` dialect composed with upstream operations, then pass
