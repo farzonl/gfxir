@@ -28,10 +28,10 @@ add_mlir_library(GfxCompiler
   DEPENDS GfxIncGen
   LINK_COMPONENTS FrontendHLSL
   LINK_LIBS PUBLIC
-  MLIRIR MLIRParser MLIRTransforms MLIRArithDialect MLIRFuncDialect MLIRVectorDialect MLIRMathDialect MLIRSCFDialect
-  MLIRSPIRVDialect MLIRLLVMDialect MLIRArithToSPIRV MLIRVectorToSPIRV
-  MLIRSPIRVSerialization MLIRArithToLLVM MLIRFuncToLLVM MLIRVectorToLLVMPass MLIRMathToLLVM MLIRMathToSPIRV MLIRSCFToSPIRV MLIRFuncToSPIRV
-  MLIRReconcileUnrealizedCasts MLIRBuiltinToLLVMIRTranslation MLIRLLVMToLLVMIRTranslation MLIRTargetLLVMIRExport)
+  MLIRIR MLIRParser MLIRTransforms MLIRArithDialect MLIRFuncDialect MLIRFuncInlinerExtension MLIRVectorDialect MLIRMathDialect MLIRSCFDialect
+  MLIRSPIRVDialect MLIRLLVMDialect MLIRLLVMIRTransforms MLIRArithToSPIRV MLIRVectorToSPIRV
+  MLIRSPIRVSerialization MLIRArithToLLVM MLIRFuncToLLVM MLIRVectorToLLVMPass MLIRMathToLLVM MLIRMathToSPIRV MLIRSCFToSPIRV MLIRFuncToSPIRV MLIRSCFToControlFlow MLIRControlFlowToLLVM
+  MLIRUBToLLVM MLIRReconcileUnrealizedCasts MLIRBuiltinToLLVMIRTranslation MLIRLLVMToLLVMIRTranslation MLIRTargetLLVMIRExport)
 
 add_llvm_executable(gfx-opt tools/gfx-opt.cpp)
 target_link_libraries(gfx-opt PRIVATE GfxCompiler MLIROptLib)

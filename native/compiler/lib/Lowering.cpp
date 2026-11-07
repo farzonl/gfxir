@@ -1,12 +1,15 @@
 #include "Gfx/Gfx.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ArithToSPIRV/ArithToSPIRV.h"
+#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
 #include "mlir/Conversion/FuncToSPIRV/FuncToSPIRV.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/MathToSPIRV/MathToSPIRV.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/SCFToSPIRV/SCFToSPIRV.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
 #include "mlir/Conversion/VectorToSPIRV/VectorToSPIRV.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -54,6 +57,38 @@ LogicalResult graphicsEntry(ModuleOp module, func::FuncOp &function,
   return success();
 }
 
+LogicalResult
+collectGraphicsFunctions(ModuleOp module, func::FuncOp entry,
+                         SmallVectorImpl<func::FuncOp> &reachable) {
+  llvm::SmallPtrSet<Operation *, 8> active, visited;
+  std::function<LogicalResult(func::FuncOp)> visit =
+      [&](func::FuncOp current) -> LogicalResult {
+    if (active.contains(current))
+      return current.emitOpError("recursive shader calls are unsupported");
+    if (!visited.insert(current).second)
+      return success();
+    if (current.isExternal() || !current.getBody().hasOneBlock() ||
+        current.getFunctionType().getNumResults() > 1)
+      return current.emitOpError("graphics helpers require a single structured "
+                                 "body and at most one result");
+    active.insert(current);
+    auto calls = current.walk([&](func::CallOp call) {
+      auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
+      if (!callee || (callee != entry && callee->hasAttr("gfx.stage"))) {
+        call.emitOpError("requires a defined ordinary shader helper");
+        return WalkResult::interrupt();
+      }
+      if (failed(visit(callee)))
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    active.erase(current);
+    reachable.push_back(current);
+    return calls.wasInterrupted() ? failure() : success();
+  };
+  return visit(entry);
+}
+
 struct GfxVerifyPass : impl::GfxVerifyBase<GfxVerifyPass> {
   void runOnOperation() override {
     if (failed(verifyShaderModule(getOperation())))
@@ -72,34 +107,8 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
     }
     auto *context = module.getContext();
     auto location = function.getLoc();
-    llvm::SmallPtrSet<Operation *, 8> active, visited;
     SmallVector<func::FuncOp> reachable;
-    std::function<LogicalResult(func::FuncOp)> visit =
-        [&](func::FuncOp current) -> LogicalResult {
-      if (active.contains(current))
-        return current.emitOpError("recursive shader calls are unsupported");
-      if (!visited.insert(current).second)
-        return success();
-      if (current.isExternal() || !current.getBody().hasOneBlock() ||
-          current.getFunctionType().getNumResults() > 1)
-        return current.emitOpError("Vulkan helpers require a single structured "
-                                   "body and at most one result");
-      active.insert(current);
-      auto calls = current.walk([&](func::CallOp call) {
-        auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
-        if (!callee || (callee != function && callee->hasAttr("gfx.stage"))) {
-          call.emitOpError("requires a defined ordinary shader helper");
-          return WalkResult::interrupt();
-        }
-        if (failed(visit(callee)))
-          return WalkResult::interrupt();
-        return WalkResult::advance();
-      });
-      active.erase(current);
-      reachable.push_back(current);
-      return calls.wasInterrupted() ? failure() : success();
-    };
-    if (failed(visit(function))) {
+    if (failed(collectGraphicsFunctions(module, function, reachable))) {
       signalPassFailure();
       return;
     }
@@ -240,6 +249,18 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
       signalPassFailure();
       return;
     }
+    SmallVector<func::FuncOp> reachable;
+    if (failed(collectGraphicsFunctions(module, function, reachable))) {
+      signalPassFailure();
+      return;
+    }
+    for (auto helper :
+         llvm::make_early_inc_range(module.getOps<func::FuncOp>()))
+      if (!llvm::is_contained(reachable, helper))
+        helper.erase();
+    for (auto helper : reachable)
+      if (helper != function)
+        helper.setPrivate();
     OpBuilder builder(module.getContext());
     SmallVector<Operation *> operations;
     function.walk([&](Operation *op) {
@@ -304,10 +325,16 @@ std::unique_ptr<Pass> createGfxToLLVMPass() {
 
 void buildDirectXPipeline(OpPassManager &manager) {
   manager.addPass(createGfxToLLVMPass());
+  // Legalize vector-valued helper boundaries without unrolling shader loops.
+  manager.addPass(createInlinerPass());
+  manager.addPass(createSymbolDCEPass());
+  manager.addPass(createSCFToControlFlowPass());
   manager.addPass(createConvertVectorToLLVMPass());
   manager.addPass(createConvertMathToLLVMPass());
   manager.addPass(createArithToLLVMConversionPass());
+  manager.addPass(createConvertControlFlowToLLVMPass());
   manager.addPass(createConvertFuncToLLVMPass());
+  manager.addPass(createUBToLLVMConversionPass());
   manager.addPass(createReconcileUnrealizedCastsPass());
 }
 
