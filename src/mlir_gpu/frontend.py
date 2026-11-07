@@ -424,18 +424,32 @@ class Entry:
         if any(parameter.kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
                for parameter in parameters):
             raise TypeError("Entry points require positional device arguments.")
+        coordinate_parameters = {
+            parameter.name for parameter in parameters
+            if parameter.annotation is FragmentCoord or parameter.annotation == "FragmentCoord"
+        }
         if self.kind == "vertex":
+            if coordinate_parameters:
+                raise TypeError("FragmentCoord parameters require a fragment entry point.")
             if len(parameters) != 1:
                 raise TypeError("A vertex entry point must take one positional vertex-index argument.")
             interfaces = (ShaderIO("vertex_index", Type.U32, builtin="vertex_index"),)
         elif varying_interface is None:
-            if len(parameters) > 1:
+            if sum(parameter.name not in coordinate_parameters for parameter in parameters) > 1:
                 raise TypeError("Trace multi-input fragment shaders through Pipeline to resolve their interfaces.")
-            interfaces = tuple(ShaderIO(parameter.name, Type.VEC4, location=0) for parameter in parameters)
+            interfaces = tuple(
+                ShaderIO(parameter.name, Type.VEC2, builtin="fragment_coord")
+                if parameter.name in coordinate_parameters else
+                ShaderIO(parameter.name, Type.VEC4, location=0)
+                for parameter in parameters
+            )
         else:
             available = {interface.name: interface for interface in varying_interface}
             resolved = []
             for parameter in parameters:
+                if parameter.name in coordinate_parameters:
+                    resolved.append(ShaderIO(parameter.name, Type.VEC2, builtin="fragment_coord"))
+                    continue
                 interface = available.get(parameter.name)
                 if interface is None and len(parameters) == 1 and len(available) == 1:
                     interface = next(iter(available.values()))
@@ -443,6 +457,8 @@ class Entry:
                     raise ValueError(f"Fragment input {parameter.name!r} has no matching vertex varying.")
                 resolved.append(interface)
             interfaces = tuple(resolved)
+        if len(coordinate_parameters) > 1:
+            raise TypeError("A fragment entry point may declare FragmentCoord only once.")
         input_nodes = tuple(Node("input", interface.type, literal=interface.name) for interface in interfaces)
         result = self.function(*(Value(node) for node in input_nodes))
         if self.kind == "vertex":
@@ -500,6 +516,10 @@ class Entry:
 
 def vertex(function: Callable) -> Entry:
     return Entry(function, "vertex")
+
+
+class FragmentCoord:
+    """Annotate a fragment parameter to read top-left-origin pixel-center XY."""
 
 
 def fragment(function: Callable) -> Entry:

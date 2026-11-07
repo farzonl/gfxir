@@ -33,6 +33,7 @@ def verify_graphics_interface(interface: object, *, preview: bool = False) -> No
                     expected = {
                         ("vertex", "inputs", "vertex_index"): Type.U32,
                         ("vertex", "outputs", "position"): Type.VEC4,
+                        ("fragment", "inputs", "fragment_coord"): Type.VEC2,
                     }.get((stage, direction, builtin)) if isinstance(builtin, str) else None
                     if expected != typ or builtin in builtins or "location" in io:
                         raise ValueError("Unsupported, duplicated, or incorrectly typed graphics builtin.")

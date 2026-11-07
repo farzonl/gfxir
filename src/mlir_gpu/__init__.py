@@ -1,9 +1,10 @@
 from .compiler import CompileError, Target, Toolchain, compile_pipeline
-from .frontend import Draw, Pipeline, Value, Vertex, fragment, i32, maximum, minimum, select, u32, vec2, vec3, vec4, vertex
+from .frontend import Draw, FragmentCoord, Pipeline, Value, Vertex, fragment, i32, maximum, minimum, select, u32, vec2, vec3, vec4, vertex
+from .graphics import fullscreen_vertex
 from . import shader_math
 
 __all__ = [
-    "CompileError", "Draw", "Pipeline", "Target", "Toolchain", "Value", "Vertex",
+    "CompileError", "Draw", "FragmentCoord", "Pipeline", "Target", "Toolchain", "Value", "Vertex",
     "compile_pipeline", "fragment", "i32", "maximum", "minimum", "select", "u32",
-    "shader_math", "vec2", "vec3", "vec4", "vertex",
+    "fullscreen_vertex", "shader_math", "vec2", "vec3", "vec4", "vertex",
 ]

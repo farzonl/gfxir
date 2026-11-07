@@ -29,7 +29,8 @@ def Gfx_Builtin : I32EnumAttr<"Builtin", "device-provided input", [
   I32EnumAttrCase<"VertexIndex", 0, "vertex_index">,
   I32EnumAttrCase<"GlobalInvocationId", 1, "global_invocation_id">,
   I32EnumAttrCase<"LocalInvocationId", 2, "local_invocation_id">,
-  I32EnumAttrCase<"WorkgroupId", 3, "workgroup_id">
+  I32EnumAttrCase<"WorkgroupId", 3, "workgroup_id">,
+  I32EnumAttrCase<"FragmentCoord", 4, "fragment_coord">
 ]> {
   let cppNamespace = "::mlir::gfx";
   let genSpecializedAttr = 0;
