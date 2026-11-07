@@ -351,13 +351,57 @@ through `Pipeline`; a fragment shader may also take no inputs. Fragment outputs
 are device values or a mapping of named render targets. The compiler links their
 interfaces from native reflection; the preview currently supports one `f32x4` target.
 
-Supported operations are finite `f32`/`u32` constants, `vec2`/`vec3`/`vec4`,
-constant-index vector extraction, matching-type
-addition/subtraction/multiplication, scalar equality, and `select`. Unsigned
-arithmetic wraps at 32 bits. Numeric literals are coerced to `f32` when combined
-with a traced float or used in `vec4`. Device input values cannot leak between
-stages. `select` is an expression: both arms are traced, not lazy control flow.
-Vector/scalar broadcasting is not implicit.
+### Arithmetic and vectors
+
+Device values support `+`, `-`, `*`, floating-point `/`, unary negation, `abs`,
+scalar comparisons, and eager Boolean `&`, `|`, `^`, `~`. Python `if`, `and`,
+`or`, and loops still cannot branch on device values; use `select` for now.
+Vector arithmetic broadcasts f32 scalars, without implicitly converting device
+integers to floats or broadcasting the arms of `select`.
+
+```python
+from mlir_gpu import maximum, minimum, vec2, vec3
+
+p = vec3(vec2(0.25, 0.75), 0.0)
+q = abs(-p).with_components(xy=p.yx)
+distance = maximum(q.xy - 0.5, 0.0) / 2.0
+bounded = minimum(distance, 1.0)
+```
+
+Vector constructors accept a scalar splat or exactly the requested number of
+components, including composed vectors. Read swizzles use `xyzw` or `rgba`;
+`with_components` returns a new vector and rejects overlapping replacements.
+Direct component assignment is not supported.
+
+`i32` and `u32` create explicit local integer scalars or reinterpret each other's
+32-bit bit patterns; they do not convert floats. Integer add/subtract/multiply
+wrap modulo 2^32, with signed comparisons for `i32` and unsigned comparisons for
+`u32`. Signed negation and `abs(INT32_MIN)` wrap to `INT32_MIN`. Integer division
+and integer rasterization interfaces are not exposed by this frontend yet.
+
+Floating `minimum`/`maximum` return the numeric operand if just one operand is
+NaN, and NaN if both are NaN. For a zero tie, the result is numerically zero but
+its sign is unspecified; NaN payloads are unspecified. Floating `abs` maps
+negative zero to positive zero. No fast-math flags are enabled. Float literals
+must be finite f32 values, although arithmetic can produce infinity/NaN.
+
+Numeric literals are coerced to `f32` when combined with a traced float or used
+as vector components. Device input values cannot leak between stages. `select`
+is an expression: both arms are traced, not lazy control flow.
+
+The [arithmetic example](examples/arithmetic.py) draws a full-screen gradient
+with a square outline using the new operations:
+
+```sh
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/python -m mlir_gpu examples/arithmetic.py \
+  --target metal --output build/arithmetic-metal
+PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/mlir-gpu-view build/arithmetic-metal/pipeline.json -frames 0
+```
+
+Use `--target vulkan` or `--target directx` with a fresh output directory to
+compile the same example for the other targets.
 
 Python executes once during tracing. Python `if`/loops cannot branch on device
 values: use `select` for now. Host-side loops and metaprogramming can construct

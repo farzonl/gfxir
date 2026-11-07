@@ -24,6 +24,36 @@ def available():
 
 @unittest.skipUnless(available(), "Build tools/build_toolchain.py and select its LLVM_BIN for native gfx IR tests")
 class NativeIRTests(unittest.TestCase):
+    def test_invalid_arithmetic_shapes_and_predicates_are_diagnostics(self):
+        shader = runpy.run_path(str(ROOT / "examples/triangle.py"))["pipeline"].trace()[1].to_dict()
+        shader["nodes"].extend([
+            {"op": "constant", "type": "f32", "args": [], "literal": 1.0},
+            {"op": "constant", "type": "u32", "args": [], "literal": 1},
+            {"op": "constant", "type": "bool", "args": [], "literal": True},
+        ])
+        for node, message in (
+            ({"op": "broadcast", "type": "f32x2", "args": [0, 0]}, "one matching scalar"),
+            ({"op": "cast", "type": "i32", "args": [0]}, "i32/u32 scalars"),
+            ({"op": "constant", "type": "i32", "args": [], "literal": 2**31}, "literal"),
+            ({"op": "cmp", "type": "bool", "args": [1, 1], "literal": "slt"}, "floating-point comparison predicate"),
+            ({"op": "cmp", "type": "bool", "args": [2, 2], "literal": "olt"}, "integer/boolean comparison predicate"),
+            ({"op": "cmp", "type": "bool", "args": [3, 3], "literal": "ult"}, "integer/boolean comparison predicate"),
+            ({"op": "div", "type": "u32", "args": [2, 2]}, "floating-point"),
+            ({"op": "neg", "type": "bool", "args": [3]}, "floating-point or signed"),
+        ):
+            with self.subTest(node=node), tempfile.TemporaryDirectory() as work:
+                source, output = Path(work) / "invalid.json", Path(work) / "invalid.spv"
+                invalid = {**shader, "nodes": [*shader["nodes"], node]}
+                source.write_text(json.dumps(invalid))
+                result = subprocess.run(
+                    [TOOLS.find("gfx-compile"), str(source), "--target", "vulkan", "--output", str(output),
+                     "--reflection", str(Path(work) / "reflection.json")],
+                    text=True, capture_output=True, check=False,
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertFalse(output.exists())
+
     def optimize(self, source, *passes):
         return subprocess.run(
             [TOOLS.find("gfx-opt"), str(source), *passes],

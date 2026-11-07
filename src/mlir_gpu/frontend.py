@@ -12,6 +12,7 @@ from typing import Callable, Mapping
 class Type(Enum):
     F32 = "f32"
     U32 = "i32"
+    I32 = "si32"
     BOOL = "i1"
     VEC2 = "vector<2xf32>"
     VEC3 = "vector<3xf32>"
@@ -20,7 +21,7 @@ class Type(Enum):
     @property
     def schema_name(self) -> str:
         return {
-            Type.F32: "f32", Type.U32: "u32", Type.BOOL: "bool",
+            Type.F32: "f32", Type.U32: "u32", Type.I32: "i32", Type.BOOL: "bool",
             Type.VEC2: "f32x2", Type.VEC3: "f32x3", Type.VEC4: "f32x4",
         }[self]
 
@@ -44,6 +45,7 @@ class Value:
     """A traced device value, not an ordinary Python number."""
 
     __hash__ = None
+    __slots__ = ("node",)
 
     def __init__(self, node: Node):
         self.node = node
@@ -69,9 +71,89 @@ class Value:
     def __rmul__(self, other: Value | float | int) -> Value:
         return _binary("mul", other, self)
 
+    def __truediv__(self, other: Value | float | int) -> Value:
+        return _binary("div", self, other)
+
+    def __rtruediv__(self, other: Value | float | int) -> Value:
+        return _binary("div", other, self)
+
+    def __neg__(self) -> Value:
+        if self.node.type not in (Type.F32, Type.I32, *VECTOR_SIZES):
+            raise TypeError("Negation requires a floating-point or signed value.")
+        return Value(Node("neg", self.node.type, (self.node,)))
+
+    def __abs__(self) -> Value:
+        if self.node.type == Type.U32:
+            return self
+        if self.node.type not in (Type.F32, Type.I32, *VECTOR_SIZES):
+            raise TypeError("Absolute value requires a numeric value.")
+        return Value(Node("abs", self.node.type, (self.node,)))
+
+    def __and__(self, other: Value | bool) -> Value:
+        return _boolean("and", self, other)
+
+    def __rand__(self, other: Value | bool) -> Value:
+        return _boolean("and", other, self)
+
+    def __or__(self, other: Value | bool) -> Value:
+        return _boolean("or", self, other)
+
+    def __ror__(self, other: Value | bool) -> Value:
+        return _boolean("or", other, self)
+
+    def __xor__(self, other: Value | bool) -> Value:
+        return _boolean("xor", self, other)
+
+    def __rxor__(self, other: Value | bool) -> Value:
+        return _boolean("xor", other, self)
+
+    def __invert__(self) -> Value:
+        return _boolean("xor", self, True)
+
+    def __lt__(self, other: Value | float | int) -> Value:
+        return _compare("lt", self, other)
+
+    def __le__(self, other: Value | float | int) -> Value:
+        return _compare("le", self, other)
+
+    def __gt__(self, other: Value | float | int) -> Value:
+        return _compare("gt", self, other)
+
+    def __ge__(self, other: Value | float | int) -> Value:
+        return _compare("ge", self, other)
+
+    def __ne__(self, other: object) -> Value:
+        if not isinstance(other, (Value, float, int)):
+            raise TypeError("Device comparison requires a device value or number.")
+        return _compare("ne", self, other)
+
+    def __getattr__(self, name: str) -> Value:
+        indices = _swizzle(self.node.type, name)
+        components = tuple(self[index] for index in indices)
+        return components[0] if len(indices) == 1 else _vector(len(indices), components)
+
+    def with_components(self, **updates: Value | float) -> Value:
+        size = VECTOR_SIZES.get(self.node.type)
+        if size is None:
+            raise TypeError("Component replacement requires a vector.")
+        components = [self[index] for index in range(size)]
+        replaced: set[int] = set()
+        for name, value in updates.items():
+            indices = _swizzle(self.node.type, name)
+            if len(set(indices)) != len(indices) or replaced.intersection(indices):
+                raise ValueError("Component replacements must not overlap.")
+            values = _components((value,))
+            if len(values) == 1:
+                values *= len(indices)
+            if len(values) != len(indices):
+                raise TypeError("Replacement shape must match its swizzle.")
+            for index, component in zip(indices, values):
+                components[index] = Value(component)
+            replaced.update(indices)
+        return _vector(size, tuple(components))
+
     def __getitem__(self, index: int) -> Value:
-        sizes = {Type.VEC2: 2, Type.VEC3: 3, Type.VEC4: 4}
-        size = sizes.get(self.node.type)
+        size = VECTOR_SIZES.get(self.node.type)
         if size is None or type(index) is not int or not 0 <= index < size:
             raise TypeError("Vector extraction requires an in-range constant integer component.")
         return Value(Node("extract", Type.F32, (self.node,), literal=index))
@@ -80,7 +162,7 @@ class Value:
         if not isinstance(other, (Value, float, int)):
             raise TypeError("Device equality requires a device value or number.")
         lhs, rhs = _operands(self, other)
-        if lhs.type not in (Type.U32, Type.F32, Type.BOOL):
+        if lhs.type not in (Type.U32, Type.I32, Type.F32, Type.BOOL):
             raise TypeError("Equality currently supports scalars only.")
         return Value(Node("eq", Type.BOOL, (lhs, rhs)))
 
@@ -89,9 +171,11 @@ def _literal(value: float | int | bool, expected: Type | None = None) -> Node:
     if isinstance(value, bool):
         node = Node("constant", Type.BOOL, literal=value)
     elif isinstance(value, int) and expected != Type.F32:
-        if not 0 <= value <= 0xFFFFFFFF:
-            raise ValueError("Unsigned integer literals must fit in 32 bits.")
-        node = Node("constant", Type.U32, literal=value)
+        signed = expected == Type.I32
+        lower, upper = (-2**31, 2**31 - 1) if signed else (0, 0xFFFFFFFF)
+        if not lower <= value <= upper:
+            raise ValueError(f"{'Signed' if signed else 'Unsigned'} integer literals must fit in 32 bits.")
+        node = Node("constant", Type.I32 if signed else Type.U32, literal=value)
     else:
         try:
             number = float(value)
@@ -116,32 +200,129 @@ def _node(value: Value | float | int, expected: Type | None = None) -> Node:
     return _literal(value, expected)
 
 
-def _operands(lhs: Value | float | int, rhs: Value | float | int) -> tuple[Node, Node]:
+VECTOR_SIZES = {Type.VEC2: 2, Type.VEC3: 3, Type.VEC4: 4}
+
+
+def _operands(lhs: Value | float | int, rhs: Value | float | int,
+              broadcast: bool = False) -> tuple[Node, Node]:
     expected = lhs.node.type if isinstance(lhs, Value) else (
         rhs.node.type if isinstance(rhs, Value) else None
     )
+    if broadcast:
+        expected = next((value.node.type for value in (lhs, rhs)
+                         if isinstance(value, Value) and value.node.type in VECTOR_SIZES), expected)
+    if broadcast and expected in VECTOR_SIZES:
+        def operand(value):
+            if isinstance(value, Value) and value.node.type in VECTOR_SIZES:
+                return _node(value, expected)
+            return Node("broadcast", expected, (_node(value, Type.F32),))
+        return operand(lhs), operand(rhs)
     left = _node(lhs, expected)
     right = _node(rhs, left.type)
     return left, right
 
 
 def _binary(op: str, lhs: Value | float | int, rhs: Value | float | int) -> Value:
-    left, right = _operands(lhs, rhs)
-    if left.type not in (Type.F32, Type.U32, Type.VEC2, Type.VEC3, Type.VEC4):
-        raise TypeError("Arithmetic requires matching floating-point or unsigned values.")
+    left, right = _operands(lhs, rhs, broadcast=True)
+    if left.type not in (Type.F32, Type.U32, Type.I32, *VECTOR_SIZES):
+        raise TypeError("Arithmetic requires matching numeric values.")
+    if op == "div" and left.type not in (Type.F32, *VECTOR_SIZES):
+        raise TypeError("Division currently requires floating-point values.")
     return Value(Node(op, left.type, (left, right)))
 
 
-def vec4(x: Value | float, y: Value | float, z: Value | float, w: Value | float) -> Value:
-    return Value(Node("vec4", Type.VEC4, tuple(_node(v, Type.F32) for v in (x, y, z, w))))
+def _compare(predicate: str, lhs: Value | float | int, rhs: Value | float | int) -> Value:
+    left, right = _operands(lhs, rhs)
+    if left.type not in (Type.F32, Type.I32, Type.U32, Type.BOOL):
+        raise TypeError("Comparisons currently require matching scalar values.")
+    if left.type == Type.BOOL and predicate != "ne":
+        raise TypeError("Ordering requires numeric values.")
+    if left.type == Type.F32:
+        predicate = "une" if predicate == "ne" else "o" + predicate
+    elif predicate != "ne":
+        predicate = ("s" if left.type == Type.I32 else "u") + predicate
+    return Value(Node("cmp", Type.BOOL, (left, right), literal=predicate))
 
 
-def vec2(x: Value | float, y: Value | float) -> Value:
-    return Value(Node("vec2", Type.VEC2, tuple(_node(v, Type.F32) for v in (x, y))))
+def _boolean(op: str, lhs: Value | bool, rhs: Value | bool) -> Value:
+    return Value(Node(op, Type.BOOL, (_node(lhs, Type.BOOL), _node(rhs, Type.BOOL))))
 
 
-def vec3(x: Value | float, y: Value | float, z: Value | float) -> Value:
-    return Value(Node("vec3", Type.VEC3, tuple(_node(v, Type.F32) for v in (x, y, z))))
+def _swizzle(typ: Type, name: str) -> tuple[int, ...]:
+    size = VECTOR_SIZES.get(typ)
+    alphabet = next((chars for chars in ("xyzw", "rgba")
+                     if name and all(char in chars for char in name)), None)
+    if size is None or alphabet is None or not 1 <= len(name) <= 4:
+        raise AttributeError(f"Invalid vector swizzle: {name!r}.")
+    indices = tuple(alphabet.index(char) for char in name)
+    if any(index >= size for index in indices):
+        raise AttributeError(f"Swizzle {name!r} exceeds the vector size.")
+    return indices
+
+
+def _components(values: tuple[Value | float | int, ...]) -> tuple[Node, ...]:
+    result = []
+    for value in values:
+        if isinstance(value, Value) and value.node.type in VECTOR_SIZES:
+            result.extend(value[index].node for index in range(VECTOR_SIZES[value.node.type]))
+        else:
+            result.append(_node(value, Type.F32))
+    return tuple(result)
+
+
+def _vector(size: int, values: tuple[Value | float | int, ...]) -> Value:
+    components = _components(values)
+    if len(components) == 1:
+        return Value(Node("broadcast", next(typ for typ, count in VECTOR_SIZES.items() if count == size),
+                          components))
+    if len(components) != size:
+        raise TypeError(f"vec{size} requires one scalar or exactly {size} components.")
+    typ = next(typ for typ, count in VECTOR_SIZES.items() if count == size)
+    return Value(Node(f"vec{size}", typ, components))
+
+
+def vec2(x: Value | float, y: Value | float | None = None) -> Value:
+    return _vector(2, (x,) if y is None else (x, y))
+
+
+def vec3(x: Value | float, y: Value | float | None = None,
+         z: Value | float | None = None) -> Value:
+    if y is None and z is not None:
+        raise TypeError("Vector components cannot have gaps.")
+    return _vector(3, tuple(value for value in (x, y, z) if value is not None))
+
+
+def vec4(x: Value | float, y: Value | float | None = None,
+         z: Value | float | None = None, w: Value | float | None = None) -> Value:
+    values = (x, y, z, w)
+    count = next((index for index, value in enumerate(values) if value is None), 4)
+    if any(value is not None for value in values[count:]):
+        raise TypeError("Vector components cannot have gaps.")
+    return _vector(4, tuple(value for value in values[:count] if value is not None))
+
+
+def _integer(value: Value | int, typ: Type) -> Value:
+    if isinstance(value, Value):
+        if value.node.type not in (Type.I32, Type.U32):
+            raise TypeError("Integer reinterpretation requires an i32/u32 scalar.")
+        return value if value.node.type == typ else Value(Node("cast", typ, (value.node,)))
+    return Value(_node(value, typ))
+
+
+def i32(value: Value | int) -> Value:
+    return _integer(value, Type.I32)
+
+
+def u32(value: Value | int) -> Value:
+    return _integer(value, Type.U32)
+
+
+def minimum(lhs: Value | float | int, rhs: Value | float | int) -> Value:
+    return _binary("min", lhs, rhs)
+
+
+def maximum(lhs: Value | float | int, rhs: Value | float | int) -> Value:
+    return _binary("max", lhs, rhs)
 
 
 def select(condition: Value, on_true: Value | float | int, on_false: Value | float | int) -> Value:
@@ -213,7 +394,7 @@ class Stage:
                 data = {"op": operation, "type": node.type.schema_name, "args": operands}
                 if operation == "input":
                     data["input"] = input_ids[key]
-                elif operation in ("constant", "extract"):
+                elif operation in ("constant", "extract", "cmp"):
                     data["literal"] = node.literal
                 ids[key] = len(nodes)
                 nodes.append(data)
@@ -301,7 +482,11 @@ class Entry:
             visited.add(id(node))
             if node.op == "input" and id(node) not in owned_inputs:
                 raise ValueError("A stage cannot capture another stage's device input.")
-            if node.op not in {"input", "constant", "vec2", "vec3", "vec4", "extract", "select", "eq", "add", "sub", "mul"}:
+            if node.op not in {
+                "input", "constant", "vec2", "vec3", "vec4", "extract", "select",
+                "eq", "cmp", "add", "sub", "mul", "div", "neg", "abs", "min", "max",
+                "and", "or", "xor", "cast", "broadcast",
+            }:
                 raise ValueError(f"Unsupported device operation: {node.op}.")
             for arg in node.args:
                 validate(arg)

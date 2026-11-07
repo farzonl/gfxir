@@ -1,5 +1,6 @@
 #include "Gfx/Gfx.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Verifier.h"
@@ -13,7 +14,7 @@ using namespace mlir::gfx;
 static Type parseType(MLIRContext &context, StringRef name) {
   if (name == "f32")
     return Float32Type::get(&context);
-  if (name == "u32")
+  if (name == "u32" || name == "i32")
     return IntegerType::get(&context, 32);
   if (name == "bool")
     return IntegerType::get(&context, 1);
@@ -156,12 +157,45 @@ mlir::gfx::importShader(MLIRContext &context,
           literal = builder.getBoolAttr(*boolean);
       } else if (type.isInteger(32)) {
         auto integer = node->getInteger("literal");
-        if (integer && *integer >= 0 && *integer <= UINT32_MAX)
+        bool signedType = *typeString == "i32";
+        if (integer && *integer >= (signedType ? INT32_MIN : 0) &&
+            *integer <= (signedType ? int64_t(INT32_MAX) : int64_t(UINT32_MAX)))
           literal = builder.getIntegerAttr(type, *integer);
       }
       if (!literal)
         return error("constant literal does not match its type");
       value = arith::ConstantOp::create(builder, location, type, literal);
+    } else if (*operation == "broadcast") {
+      auto vector = dyn_cast<VectorType>(type);
+      if (!vector || arguments.size() != 1 ||
+          arguments[0].getType() != vector.getElementType())
+        return error(
+            "broadcast requires one matching scalar and a vector result");
+      value =
+          vector::BroadcastOp::create(builder, location, type, arguments[0]);
+    } else if (*operation == "cast") {
+      if (arguments.size() != 1 || !type.isInteger(32) ||
+          !arguments[0].getType().isInteger(32))
+        return error("integer reinterpretation requires i32/u32 scalars");
+      value = arguments[0];
+    } else if (*operation == "neg" || *operation == "abs") {
+      if (arguments.size() != 1 || arguments[0].getType() != type)
+        return error("unary operations require one matching operand");
+      if (type.isF32() || isa<VectorType>(type))
+        value =
+            *operation == "neg"
+                ? Value(arith::NegFOp::create(builder, location, arguments[0]))
+                : Value(math::AbsFOp::create(builder, location, arguments[0]));
+      else if (*typeString == "i32") {
+        if (*operation == "abs")
+          value = math::AbsIOp::create(builder, location, arguments[0]);
+        else {
+          auto zero = arith::ConstantOp::create(builder, location,
+                                                builder.getI32IntegerAttr(0));
+          value = arith::SubIOp::create(builder, location, zero, arguments[0]);
+        }
+      } else
+        return error("neg/abs requires a floating-point or signed value");
     } else if (*operation == "vector") {
       auto vector = dyn_cast<VectorType>(type);
       if (!vector ||
@@ -195,11 +229,30 @@ mlir::gfx::importShader(MLIRContext &context,
         return error("binary operations require two matching operands");
       auto operandType = arguments[0].getType();
       bool floating = operandType.isF32() || isa<VectorType>(operandType);
-      if (*operation == "eq") {
+      if (*operation == "eq" || *operation == "cmp") {
         if (type != builder.getI1Type() || isa<VectorType>(operandType))
           return error(
               "equality requires scalar operands and a boolean result");
-        if (floating)
+        if (*operation == "cmp") {
+          auto predicate = node->getString("literal");
+          if (!predicate)
+            return error("comparison requires a typed predicate");
+          if (floating) {
+            auto kind = arith::symbolizeCmpFPredicate(*predicate);
+            if (!kind)
+              return error("invalid floating-point comparison predicate");
+            value = arith::CmpFOp::create(builder, location, *kind,
+                                          arguments[0], arguments[1]);
+          } else {
+            auto kind = arith::symbolizeCmpIPredicate(*predicate);
+            if (!kind || (operandType.isInteger(1) &&
+                          *kind != arith::CmpIPredicate::eq &&
+                          *kind != arith::CmpIPredicate::ne))
+              return error("invalid integer/boolean comparison predicate");
+            value = arith::CmpIOp::create(builder, location, *kind,
+                                          arguments[0], arguments[1]);
+          }
+        } else if (floating)
           value = arith::CmpFOp::create(builder, location,
                                         arith::CmpFPredicate::OEQ, arguments[0],
                                         arguments[1]);
@@ -207,6 +260,20 @@ mlir::gfx::importShader(MLIRContext &context,
           value =
               arith::CmpIOp::create(builder, location, arith::CmpIPredicate::eq,
                                     arguments[0], arguments[1]);
+      } else if (*operation == "and" || *operation == "or" ||
+                 *operation == "xor") {
+        if (!type.isInteger(1) || operandType != type)
+          return error(
+              "boolean operations require boolean operands and result");
+        if (*operation == "and")
+          value = arith::AndIOp::create(builder, location, arguments[0],
+                                        arguments[1]);
+        else if (*operation == "or")
+          value = arith::OrIOp::create(builder, location, arguments[0],
+                                       arguments[1]);
+        else
+          value = arith::XOrIOp::create(builder, location, arguments[0],
+                                        arguments[1]);
       } else {
         if (operandType != type || type.isInteger(1))
           return error(
@@ -229,7 +296,31 @@ mlir::gfx::importShader(MLIRContext &context,
                                                     arguments[0], arguments[1]))
                       : Value(arith::MulIOp::create(
                             builder, location, arguments[0], arguments[1]));
-        else
+        else if (*operation == "div") {
+          if (!floating)
+            return error("division currently requires floating-point operands");
+          value = arith::DivFOp::create(builder, location, arguments[0],
+                                        arguments[1]);
+        } else if (*operation == "min" || *operation == "max") {
+          if (floating)
+            value = *operation == "min"
+                        ? Value(arith::MinNumFOp::create(
+                              builder, location, arguments[0], arguments[1]))
+                        : Value(arith::MaxNumFOp::create(
+                              builder, location, arguments[0], arguments[1]));
+          else if (*typeString == "i32")
+            value = *operation == "min"
+                        ? Value(arith::MinSIOp::create(
+                              builder, location, arguments[0], arguments[1]))
+                        : Value(arith::MaxSIOp::create(
+                              builder, location, arguments[0], arguments[1]));
+          else
+            value = *operation == "min"
+                        ? Value(arith::MinUIOp::create(
+                              builder, location, arguments[0], arguments[1]))
+                        : Value(arith::MaxUIOp::create(
+                              builder, location, arguments[0], arguments[1]));
+        } else
           return error("unsupported node operation");
       }
     }
