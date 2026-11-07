@@ -47,6 +47,29 @@ static InterpolationAttr interpolation(OpBuilder &builder,
                : InterpolationAttr{};
 }
 
+Value mlir::gfx::buildPortablePow(OpBuilder &builder, Location location,
+                                  Value base, Value exponent) {
+  Type type = base.getType();
+  auto constant = [&](float number) -> Value {
+    TypedAttr literal = builder.getF32FloatAttr(number);
+    if (auto vector = dyn_cast<VectorType>(type))
+      literal = DenseElementsAttr::get(vector, ArrayRef<Attribute>{literal});
+    return arith::ConstantOp::create(builder, location, type, literal);
+  };
+  auto zero = constant(0), one = constant(1);
+  auto baseZero = arith::CmpFOp::create(builder, location,
+                                        arith::CmpFPredicate::OEQ, base, zero);
+  auto exponentPositive = arith::CmpFOp::create(
+      builder, location, arith::CmpFPredicate::OGT, exponent, zero);
+  auto zeroCase =
+      arith::AndIOp::create(builder, location, baseZero, exponentPositive);
+  // Upstream pow expansion uses log(base), whose portable domain excludes zero.
+  auto safeBase =
+      arith::SelectOp::create(builder, location, zeroCase, one, base);
+  auto power = math::PowFOp::create(builder, location, safeBase, exponent);
+  return arith::SelectOp::create(builder, location, zeroCase, zero, power);
+}
+
 OwningOpRef<ModuleOp>
 mlir::gfx::importShader(MLIRContext &context,
                         const llvm::json::Object &source) {
@@ -339,28 +362,8 @@ mlir::gfx::importShader(MLIRContext &context,
         } else if (*operation == "pow") {
           if (!floating)
             return error("pow requires matching f32 scalar/vector operands");
-          auto constant = [&](float number) -> Value {
-            TypedAttr literal = builder.getF32FloatAttr(number);
-            if (auto vector = dyn_cast<VectorType>(type))
-              literal =
-                  DenseElementsAttr::get(vector, ArrayRef<Attribute>{literal});
-            return arith::ConstantOp::create(builder, location, type, literal);
-          };
-          auto zero = constant(0), one = constant(1);
-          auto baseZero = arith::CmpFOp::create(
-              builder, location, arith::CmpFPredicate::OEQ, arguments[0], zero);
-          auto exponentPositive = arith::CmpFOp::create(
-              builder, location, arith::CmpFPredicate::OGT, arguments[1], zero);
-          auto zeroCase = arith::AndIOp::create(builder, location, baseZero,
-                                                exponentPositive);
-          // Upstream pow expansion uses log(base), whose SPIR-V domain excludes
-          // zero.
-          auto safeBase = arith::SelectOp::create(builder, location, zeroCase,
-                                                  one, arguments[0]);
-          auto power =
-              math::PowFOp::create(builder, location, safeBase, arguments[1]);
           value =
-              arith::SelectOp::create(builder, location, zeroCase, zero, power);
+              buildPortablePow(builder, location, arguments[0], arguments[1]);
         } else if (*operation == "min" || *operation == "max") {
           if (floating)
             value = *operation == "min"

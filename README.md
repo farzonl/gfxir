@@ -44,9 +44,10 @@ varying inputs/outputs, and clip-position writes. Entry points are standard
 count or the triangle example. Arithmetic and vector construction/extraction
 use upstream `arith` and `vector` operations.
 
-The Python tracer sends a typed, indexed JSON graph to `gfx-compile`, which
-constructs real MLIR operations through C++ builders. It does not generate
-textual MLIR, LLVM assembly, or SSA variable names. Textual IR is an inspectable
+The default Python AST frontend sends typed JSON to `gfx-compile`, which
+constructs real MLIR operations through C++ builders. Straight-line expressions
+use indexed graphs; control flow uses structured operations and SSA references.
+Neither path generates textual MLIR or LLVM assembly. Textual IR is an inspectable
 compiler output and a native-tool input format, not a string-based lowering
 implementation. The compiler also accepts version-2 structured JSON: typed
 functions, blocks, operations, regions, and SSA references. It constructs
@@ -72,7 +73,7 @@ there is no custom `gfx` arithmetic or loop dialect.
 This is the graphics-first starting point of the unified-dialect roadmap, not a
 claim that its later milestones are complete. Compute has a distinct entry-point
 contract from day one. Pointer-first/bindless memory lowering, shared host/device
-struct layouts, Python structured control flow, native host-language frontends, mesh/task
+struct layouts, native host-language frontends, mesh/task
 execution, ray queries and differentiation remain future work with explicit
 capability boundaries.
 
@@ -345,8 +346,8 @@ error rather than a silent fallback to another installed version.
 
 ## Programming model
 
-See [the triangle](examples/triangle.py). Ordinary Python helpers compose traced
-device expressions, with no custom parser, source rewriting, or shader strings.
+See [the triangle](examples/triangle.py). Ordinary Python helpers compose device
+expressions through AST interpretation, without source rewriting or shader strings.
 `@vertex` receives a `u32` vertex index and returns `Vertex(position, color=...)`
 or `Vertex(position, varyings={"name": value, ...})`.
 `@fragment` parameters resolve against those varying names and types when traced
@@ -415,7 +416,54 @@ PATH="$PWD/.tools/bin:$PATH" .venv/bin/mlir-gpu-view \
 
 Use `--target metal` and a fresh directory for preconverted metallibs. On macOS
 the DirectX artifact is rendered through Metal, not a native DirectX device.
-Python `if`/loops on device values remain pending AST frontend work.
+Python authoring supports the same device control flow through the default AST frontend.
+
+### Default Python AST frontend
+
+The existing decorators and `Pipeline` API now interpret shader/helper source
+instead of calling shader functions with symbolic arguments. Source must be
+inspectable; unavailable source or unsupported syntax produces a file/line/column
+error, never a fallback to executing the shader as host Python.
+
+Supported device syntax includes local assignment and augmented assignment,
+`if`/`else`, conditional expressions, `while`, direct `for ... in range(...)`,
+`break`, `continue`, helper returns, and scalar/vector loop-carried state.
+`and`, `or`, `not`, and chained comparisons short-circuit with structured
+selections; `select` and Boolean bitwise operators remain eager.
+`int(device_float)` and `float(device_integer)` are explicit numeric conversions.
+Device floating `**` uses the portable shader-power operation.
+
+Direct range loops become GPU loops, even with literal bounds: changing the
+bound does not duplicate the body. Bounds must fit signed 32-bit integers;
+the step must be a nonzero compile-time signed 32-bit integer. Loop `else`
+and dynamically selected steps are unsupported. GPU `while` termination is
+the author's responsibility.
+
+Literal tuple/reversed-range iteration, list/generator comprehensions, dictionary
+expansion, and constant arithmetic are compile-time metaprogramming. They preserve
+existing vector/table construction; device-dependent iterables or comprehension
+filters are not supported. Ordinary helpers, local helper definitions, and lambdas
+are AST-interpreted and inlined. Captured locals are snapshots: rebinding a captured
+local is rejected, so pass changing state as an explicit helper argument instead.
+Dynamic calls, recursion, arbitrary object mutation/introspection, and exception
+handling are outside this subset. SDK expression factories remain explicitly
+registered builders; Python builtins and math modules are not monkeypatched.
+
+[The capsule marcher](examples/capsule_march.py) demonstrates a Python-authored
+64-step GPU loop, nested hit/miss breaks, continue, carried scalar/vector state,
+an ordinary distance helper, and the reusable tetrahedral normal helper:
+
+```sh
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/python -m mlir_gpu examples/capsule_march.py \
+  --target metal --output build/capsule-march-metal
+PATH="$PWD/.tools/bin:$PATH" .venv/bin/mlir-gpu-view \
+  build/capsule-march-metal/pipeline.json --width 128 --height 128 -frames 0 --validation
+```
+
+This target-neutral example also supports `--target vulkan` and `--target directx`.
+Its camera is fixed at 128×128; animation and resize-aware frame resources are
+separate upcoming capabilities.
 
 ### Typed structured input
 
@@ -501,8 +549,8 @@ still retaining the counter/glow updates performed in the terminating iteration.
 ### Arithmetic and vectors
 
 Device values support `+`, `-`, `*`, floating-point `/`, unary negation, `abs`,
-scalar comparisons, and eager Boolean `&`, `|`, `^`, `~`. Python `if`, `and`,
-`or`, and loops still cannot branch on device values; use `select` for now.
+scalar comparisons, and eager Boolean `&`, `|`, `^`, `~`. The AST frontend lowers
+Python branches, short-circuit expressions, and loops to device control flow.
 Vector arithmetic broadcasts f32 scalars, without implicitly converting device
 integers to floats or broadcasting the arms of `select`.
 
@@ -532,9 +580,9 @@ its sign is unspecified; NaN payloads are unspecified. Floating `abs` maps
 negative zero to positive zero. No fast-math flags are enabled. Float literals
 must be finite f32 values, although arithmetic can produce infinity/NaN.
 
-Numeric literals are coerced to `f32` when combined with a traced float or used
+Numeric literals are coerced to `f32` when combined with a device float or used
 as vector components. Device input values cannot leak between stages. `select`
-is an expression: both arms are traced, not lazy control flow.
+is an expression: both arms are built, not lazy control flow.
 
 The [arithmetic example](examples/arithmetic.py) draws a full-screen gradient
 with a square outline using the new operations:
@@ -672,14 +720,11 @@ PATH="$PWD/.tools/bin:$PATH" \
 ```
 
 Compile `examples/surface_normals.py` into another fresh directory for the
-second example. The current frontend deliberately inlines these small pure
-helpers, including four fixed normal samples, during tracing. It does not
-unroll a ray-marching loop; GPU loops/functions remain separate pending work.
-
-Python executes once during tracing. Python `if`/loops cannot branch on device
-values: use `select` for now. Host-side loops and metaprogramming can construct
-expressions. This is not a compiler for arbitrary Python, dynamic GPU function
-pointers, recursion, or a claim that those features are portable.
+second example. The AST frontend deliberately inlines these small pure helpers,
+including four fixed normal samples. Direct range/while loops remain GPU loops;
+the capsule marcher above uses these helpers inside device control flow.
+This is not a compiler for arbitrary Python, dynamic GPU function pointers,
+or recursion.
 
 ## Design decisions
 

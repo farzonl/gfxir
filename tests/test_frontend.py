@@ -278,15 +278,16 @@ class FrontendTests(unittest.TestCase):
 
         self.assertEqual(evaluate(entry.trace().outputs[0], 1), (1.0, 0.0, 0.0, 1.0))
 
-    def test_python_control_flow_rejected(self):
+    def test_python_control_flow_uses_default_ast_lowering(self):
         @vertex
         def entry(index):
             if index == 0:
                 return Vertex(vec4(0, 0, 0, 1), vec4(1, 1, 1, 1))
-            raise AssertionError("unreachable")
+            return Vertex(vec4(1, 0, 0, 1), vec4(0, 0, 0, 1))
 
-        with self.assertRaisesRegex(TypeError, "cannot control Python"):
-            entry.trace()
+        source = entry.trace().to_dict()
+        self.assertEqual(source["schema_version"], 2)
+        self.assertIn("scf.if", str(source))
 
     def test_invalid_floats_rejected(self):
         for value in (math.inf, -math.inf, math.nan, 1e100, 10**1000):
