@@ -57,7 +57,7 @@ implementation.
   modern LLVM IR.
 - Vulkan uses upstream MLIR SPIR-V conversion patterns and serialization.
 - DirectX uses upstream `llvm.dx.*` intrinsics and LLVM's official DirectX
-  backend. LLVM handles scalarization, `dx.op` lowering, old-bitcode
+  backend. LLVM handles instruction scalarization, `dx.op` lowering, old-bitcode
   compatibility, signature translation and DXContainer emission. The project
   uses LLVM's typed semantic-signature API, not regexes or hand-numbered metadata.
   Interface information retains MLIR types and enums through lowering; JSON
@@ -351,7 +351,7 @@ through `Pipeline`; a fragment shader may also take no inputs. Fragment outputs
 are device values or a mapping of named render targets. The compiler links their
 interfaces from native reflection; the preview currently supports one `f32x4` target.
 
-### Native MLIR and Vulkan device loops
+### Native MLIR and device loops
 
 `MLIRPipeline` accepts vertex/fragment MLIR files and their declared entry names,
 using the same validated artifact, reflection, and viewer pipeline as Python
@@ -359,14 +359,19 @@ authoring. Entry names/stages must match native reflection. Missing files,
 malformed IR, unsupported target operations, and interface mismatches fail
 before publishing the output directory.
 
-Vulkan lowering now supports native `scf.for`, `scf.while`, `scf.if`, and
+Native graphics lowering supports `scf.for`, `scf.while`, `scf.if`, and
 direct calls to defined, nonrecursive helpers with at most one result.
 Helpers may return vectors; loops carry multiple scalars/vectors. Use structured
 regions, not raw multi-block CFGs or indirect/recursive calls. Shader IO belongs
 to the marked entry; helpers are ordinary functions. The compiler converts only
 the reachable call graph and resolves reflection by the marked entry, not
 function order. Upstream SPIR-V conversion performs function/signature and
-structured merge/loop legalization.
+structured merge/loop legalization for Vulkan. DirectX reuses upstream
+SCF-to-CF and CF/function-to-LLVM conversion. Its profile-6.6 legalization
+inlines ordinary helpers with upstream MLIR, then removes unused helpers,
+before LLVM handles instruction scalarization. This avoids unsupported vector
+values crossing helper-call boundaries in DXIL; it does not unroll loops.
+Only the marked entry receives shader attributes/signature metadata.
 
 [The Vulkan loop example](examples/vulkan_loops.py) loads a native
 [sphere marcher](examples/ir/sphere_march.mlir). It executes a bounded GPU while
@@ -387,9 +392,22 @@ most 64 iterations per pixel. Increasing the cap changes the loop bound, not
 shader-body duplication. The bound is authored in IR; the compiler does not
 guarantee termination for arbitrary native programs.
 
-Python `if`/loops on device values, DirectX/Metal structured-loop lowering, and
-the extended JSON region/function importer remain separate pending work.
-The native Vulkan example is not claimed to run on those other targets yet.
+The same sphere source now compiles for DirectX and converted Metal. The
+[DirectX loop example](examples/directx_loops.py) additionally shows color
+bands where each pixel selects the number of GPU loop iterations:
+
+```sh
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/python -m mlir_gpu examples/directx_loops.py \
+  --target directx --output build/directx-loops
+PATH="$PWD/.tools/bin:$PATH" .venv/bin/mlir-gpu-view \
+  build/directx-loops/pipeline.json -frames 0 --validation
+```
+
+Use `--target metal` and a fresh directory for preconverted metallibs. On macOS
+the DirectX artifact is rendered through Metal, not a native DirectX device.
+Python `if`/loops on device values and the extended JSON region/function
+importer remain separate pending work.
 
 ### Arithmetic and vectors
 

@@ -1,6 +1,8 @@
 #include "Gfx/Gfx.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
@@ -44,6 +46,8 @@ void mlir::gfx::registerGfxDialects(DialectRegistry &registry) {
                   spirv::SPIRVDialect, LLVM::LLVMDialect>();
   registerLLVMDialectTranslation(registry);
   registerBuiltinDialectTranslation(registry);
+  func::registerInlinerExtension(registry);
+  LLVM::registerInlinerInterface(registry);
 }
 
 static StageAttr stageOf(Operation *op) {
