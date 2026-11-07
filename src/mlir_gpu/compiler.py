@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .frontend import Draw, Pipeline, Stage
-from .interfaces import verify_graphics_interface
+from .interfaces import reflect_pipeline_parameters, verify_graphics_interface
 
 
 class CompileError(RuntimeError):
@@ -52,6 +52,7 @@ class MLIRPipeline:
 
 
 PIPELINE_SCHEMA_VERSION = 3
+PARAMETER_SCHEMA_VERSION = 4
 RASTER_CONVENTION = {
     "clip_x": "right",
     "clip_y": "up",
@@ -197,11 +198,12 @@ def compile_pipeline(
             for stage in stages
         }
         verify_graphics_interface(interface)
+        parameters = reflect_pipeline_parameters(interface)
         for stage in stages:
             if interface[stage.kind]["name"] != stage.name or interface[stage.kind]["stage"] != stage.kind:
                 raise CompileError(f"Reflected entry does not match the declared {stage.kind} stage {stage.name!r}.")
         manifest = {
-            "schema_version": PIPELINE_SCHEMA_VERSION,
+            "schema_version": PARAMETER_SCHEMA_VERSION if parameters else PIPELINE_SCHEMA_VERSION,
             "target": target.value,
             "entries": entries,
             "interface": interface,
@@ -210,6 +212,8 @@ def compile_pipeline(
             "runtime_verified": False,
             "backend_status": "converted-binary" if target == Target.METAL else "validated-binary",
         }
+        if parameters:
+            manifest["parameters"] = parameters
         (directory / "pipeline.json").write_text(json.dumps(manifest, indent=2) + "\n")
         directory.rename(output)
     return output / "pipeline.json"

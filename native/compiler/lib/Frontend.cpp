@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Verifier.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include <cmath>
 #include <limits>
@@ -98,6 +99,8 @@ mlir::gfx::importShader(MLIRContext &context,
     emitError(location, message);
     return {};
   };
+  if (source.get("parameters"))
+    return error("parameter blocks require structured input schema version 2");
   auto name = source.getString("name");
   auto stageName = source.getString("stage");
   auto stage = stageName ? symbolizeStage(*stageName) : std::nullopt;
@@ -432,7 +435,23 @@ ShaderInterface mlir::gfx::reflectShader(ModuleOp module) {
       function.getSymName().str(),
       function->getAttrOfType<StageAttr>("gfx.stage").getValue(),
       {},
+      {},
       {}};
+  SmallVector<func::FuncOp> pending{function};
+  llvm::SmallPtrSet<Operation *, 8> visited;
+  while (!pending.empty()) {
+    auto current = pending.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    current.walk([&](ParameterOp) {
+      result.parameters =
+          module->getAttrOfType<ParameterBlockAttr>("gfx.parameters");
+    });
+    current.walk([&](func::CallOp call) {
+      if (auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee()))
+        pending.push_back(callee);
+    });
+  }
   function.walk([&](Operation *op) {
     if (auto builtin = dyn_cast<BuiltinOp>(op)) {
       result.inputs.push_back({stringifyBuiltin(builtin.getKind()).str(),
@@ -474,8 +493,53 @@ mlir::gfx::serializeReflection(const ShaderInterface &reflection) {
     }
     return result;
   };
-  return llvm::json::Object{{"name", reflection.name},
+  llvm::json::Object result{{"name", reflection.name},
                             {"stage", stringifyStage(reflection.stage)},
                             {"inputs", serialize(reflection.inputs)},
                             {"outputs", serialize(reflection.outputs)}};
+  if (reflection.parameters)
+    result["parameters"] =
+        serializeParameters(reflection.parameters, reflection.stage);
+  return result;
+}
+
+llvm::json::Object mlir::gfx::serializeParameters(ParameterBlockAttr block,
+                                                  Stage stage) {
+  auto layout = parameterLayout(block);
+  llvm::json::Array fields;
+  for (const auto &item : layout.fields)
+    fields.push_back(
+        llvm::json::Object{{"name", item.field.getName()},
+                           {"type", typeName(item.field.getType())},
+                           {"offset", item.offset},
+                           {"size", item.size},
+                           {"alignment", item.alignment}});
+  return llvm::json::Object{
+      {"schema_version", 1},
+      {"name", block.getName()},
+      {"layout", "gfx-root-f32-v1"},
+      {"size", layout.size},
+      {"alignment", 16},
+      {"fields", std::move(fields)},
+      {"stages", llvm::json::Array{stringifyStage(stage)}},
+      {"ownership", "host"},
+      {"access", "read-only"},
+      {"addressable", false},
+      {"bindings",
+       llvm::json::Object{
+           {"vulkan",
+            llvm::json::Object{{"storage", "push_constant"}, {"offset", 0}}},
+           {"directx",
+            llvm::json::Object{{"storage", "root_constants"},
+                               {"parameter_index", 0},
+                               {"register", 0},
+                               {"space", 0},
+                               {"num32bit_constants", layout.size / 4},
+                               {"visibility", "all"},
+                               {"root_signature_version", "1.1"}}},
+           {"metal",
+            llvm::json::Object{{"storage", "converter_argument_buffer"},
+                               {"buffer_index", 2},
+                               {"offset", 0},
+                               {"size", layout.size}}}}}};
 }

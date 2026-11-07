@@ -55,9 +55,27 @@ def load_program(manifest: Path) -> GraphicsProgram:
         )
     if (
         not isinstance(data, dict) or type(data.get("schema_version")) is not int
-        or data.get("schema_version") not in (2, PIPELINE_SCHEMA_VERSION) or data.get("target") not in ("vulkan", "directx", "metal")
+        or data.get("schema_version") not in (2, 3, 4) or data.get("target") not in ("vulkan", "directx", "metal")
     ):
         raise ViewerError(f"The viewer requires a schema-version {PIPELINE_SCHEMA_VERSION} Vulkan, DirectX, or Metal pipeline manifest.")
+    if data["schema_version"] == 4:
+        from .interfaces import reflect_pipeline_parameters
+        from .parameters import verify_parameters
+        try:
+            verify_graphics_interface(data.get("interface"), preview=True)
+            parameters = reflect_pipeline_parameters(data["interface"])
+            verify_parameters(data.get("parameters"))
+            if parameters is None or data.get("parameters") != parameters:
+                raise ValueError("Manifest parameters must match complete stage reflection.")
+        except ValueError as error:
+            raise ViewerError(f"Invalid parameter resource manifest: {error}") from error
+        raise ViewerError("Parameter resource previews require the Vulkan/Metal runtime binding adapters (#9/#10); this compiler-only milestone does not bind resources.")
+    reflected = data.get("interface")
+    has_parameters = isinstance(reflected, dict) and any(
+        isinstance(stage, dict) and "parameters" in stage for stage in reflected.values()
+    )
+    if "parameters" in data or has_parameters:
+        raise ViewerError("Parameter resources require schema version 4; recompile this stale manifest.")
     if data["schema_version"] == 2:
         legacy_interface = {
             "vertex_input": "vertex_index:u32",

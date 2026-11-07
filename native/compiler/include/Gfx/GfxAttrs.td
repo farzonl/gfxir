@@ -37,6 +37,20 @@ def Gfx_Builtin : I32EnumAttr<"Builtin", "device-provided input", [
 }
 def Gfx_BuiltinAttr : EnumAttr<Gfx_Dialect, Gfx_Builtin, "builtin">;
 
+def Gfx_ParameterFieldAttr : AttrDef<Gfx_Dialect, "ParameterField"> {
+  let mnemonic = "parameter_field";
+  let parameters = (ins StringRefParameter<>:$name, "::mlir::Type":$type);
+  let assemblyFormat = "`<` $name `,` $type `>`";
+  let genVerifyDecl = 1;
+}
+
+def Gfx_ParameterBlockAttr : AttrDef<Gfx_Dialect, "ParameterBlock"> {
+  let mnemonic = "parameter_block";
+  let parameters = (ins StringRefParameter<>:$name, "::mlir::ArrayAttr":$fields);
+  let assemblyFormat = "`<` $name `,` $fields `>`";
+  let genVerifyDecl = 1;
+}
+
 def Gfx_StorageClass : I32EnumAttr<"StorageClass", "device memory domain", [
   I32EnumAttrCase<"Global", 0, "global">,
   I32EnumAttrCase<"Workgroup", 1, "workgroup">,
