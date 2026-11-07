@@ -546,7 +546,7 @@ state. Do not place function returns or stage writes inside SCF regions.
 The Julia example demonstrates an escape check that freezes coordinates while
 still retaining the counter/glow updates performed in the terminating iteration.
 
-### Read-only frame parameters (compiler-only)
+### Read-only frame parameters
 
 [Frame bands](examples/frame_bands.py) reads elapsed time and framebuffer-pixel
 resolution through a typed, immutable parameter block, not interpolated inputs:
@@ -611,11 +611,51 @@ LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
 ```
 
 Also compile with `--target vulkan` or `--target directx` into fresh directories.
-This milestone deliberately provides a **compile-only** example: validated
-binaries and host/device ABI checks, not GPU execution of frame data.
-The viewer rejects these resource artifacts until the Vulkan/Metal binding
-adapters land; it never silently substitutes zero time/resolution. Live updates,
-resize, synchronization, and deterministic snapshots are separate milestones.
+Vulkan previews now bind these resources. Metal/DXIL-to-Metal resource previews
+remain gated until their runtime adapter lands; they never silently substitute
+zero time/resolution. Custom parameter blocks compile, but the preview supplies
+only the standard `FrameParameters` profile.
+
+### Animated Vulkan previews and fixed-time snapshots
+
+[Orbiting sphere](examples/orbiting_sphere.py) is a portable Python ray marcher
+with an animated sphere center and a resize-aware camera. It uses the same
+frame-parameter ABI as frame bands. Vulkan live previews supply monotonic elapsed
+seconds since renderer initialization and the actual swapchain framebuffer-pixel
+dimensions, not logical window points. Minimized/zero-sized windows pause drawing;
+restoration and resize rebuild the swapchain and use its new extent.
+
+```sh
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/python -m mlir_gpu examples/orbiting_sphere.py \
+  --target vulkan --output build/orbiting-sphere-vulkan
+DYLD_LIBRARY_PATH=/usr/local/lib .venv/bin/mlir-gpu-view \
+  build/orbiting-sphere-vulkan/pipeline.json --width 640 --height 480 -frames 0 --validation
+```
+
+For a deterministic PNG, use a fresh output file:
+
+```sh
+DYLD_LIBRARY_PATH=/usr/local/lib .venv/bin/mlir-gpu-view \
+  build/orbiting-sphere-vulkan/pipeline.json --width 640 --height 480 \
+  --time 1.25 --output build/orbiting-sphere-1.25.png --validation
+```
+
+Offscreen time defaults to **0 seconds**. `--time` (or Python `time=...`) supplies
+fixed, finite, nonnegative f32 seconds. In live mode it freezes shader time while
+still updating framebuffer dimensions on resize; omitting it advances the clock.
+The Python APIs are `render_offscreen(program, ..., time=1.25)` and
+`show_window(program, ..., time=None)`. Metal time forwarding is a separate adapter
+capability and currently reports an explicit unsupported error.
+
+The reflected push-constant range and stage visibility determine the Vulkan
+pipeline layout. Packing uses reflected offsets and zero padding. Each acquired
+image's command buffer is reset/re-recorded with fresh frame bytes, after the
+previous submission has completed. Push-constant data is copied into the command
+buffer; the single-frame-in-flight queue-idle policy prevents resetting commands
+still used by the GPU. Missing/mismatched layouts, unbound custom blocks, invalid
+time, and device-limit failures are explicit errors. No shader recompilation,
+descriptor heap, or writable memory is needed for this read-only ABI.
 
 ### Arithmetic and vectors
 

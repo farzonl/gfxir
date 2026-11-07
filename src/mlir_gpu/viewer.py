@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import os
 import re
 import struct
 import subprocess
 import sys
 import tempfile
+import time as clock
 import zlib
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -16,7 +18,8 @@ from pathlib import Path
 
 from .compiler import CompileError, PIPELINE_SCHEMA_VERSION, RASTER_CONVENTION, Toolchain, _check_binary, _run, convert_dxil_to_metallib
 from .frontend import Draw
-from .interfaces import verify_graphics_interface
+from .interfaces import reflect_pipeline_parameters, verify_graphics_interface
+from .parameters import FrameParameters, pack_parameters, verify_parameters
 
 
 class ViewerError(RuntimeError):
@@ -35,6 +38,7 @@ class GraphicsProgram:
     fragment: Shader
     target: str = "vulkan"
     draw: Draw = Draw()
+    parameters: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -58,9 +62,8 @@ def load_program(manifest: Path) -> GraphicsProgram:
         or data.get("schema_version") not in (2, 3, 4) or data.get("target") not in ("vulkan", "directx", "metal")
     ):
         raise ViewerError(f"The viewer requires a schema-version {PIPELINE_SCHEMA_VERSION} Vulkan, DirectX, or Metal pipeline manifest.")
+    parameters = None
     if data["schema_version"] == 4:
-        from .interfaces import reflect_pipeline_parameters
-        from .parameters import verify_parameters
         try:
             verify_graphics_interface(data.get("interface"), preview=True)
             parameters = reflect_pipeline_parameters(data["interface"])
@@ -69,12 +72,14 @@ def load_program(manifest: Path) -> GraphicsProgram:
                 raise ValueError("Manifest parameters must match complete stage reflection.")
         except ValueError as error:
             raise ViewerError(f"Invalid parameter resource manifest: {error}") from error
-        raise ViewerError("Parameter resource previews require the Vulkan/Metal runtime binding adapters (#9/#10); this compiler-only milestone does not bind resources.")
+        if data["target"] != "vulkan":
+            raise ViewerError("Metal parameter resources require the runtime binding adapters in #10.")
+        _frame_parameters(parameters)
     reflected = data.get("interface")
     has_parameters = isinstance(reflected, dict) and any(
         isinstance(stage, dict) and "parameters" in stage for stage in reflected.values()
     )
-    if "parameters" in data or has_parameters:
+    if data["schema_version"] != 4 and ("parameters" in data or has_parameters):
         raise ViewerError("Parameter resources require schema version 4; recompile this stale manifest.")
     if data["schema_version"] == 2:
         legacy_interface = {
@@ -111,7 +116,7 @@ def load_program(manifest: Path) -> GraphicsProgram:
             raise ViewerError("The manifest must contain unique vertex and fragment stages.")
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise ViewerError("Invalid shader entry-point name.")
-        if data["schema_version"] == PIPELINE_SCHEMA_VERSION and data["interface"][stage]["name"] != name:
+        if data["schema_version"] in (3, 4) and data["interface"][stage]["name"] != name:
             raise ViewerError("Shader entry-point names must match the compiler-generated reflection.")
         if not isinstance(filename, str) or not filename:
             raise ViewerError("A shader binary path is required.")
@@ -126,7 +131,33 @@ def load_program(manifest: Path) -> GraphicsProgram:
         if data["target"] == "vulkan" and len(code) % 4:
             raise ViewerError(f"SPIR-V binary is not word-aligned: {filename}.")
         shaders[stage] = Shader(name, code)
-    return GraphicsProgram(shaders["vertex"], shaders["fragment"], data["target"], draw)
+    return GraphicsProgram(shaders["vertex"], shaders["fragment"], data["target"], draw, parameters)
+
+
+def _frame_parameters(parameters: dict | None) -> None:
+    if parameters is None:
+        return
+    try:
+        verify_parameters(parameters)
+    except ValueError as error:
+        raise ViewerError(f"Invalid frame parameter resource: {error}") from error
+    fields = [{"name": field["name"], "type": field["type"]} for field in parameters["fields"]]
+    if ({"name": parameters["name"], "fields": fields} != FrameParameters.to_dict()
+            or any(stage not in ("vertex", "fragment") for stage in parameters["stages"])):
+        raise ViewerError("The preview supplies FrameParameters only; custom parameter blocks require explicit host values.")
+
+
+def _time_value(value: float) -> float:
+    if type(value) not in (int, float) or value < 0 or value > 3.4028234663852886e38 or not math.isfinite(value):
+        raise ViewerError("Time must be finite, nonnegative f32 seconds.")
+    return float(value)
+
+
+def _frame_data(parameters: dict, width: int, height: int, elapsed: float) -> bytes:
+    _frame_parameters(parameters)
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+        raise ViewerError("Frame parameters require positive framebuffer-pixel dimensions.")
+    return pack_parameters(parameters, {"time": _time_value(elapsed), "resolution": (width, height)})
 
 
 def _dimensions(width: int, height: int) -> None:
@@ -159,6 +190,8 @@ def _metal_libraries(program: GraphicsProgram, toolchain: Toolchain):
         raise ViewerError("DXIL-to-Metal preview requires macOS. This is not a DirectX runtime renderer.")
     if program.target not in ("directx", "metal"):
         raise ViewerError("The Metal viewer requires DirectX or Metal artifacts.")
+    if program.parameters is not None:
+        raise ViewerError("Metal parameter resources require the runtime binding adapters in #10.")
     with tempfile.TemporaryDirectory(prefix="mlir-gpu-metal-") as work:
         directory = Path(work)
         libraries = []
@@ -333,6 +366,7 @@ class _Vulkan:
         self.name = properties.deviceName
         self.max_width = properties.limits.maxFramebufferWidth
         self.max_height = properties.limits.maxFramebufferHeight
+        self.max_push_constants = properties.limits.maxPushConstantsSize
         enabled = ["VK_KHR_swapchain"] if self.surface is not None else []
         if "VK_KHR_portability_subset" in device_extensions:
             enabled.append("VK_KHR_portability_subset")
@@ -343,7 +377,9 @@ class _Vulkan:
         ), None)
         resources.callback(vk.vkDestroyDevice, self.device, None)
         self.queue = vk.vkGetDeviceQueue(self.device, self.family, 0)
-        self.pool = vk.vkCreateCommandPool(self.device, vk.VkCommandPoolCreateInfo(queueFamilyIndex=self.family), None)
+        self.pool = vk.vkCreateCommandPool(self.device, vk.VkCommandPoolCreateInfo(
+            queueFamilyIndex=self.family, flags=vk.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        ), None)
         resources.callback(vk.vkDestroyCommandPool, self.device, self.pool, None)
 
     def check_validation(self):
@@ -429,6 +465,7 @@ class _Vulkan:
 
     def pipeline(self, resources, program, format, width, height, present):
         vk = self.vk
+        _frame_parameters(program.parameters)
         if width > self.max_width or height > self.max_height:
             raise ViewerError("The requested preview exceeds the device's framebuffer limits.")
         final_layout = vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR if present else vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
@@ -462,7 +499,16 @@ class _Vulkan:
             ],
         ), None)
         resources.callback(vk.vkDestroyRenderPass, self.device, render_pass, None)
-        layout = vk.vkCreatePipelineLayout(self.device, vk.VkPipelineLayoutCreateInfo(), None)
+        ranges = []
+        if program.parameters is not None:
+            if program.parameters["size"] > self.max_push_constants:
+                raise ViewerError("The reflected frame block exceeds the device's push-constant limit.")
+            ranges.append(vk.VkPushConstantRange(
+                stageFlags=self.parameter_stages(program.parameters),
+                offset=program.parameters["bindings"]["vulkan"]["offset"],
+                size=program.parameters["size"],
+            ))
+        layout = vk.vkCreatePipelineLayout(self.device, vk.VkPipelineLayoutCreateInfo(pPushConstantRanges=ranges), None)
         resources.callback(vk.vkDestroyPipelineLayout, self.device, layout, None)
         stages = []
         for shader, stage in ((program.vertex, vk.VK_SHADER_STAGE_VERTEX_BIT), (program.fragment, vk.VK_SHADER_STAGE_FRAGMENT_BIT)):
@@ -488,7 +534,14 @@ class _Vulkan:
             layout=layout, renderPass=render_pass, subpass=0,
         )], None)[0]
         resources.callback(vk.vkDestroyPipeline, self.device, pipeline, None)
-        return render_pass, pipeline
+        return render_pass, pipeline, layout
+
+    def parameter_stages(self, parameters):
+        flags = 0
+        for stage in parameters["stages"]:
+            flags |= {"vertex": self.vk.VK_SHADER_STAGE_VERTEX_BIT,
+                      "fragment": self.vk.VK_SHADER_STAGE_FRAGMENT_BIT}[stage]
+        return flags
 
     def framebuffer(self, resources, render_pass, view, width, height):
         vk = self.vk
@@ -498,12 +551,19 @@ class _Vulkan:
         resources.callback(vk.vkDestroyFramebuffer, self.device, framebuffer, None)
         return framebuffer
 
-    def command(self, resources, render_pass, pipeline, framebuffer, width, height, draw: Draw, copy=None):
+    def command(self, resources, render_pass, pipeline, framebuffer, width, height, draw: Draw, copy=None,
+                *, layout=None, parameters=None, elapsed=0.0, command=None):
         vk = self.vk
-        command = vk.vkAllocateCommandBuffers(self.device, vk.VkCommandBufferAllocateInfo(
-            commandPool=self.pool, level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount=1,
-        ))[0]
-        resources.callback(vk.vkFreeCommandBuffers, self.device, self.pool, 1, [command])
+        data = _frame_data(parameters, width, height, elapsed) if parameters is not None else None
+        if data is not None and layout is None:
+            raise ViewerError("Frame parameters require the reflected pipeline layout.")
+        if command is None:
+            command = vk.vkAllocateCommandBuffers(self.device, vk.VkCommandBufferAllocateInfo(
+                commandPool=self.pool, level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount=1,
+            ))[0]
+            resources.callback(vk.vkFreeCommandBuffers, self.device, self.pool, 1, [command])
+        else:
+            vk.vkResetCommandBuffer(command, 0)
         vk.vkBeginCommandBuffer(command, vk.VkCommandBufferBeginInfo())
         vk.vkCmdBeginRenderPass(command, vk.VkRenderPassBeginInfo(
             renderPass=render_pass, framebuffer=framebuffer,
@@ -511,6 +571,9 @@ class _Vulkan:
             pClearValues=[vk.VkClearValue(color=vk.VkClearColorValue(float32=[0.02, 0.02, 0.04, 1.0]))],
         ), vk.VK_SUBPASS_CONTENTS_INLINE)
         vk.vkCmdBindPipeline(command, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline)
+        if data is not None:
+            vk.vkCmdPushConstants(command, layout, self.parameter_stages(parameters),
+                                  parameters["bindings"]["vulkan"]["offset"], len(data), vk.ffi.from_buffer(data))
         vk.vkCmdDraw(command, draw.vertex_count, 1, 0, 0)
         vk.vkCmdEndRenderPass(command)
         if copy is not None:
@@ -530,8 +593,11 @@ class _Vulkan:
         return command
 
 
-def render_offscreen(program: GraphicsProgram, width: int = 640, height: int = 480, validation: bool = False) -> RenderedImage:
+def render_offscreen(program: GraphicsProgram, width: int = 640, height: int = 480,
+                     validation: bool = False, time: float = 0.0) -> RenderedImage:
     _dimensions(width, height)
+    elapsed = _time_value(time)
+    _frame_parameters(program.parameters)
     if program.target != "vulkan":
         raise ViewerError("Vulkan rendering requires Vulkan artifacts; use the Metal preview for DXIL.")
     with _api_errors(), ExitStack() as resources:
@@ -540,9 +606,10 @@ def render_offscreen(program: GraphicsProgram, width: int = 640, height: int = 4
         format = vk.VK_FORMAT_R8G8B8A8_UNORM
         image, view = gpu.image(resources, width, height, format)
         buffer, memory = gpu.readback_buffer(resources, width * height * 4)
-        render_pass, pipeline = gpu.pipeline(resources, program, format, width, height, False)
+        render_pass, pipeline, layout = gpu.pipeline(resources, program, format, width, height, False)
         framebuffer = gpu.framebuffer(resources, render_pass, view, width, height)
-        command = gpu.command(resources, render_pass, pipeline, framebuffer, width, height, program.draw, (image, buffer))
+        command = gpu.command(resources, render_pass, pipeline, framebuffer, width, height, program.draw, (image, buffer),
+                              layout=layout, parameters=program.parameters, elapsed=elapsed)
         fence = vk.vkCreateFence(gpu.device, vk.VkFenceCreateInfo(), None)
         resources.callback(vk.vkDestroyFence, gpu.device, fence, None)
         resources.callback(vk.vkDeviceWaitIdle, gpu.device)
@@ -584,6 +651,8 @@ def _swapchain(gpu, resources, program, width, height):
     else:
         width = max(capabilities.minImageExtent.width, min(width, capabilities.maxImageExtent.width))
         height = max(capabilities.minImageExtent.height, min(height, capabilities.maxImageExtent.height))
+    if width == 0 or height == 0:
+        raise vk.VkErrorOutOfDateKhr()
     count = capabilities.minImageCount + 1
     if capabilities.maxImageCount:
         count = min(count, capabilities.maxImageCount)
@@ -600,23 +669,33 @@ def _swapchain(gpu, resources, program, width, height):
         presentMode=vk.VK_PRESENT_MODE_FIFO_KHR, clipped=vk.VK_TRUE,
     ), None)
     resources.callback(gpu.device_function("vkDestroySwapchainKHR"), gpu.device, swapchain, None)
-    render_pass, pipeline = gpu.pipeline(resources, program, format, width, height, True)
-    commands, finished = [], []
+    render_pass, pipeline, layout = gpu.pipeline(resources, program, format, width, height, True)
+    commands, finished, framebuffers = [], [], []
     for image in gpu.device_function("vkGetSwapchainImagesKHR")(gpu.device, swapchain):
         view = gpu.view(resources, image, format)
         framebuffer = gpu.framebuffer(resources, render_pass, view, width, height)
-        commands.append(gpu.command(resources, render_pass, pipeline, framebuffer, width, height, program.draw))
+        framebuffers.append(framebuffer)
+        commands.append(gpu.command(resources, render_pass, pipeline, framebuffer, width, height, program.draw,
+                                    layout=layout, parameters=program.parameters))
         semaphore = vk.vkCreateSemaphore(gpu.device, vk.VkSemaphoreCreateInfo(), None)
         resources.callback(vk.vkDestroySemaphore, gpu.device, semaphore, None)
         finished.append(semaphore)
     acquired = vk.vkCreateSemaphore(gpu.device, vk.VkSemaphoreCreateInfo(), None)
     resources.callback(vk.vkDestroySemaphore, gpu.device, acquired, None)
     resources.callback(vk.vkDeviceWaitIdle, gpu.device)
-    return swapchain, commands, acquired, finished
+    def record_frame(index, elapsed):
+        if program.parameters is not None:
+            gpu.command(resources, render_pass, pipeline, framebuffers[index], width, height, program.draw,
+                        layout=layout, parameters=program.parameters, elapsed=elapsed, command=commands[index])
+
+    return swapchain, commands, acquired, finished, record_frame
 
 
-def show_window(program: GraphicsProgram, width: int = 800, height: int = 600, frames: int = 0, validation: bool = False) -> int:
+def show_window(program: GraphicsProgram, width: int = 800, height: int = 600, frames: int = 0,
+                validation: bool = False, time: float | None = None) -> int:
     _dimensions(width, height)
+    _frame_parameters(program.parameters)
+    frozen_time = _time_value(time) if time is not None else None
     if program.target != "vulkan":
         raise ViewerError("Vulkan rendering requires Vulkan artifacts; use the Metal preview for DXIL.")
     if type(frames) is not int or frames < 0:
@@ -635,6 +714,7 @@ def show_window(program: GraphicsProgram, width: int = 800, height: int = 600, f
             raise ViewerError(f"GLFW window creation failed: {glfw.get_error()}.")
         resources.callback(glfw.destroy_window, window)
         gpu = _Vulkan(resources, window, glfw, validation)
+        started = clock.monotonic()
         vk = gpu.vk
         presented = 0
         announced = False
@@ -646,7 +726,7 @@ def show_window(program: GraphicsProgram, width: int = 800, height: int = 600, f
                 continue
             with ExitStack() as swap_resources:
                 try:
-                    swapchain, commands, acquired, finished = _swapchain(gpu, swap_resources, program, *size)
+                    swapchain, commands, acquired, finished, record_frame = _swapchain(gpu, swap_resources, program, *size)
                 except vk.VkErrorOutOfDateKhr:
                     glfw.wait_events_timeout(0.1)
                     continue
@@ -673,6 +753,7 @@ def show_window(program: GraphicsProgram, width: int = 800, height: int = 600, f
                     except vk.VkErrorOutOfDateKhr:
                         break
                     image_index = index[0]
+                    record_frame(image_index, frozen_time if frozen_time is not None else clock.monotonic() - started)
                     vk.vkQueueSubmit(gpu.queue, 1, [vk.VkSubmitInfo(
                         pWaitSemaphores=[acquired], pWaitDstStageMask=[vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT],
                         pCommandBuffers=[commands[image_index]], pSignalSemaphores=[finished[image_index]],
@@ -704,18 +785,22 @@ def main() -> int:
     mode.add_argument("--output", type=Path, help="Render an offscreen PNG instead of opening a window (new file)")
     mode.add_argument("--frames", "-frames", type=int, default=0, help="Live window: close after N frames; 0 stays open")
     parser.add_argument("--validation", action="store_true", help="Enable Vulkan validation or Metal API/GPU validation")
+    parser.add_argument("--time", type=float, help="Vulkan: fixed elapsed seconds (snapshot default 0; live default monotonic clock)")
     args = parser.parse_args()
     try:
         program = load_program(args.manifest)
+        timing = {"time": args.time} if args.time is not None else {}
+        if timing and program.target != "vulkan":
+            raise ViewerError("--time for Metal previews requires the runtime adapter in #10.")
         if args.output:
             if args.output.exists():
                 raise ViewerError(f"Output already exists; choose a new PNG path: {args.output}")
             render = render_offscreen if program.target == "vulkan" else render_metal_offscreen
-            image = render(program, args.width, args.height, args.validation)
+            image = render(program, args.width, args.height, args.validation, **timing)
             write_png(args.output, image)
             print(f"Rendered {image.width}x{image.height} on {image.device}: {args.output}")
         elif program.target == "vulkan":
-            count = show_window(program, args.width, args.height, args.frames, args.validation)
+            count = show_window(program, args.width, args.height, args.frames, args.validation, **timing)
             print(f"Presented {count} Vulkan frames.")
         else:
             show_metal_window(program, args.width, args.height, args.frames, args.validation)

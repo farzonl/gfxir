@@ -169,8 +169,12 @@ class ParameterABITests(unittest.TestCase):
                     self.assertEqual(data["schema_version"], 4)
                     self.assertEqual(data["parameters"]["stages"], ["fragment"])
                     self.assertEqual(data["parameters"], data["interface"]["fragment"]["parameters"])
-                    with self.assertRaisesRegex(ViewerError, "runtime binding adapters"):
-                        load_program(manifest)
+                    if target == Target.VULKAN and data["parameters"]["name"] == "frame":
+                        self.assertEqual(load_program(manifest).parameters, data["parameters"])
+                    else:
+                        message = "FrameParameters only" if target == Target.VULKAN else "runtime binding adapters"
+                        with self.assertRaisesRegex(ViewerError, message):
+                            load_program(manifest)
                     invalid = copy.deepcopy(data)
                     invalid["parameters"]["bindings"]["vulkan"]["offset"] = False
                     manifest.write_text(json.dumps(invalid))
