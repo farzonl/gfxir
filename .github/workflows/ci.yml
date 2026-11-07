@@ -1,0 +1,188 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python package and viewer dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e '.[viewer,video]' lit
+
+      - name: Install system packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            spirv-tools \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            vulkan-validationlayers \
+            libglfw3
+
+      - name: Ensure Ninja is installed (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          command -v ninja >/dev/null 2>&1 || brew install ninja
+
+      - name: Cache GPU SDK dependencies
+        id: cache-gpu-sdk
+        uses: actions/cache@v4
+        with:
+          path: .sdk
+          key: gpu-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0-msc1.1
+
+      - name: Install DirectXShaderCompiler SDK (Linux)
+        if: runner.os == 'Linux' && steps.cache-gpu-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk
+          curl -fsSL https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/linux_dxc_2026_09_28.x86_x64.tar.gz \
+            | tar -xzf - -C .sdk ./include ./lib
+
+      - name: Install Vulkan SDK & Metal Shader Converter (macOS)
+        if: runner.os == 'macOS' && steps.cache-gpu-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk/bin .sdk/include .sdk/lib .sdk/share/vulkan
+          VULKAN_VER="1.4.357.0"
+          curl -fsSL "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/mac/vulkansdk-macos-${VULKAN_VER}.zip" -o /tmp/vulkansdk.zip
+          unzip -q /tmp/vulkansdk.zip -d /tmp/vulkansdk-installer
+          INSTALLER_APP="$(find /tmp/vulkansdk-installer -maxdepth 2 -name '*.app' | head -n 1)"
+          INSTALLER_BIN="${INSTALLER_APP}/Contents/MacOS/$(basename "${INSTALLER_APP}" .app)"
+          "${INSTALLER_BIN}" --root "/tmp/vulkansdk" --accept-licenses --default-answer --confirm-command install com.lunarg.vulkan.core
+          cp -a /tmp/vulkansdk/macOS/bin/spirv-val .sdk/bin/
+          cp -a /tmp/vulkansdk/macOS/include/dxc .sdk/include/
+          cp -a /tmp/vulkansdk/macOS/lib/libdxcompiler* .sdk/lib/
+          cp -a /tmp/vulkansdk/macOS/lib/libvulkan* .sdk/lib/
+          cp -a /tmp/vulkansdk/macOS/lib/libMoltenVK* .sdk/lib/
+          cp -a /tmp/vulkansdk/macOS/lib/libVkLayer_khronos_validation* .sdk/lib/
+          cp -a /tmp/vulkansdk/macOS/share/vulkan/icd.d .sdk/share/vulkan/
+          cp -a /tmp/vulkansdk/macOS/share/vulkan/explicit_layer.d .sdk/share/vulkan/
+          rm -rf /tmp/vulkansdk /tmp/vulkansdk-installer /tmp/vulkansdk.zip
+
+          git clone --depth 1 https://github.com/MethanePowered/MetalShaderConverterBinary.git /tmp/msc
+          cp -a /tmp/msc/include/metal_irconverter_runtime .sdk/include/
+          unzip -q /tmp/msc/binaries/MacOS.zip -d /tmp/msc-bins
+          cp -a /tmp/msc-bins/bin/metal-shaderconverter .sdk/bin/
+          chmod +x .sdk/bin/metal-shaderconverter
+          cp -a /tmp/msc-bins/lib/libmetalirconverter* .sdk/lib/
+          rm -rf /tmp/msc /tmp/msc-bins
+
+      - name: Cache compiled gfx compiler & LLVM runtime binaries
+        id: cache-compiler-binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            .toolchains/llvm-build/bin/gfx-opt
+            .toolchains/llvm-build/bin/gfx-compile
+            .toolchains/llvm-build/bin/llc
+            .toolchains/llvm-build/bin/llvm-config
+            .toolchains/llvm-build/bin/FileCheck
+            .toolchains/llvm-build/bin/split-file
+          key: gfx-compiler-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/llvm-revision.txt', 'tools/build_toolchain.py', 'native/compiler/**') }}
+
+      - name: Cache pinned LLVM/MLIR toolchain SDK
+        id: cache-llvm
+        if: steps.cache-compiler-binaries.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            .toolchains/llvm-project
+            .toolchains/llvm-build
+          key: llvm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/llvm-revision.txt') }}
+
+      - name: Build pinned LLVM/MLIR toolchain and gfx compiler
+        if: steps.cache-compiler-binaries.outputs.cache-hit != 'true' && steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          JOBS="$(python3 -c 'import os; print(os.cpu_count() or 4)')"
+          python3 tools/build_toolchain.py --jobs "$JOBS"
+
+      - name: Rebuild native/compiler against cached LLVM/MLIR toolchain
+        if: steps.cache-compiler-binaries.outputs.cache-hit != 'true' && steps.cache-llvm.outputs.cache-hit == 'true'
+        run: |
+          JOBS="$(python3 -c 'import os; print(os.cpu_count() or 4)')"
+          python3 tools/build_toolchain.py --jobs "$JOBS" --compiler-only
+
+      - name: Cache native helper binaries (dxv, dxil-assemble, mlir-gpu-metal-view)
+        id: cache-native-tools
+        uses: actions/cache@v4
+        with:
+          path: .tools/bin
+          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm') }}
+
+      - name: Build native helper binaries
+        if: steps.cache-native-tools.outputs.cache-hit != 'true'
+        run: |
+          EXTRA_ARGS=()
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
+            EXTRA_ARGS+=("-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0" "-DCMAKE_OSX_SYSROOT=$SDK_PATH")
+          fi
+          cmake -S . -B build/native -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/.sdk" \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.tools" \
+            "${EXTRA_ARGS[@]}"
+          cmake --build build/native
+          cmake --install build/native
+
+      - name: Run unit, compiler integration, and Vulkan rendering tests (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE/src"
+          export LLVM_BIN="$GITHUB_WORKSPACE/.toolchains/llvm-build/bin"
+          export PATH="$GITHUB_WORKSPACE/.tools/bin:$GITHUB_WORKSPACE/.sdk/bin:$PATH"
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/.sdk/lib:${LD_LIBRARY_PATH:-}"
+          export MLIR_GPU_TEST_VULKAN=1
+          export MLIR_GPU_TEST_VALIDATION=1
+          lit -sv tests/lit
+          python3 -m unittest discover -s tests -v
+
+      - name: Run full test suite including Vulkan and Metal (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE/src"
+          export LLVM_BIN="$GITHUB_WORKSPACE/.toolchains/llvm-build/bin"
+          export PATH="$GITHUB_WORKSPACE/.tools/bin:$GITHUB_WORKSPACE/.sdk/bin:$PATH"
+          export DYLD_LIBRARY_PATH="$GITHUB_WORKSPACE/.sdk/lib:${DYLD_LIBRARY_PATH:-}"
+          export VK_ICD_FILENAMES="$GITHUB_WORKSPACE/.sdk/share/vulkan/icd.d/MoltenVK_icd.json"
+          export VK_DRIVER_FILES="$GITHUB_WORKSPACE/.sdk/share/vulkan/icd.d/MoltenVK_icd.json"
+          export VK_ADD_LAYER_PATH="$GITHUB_WORKSPACE/.sdk/share/vulkan/explicit_layer.d"
+          export MLIR_GPU_TEST_VULKAN=1
+          export MLIR_GPU_TEST_VALIDATION=1
+          if swift -e 'import Metal; guard let d = MTLCreateSystemDefaultDevice(), d.argumentBuffersSupport == .tier2 else { exit(1) }' 2>/dev/null; then
+            echo "Metal Argument Buffers Tier 2 device detected; enabling MLIR_GPU_TEST_METAL=1"
+            export MLIR_GPU_TEST_METAL=1
+          else
+            echo "Notice: Runner Metal device does not support Argument Buffers Tier 2; running metallib compilation tests without Metal GPU execution."
+          fi
+          lit -sv tests/lit
+          python3 -m unittest discover -s tests -v
