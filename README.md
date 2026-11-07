@@ -612,9 +612,8 @@ LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
 ```
 
 Also compile with `--target vulkan` or `--target directx` into fresh directories.
-Vulkan previews now bind these resources. Metal/DXIL-to-Metal resource previews
-remain gated until their runtime adapter lands; they never silently substitute
-zero time/resolution. Custom parameter blocks compile, but the preview supplies
+Vulkan, Metal, and DXIL-to-Metal previews now bind these resources; they never
+silently substitute zero resolution. Custom parameter blocks compile, but the preview supplies
 only the standard `FrameParameters` profile.
 
 ### Animated Vulkan previews and fixed-time snapshots
@@ -646,8 +645,25 @@ Offscreen time defaults to **0 seconds**. `--time` (or Python `time=...`) suppli
 fixed, finite, nonnegative f32 seconds. In live mode it freezes shader time while
 still updating framebuffer dimensions on resize; omitting it advances the clock.
 The Python APIs are `render_offscreen(program, ..., time=1.25)` and
-`show_window(program, ..., time=None)`. Metal time forwarding is a separate adapter
-capability and currently reports an explicit unsupported error.
+`show_window(program, ..., time=None)`. `render_metal_offscreen` and
+`show_metal_window` accept the same time policy, after their existing `toolchain`
+argument. Metal uses actual attachment texture dimensions, including Retina
+drawable pixels, and a monotonic live clock. Reflected offsets and stage visibility
+control copied encoder bytes at the converter SDK's argument-buffer bind point.
+Each submission completes before the next frame; no buffer is reused in flight.
+
+[Pulse rings](examples/pulse_rings.py) demonstrates the Metal frame adapter:
+
+```sh
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/python -m mlir_gpu examples/pulse_rings.py \
+  --target metal --output build/pulse-rings-metal
+PATH="$PWD/.tools/bin:$PATH" .venv/bin/mlir-gpu-view \
+  build/pulse-rings-metal/pipeline.json --time 0.4 --output build/pulse-rings.png --validation
+```
+
+Omit `--time`/`--output` for animation; compile with `--target directx` to
+exercise launch-time DXIL conversion instead of loading preconverted libraries.
 
 The reflected push-constant range and stage visibility determine the Vulkan
 pipeline layout. Packing uses reflected offsets and zero padding. Each acquired
@@ -660,7 +676,7 @@ descriptor heap, or writable memory is needed for this read-only ABI.
 
 ### Export animation to MP4
 
-MP4 export renders actual offscreen Vulkan GPU frames at fixed shader times.
+MP4 export renders actual offscreen GPU frames at fixed shader times on all three preview paths.
 It does not record the desktop, recompile shaders, or create a PNG sequence.
 Install the optional encoder dependency in the project environment:
 
@@ -702,8 +718,11 @@ nonnegative f32 seconds. Output paths must end in `.mp4`, have an existing paren
 and not already exist. The final file is published only after encoding succeeds;
 failures clean up temporary output and stop the encoder without overwriting files.
 
-This separate export milestone currently supports **Vulkan artifacts only**.
-Metal frame-resource and time forwarding remain the next adapter milestone.
+Metal export converts DXIL libraries once per sequence (preconverted Metal
+needs no converter). It launches a native offscreen renderer per frame;
+unlike Vulkan, Metal device/pipeline reuse across a movie is not yet implemented.
+For example, export `build/pulse-rings-metal/pipeline.json` with
+`--video build/pulse-rings.mp4 --duration 3 --fps 24 --width 320 --height 240`.
 Existing PNG and persistent-window behavior is unchanged.
 
 ### Arithmetic and vectors

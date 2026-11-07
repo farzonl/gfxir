@@ -106,7 +106,7 @@ class VideoTests(unittest.TestCase):
                     export_mp4(self.program, **{"path": self.path, "width": 16, "height": 12, **changes})
                 encoder.assert_not_called()
         with self.assertRaisesRegex(ViewerError, "Vulkan"):
-            export_mp4(GraphicsProgram(self.program.vertex, self.program.fragment, target="metal"), self.path, 16, 12)
+            export_mp4(GraphicsProgram(self.program.vertex, self.program.fragment, target="compute"), self.path, 16, 12)
 
     def test_decimal_duration_does_not_add_a_spurious_frame(self):
         with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):

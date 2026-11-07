@@ -6,6 +6,9 @@
 #include <metal_irconverter_runtime/metal_irconverter_runtime.h>
 
 #include <fstream>
+#include <chrono>
+#include <cmath>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <stdexcept>
@@ -34,13 +37,82 @@ static NSUInteger number(const std::string& value, NSUInteger maximum) {
     return result;
 }
 
+static double seconds(const std::string& value) {
+    size_t consumed = 0;
+    double result = std::stod(value, &consumed);
+    if (consumed != value.size() || !std::isfinite(result) || result < 0 ||
+        result > 3.4028234663852886e38)
+        throw std::runtime_error("Time must be finite, nonnegative f32 seconds");
+    return result;
+}
+
+static bool matchesJSON(id actual, id expected) {
+    if ([expected isKindOfClass:[NSDictionary class]]) {
+        if (![actual isKindOfClass:[NSDictionary class]] || [actual count] != [expected count]) return false;
+        for (id key in expected) if (!matchesJSON(actual[key], expected[key])) return false;
+        return true;
+    }
+    if ([expected isKindOfClass:[NSArray class]]) {
+        if (![actual isKindOfClass:[NSArray class]] || [actual count] != [expected count]) return false;
+        for (NSUInteger i = 0; i < [expected count]; ++i)
+            if (!matchesJSON(actual[i], expected[i])) return false;
+        return true;
+    }
+    if ([expected isKindOfClass:[NSNumber class]]) {
+        if (![actual isKindOfClass:[NSNumber class]]) return false;
+        bool boolean = CFGetTypeID((__bridge CFTypeRef)expected) == CFBooleanGetTypeID();
+        if (boolean != (CFGetTypeID((__bridge CFTypeRef)actual) == CFBooleanGetTypeID())) return false;
+        if (!boolean && CFNumberIsFloatType((__bridge CFNumberRef)actual) !=
+                        CFNumberIsFloatType((__bridge CFNumberRef)expected)) return false;
+    }
+    return [actual isEqual:expected];
+}
+
+static NSDictionary* frameLayout(const std::string& path) {
+    NSError* error = nil;
+    NSData* data = [NSData dataWithContentsOfFile:@(path.c_str()) options:0 error:&error];
+    if (!data) throw failure(@"Cannot read frame layout", error);
+    id layout = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+    if (![layout isKindOfClass:[NSDictionary class]]) throw failure(@"Invalid frame layout JSON", error);
+    id stages = layout[@"stages"];
+    if (![stages isKindOfClass:[NSArray class]] || ![stages count] || [stages count] > 2 ||
+        [[NSSet setWithArray:stages] count] != [stages count])
+        throw failure(@"Invalid frame stage visibility");
+    for (id stage in stages)
+        if (![stage isEqual:@"vertex"] && ![stage isEqual:@"fragment"])
+            throw failure(@"Unsupported frame stage");
+    NSDictionary* expected = @{
+        @"schema_version": @1, @"name": @"frame", @"layout": @"gfx-root-f32-v1",
+        @"size": @16, @"alignment": @16, @"ownership": @"host", @"access": @"read-only",
+        @"addressable": @NO, @"stages": stages,
+        @"fields": @[
+            @{@"name": @"time", @"type": @"f32", @"offset": @0, @"size": @4, @"alignment": @4},
+            @{@"name": @"resolution", @"type": @"f32x2", @"offset": @8, @"size": @8, @"alignment": @8}],
+        @"bindings": @{
+            @"vulkan": @{@"storage": @"push_constant", @"offset": @0},
+            @"directx": @{@"storage": @"root_constants", @"parameter_index": @0, @"register": @0,
+                @"space": @0, @"num32bit_constants": @4, @"visibility": @"all", @"root_signature_version": @"1.1"},
+            @"metal": @{@"storage": @"converter_argument_buffer", @"buffer_index": @(kIRArgumentBufferBindPoint),
+                @"offset": @0, @"size": @16}}};
+    if (!matchesJSON(layout, expected))
+        throw failure(@"Unsupported or mismatched frame layout/bindings");
+    return layout;
+}
+
 @interface GraphicsRenderer : NSObject <MTKViewDelegate, NSWindowDelegate>
+{
+    std::chrono::steady_clock::time_point _started;
+}
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
 @property(nonatomic, strong) id<MTLRenderPipelineState> pipeline;
 @property(nonatomic) NSUInteger frames;
 @property(nonatomic) NSUInteger limit;
 @property(nonatomic) NSUInteger vertexCount;
+@property(nonatomic, copy) NSDictionary* frameLayout;
+@property(nonatomic) BOOL live;
+@property(nonatomic) BOOL hasFixedTime;
+@property(nonatomic) double fixedTime;
 - (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry;
 - (void)encode:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass;
@@ -71,6 +143,7 @@ static NSUInteger number(const std::string& value, NSUInteger maximum) {
     if (!_pipeline) throw failure(@"Cannot create the converted DXIL render pipeline", error);
     _queue = [_device newCommandQueue];
     if (!_queue) throw failure(@"Cannot create a Metal command queue");
+    _started = std::chrono::steady_clock::now();
     return self;
 }
 
@@ -81,6 +154,23 @@ static NSUInteger number(const std::string& value, NSUInteger maximum) {
     [encoder setCullMode:MTLCullModeNone];
     [encoder setDepthClipMode:MTLDepthClipModeClip];
     id<MTLTexture> texture = pass.colorAttachments[0].texture;
+    if (!texture || !texture.width || !texture.height) throw failure(@"Framebuffer dimensions must be positive");
+    if (self.frameLayout) {
+        double elapsed = self.hasFixedTime ? self.fixedTime :
+            (self.live ? std::chrono::duration<double>(std::chrono::steady_clock::now() - _started).count() : 0);
+        if (!std::isfinite(elapsed) || elapsed < 0 || elapsed > 3.4028234663852886e38)
+            throw failure(@"Invalid elapsed frame time");
+        std::vector<uint8_t> bytes([self.frameLayout[@"size"] unsignedIntegerValue], 0);
+        NSArray* fields = self.frameLayout[@"fields"];
+        float time = static_cast<float>(elapsed);
+        float resolution[] = {static_cast<float>(texture.width), static_cast<float>(texture.height)};
+        std::memcpy(bytes.data() + [fields[0][@"offset"] unsignedIntegerValue], &time, sizeof(time));
+        std::memcpy(bytes.data() + [fields[1][@"offset"] unsignedIntegerValue], resolution, sizeof(resolution));
+        NSUInteger index = [self.frameLayout[@"bindings"][@"metal"][@"buffer_index"] unsignedIntegerValue];
+        NSArray* stages = self.frameLayout[@"stages"];
+        if ([stages containsObject:@"vertex"]) [encoder setVertexBytes:bytes.data() length:bytes.size() atIndex:index];
+        if ([stages containsObject:@"fragment"]) [encoder setFragmentBytes:bytes.data() length:bytes.size() atIndex:index];
+    }
     [encoder setViewport:(MTLViewport){0, 0, static_cast<double>(texture.width),
         static_cast<double>(texture.height), 0, 1}];
     IRRuntimeDrawPrimitives(encoder, MTLPrimitiveTypeTriangle, uint64_t{0},
@@ -193,7 +283,7 @@ int main(int argc, char** argv) {
                         pair.first != "--vertex-entry" && pair.first != "--fragment-entry" &&
                         pair.first != "--width" && pair.first != "--height" &&
                         pair.first != "--frames" && pair.first != "--readback" &&
-                        pair.first != "--vertex-count")
+                        pair.first != "--vertex-count" && pair.first != "--frame-layout" && pair.first != "--time")
                         throw std::runtime_error("Unknown option: " + pair.first);
                 }
                 auto required = [&](const char* key) -> const std::string& {
@@ -205,12 +295,18 @@ int main(int argc, char** argv) {
                 NSUInteger width = number(required("--width"), 4096);
                 NSUInteger height = number(required("--height"), 4096);
                 if (!width || !height) throw std::runtime_error("Dimensions must be positive");
+                NSDictionary* layout = arguments.count("--frame-layout") ? frameLayout(arguments.at("--frame-layout")) : nil;
+                double fixedTime = arguments.count("--time") ? seconds(arguments.at("--time")) : 0;
                 GraphicsRenderer* renderer = [[GraphicsRenderer alloc]
                     initWithVertex:@(required("--vertex").c_str()) vertexEntry:@(required("--vertex-entry").c_str())
                     fragment:@(required("--fragment").c_str()) fragmentEntry:@(required("--fragment-entry").c_str())];
                 renderer.vertexCount = number(required("--vertex-count"), UINT32_MAX);
                 if (renderer.vertexCount % 3) throw std::runtime_error("Triangle-list vertex count must be a multiple of three");
                 renderer.limit = arguments.count("--frames") ? number(arguments.at("--frames"), NSUIntegerMax) : 0;
+                renderer.frameLayout = layout;
+                renderer.live = !arguments.count("--readback");
+                renderer.hasFixedTime = arguments.count("--time");
+                renderer.fixedTime = fixedTime;
                 if (arguments.count("--readback")) {
                     readback(renderer, width, height, arguments.at("--readback"));
                     return 0;
