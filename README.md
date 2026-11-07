@@ -12,6 +12,7 @@ Compile them into artifacts, then open a live window or render a PNG through
 Vulkan (MoltenVK on macOS) or native Metal using converted DXIL. The viewer loads
 the actual compiled shaders; it does not redraw the triangle with CPU code or
 generate shading-language source.
+Vulkan artifacts can also be exported to MP4 animation.
 
 ## Status
 
@@ -656,6 +657,54 @@ buffer; the single-frame-in-flight queue-idle policy prevents resetting commands
 still used by the GPU. Missing/mismatched layouts, unbound custom blocks, invalid
 time, and device-limit failures are explicit errors. No shader recompilation,
 descriptor heap, or writable memory is needed for this read-only ABI.
+
+### Export animation to MP4
+
+MP4 export renders actual offscreen Vulkan GPU frames at fixed shader times.
+It does not record the desktop, recompile shaders, or create a PNG sequence.
+Install the optional encoder dependency in the project environment:
+
+```sh
+.venv/bin/python -m pip install -e '.[video]'
+```
+
+An existing FFmpeg executable on `PATH` takes precedence; it must support
+`libx264`. Otherwise the video extra supplies a platform-specific FFmpeg binary.
+Missing encoders and encoding errors are reported explicitly.
+
+After compiling the orbiting sphere as above:
+
+```sh
+DYLD_LIBRARY_PATH=/usr/local/lib .venv/bin/mlir-gpu-view \
+  build/orbiting-sphere-vulkan/pipeline.json \
+  --video build/orbiting-sphere.mp4 --duration 6 --fps 30 \
+  --width 640 --height 480 --validation
+```
+
+`--video`, PNG `--output`, and live `--frames` are mutually exclusive.
+Video duration defaults to 4 seconds and FPS to 30; `--duration`/`--fps` are
+video-only controls. `--time` selects the shader's starting time (default 0).
+Frame `i` samples `start_time + i / fps`, independently of GPU/encoding speed.
+The frame count is `ceil(duration * fps)`, so playback duration rounds upward
+to a whole frame; playback timestamps start at zero.
+
+The Python API is
+`export_mp4(program, path, width=640, height=480, duration=6, fps=30, start_time=0, validation=True)`
+from `mlir_gpu.viewer`; it returns the exported frame count. The Vulkan device,
+pipeline, attachments, command buffer, fence, and readback buffer are reused
+across frames, with completion before each reset/readback.
+
+Output is H.264/yuv420p MP4 with fast-start metadata for ordinary video players.
+It is lossy and has no alpha channel; decoded pixel values can differ from PNG
+readback. Dimensions must be even, within the existing 1–4096 preview limits,
+FPS an integer from 1–240, and duration positive. Times must be finite,
+nonnegative f32 seconds. Output paths must end in `.mp4`, have an existing parent,
+and not already exist. The final file is published only after encoding succeeds;
+failures clean up temporary output and stop the encoder without overwriting files.
+
+This separate export milestone currently supports **Vulkan artifacts only**.
+Metal frame-resource and time forwarding remain the next adapter milestone.
+Existing PNG and persistent-window behavior is unchanged.
 
 ### Arithmetic and vectors
 

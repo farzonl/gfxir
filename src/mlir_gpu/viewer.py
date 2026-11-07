@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import time as clock
 import zlib
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 from .compiler import CompileError, PIPELINE_SCHEMA_VERSION, RASTER_CONVENTION, Toolchain, _check_binary, _run, convert_dxil_to_metallib
@@ -595,8 +597,14 @@ class _Vulkan:
 
 def render_offscreen(program: GraphicsProgram, width: int = 640, height: int = 480,
                      validation: bool = False, time: float = 0.0) -> RenderedImage:
-    _dimensions(width, height)
     elapsed = _time_value(time)
+    with _offscreen_renderer(program, width, height, validation) as render:
+        return render(elapsed)
+
+
+@contextmanager
+def _offscreen_renderer(program: GraphicsProgram, width: int, height: int, validation: bool):
+    _dimensions(width, height)
     _frame_parameters(program.parameters)
     if program.target != "vulkan":
         raise ViewerError("Vulkan rendering requires Vulkan artifacts; use the Metal preview for DXIL.")
@@ -608,19 +616,128 @@ def render_offscreen(program: GraphicsProgram, width: int = 640, height: int = 4
         buffer, memory = gpu.readback_buffer(resources, width * height * 4)
         render_pass, pipeline, layout = gpu.pipeline(resources, program, format, width, height, False)
         framebuffer = gpu.framebuffer(resources, render_pass, view, width, height)
-        command = gpu.command(resources, render_pass, pipeline, framebuffer, width, height, program.draw, (image, buffer),
-                              layout=layout, parameters=program.parameters, elapsed=elapsed)
         fence = vk.vkCreateFence(gpu.device, vk.VkFenceCreateInfo(), None)
         resources.callback(vk.vkDestroyFence, gpu.device, fence, None)
-        resources.callback(vk.vkDeviceWaitIdle, gpu.device)
-        vk.vkQueueSubmit(gpu.queue, 1, [vk.VkSubmitInfo(pCommandBuffers=[command])], fence)
-        vk.vkWaitForFences(gpu.device, 1, [fence], vk.VK_TRUE, 10_000_000_000)
-        mapped = vk.vkMapMemory(gpu.device, memory, 0, width * height * 4, 0)
+        command = None
+
+        def render(elapsed):
+            nonlocal command
+            first = command is None
+            command = gpu.command(resources, render_pass, pipeline, framebuffer, width, height, program.draw, (image, buffer),
+                                  layout=layout, parameters=program.parameters, elapsed=_time_value(elapsed), command=command)
+            if first:
+                resources.callback(vk.vkDeviceWaitIdle, gpu.device)
+            vk.vkResetFences(gpu.device, 1, [fence])
+            vk.vkQueueSubmit(gpu.queue, 1, [vk.VkSubmitInfo(pCommandBuffers=[command])], fence)
+            vk.vkWaitForFences(gpu.device, 1, [fence], vk.VK_TRUE, 10_000_000_000)
+            mapped = vk.vkMapMemory(gpu.device, memory, 0, width * height * 4, 0)
+            try:
+                rgba = bytes(mapped)
+            finally:
+                vk.vkUnmapMemory(gpu.device, memory)
+            return RenderedImage(width, height, rgba, gpu.name)
+
+        yield render
+
+
+def _video_encoder() -> str:
+    executable = shutil.which("ffmpeg")
+    if executable:
+        return executable
+    try:
+        import imageio_ffmpeg
+    except ImportError as error:
+        raise ViewerError("MP4 export requires FFmpeg on PATH or the video extra: "
+                          "python -m pip install -e '.[video]'.") from error
+    try:
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except RuntimeError as error:
+        raise ViewerError(f"Cannot find the MP4 encoder: {error}") from error
+
+
+def export_mp4(program: GraphicsProgram, path: Path, width: int = 640, height: int = 480,
+               duration: float = 4.0, fps: int = 30, start_time: float = 0.0,
+               validation: bool = False) -> int:
+    _dimensions(width, height)
+    if width % 2 or height % 2:
+        raise ViewerError("H.264 MP4 dimensions must be even for yuv420p.")
+    if type(fps) is not int or not 1 <= fps <= 240:
+        raise ViewerError("Video FPS must be an integer between 1 and 240.")
+    seconds = _time_value(duration)
+    if seconds == 0:
+        raise ViewerError("Video duration must be positive.")
+    start = _time_value(start_time)
+    count = math.ceil(Fraction(str(seconds)) * fps)
+    _time_value(start + (count - 1) / fps)
+    if program.target != "vulkan":
+        raise ViewerError("MP4 export currently requires Vulkan artifacts; Metal frame resources remain #10.")
+    _frame_parameters(program.parameters)
+    path = Path(path).absolute()
+    if path.suffix.lower() != ".mp4":
+        raise ViewerError("Video output must have an .mp4 extension.")
+    if path.exists():
+        raise ViewerError(f"Output already exists; choose a new MP4 path: {path}")
+    executable = _video_encoder()
+    with tempfile.TemporaryDirectory(prefix=".mlir-gpu-video-", dir=path.parent) as work, tempfile.TemporaryFile() as diagnostics:
+        output = Path(work) / "animation.mp4"
+        arguments = [
+            executable, "-hide_banner", "-loglevel", "error", "-n",
+            "-f", "rawvideo", "-pixel_format", "rgba", "-video_size", f"{width}x{height}",
+            "-framerate", str(fps), "-i", "pipe:0", "-an", "-c:v", "libx264",
+            "-crf", "18", "-pix_fmt", "yuv420p", "-frames:v", str(count),
+            "-movflags", "+faststart", str(output),
+        ]
+
+        def encoder_error(status):
+            diagnostics.seek(0)
+            message = diagnostics.read(65536).decode("utf-8", errors="replace").strip()
+            return ViewerError(f"MP4 encoder failed ({status}): {message or '(no diagnostics)'}")
+
         try:
-            rgba = bytes(mapped)
-        finally:
-            vk.vkUnmapMemory(gpu.device, memory)
-        return RenderedImage(width, height, rgba, gpu.name)
+            encoder = subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                       stderr=diagnostics, bufsize=0)
+        except OSError as error:
+            raise ViewerError(f"Cannot start the MP4 encoder: {error}") from error
+        with encoder:
+            try:
+                with _offscreen_renderer(program, width, height, validation) as render:
+                    for index in range(count):
+                        image = render(start + index / fps)
+                        if (image.width, image.height, len(image.rgba)) != (width, height, width * height * 4):
+                            raise ViewerError("Video RGBA frame does not match the requested dimensions.")
+                        data = memoryview(image.rgba)
+                        while data:
+                            written = encoder.stdin.write(data)
+                            if not written:
+                                raise ViewerError("MP4 encoder stopped accepting frame data.")
+                            data = data[written:]
+                encoder.stdin.close()
+                status = encoder.wait()
+                if status:
+                    raise encoder_error(status)
+            except BrokenPipeError as error:
+                raise encoder_error(encoder.wait()) from error
+            finally:
+                if not encoder.stdin.closed:
+                    encoder.stdin.close()
+                if encoder.poll() is None:
+                    encoder.terminate()
+                    try:
+                        encoder.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        encoder.kill()
+                        encoder.wait()
+        if not output.is_file() or output.stat().st_size < 32:
+            raise ViewerError("MP4 encoder did not produce a complete MP4 container.")
+        with output.open("rb") as binary:
+            header = binary.read(12)
+        if len(header) != 12 or header[4:8] != b"ftyp":
+            raise ViewerError("MP4 encoder did not produce a valid MP4 container.")
+        try:
+            os.link(output, path)
+        except FileExistsError as error:
+            raise ViewerError(f"Output already exists; choose a new MP4 path: {path}") from error
+    return count
 
 
 def _swapchain(gpu, resources, program, width, height):
@@ -776,23 +893,34 @@ def show_window(program: GraphicsProgram, width: int = 800, height: int = 600, f
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Open a live Vulkan or DXIL-to-Metal preview window by default.",
-        epilog="Use -frames 0 (or --frames 0) to keep the window open. --output selects PNG-only mode instead.",
+        epilog="Use -frames 0 to keep the window open, --output for PNG, or --video for MP4.",
     )
     parser.add_argument("manifest", type=Path, help="Compiled Vulkan, DirectX, or Metal pipeline.json")
     parser.add_argument("--width", type=int, default=800)
     parser.add_argument("--height", type=int, default=600)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--output", type=Path, help="Render an offscreen PNG instead of opening a window (new file)")
+    mode.add_argument("--video", type=Path, help="Export a fixed-time Vulkan animation to MP4 (new file)")
     mode.add_argument("--frames", "-frames", type=int, default=0, help="Live window: close after N frames; 0 stays open")
     parser.add_argument("--validation", action="store_true", help="Enable Vulkan validation or Metal API/GPU validation")
-    parser.add_argument("--time", type=float, help="Vulkan: fixed elapsed seconds (snapshot default 0; live default monotonic clock)")
+    parser.add_argument("--time", type=float, help="Vulkan: fixed snapshot/live time or MP4 start time (seconds)")
+    parser.add_argument("--duration", type=float, help="MP4 duration in seconds (default 4)")
+    parser.add_argument("--fps", type=int, help="MP4 frames per second, 1-240 (default 30)")
     args = parser.parse_args()
+    if args.video is None and (args.duration is not None or args.fps is not None):
+        parser.error("--duration and --fps require --video")
     try:
         program = load_program(args.manifest)
         timing = {"time": args.time} if args.time is not None else {}
         if timing and program.target != "vulkan":
             raise ViewerError("--time for Metal previews requires the runtime adapter in #10.")
-        if args.output:
+        if args.video:
+            fps = args.fps if args.fps is not None else 30
+            count = export_mp4(program, args.video, args.width, args.height,
+                               args.duration if args.duration is not None else 4.0,
+                               fps, args.time if args.time is not None else 0.0, args.validation)
+            print(f"Exported {count} frames at {fps} fps: {args.video}")
+        elif args.output:
             if args.output.exists():
                 raise ViewerError(f"Output already exists; choose a new PNG path: {args.output}")
             render = render_offscreen if program.target == "vulkan" else render_metal_offscreen
