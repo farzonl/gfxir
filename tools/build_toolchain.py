@@ -26,21 +26,27 @@ def _rewrite_stale_sdk_paths(build: Path) -> None:
     if platform.system() != "Darwin" or not build.is_dir():
         return
     current_sdk = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True).strip()
-    candidates = [build / "CMakeCache.txt", build / "build.ninja"]
-    cmake_dir = build / "lib/cmake"
-    if cmake_dir.is_dir():
-        candidates.extend(cmake_dir.rglob("*.cmake"))
-    pattern = re.compile(r"/Applications/Xcode[^\s:;\"']+\.sdk")
+    current_dev = subprocess.check_output(["xcode-select", "-p"], text=True).strip()
+    candidates = [build / "CMakeCache.txt", build / "build.ninja", build / "CMakeFiles/rules.ninja"]
+    for subdir in ("CMakeFiles", "lib/cmake"):
+        directory = build / subdir
+        if directory.is_dir():
+            candidates.extend(directory.rglob("*.cmake"))
+            candidates.extend(directory.rglob("*.ninja"))
+    sdk_pattern = re.compile(r"/Applications/Xcode[^\s:;\"']+\.sdk")
+    dev_pattern = re.compile(r"/Applications/Xcode[^\s:;\"'/]+\.app/Contents/Developer")
     rewrote_sdk = False
     for path in candidates:
         if not path.is_file():
             continue
         text = path.read_text(errors="replace")
-        stale = {sdk for sdk in pattern.findall(text) if sdk != current_sdk and not Path(sdk).exists()}
-        if stale:
-            for old_sdk in stale:
-                text = text.replace(old_sdk, current_sdk)
-            path.write_text(text)
+        updated = text
+        for old_sdk in {s for s in sdk_pattern.findall(updated) if s != current_sdk and not Path(s).exists()}:
+            updated = updated.replace(old_sdk, current_sdk)
+        for old_dev in {d for d in dev_pattern.findall(updated) if d != current_dev and not Path(d).exists()}:
+            updated = updated.replace(old_dev, current_dev)
+        if updated != text:
+            path.write_text(updated)
             rewrote_sdk = True
     if rewrote_sdk:
         for pch in build.rglob("*.pch"):
