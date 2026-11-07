@@ -37,7 +37,7 @@ checks and signs the actual containers. Real rendering tests cover Vulkan and
 DXIL-to-Metal in addition to mocked command-wiring tests. Native Windows
 DirectX runtime interoperability remains unverified. No path emits fake binaries
 or falls back to shading-language source.
-The completed ray-march stack passed **177 tests** with both GPU paths,
+The completed ray-march stack and Light Cycle example passed **180 tests** with both GPU paths,
 API validation, and real desktop windows enabled. The measured acceptance
 section records reproducible workload, binary sizes, and numerical thresholds.
 
@@ -765,6 +765,45 @@ Increasing the step cap changes the loop bound, not the number of cloned bodies.
 Normals are evaluated only on a confirmed hit; glow integrates along the ray.
 Use `--time 0.25 --output build/gallery.png` for a deterministic snapshot,
 or omit output/time for a persistent, resize-aware window.
+
+### User-provided Light Cycle shader
+
+[Light Cycle](examples/light_cycle.py) ports the shader supplied by the user,
+originally credited to **Noztol**. Unlike the original GfxIR beacon gallery,
+this is an adaptation of that supplied source. It retains the tunnel cutouts,
+cyan ribs, orange streams, curved/banked camera, cone coverage, volumetric glow,
+box-filtered grid, fog, tone mapping, vignette, and dithering.
+
+The adaptation uses `FrameParameters`, immutable `with_components` updates,
+shared box/folding/repetition/normal helpers, and `rotate2` for the original
+row-vector rotation. Bottom-left Shadertoy pixel centers are explicitly converted
+from the viewer's top-left coordinates. Time is passed to helpers explicitly.
+The **110-step GPU loop** preserves accumulation-before-break order and the
+original `distance < MAX_DIST` shading condition: exhausting the iteration cap
+can still shade an unconverged ray, and `hit_z` remains zero without a break.
+This is intentional fidelity, not the gallery's explicit-hit policy. Shared
+normalization defines a zero gradient as zero, where GLSL zero normalization
+has no portable result. Transcendentals/dithering need not be bit-identical.
+
+```sh
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/python -m mlir_gpu examples/light_cycle.py \
+  --target vulkan --output build/light-cycle-vulkan
+DYLD_LIBRARY_PATH=/usr/local/lib .venv/bin/mlir-gpu-view \
+  build/light-cycle-vulkan/pipeline.json --width 320 --height 240 \
+  --video build/light-cycle.mp4 --duration 4 --fps 24 --validation
+```
+
+Use `--target directx` or `--target metal` with fresh directories for the other
+paths. Omit `--video`/`--duration`/`--fps` for live animation; add
+`--time 1.25 --output build/light-cycle.png` for a fixed snapshot instead.
+Start at **320x240**: this source is heavier than the gallery and keeps its
+original 110-step cap. GPU tests compare repeated/animated snapshots at square,
+rectangular, and odd sizes and independently check signed distances, negative
+repetition cells, and rotation against CPU calculations.
+At tested times 0.25/1.25 and sizes 64x64, 96x54, and 97x73, Vulkan/Metal
+differences peak at 1/255, with mean RGB channel error below 0.075/255.
+Launch-converted DXIL and preconverted Metal readbacks are byte-identical.
 
 ### Device Python authoring walkthrough
 
