@@ -373,17 +373,17 @@ before LLVM handles instruction scalarization. This avoids unsupported vector
 values crossing helper-call boundaries in DXIL; it does not unroll loops.
 Only the marked entry receives shader attributes/signature metadata.
 
-[The Vulkan loop example](examples/vulkan_loops.py) loads a native
+[The sphere march example](examples/sphere_march.py) loads a native
 [sphere marcher](examples/ir/sphere_march.mlir). It executes a bounded GPU while
 loop with early hit/miss termination, a distance helper, a nested conditional,
 and carried iteration/distance/hit/glow state:
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/vulkan_loops.py \
-  --target vulkan --output build/vulkan-loops
+  .venv/bin/python -m mlir_gpu examples/sphere_march.py \
+  --target vulkan --output build/sphere-march-vulkan
 DYLD_LIBRARY_PATH=/usr/local/lib .venv/bin/mlir-gpu-view \
-  build/vulkan-loops/pipeline.json --width 256 --height 256 -frames 0 --validation
+  build/sphere-march-vulkan/pipeline.json --width 256 --height 256 -frames 0 --validation
 ```
 
 The example intentionally uses a fixed pixel camera centered at `(128, 128)`;
@@ -392,16 +392,17 @@ most 64 iterations per pixel. Increasing the cap changes the loop bound, not
 shader-body duplication. The bound is authored in IR; the compiler does not
 guarantee termination for arbitrary native programs.
 
-The same sphere source now compiles for DirectX and converted Metal. The
-[DirectX loop example](examples/directx_loops.py) additionally shows color
+Both examples support Vulkan, DirectX, and converted Metal; the `--target`
+option selects the backend, not the example's filename. The
+[loop bands example](examples/loop_bands.py) additionally shows color
 bands where each pixel selects the number of GPU loop iterations:
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/directx_loops.py \
-  --target directx --output build/directx-loops
+  .venv/bin/python -m mlir_gpu examples/loop_bands.py \
+  --target directx --output build/loop-bands-directx
 PATH="$PWD/.tools/bin:$PATH" .venv/bin/mlir-gpu-view \
-  build/directx-loops/pipeline.json -frames 0 --validation
+  build/loop-bands-directx/pipeline.json -frames 0 --validation
 ```
 
 Use `--target metal` and a fresh directory for preconverted metallibs. On macOS
