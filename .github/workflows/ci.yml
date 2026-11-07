@@ -117,9 +117,7 @@ jobs:
           path: |
             .toolchains/llvm-project
             .toolchains/llvm-build
-          key: llvm-toolchain-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/llvm-revision.txt') }}
-          restore-keys: |
-            llvm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/llvm-revision.txt') }}
+          key: llvm-toolchain-v2-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('tools/llvm-revision.txt') }}
 
       - name: Build pinned LLVM/MLIR toolchain and gfx compiler
         if: steps.cache-compiler-binaries.outputs.cache-hit != 'true' && steps.cache-llvm.outputs.cache-hit != 'true'

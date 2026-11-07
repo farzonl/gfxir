@@ -3,6 +3,7 @@ import argparse
 import os
 import platform
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -19,6 +20,34 @@ def _darwin_cmake_flags():
         return []
     sdk = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True).strip()
     return [f"-DCMAKE_OSX_SYSROOT={sdk}", "-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"]
+
+
+def _clean_stale_cmake_cache(build: Path) -> bool:
+    cache_file = build / "CMakeCache.txt"
+    if not cache_file.is_file():
+        return False
+    text = cache_file.read_text(errors="replace")
+    sdk_paths = set(re.findall(r"/Applications/Xcode[^\s:;\"']+\.sdk", text))
+    if any(not Path(sdk_path).exists() for sdk_path in sdk_paths):
+        cache_file.unlink(missing_ok=True)
+        shutil.rmtree(build / "CMakeFiles", ignore_errors=True)
+        return True
+    return False
+
+
+def _llvm_cmake_configuration(source: Path, build: Path):
+    return [
+        "cmake", "-S", source / "llvm", "-B", build, "-G", "Ninja",
+        "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CXX_FLAGS_RELEASE=-O1 -DNDEBUG",
+        "-DLLVM_ENABLE_PROJECTS=mlir", "-DLLVM_TARGETS_TO_BUILD=Native;DirectX",
+        "-DLLVM_ENABLE_ASSERTIONS=ON", "-DLLVM_INCLUDE_TESTS=OFF", "-DMLIR_INCLUDE_TESTS=OFF",
+        "-DLLVM_INCLUDE_BENCHMARKS=OFF", "-DLLVM_ENABLE_ZSTD=OFF", "-DLLVM_ENABLE_ZLIB=OFF",
+        "-DLLVM_ENABLE_LIBEDIT=OFF", "-DLLVM_ENABLE_TERMINFO=OFF", "-DLLVM_ENABLE_LIBXML2=OFF",
+        "-DLLVM_PARALLEL_LINK_JOBS=1", "-DLLVM_EXTERNAL_PROJECTS=gfx",
+        f"-DLLVM_EXTERNAL_GFX_SOURCE_DIR={ROOT / 'native/compiler'}",
+        f"-DLLVM_EXTERNAL_LIT={source / 'llvm/utils/lit/lit.py'}",
+        *_darwin_cmake_flags(),
+    ]
 
 
 def _patch_cmake_export_checks(build: Path) -> None:
@@ -44,7 +73,9 @@ def _prune_object_files(build: Path) -> None:
         obj.unlink(missing_ok=True)
 
 
-def _ensure_toolchain_dependencies(build: Path, jobs: int) -> None:
+def _ensure_toolchain_dependencies(source: Path, build: Path, jobs: int) -> None:
+    if _clean_stale_cmake_cache(build):
+        run(*_llvm_cmake_configuration(source, build))
     cmake_text = (ROOT / "native/compiler/CMakeLists.txt").read_text()
     required_libs = sorted(set(re.findall(r"\bMLIR[A-Za-z0-9_]+\b", cmake_text)))
     missing_targets = [
@@ -59,7 +90,7 @@ def _ensure_toolchain_dependencies(build: Path, jobs: int) -> None:
         run("cmake", "--build", build, "--parallel", jobs, "--target", *missing_targets)
 
 
-def _build_compiler_only(build: Path, jobs: int) -> None:
+def _build_compiler_only(source: Path, build: Path, jobs: int) -> None:
     mlir_cmake = build / "lib/cmake/mlir"
     llvm_cmake = build / "lib/cmake/llvm"
     if not (mlir_cmake / "MLIRConfig.cmake").is_file() or not (llvm_cmake / "LLVMConfig.cmake").is_file():
@@ -67,12 +98,14 @@ def _build_compiler_only(build: Path, jobs: int) -> None:
             f"Prebuilt LLVM/MLIR CMake config not found in {build}. "
             "Run tools/build_toolchain.py without --compiler-only first."
         )
-    _ensure_toolchain_dependencies(build, jobs)
+    _ensure_toolchain_dependencies(source, build, jobs)
     _patch_cmake_export_checks(build)
     compiler_build = ROOT / "build/compiler"
+    _clean_stale_cmake_cache(compiler_build)
     configuration = [
         "cmake", "-S", ROOT / "native/compiler", "-B", compiler_build, "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CXX_FLAGS_RELEASE=-O1 -DNDEBUG",
+        "-DLLVM_ENABLE_LIBEDIT=OFF", "-DLLVM_ENABLE_TERMINFO=OFF", "-DLLVM_ENABLE_LIBXML2=OFF",
         f"-DLLVM_DIR={llvm_cmake}",
         f"-DMLIR_DIR={mlir_cmake}",
         f"-DCMAKE_INSTALL_PREFIX={build}",
@@ -104,7 +137,7 @@ def main():
     revision = (ROOT / "tools/llvm-revision.txt").read_text().strip()
     source, build = ROOT / ".toolchains/llvm-project", ROOT / ".toolchains/llvm-build"
     if args.compiler_only:
-        _build_compiler_only(build, args.jobs)
+        _build_compiler_only(source, build, args.jobs)
         return
     if not source.exists():
         source.parent.mkdir(parents=True, exist_ok=True)
@@ -121,18 +154,8 @@ def main():
     )
     if changed:
         raise SystemExit("The LLVM checkout has local modifications; preserve them and use a clean pinned checkout.")
-    configuration = [
-        "cmake", "-S", source / "llvm", "-B", build, "-G", "Ninja",
-        "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CXX_FLAGS_RELEASE=-O1 -DNDEBUG",
-        "-DLLVM_ENABLE_PROJECTS=mlir", "-DLLVM_TARGETS_TO_BUILD=Native;DirectX",
-        "-DLLVM_ENABLE_ASSERTIONS=ON", "-DLLVM_INCLUDE_TESTS=OFF", "-DMLIR_INCLUDE_TESTS=OFF",
-        "-DLLVM_INCLUDE_BENCHMARKS=OFF", "-DLLVM_ENABLE_ZSTD=OFF", "-DLLVM_ENABLE_ZLIB=OFF",
-        "-DLLVM_PARALLEL_LINK_JOBS=1", "-DLLVM_EXTERNAL_PROJECTS=gfx",
-        f"-DLLVM_EXTERNAL_GFX_SOURCE_DIR={ROOT / 'native/compiler'}",
-        f"-DLLVM_EXTERNAL_LIT={source / 'llvm/utils/lit/lit.py'}",
-        *_darwin_cmake_flags(),
-    ]
-    run(*configuration)
+    _clean_stale_cmake_cache(build)
+    run(*_llvm_cmake_configuration(source, build))
     run(
         "cmake", "--build", build, "--parallel", args.jobs,
         "--target", "llvm-tblgen", "mlir-tblgen", "gfx-opt", "gfx-compile", "llc", "llvm-config", "FileCheck", "split-file",
