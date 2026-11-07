@@ -1,0 +1,59 @@
+#ifndef GFX_ATTRS_TD
+#define GFX_ATTRS_TD
+include "Gfx/GfxDialect.td"
+include "mlir/IR/EnumAttr.td"
+
+def Gfx_Stage : I32EnumAttr<"Stage", "execution stage", [
+  I32EnumAttrCase<"Vertex", 0, "vertex">,
+  I32EnumAttrCase<"Fragment", 1, "fragment">,
+  I32EnumAttrCase<"Compute", 2, "compute">,
+  I32EnumAttrCase<"Task", 3, "task">,
+  I32EnumAttrCase<"Mesh", 4, "mesh">
+]> {
+  let cppNamespace = "::mlir::gfx";
+  let genSpecializedAttr = 0;
+}
+def Gfx_StageAttr : EnumAttr<Gfx_Dialect, Gfx_Stage, "stage">;
+
+def Gfx_Interpolation : I32EnumAttr<"Interpolation", "interpolation rule", [
+  I32EnumAttrCase<"Perspective", 0, "perspective">,
+  I32EnumAttrCase<"Flat", 1, "flat">,
+  I32EnumAttrCase<"NoPerspective", 2, "no_perspective">
+]> {
+  let cppNamespace = "::mlir::gfx";
+  let genSpecializedAttr = 0;
+}
+def Gfx_InterpolationAttr : EnumAttr<Gfx_Dialect, Gfx_Interpolation, "interpolation">;
+
+def Gfx_Builtin : I32EnumAttr<"Builtin", "device-provided input", [
+  I32EnumAttrCase<"VertexIndex", 0, "vertex_index">,
+  I32EnumAttrCase<"GlobalInvocationId", 1, "global_invocation_id">,
+  I32EnumAttrCase<"LocalInvocationId", 2, "local_invocation_id">,
+  I32EnumAttrCase<"WorkgroupId", 3, "workgroup_id">
+]> {
+  let cppNamespace = "::mlir::gfx";
+  let genSpecializedAttr = 0;
+}
+def Gfx_BuiltinAttr : EnumAttr<Gfx_Dialect, Gfx_Builtin, "builtin">;
+
+def Gfx_StorageClass : I32EnumAttr<"StorageClass", "device memory domain", [
+  I32EnumAttrCase<"Global", 0, "global">,
+  I32EnumAttrCase<"Workgroup", 1, "workgroup">,
+  I32EnumAttrCase<"Private", 2, "private">,
+  I32EnumAttrCase<"PushConstant", 3, "push_constant">
+]> {
+  let cppNamespace = "::mlir::gfx";
+  let genSpecializedAttr = 0;
+}
+
+def Gfx_ResourceKind : I32EnumAttr<"ResourceKind", "opaque bindless resource kind", [
+  I32EnumAttrCase<"Buffer", 0, "buffer">,
+  I32EnumAttrCase<"Texture2D", 1, "texture_2d">,
+  I32EnumAttrCase<"Sampler", 2, "sampler">,
+  I32EnumAttrCase<"StorageImage2D", 3, "storage_image_2d">,
+  I32EnumAttrCase<"AccelerationStructure", 4, "acceleration_structure">
+]> {
+  let cppNamespace = "::mlir::gfx";
+  let genSpecializedAttr = 0;
+}
+#endif
