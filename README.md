@@ -752,6 +752,67 @@ Normals are evaluated only on a confirmed hit; glow integrates along the ray.
 Use `--time 0.25 --output build/gallery.png` for a deterministic snapshot,
 or omit output/time for a persistent, resize-aware window.
 
+### Measured ray-march acceptance
+
+[March budget](examples/march_budget.py) visualizes a per-pixel device loop
+bound: four iterations on the left and 64 on the right. Red encodes iterations
+used, green a confirmed hit, and bright blue a distance-limit miss; dark blue
+indicates budget exhaustion. It animates using the standard frame block.
+
+The focused suite is `tests/test_ray_march_acceptance.py`. On Apple M3 Max,
+with the pinned LLVM main build and Vulkan/Metal API validation enabled:
+
+| Gallery target | Compile wall time (warm tools) | Fragment binary |
+|----------------|--------------------------------|-----------------|
+| Vulkan | ~0.09 s | 19,508 bytes |
+| DirectX | ~0.17 s | 12,572 bytes |
+| Converted Metal | ~0.22 s | 11,932 bytes |
+
+Changing the gallery cap from 72 to 288 leaves the native MLIR operation counts
+and SPIR-V/DXIL byte sizes unchanged. SPIR-V retains a loop; LLVM retains
+loop-carried scalar/vector phi state. Compile timings are observations, not
+portable performance promises; the suite prints fresh timings and sizes.
+The documented 320x240 workload measured approximately **31 ms Vulkan,
+164 ms DXIL-to-Metal, and 109 ms preconverted Metal** for a single offscreen
+call including setup/readback. These are not GPU-only timings or live frame
+rates; launch-time conversion/process creation accounts for part of the Metal
+cost. Four-frame live runs were also verified on all three paths.
+
+At **64x64, 96x54, 97x73**, and times **0, 0.25, 1.75**, launch-converted
+DXIL and preconverted Metal are byte-identical. Measured Vulkan/Metal RGB
+differences peak at **1/255**, with mean below **0.0002/255** and zero 99th
+percentile pixel error. Regression limits allow mean channel error <=1/255,
+99th percentile maximum-channel error <=4/255, and at most 0.2% of pixels
+above 16/255 to distinguish rare hit-edge discontinuities from broad drift.
+Alpha remains exact; unchanged triangle/quad coordinate/coverage tests retain
+their existing stricter contracts.
+
+The budget shader checks **every pixel** against an independent double-precision
+CPU sphere-tracing oracle at square, rectangular, and odd dimensions. Hit,
+distance-miss, budget-miss, and alpha classifications are exact. Iteration-color
+tolerance is 1/255, or 5/255 (one extra iteration plus quantization) only where
+the oracle comes within 1e-5 world units of the 0.002 hit threshold. No pixels
+are excluded. CPU code is a test oracle, never a preview fallback.
+
+A test-only Cocoa/Metal probe reuses the production encoder and reads actual
+live drawable pixels before presentation. It verifies advancing time, frozen
+time, resize, and framebuffer-pixel rather than window-point dimensions on both
+Metal paths. It requires `clang++`, a desktop session, and the converter runtime
+headers; set `METAL_CONVERTER_RUNTIME_INCLUDE_DIR` if they are not in
+`/usr/local/include`.
+
+```sh
+PATH="$PWD/.tools/bin:$PATH" DYLD_LIBRARY_PATH=/usr/local/lib \
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" \
+MLIR_GPU_TEST_VULKAN=1 MLIR_GPU_TEST_METAL=1 \
+MLIR_GPU_TEST_VALIDATION=1 MLIR_GPU_TEST_WINDOW=1 \
+  .venv/bin/python -m unittest discover -s tests -p test_ray_march_acceptance.py -v
+```
+
+GPU/window tests are explicitly opt-in. Opted-in missing tools, runtime errors,
+and invalid resource layouts fail; they do not select a substitute renderer.
+Run desktop suites serially, not alongside another window/video workload.
+
 ### Arithmetic and vectors
 
 Device values support `+`, `-`, `*`, floating-point `/`, unary negation, `abs`,
