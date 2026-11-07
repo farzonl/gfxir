@@ -486,6 +486,7 @@ class Entry:
                 "input", "constant", "vec2", "vec3", "vec4", "extract", "select",
                 "eq", "cmp", "add", "sub", "mul", "div", "neg", "abs", "min", "max",
                 "and", "or", "xor", "cast", "broadcast",
+                "sin", "cos", "sqrt", "exp", "exp2", "log", "log2", "floor", "pow",
             }:
                 raise ValueError(f"Unsupported device operation: {node.op}.")
             for arg in node.args:

@@ -403,6 +403,41 @@ PATH="$PWD/.tools/bin:$PATH" \
 Use `--target vulkan` or `--target directx` with a fresh output directory to
 compile the same example for the other targets.
 
+### Device math
+
+Use `from mlir_gpu import shader_math as sm`, not Python's host `math` module,
+for `sin`, `cos`, `sqrt`, `exp`, `exp2`, `log`, `log2`, `floor`, and `pow`.
+These functions build upstream MLIR `math` operations for f32 scalars/vectors.
+`pow` allows scalar/vector broadcasting.
+
+The portable contract requires finite inputs, nonnegative `sqrt` inputs,
+positive `log`/`log2` inputs, and positive `pow` bases (also zero with a positive
+exponent). Negative bases, zero to a nonpositive exponent, and out-of-domain
+dynamic inputs have no portable result guarantee. Known literal-domain errors
+are rejected at authoring time; dynamic domain validity is the program's
+responsibility. Positive powers of zero return zero using a guarded native
+lowering, because upstream logarithmic power expansion excludes zero.
+
+Transcendentals are approximate f32 operations, not cross-device bit-exact
+Python/libm results. No fast-math flags, contraction permission, or host libm
+calls are added. Overflow, underflow/subnormal handling, infinity/NaN payloads,
+and the sign of zero are target-dependent outside the stated finite-result
+contract. Tests check scalar/vector identities with absolute error <= 2e-5
+over the example's bounded range and rendered colors against CPU references
+and other targets within 2/255; these are tested ranges, not a universal ULP
+guarantee. The existing arithmetic-only exact-parity tests remain unchanged.
+
+[The math example](examples/math.py) adds procedural rings, stripes, glow, and
+grid cells without frame resources or loops:
+
+```sh
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/python -m mlir_gpu examples/math.py \
+  --target metal --output build/math-metal
+PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/mlir-gpu-view build/math-metal/pipeline.json -frames 0
+```
+
 Python executes once during tracing. Python `if`/loops cannot branch on device
 values: use `select` for now. Host-side loops and metaprogramming can construct
 expressions. This is not a compiler for arbitrary Python, dynamic GPU function
