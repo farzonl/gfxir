@@ -163,7 +163,7 @@ jobs:
           export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/.sdk/lib:${LD_LIBRARY_PATH:-}"
           export MLIR_GPU_TEST_VULKAN=1
           export MLIR_GPU_TEST_VALIDATION=1
-          python3 -m lit -sv tests/lit
+          lit -sv tests/lit
           python3 -m unittest discover -s tests -v
 
       - name: Run full test suite including Vulkan and Metal (macOS)
@@ -184,5 +184,5 @@ jobs:
           else
             echo "Notice: Runner Metal device does not support Argument Buffers Tier 2; running metallib compilation tests without Metal GPU execution."
           fi
-          python3 -m lit -sv tests/lit
+          lit -sv tests/lit
           python3 -m unittest discover -s tests -v

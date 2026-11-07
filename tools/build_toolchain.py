@@ -31,6 +31,7 @@ def _rewrite_stale_sdk_paths(build: Path) -> None:
     if cmake_dir.is_dir():
         candidates.extend(cmake_dir.rglob("*.cmake"))
     pattern = re.compile(r"/Applications/Xcode[^\s:;\"']+\.sdk")
+    rewrote_sdk = False
     for path in candidates:
         if not path.is_file():
             continue
@@ -40,6 +41,10 @@ def _rewrite_stale_sdk_paths(build: Path) -> None:
             for old_sdk in stale:
                 text = text.replace(old_sdk, current_sdk)
             path.write_text(text)
+            rewrote_sdk = True
+    if rewrote_sdk:
+        for pch in build.rglob("*.pch"):
+            pch.unlink(missing_ok=True)
 
 
 def _freeze_existing_build_targets(build: Path) -> None:
@@ -73,7 +78,11 @@ def _freeze_existing_build_targets(build: Path) -> None:
                 if (
                     targets
                     and rule != "phony"
-                    and all(t.startswith("lib/") or t.startswith("bin/") for t in targets)
+                    and all(
+                        (t.startswith("lib/") and (t.endswith(".a") or t.endswith(".lib")))
+                        or t.startswith("bin/")
+                        for t in targets
+                    )
                     and all((build / t).exists() for t in targets)
                 ):
                     out.append(f"build {' '.join(targets)}: phony\n")
