@@ -1,4 +1,13 @@
+#ifdef _WIN32
+#include <windows.h>
+#include <objbase.h>
+#include <oleauto.h>
+#endif
+#if __has_include(<dxc/dxcapi.h>)
 #include <dxc/dxcapi.h>
+#else
+#include <dxcapi.h>
+#endif
 
 #include <cstdint>
 #include <fstream>

@@ -213,23 +213,97 @@ def _metal_libraries(program: GraphicsProgram, toolchain: Toolchain):
         yield directory, arguments
 
 
+def _native_run(arguments: list[str], capture: bool, backend: str, environment: dict[str, str] | None = None) -> str:
+    try:
+        result = subprocess.run(arguments, text=True, capture_output=capture, env=environment, check=False)
+    except OSError as error:
+        raise ViewerError(f"Cannot start the native {backend} preview: {error}") from error
+    if result.returncode:
+        diagnostics = (result.stderr or result.stdout or "").strip() if capture else "See native renderer diagnostics above."
+        raise ViewerError(f"Native {backend} preview failed ({result.returncode}): {diagnostics}")
+    return result.stdout or ""
+
+
 def _metal_run(arguments: list[str], validation: bool, capture: bool) -> str:
     environment = os.environ.copy()
     if validation:
         environment.update(MTL_DEBUG_LAYER="1", MTL_SHADER_VALIDATION="1")
-    try:
-        result = subprocess.run(arguments, text=True, capture_output=capture, env=environment, check=False)
-    except OSError as error:
-        raise ViewerError(f"Cannot start the native Metal preview: {error}") from error
-    if result.returncode:
-        diagnostics = (result.stderr or result.stdout or "").strip() if capture else "See native renderer diagnostics above."
-        raise ViewerError(f"Native Metal preview failed ({result.returncode}): {diagnostics}")
-    return result.stdout or ""
+    return _native_run(arguments, capture, "Metal", environment)
+
+
+def _directx_run(arguments: list[str], validation: bool, capture: bool) -> str:
+    return _native_run([*arguments, *(["--validation"] if validation else [])], capture, "DirectX 12")
 
 
 def _preview_toolchain() -> Toolchain:
     directory = os.environ.get("GPU_TOOLS_BIN")
     return Toolchain(tools_bin=Path(directory) if directory else None)
+
+
+@contextmanager
+def _directx_shaders(program: GraphicsProgram, toolchain: Toolchain):
+    if sys.platform != "win32":
+        raise ViewerError("Native DirectX 12 preview requires Windows.")
+    if program.target != "directx":
+        raise ViewerError("The DirectX 12 viewer requires DirectX artifacts.")
+    if program.parameters is not None:
+        raise ViewerError(
+            "Native DirectX 12 preview does not implement frame parameter resources yet; "
+            "use Vulkan or DXIL-to-Metal on macOS for parameterized shaders."
+        )
+    with tempfile.TemporaryDirectory(prefix="mlir-gpu-directx-") as work:
+        directory = Path(work)
+        arguments = [toolchain.find("mlir-gpu-directx-view")]
+        for stage, shader in (("vertex", program.vertex), ("fragment", program.fragment)):
+            path = directory / f"{stage}.dxil"
+            path.write_bytes(shader.code)
+            arguments.extend([f"--{stage}", str(path)])
+        yield directory, [*arguments, "--vertex-count", str(program.draw.vertex_count)]
+
+
+def _readback_result(text: str, output: Path, width: int, height: int, backend: str) -> RenderedImage:
+    report = json.loads(text)
+    if (
+        not isinstance(report, dict) or type(report.get("width")) is not int
+        or type(report.get("height")) is not int or report["width"] != width or report["height"] != height
+        or not isinstance(report.get("device"), str) or not report["device"]
+    ):
+        raise ViewerError(f"The native {backend} renderer returned an invalid render report.")
+    rgba = output.read_bytes()
+    if len(rgba) != width * height * 4:
+        raise ViewerError(f"{backend} RGBA readback size does not match the requested dimensions.")
+    return RenderedImage(width, height, rgba, report["device"])
+
+
+def render_directx_offscreen(
+    program: GraphicsProgram, width: int = 640, height: int = 480,
+    validation: bool = False, toolchain: Toolchain | None = None, time: float = 0.0,
+) -> RenderedImage:
+    _dimensions(width, height)
+    _time_value(time)
+    with _directx_shaders(program, toolchain or _preview_toolchain()) as (directory, arguments):
+        output = directory / "readback.rgba"
+        text = _directx_run(
+            [*arguments, "--width", str(width), "--height", str(height), "--readback", str(output)],
+            validation, True,
+        )
+        return _readback_result(text, output, width, height, "DirectX 12")
+
+
+def show_directx_window(
+    program: GraphicsProgram, width: int = 800, height: int = 600, frames: int = 0,
+    validation: bool = False, toolchain: Toolchain | None = None, time: float | None = None,
+) -> None:
+    _dimensions(width, height)
+    if time is not None:
+        _time_value(time)
+    if type(frames) is not int or frames < 0:
+        raise ViewerError("Frame count must be a nonnegative integer (0 means until closed).")
+    with _directx_shaders(program, toolchain or _preview_toolchain()) as (_, arguments):
+        _directx_run(
+            [*arguments, "--width", str(width), "--height", str(height), "--frames", str(frames)],
+            validation, False,
+        )
 
 
 def render_metal_offscreen(
@@ -254,16 +328,7 @@ def _metal_offscreen_renderer(
                 [*arguments, "--width", str(width), "--height", str(height), "--readback", str(output), *timing],
                 validation, True,
             )
-            report = json.loads(text)
-            if (
-                not isinstance(report, dict) or report.get("width") != width or report.get("height") != height
-                or not isinstance(report.get("device"), str) or not report["device"]
-            ):
-                raise ViewerError("The native Metal renderer returned an invalid render report.")
-            rgba = output.read_bytes()
-            if len(rgba) != width * height * 4:
-                raise ViewerError("Metal RGBA readback size does not match the requested dimensions.")
-            return RenderedImage(width, height, rgba, report["device"])
+            return _readback_result(text, output, width, height, "Metal")
         yield render
 
 
@@ -685,6 +750,11 @@ def export_mp4(program: GraphicsProgram, path: Path, width: int = 640, height: i
     _time_value(start + (count - 1) / fps)
     if program.target not in ("vulkan", "directx", "metal"):
         raise ViewerError("MP4 export requires Vulkan, DirectX, or Metal artifacts.")
+    if program.target == "directx" and sys.platform != "darwin":
+        raise ViewerError(
+            "Native DirectX 12 MP4 export is not implemented yet; "
+            "use Vulkan or DXIL-to-Metal on macOS for video export."
+        )
     _frame_parameters(program.parameters)
     path = Path(path).absolute()
     if path.suffix.lower() != ".mp4":
@@ -907,8 +977,8 @@ def show_window(program: GraphicsProgram, width: int = 800, height: int = 600, f
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Open a live Vulkan or DXIL-to-Metal preview window by default.",
-        epilog="Use -frames 0 to keep the window open, --output for PNG, or --video for MP4.",
+        description="Open a live Vulkan, DirectX 12 (Windows), or Metal preview window by default.",
+        epilog="Use -frames 0 to keep the window open, --output for PNG, or --video for MP4 on Vulkan/Metal.",
     )
     parser.add_argument("manifest", type=Path, help="Compiled Vulkan, DirectX, or Metal pipeline.json")
     parser.add_argument("--width", type=int, default=800)
@@ -917,7 +987,7 @@ def main() -> int:
     mode.add_argument("--output", type=Path, help="Render an offscreen PNG instead of opening a window (new file)")
     mode.add_argument("--video", type=Path, help="Export a fixed-time GPU animation to MP4 (new file)")
     mode.add_argument("--frames", "-frames", type=int, default=0, help="Live window: close after N frames; 0 stays open")
-    parser.add_argument("--validation", action="store_true", help="Enable Vulkan validation or Metal API/GPU validation")
+    parser.add_argument("--validation", action="store_true", help="Enable Vulkan, D3D12 debug/GPU, or Metal API/GPU validation")
     parser.add_argument("--time", type=float, help="Fixed snapshot/live time or MP4 start time (seconds)")
     parser.add_argument("--duration", type=float, help="MP4 duration in seconds (default 4)")
     parser.add_argument("--fps", type=int, help="MP4 frames per second, 1-240 (default 30)")
@@ -936,13 +1006,19 @@ def main() -> int:
         elif args.output:
             if args.output.exists():
                 raise ViewerError(f"Output already exists; choose a new PNG path: {args.output}")
-            render = render_offscreen if program.target == "vulkan" else render_metal_offscreen
+            render = (
+                render_offscreen if program.target == "vulkan" else
+                render_directx_offscreen if program.target == "directx" and sys.platform != "darwin" else
+                render_metal_offscreen
+            )
             image = render(program, args.width, args.height, args.validation, **timing)
             write_png(args.output, image)
             print(f"Rendered {image.width}x{image.height} on {image.device}: {args.output}")
         elif program.target == "vulkan":
             count = show_window(program, args.width, args.height, args.frames, args.validation, **timing)
             print(f"Presented {count} Vulkan frames.")
+        elif program.target == "directx" and sys.platform != "darwin":
+            show_directx_window(program, args.width, args.height, args.frames, args.validation, **timing)
         else:
             show_metal_window(program, args.width, args.height, args.frames, args.validation, **timing)
     except (ViewerError, CompileError, OSError, ValueError) as error:

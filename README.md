@@ -5,15 +5,15 @@ and target Vulkan, DirectX 12, and Metal without authoring or generating GLSL,
 HLSL, or MSL.
 
 This is a graphics-first **out-of-tree `gfx` MLIR compiler** with
-Vulkan and DXIL-to-Metal viewers. Python is a bootstrap authoring frontend, not
+Vulkan, native DirectX 12, and DXIL-to-Metal viewers. Python is a bootstrap authoring frontend, not
 the compiler's internal representation or a permanent restriction on frontends.
 Examples range from triangle/quad basics to an original animated ray-marched
 [beacon gallery](examples/beacon_gallery.py). Compile them into artifacts,
 then open a live window or render a PNG through
-Vulkan (MoltenVK on macOS) or native Metal using converted DXIL. The viewer loads
+Vulkan (MoltenVK on macOS), native DirectX 12 on Windows, or native Metal using converted DXIL. The viewer loads
 the actual compiled shaders; it does not redraw the triangle with CPU code or
 generate shading-language source.
-All three preview paths can export deterministic MP4 animation.
+Vulkan and both Metal preview paths can export deterministic MP4 animation.
 
 ## Status
 
@@ -28,14 +28,14 @@ All three preview paths can export deterministic MP4 animation.
 | Native Metal rendering of DXIL | MetalKit window and offscreen readback using Apple's converter runtime | Tested on Apple M3 Max with API/GPU validation, pixel checks, and persistent-window tests |
 | Python device control flow / SDF composition | Default AST frontend and upstream SCF | Real bounded GPU loops, branches, early exits, carried scalar/vector state, and finite-difference normals |
 | Read-only frame resources | Reflected f32 root ABI, Vulkan push constants, DXIL root constants, converted Metal argument buffer | Exact time/pixel dimensions in both stages; live clock, frozen snapshots, resize and Retina drawable readback |
-| Native DirectX 12 runtime rendering | Not implemented | DirectX artifacts are previewed through Metal on macOS, not a DirectX device |
+| Native DirectX 12 runtime rendering | Win32 window, D3D12 pipeline, DXGI swapchain, and offscreen RGBA readback | Readback/clipping tested on NVIDIA RTX 5060 with GPU validation; Vulkan pixel parity verified; live-window tests require an interactive desktop |
 | Compute entry points | IR foundation only | Typed stage, workgroup-size and invocation-ID verification; compute lowering/execution is explicitly rejected for now |
 | Typed pointers / bindless handles | IR foundation only | ODS types parse and round-trip; general pointer/load-store lowering and resource heaps are not implemented yet |
 
 LLVM IR verification is **not** DXIL validation: the native DXC validator also
 checks and signs the actual containers. Real rendering tests cover Vulkan and
-DXIL-to-Metal in addition to mocked command-wiring tests. Native Windows
-DirectX runtime interoperability remains unverified. No path emits fake binaries
+DXIL-to-Metal and Windows DirectX 12 in addition to mocked command-wiring tests.
+GPU tests are opt-in and require their native toolchains and devices. No path emits fake binaries
 or falls back to shading-language source.
 The completed ray-march stack and Light Cycle example passed **180 tests** with both GPU paths,
 API validation, and real desktop windows enabled. The measured acceptance
@@ -260,13 +260,86 @@ Fixtures include the RGB triangle, asymmetric geometry with varying homogeneous
 W, near/far clipping, and the six-vertex UV quad at square, non-square, and odd resolutions.
 This tests shared geometry, scale, perspective interpolation, and color placement,
 not just independently plausible images. It does not promise bit-identical
-floating-point results on arbitrary hardware or verify a Windows DirectX runtime.
+floating-point results on arbitrary hardware. On Windows, enable
+`MLIR_GPU_TEST_VULKAN=1` and `MLIR_GPU_TEST_DIRECTX=1` instead to compare Vulkan
+against native D3D12 (no Metal converter).
 The full ray-march acceptance also covers frame resources, device control flow,
 the original scene, MP4 encoding, and live drawable readback. Install the
 `video` extra or supply FFmpeg for movie tests, and provide converter runtime
 headers plus `clang++` for the opted-in Metal window probe. Run window suites
 serially. See the measured ray-march section below for its separate numerical
 thresholds; those do not weaken the exact simple-graphics baselines.
+
+### Native DirectX 12 on Windows
+
+Use an **x64 Native Tools Command Prompt for VS 2022** (or a Developer PowerShell
+with the x64 compiler environment). Install the Desktop development with C++
+workload, a current Windows SDK, CMake, Ninja, and Python 3.11+. Rendering requires
+a Windows 10/11 D3D12 driver and a hardware GPU supporting **Shader Model 6.6**.
+There is no silent WARP, Vulkan, HLSL, or Metal fallback.
+
+Build the pinned LLVM/MLIR compiler using `python tools\build_toolchain.py --jobs 8`.
+Then build the native tools against Microsoft's x64 DXC distribution. The
+Vulkan SDK's DXC component can supply the headers, import library, and DLL;
+adjust this example to your installed SDK:
+
+```powershell
+$env:DXC_ROOT = "C:\VulkanSDK\1.4.335.0"
+cmake -S . -B build\native -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD\.tools" `
+  -DDXC_INCLUDE_DIR="$env:DXC_ROOT\Include" `
+  -DDXC_LIBRARY="$env:DXC_ROOT\Lib\dxcompiler.lib"
+cmake --build build\native
+cmake --install build\native
+
+$env:PYTHONPATH = "$PWD\src"
+$env:LLVM_BIN = "$PWD\.toolchains\llvm-build\bin"
+$env:GPU_TOOLS_BIN = "$PWD\.tools\bin"
+python -m mlir_gpu examples\triangle.py --target directx --output build\triangle-directx
+python -m mlir_gpu.viewer build\triangle-directx\pipeline.json
+python -m mlir_gpu.viewer build\triangle-directx\pipeline.json --frames 3
+python -m mlir_gpu.viewer build\triangle-directx\pipeline.json --output build\triangle-directx.png
+```
+
+The native tools install `dxcompiler.dll` alongside `dxv.exe` and
+`dxil-assemble.exe`, plus `dxil.dll` when found. For a standalone DXC release
+whose DLLs are not in a sibling `bin` directory, set `-DDXC_RUNTIME=<absolute DLL path>`
+and `-DDXIL_RUNTIME=<absolute DLL path>` at configuration time.
+The Windows viewer consumes the validated `.dxil` containers directly; it does
+not need DXC at preview time or the Python `viewer` extra. Entry points are
+already compiled into each stage's DXIL, so no runtime entry-point renaming is
+needed. It uses the reflected manifest's draw count, an empty root signature,
+no vertex buffers, and one linear RGBA8 UNORM attachment. Resource-backed
+shaders remain outside the native DirectX preview interface. In particular,
+schema-version 4 frame-parameter shaders and native DirectX MP4 export are
+explicitly rejected for now; use Vulkan or DXIL-to-Metal on macOS for those
+workflows. `--time` is validated but has no effect on resource-free DirectX shaders.
+
+Windows DirectX manifests open a resizable D3D12/DXGI window by default; Esc or
+closing the window exits. Zero frames means unlimited, and minimized windows
+pause. PNG export reads back the actual GPU texture, removing D3D12's aligned
+row padding without changing orientation or color channels. Existing DirectX
+previews on macOS still convert through Metal. Live DXGI presentation requires
+an interactive desktop session; Windows services/Session 0 can use offscreen
+rendering but cannot create the window's swapchain.
+
+Install the optional **Graphics Tools** Windows feature to use `--validation`.
+It enables the D3D12 debug layer and GPU-based validation before device
+creation; missing validation support and validation errors are reported as failures.
+To run the real compiler/runtime tests:
+
+```powershell
+$env:MLIR_GPU_TEST_DIRECTX = "1"
+$env:MLIR_GPU_TEST_VALIDATION = "1"
+$env:MLIR_GPU_TEST_WINDOW = "1" # Only in a desktop session
+python -m unittest discover -s tests -v
+```
+
+These test triangle/quad pixels and coverage at square, non-square, and odd
+widths, near/far clipping, bounded presentation, and persistent windows through
+resize/minimize/restore. Also enable `MLIR_GPU_TEST_VULKAN=1` for the asymmetric
+perspective and depth-clipping cross-target parity tests (requires Vulkan tools
+and the Python viewer extra).
 
 ### Other native targets
 
@@ -1157,7 +1230,8 @@ Inspired by [Death to Shading Languages](https://xol.io/blah/death-to-shading-la
 
 Next steps are pointer/resource operations with verified host/device layouts,
 capability-driven legalization and meaningful compute execution, followed by
-broader graphics features and a native Windows DirectX 12 runtime adapter.
+broader graphics features and frame-resource support in the native Windows
+DirectX 12 runtime adapter.
 The shared dialect is designed for both graphics and compute, while this first
 executable milestone remains graphics-first.
 

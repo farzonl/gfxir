@@ -1,11 +1,12 @@
 import os
 import runpy
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from mlir_gpu import Pipeline, Target, Toolchain, Vertex, compile_pipeline, fragment, select, vec4, vertex
-from mlir_gpu.viewer import load_program, render_metal_offscreen, render_offscreen
+from mlir_gpu.viewer import load_program, render_directx_offscreen, render_metal_offscreen, render_offscreen
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,8 +32,11 @@ def positioned_triangle(positions):
 
 
 @unittest.skipUnless(
-    os.environ.get("MLIR_GPU_TEST_VULKAN") == "1" and os.environ.get("MLIR_GPU_TEST_METAL") == "1",
-    "Set both MLIR_GPU_TEST_VULKAN=1 and MLIR_GPU_TEST_METAL=1 for cross-target GPU parity",
+    os.environ.get("MLIR_GPU_TEST_VULKAN") == "1" and (
+        os.environ.get("MLIR_GPU_TEST_DIRECTX") == "1" if sys.platform == "win32" else
+        os.environ.get("MLIR_GPU_TEST_METAL") == "1"
+    ),
+    "Enable Vulkan plus DirectX (Windows) or Metal (macOS) for cross-target GPU parity",
 )
 class TargetParityTests(unittest.TestCase):
     @classmethod
@@ -56,7 +60,8 @@ class TargetParityTests(unittest.TestCase):
                 if name in ("triangle", "quad") else positioned_triangle(positions)
             )
             cls.programs[name] = {}
-            for target in Target:
+            targets = (Target.VULKAN, Target.DIRECTX) if sys.platform == "win32" else tuple(Target)
+            for target in targets:
                 manifest = compile_pipeline(pipeline, target, Path(work.name) / f"{name}-{target.value}", cls.tools)
                 cls.programs[name][target] = load_program(manifest)
 
@@ -68,7 +73,9 @@ class TargetParityTests(unittest.TestCase):
                     image = (
                         render_offscreen(program, width, height, self.validation)
                         if target == Target.VULKAN else
-                        render_metal_offscreen(program, width, height, self.validation, self.tools)
+                        (render_directx_offscreen if sys.platform == "win32" else render_metal_offscreen)(
+                            program, width, height, self.validation, self.tools
+                        )
                     )
                     self.assertEqual((image.width, image.height), (width, height))
                     self.assertEqual(len(image.rgba), width * height * 4)
@@ -87,7 +94,9 @@ class TargetParityTests(unittest.TestCase):
                             for channel, expected in zip(pixel, (u, v, u * v, 1)):
                                 self.assertAlmostEqual(channel, round(expected * 255), delta=2)
             reference = images[Target.VULKAN]
-            for target in (Target.DIRECTX, Target.METAL):
+            for target in images:
+                if target == Target.VULKAN:
+                    continue
                 with self.subTest(scene=name, target=target.value, size=(width, height)):
                     self.assertEqual(masks[target], masks[Target.VULKAN], "Coverage differs: orientation, scale, or clipping mismatch")
                     maximum_error = max(abs(left - right) for left, right in zip(reference, images[target]))

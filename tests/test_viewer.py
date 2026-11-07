@@ -18,8 +18,9 @@ from mlir_gpu import CompileError, Target, Toolchain, compile_pipeline
 from mlir_gpu.compiler import PIPELINE_SCHEMA_VERSION, RASTER_CONVENTION
 from mlir_gpu.frontend import Draw
 from mlir_gpu.viewer import (
-    RenderedImage, ViewerError, _binding, _dimensions, _metal_libraries, _metal_run, _Vulkan,
-    load_program, main, render_metal_offscreen, render_offscreen, show_metal_window, show_window, write_png,
+    RenderedImage, ViewerError, _binding, _dimensions, _directx_run, _directx_shaders, _metal_libraries, _metal_run, _Vulkan,
+    load_program, main, render_directx_offscreen, render_metal_offscreen, render_offscreen,
+    show_directx_window, show_metal_window, show_window, write_png,
 )
 
 
@@ -127,13 +128,15 @@ class ViewerTests(unittest.TestCase):
                     else:
                         self.native_program(target)
                     arguments = ["mlir-gpu-view", str(self.manifest), *frame_arguments]
-                    with patch("sys.argv", arguments), contextlib.redirect_stdout(io.StringIO()):
-                        with patch("mlir_gpu.viewer.show_window", return_value=0) as vulkan, patch("mlir_gpu.viewer.show_metal_window") as metal:
-                            with patch("mlir_gpu.viewer.write_png") as png:
+                    for platform in ("win32", "darwin"):
+                        with patch("sys.argv", arguments), patch("mlir_gpu.viewer.sys.platform", platform), contextlib.redirect_stdout(io.StringIO()):
+                            with patch("mlir_gpu.viewer.show_window", return_value=0) as vulkan, patch("mlir_gpu.viewer.show_metal_window") as metal, patch("mlir_gpu.viewer.show_directx_window") as directx, patch("mlir_gpu.viewer.write_png") as png:
                                 self.assertEqual(main(), 0)
-                                active, inactive = (vulkan, metal) if target == "vulkan" else (metal, vulkan)
+                                active = vulkan if target == "vulkan" else directx if target == "directx" and platform == "win32" else metal
                                 self.assertEqual(active.call_args.args[3], 0)
-                                inactive.assert_not_called()
+                                for inactive in (vulkan, metal, directx):
+                                    if inactive is not active:
+                                        inactive.assert_not_called()
                                 png.assert_not_called()
 
     def test_png_and_live_modes_are_explicitly_exclusive(self):
@@ -154,6 +157,116 @@ class ViewerTests(unittest.TestCase):
     def test_load_native_binary_formats(self):
         for target in ("directx", "metal"):
             self.assertEqual(self.native_program(target).target, target)
+
+    def test_directx_png_routing_on_windows_and_macos(self):
+        self.native_program("directx")
+        for platform in ("win32", "darwin"):
+            with patch("sys.argv", ["mlir-gpu-view", str(self.manifest), "--output", str(self.directory / "preview.png")]):
+                with patch("mlir_gpu.viewer.sys.platform", platform), contextlib.redirect_stdout(io.StringIO()):
+                    with patch("mlir_gpu.viewer.render_directx_offscreen") as directx, patch("mlir_gpu.viewer.render_metal_offscreen") as metal, patch("mlir_gpu.viewer.write_png"):
+                        self.assertEqual(main(), 0)
+                        active, inactive = (directx, metal) if platform == "win32" else (metal, directx)
+                        active.assert_called_once()
+                        inactive.assert_not_called()
+
+    def test_directx_cli_preserves_fixed_time_on_windows_and_macos(self):
+        self.native_program("directx")
+        for platform in ("win32", "darwin"):
+            for png in (False, True):
+                arguments = ["mlir-gpu-view", str(self.manifest), "--time", "1.5"]
+                if png:
+                    arguments.extend(["--output", str(self.directory / "snapshot.png")])
+                native = "render_directx_offscreen" if png else "show_directx_window"
+                metal = "render_metal_offscreen" if png else "show_metal_window"
+                with self.subTest(platform=platform, png=png):
+                    with patch("sys.argv", arguments), patch("mlir_gpu.viewer.sys.platform", platform), contextlib.redirect_stdout(io.StringIO()):
+                        with patch(f"mlir_gpu.viewer.{native}") as directx, patch(f"mlir_gpu.viewer.{metal}") as converted, patch("mlir_gpu.viewer.write_png"):
+                            self.assertEqual(main(), 0)
+                            active, inactive = (directx, converted) if platform == "win32" else (converted, directx)
+                            self.assertEqual(active.call_args.kwargs, {"time": 1.5})
+                            inactive.assert_not_called()
+
+    def test_directx_resource_and_invalid_time_limits_fail_before_launch(self):
+        program = self.native_program("directx")
+        parameterized = type(program)(program.vertex, program.fragment, program.target, program.draw, parameters={})
+        with patch("mlir_gpu.viewer.sys.platform", "win32"), patch.object(Toolchain, "find") as find:
+            for render in (render_directx_offscreen, show_directx_window):
+                with self.subTest(render=render.__name__):
+                    with self.assertRaisesRegex(ViewerError, "frame parameter resources"):
+                        render(parameterized)
+                    with self.assertRaisesRegex(ViewerError, "Time"):
+                        render(program, time=float("nan"))
+            find.assert_not_called()
+
+    def test_directx_native_readback_uses_original_dxil_and_draw_count(self):
+        program = self.native_program("directx")
+        program = type(program)(program.vertex, program.fragment, program.target, Draw(vertex_count=6))
+        paths = []
+
+        def renderer(arguments, validation, capture):
+            self.assertTrue(validation)
+            self.assertTrue(capture)
+            self.assertEqual(arguments[0], "mlir-gpu-directx-view")
+            self.assertEqual(arguments[arguments.index("--vertex-count") + 1], "6")
+            for stage, code in (("vertex", program.vertex.code), ("fragment", program.fragment.code)):
+                path = Path(arguments[arguments.index(f"--{stage}") + 1])
+                paths.append(path)
+                self.assertEqual(path.read_bytes(), code)
+            Path(arguments[arguments.index("--readback") + 1]).write_bytes(bytes([1, 2, 3, 255]))
+            return '{"device":"D3D12 test GPU","width":1,"height":1}'
+
+        with patch("mlir_gpu.viewer.sys.platform", "win32"), patch.object(Toolchain, "find", side_effect=lambda name: name):
+            with patch("mlir_gpu.viewer._directx_run", side_effect=renderer), patch("mlir_gpu.viewer._run") as compiler:
+                image = render_directx_offscreen(program, 1, 1, True)
+                compiler.assert_not_called()
+        self.assertEqual(image, RenderedImage(1, 1, bytes([1, 2, 3, 255]), "D3D12 test GPU"))
+        self.assertTrue(all(not path.exists() for path in paths))
+
+    def test_directx_validation_and_failure_diagnostics(self):
+        result = subprocess.CompletedProcess(["native"], 1, "", "D3D12 shader signature rejected")
+        with patch("mlir_gpu.viewer.subprocess.run", return_value=result) as run:
+            with self.assertRaisesRegex(ViewerError, "D3D12 shader signature rejected"):
+                _directx_run(["native"], True, True)
+            self.assertEqual(run.call_args.args[0], ["native", "--validation"])
+        with patch("mlir_gpu.viewer.subprocess.run", side_effect=OSError("missing executable")):
+            with self.assertRaisesRegex(ViewerError, "Cannot start.*DirectX 12"):
+                _directx_run(["native"], False, True)
+
+    def test_directx_native_readback_rejects_invalid_reports_and_sizes(self):
+        program = self.native_program("directx")
+        for report, rgba in (
+            ('{}', bytes(4)),
+            ('{"device":"GPU","width":true,"height":1}', bytes(4)),
+            ('{"device":"","width":1,"height":1}', bytes(4)),
+            ('{"device":"GPU","width":2,"height":1}', bytes(4)),
+            ('{"device":"GPU","width":1,"height":1}', bytes(3)),
+        ):
+            def renderer(arguments, validation, capture):
+                Path(arguments[arguments.index("--readback") + 1]).write_bytes(rgba)
+                return report
+
+            with self.subTest(report=report, length=len(rgba)):
+                with patch("mlir_gpu.viewer.sys.platform", "win32"), patch.object(Toolchain, "find", return_value="native"), patch("mlir_gpu.viewer._directx_run", side_effect=renderer):
+                    with self.assertRaises(ViewerError):
+                        render_directx_offscreen(program, 1, 1)
+
+    def test_directx_native_window_defaults_and_platform_guards(self):
+        program = self.native_program("directx")
+        with patch("mlir_gpu.viewer.sys.platform", "win32"), patch.object(Toolchain, "find", return_value="native"):
+            with patch("mlir_gpu.viewer._directx_run") as renderer:
+                show_directx_window(program)
+                arguments, validation, capture = renderer.call_args.args
+                self.assertEqual(arguments[arguments.index("--frames") + 1], "0")
+                self.assertFalse(validation)
+                self.assertFalse(capture)
+            for frames in (-1, True, 1.5):
+                with self.assertRaisesRegex(ViewerError, "Frame count"):
+                    show_directx_window(program, frames=frames)
+            with self.assertRaisesRegex(ViewerError, "requires DirectX artifacts"):
+                render_directx_offscreen(self.native_program("metal"))
+        with patch("mlir_gpu.viewer.sys.platform", "linux"):
+            with self.assertRaisesRegex(ViewerError, "requires Windows"):
+                render_directx_offscreen(program)
 
     def test_directx_preview_validates_converts_and_reads_back(self):
         program = self.native_program("directx")
