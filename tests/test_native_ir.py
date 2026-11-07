@@ -40,6 +40,9 @@ class NativeIRTests(unittest.TestCase):
             ({"op": "cmp", "type": "bool", "args": [3, 3], "literal": "ult"}, "integer/boolean comparison predicate"),
             ({"op": "div", "type": "u32", "args": [2, 2]}, "floating-point"),
             ({"op": "neg", "type": "bool", "args": [3]}, "floating-point or signed"),
+            ({"op": "sin", "type": "u32", "args": [2]}, "f32 scalar/vector"),
+            ({"op": "sqrt", "type": "f32x2", "args": [1]}, "matching f32"),
+            ({"op": "pow", "type": "u32", "args": [2, 2]}, "f32 scalar/vector"),
         ):
             with self.subTest(node=node), tempfile.TemporaryDirectory() as work:
                 source, output = Path(work) / "invalid.json", Path(work) / "invalid.spv"

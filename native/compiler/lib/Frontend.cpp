@@ -196,6 +196,30 @@ mlir::gfx::importShader(MLIRContext &context,
         }
       } else
         return error("neg/abs requires a floating-point or signed value");
+    } else if (*operation == "sin" || *operation == "cos" ||
+               *operation == "sqrt" || *operation == "exp" ||
+               *operation == "exp2" || *operation == "log" ||
+               *operation == "log2" || *operation == "floor") {
+      if (arguments.size() != 1 || arguments[0].getType() != type ||
+          !(type.isF32() || isa<VectorType>(type)))
+        return error(
+            "shader math requires one matching f32 scalar/vector operand");
+      if (*operation == "sin")
+        value = math::SinOp::create(builder, location, arguments[0]);
+      else if (*operation == "cos")
+        value = math::CosOp::create(builder, location, arguments[0]);
+      else if (*operation == "sqrt")
+        value = math::SqrtOp::create(builder, location, arguments[0]);
+      else if (*operation == "exp")
+        value = math::ExpOp::create(builder, location, arguments[0]);
+      else if (*operation == "exp2")
+        value = math::Exp2Op::create(builder, location, arguments[0]);
+      else if (*operation == "log")
+        value = math::LogOp::create(builder, location, arguments[0]);
+      else if (*operation == "log2")
+        value = math::Log2Op::create(builder, location, arguments[0]);
+      else
+        value = math::FloorOp::create(builder, location, arguments[0]);
     } else if (*operation == "vector") {
       auto vector = dyn_cast<VectorType>(type);
       if (!vector ||
@@ -301,6 +325,31 @@ mlir::gfx::importShader(MLIRContext &context,
             return error("division currently requires floating-point operands");
           value = arith::DivFOp::create(builder, location, arguments[0],
                                         arguments[1]);
+        } else if (*operation == "pow") {
+          if (!floating)
+            return error("pow requires matching f32 scalar/vector operands");
+          auto constant = [&](float number) -> Value {
+            TypedAttr literal = builder.getF32FloatAttr(number);
+            if (auto vector = dyn_cast<VectorType>(type))
+              literal =
+                  DenseElementsAttr::get(vector, ArrayRef<Attribute>{literal});
+            return arith::ConstantOp::create(builder, location, type, literal);
+          };
+          auto zero = constant(0), one = constant(1);
+          auto baseZero = arith::CmpFOp::create(
+              builder, location, arith::CmpFPredicate::OEQ, arguments[0], zero);
+          auto exponentPositive = arith::CmpFOp::create(
+              builder, location, arith::CmpFPredicate::OGT, arguments[1], zero);
+          auto zeroCase = arith::AndIOp::create(builder, location, baseZero,
+                                                exponentPositive);
+          // Upstream pow expansion uses log(base), whose SPIR-V domain excludes
+          // zero.
+          auto safeBase = arith::SelectOp::create(builder, location, zeroCase,
+                                                  one, arguments[0]);
+          auto power =
+              math::PowFOp::create(builder, location, safeBase, arguments[1]);
+          value =
+              arith::SelectOp::create(builder, location, zeroCase, zero, power);
         } else if (*operation == "min" || *operation == "max") {
           if (floating)
             value = *operation == "min"

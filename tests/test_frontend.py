@@ -3,7 +3,7 @@ import runpy
 import unittest
 from pathlib import Path
 
-from mlir_gpu import Draw, Pipeline, Value, Vertex, fragment, i32, maximum, minimum, select, u32, vec2, vec3, vec4, vertex
+from mlir_gpu import Draw, Pipeline, Value, Vertex, fragment, i32, maximum, minimum, select, shader_math as sm, u32, vec2, vec3, vec4, vertex
 from mlir_gpu.frontend import Node, Type
 
 
@@ -40,6 +40,7 @@ def evaluate(node: Node, argument):
         "min": lambda a, b: numeric_extreme(a, b, min),
         "max": lambda a, b: numeric_extreme(a, b, max),
         "and": lambda a, b: a & b, "or": lambda a, b: a | b, "xor": lambda a, b: a ^ b,
+        **{name: getattr(math, name) for name in ("sin", "cos", "sqrt", "exp", "exp2", "log", "log2", "floor", "pow")},
     }
     operation = operations[node.op]
     if node.type in (Type.VEC2, Type.VEC3, Type.VEC4):
@@ -53,6 +54,49 @@ def evaluate(node: Node, argument):
 
 
 class FrontendTests(unittest.TestCase):
+    def test_shader_math_builds_typed_nodes_and_matches_host_references(self):
+        for name, values in (
+            ("sin", (-12.0, -0.25, 0.0, 0.25, 12.0)),
+            ("cos", (-12.0, -0.25, 0.0, 0.25, 12.0)),
+            ("sqrt", (0.0, 0.001, 0.25, 1.0, 64.0)),
+            ("exp", (-12.0, -1.0, 0.0, 1.0, 6.0)),
+            ("exp2", (-12.0, -1.0, 0.0, 1.0, 6.0)),
+            ("log", (0.001, 0.25, 1.0, 64.0)),
+            ("log2", (0.001, 0.25, 1.0, 64.0)),
+            ("floor", (-2.75, -0.25, 0.0, 0.25, 2.75)),
+        ):
+            operation = getattr(sm, name)
+            for value in values:
+                result = operation(value)
+                self.assertEqual(result.node.op, name)
+                self.assertEqual(result.node.type, Type.F32)
+                expected = getattr(math, name)(result.node.args[0].literal)
+                self.assertAlmostEqual(evaluate(result.node, None), expected)
+            for constructor in (vec2, vec3, vec4):
+                vector = constructor(0.25)
+                self.assertEqual(operation(vector).node.type, vector.node.type)
+            for invalid in (i32(1), u32(1), True, math.inf, math.nan):
+                with self.assertRaises((TypeError, ValueError)):
+                    operation(invalid)
+        self.assertEqual(evaluate(sm.pow(vec3(0.0, 0.25, 1.0), 1.5).node, None), (0.0, 0.125, 1.0))
+        for operation in (
+            lambda: sm.sqrt(-1), lambda: sm.sqrt(vec3(-1, 0, 1)),
+            lambda: sm.log(0), lambda: sm.log2(-1),
+            lambda: sm.pow(-1, 2), lambda: sm.pow(0, 0),
+            lambda: sm.pow(vec2(0, 1), vec2(-1, 2)),
+        ):
+            with self.assertRaises(ValueError):
+                operation()
+        with self.assertRaises(TypeError):
+            sm.pow(vec2(1), vec3(1))
+
+    def test_math_example_uses_device_math_and_finite_output(self):
+        _, fs = runpy.run_path(str(ROOT / "examples/math.py"))["pipeline"].trace()
+        for uv in ((0.5, 0.5), (0.125, 0.75), (0.9, 0.1)):
+            output = evaluate(fs.outputs[0], uv)
+            self.assertTrue(all(math.isfinite(channel) and 0 <= channel <= 1 for channel in output))
+            self.assertEqual(output[3], 1)
+
     def test_arithmetic_example_exposes_the_new_capabilities(self):
         vs, fs = runpy.run_path(str(ROOT / "examples/arithmetic.py"))["pipeline"].trace()
         for index, expected in enumerate(((-1, -1, 0, 1), (3, -1, 0, 1), (-1, 3, 0, 1))):

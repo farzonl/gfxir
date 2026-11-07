@@ -9,10 +9,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mlir_gpu import CompileError, Pipeline, Target, Toolchain, Vertex, fragment, i32, maximum, minimum, select, u32, vec3, vec4, vertex
+from mlir_gpu import CompileError, Pipeline, Target, Toolchain, Vertex, fragment, i32, maximum, minimum, select, shader_math as sm, u32, vec2, vec3, vec4, vertex
 from mlir_gpu.__main__ import main
 from mlir_gpu.compiler import PIPELINE_SCHEMA_VERSION, RASTER_CONVENTION, _check_binary, _run
 from mlir_gpu.compiler import compile_pipeline
+from mlir_gpu.frontend import Type
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,6 +95,42 @@ def expanded_arithmetic_pipeline():
         return minimum(maximum(abs(-color), 0.0), 1.0)
 
     return Pipeline(expanded_vertex, expanded_fragment, draw=quad.draw)
+
+
+def shader_math_pipeline():
+    quad = runpy.run_path(str(ROOT / "examples/quad.py"))["pipeline"]
+
+    @fragment
+    def checked_math(uv):
+        valid = True
+        for value in (uv.x + 0.125, uv + 0.125, vec3(uv, uv.x) + 0.125, vec4(uv, uv) + 0.125):
+            angle = value * 8 - 4
+            sine, cosine = sm.sin(angle), sm.cos(angle)
+            zero = value - value
+            errors = (
+                abs(sine * sine + cosine * cosine - 1),
+                abs(sm.sqrt(value * value) - value),
+                abs(sm.exp(sm.log(value)) - value),
+                abs(sm.exp2(sm.log2(value)) - value),
+                abs(sm.pow(value, 2.5) - value * value * sm.sqrt(value)),
+                abs(sm.pow(zero, value + 1)),
+                abs(sm.sqrt(zero)),
+            )
+            for error in errors:
+                components = (error,) if error.node.type == Type.F32 else tuple(
+                    error[index] for index in range({Type.VEC2: 2, Type.VEC3: 3, Type.VEC4: 4}[error.node.type])
+                )
+                for component in components:
+                    valid = valid & (component <= 2e-5)
+            components = (value,) if value.node.type == Type.F32 else tuple(
+                value[index] for index in range({Type.VEC2: 2, Type.VEC3: 3, Type.VEC4: 4}[value.node.type])
+            )
+            for component in components:
+                valid = valid & (sm.floor(component) == select(component < 1, 0.0, 1.0))
+                valid = valid & (sm.floor(-component) == select(component <= 1, -1.0, -2.0))
+        return select(valid, vec4(1), vec4(0, 0, 0, 1))
+
+    return Pipeline(quad.vertex, checked_math, draw=quad.draw)
 
 
 def available(*names):
@@ -302,6 +339,36 @@ class LLVMIntegrationTests(unittest.TestCase):
 
 
 class NativeTargetIntegrationTests(unittest.TestCase):
+    def test_shader_math_validates_and_executes_scalar_and_vector_reference_checks(self):
+        for target in Target:
+            with self.subTest(target=target.value), tempfile.TemporaryDirectory() as work:
+                try:
+                    TOOLS.preflight(target)
+                except CompileError as error:
+                    self.skipTest(str(error))
+                manifest = compile_pipeline(shader_math_pipeline(), target, Path(work) / "out", TOOLS)
+                if target != Target.VULKAN:
+                    text = (manifest.parent / "fragment.ll").read_text()
+                    for intrinsic in ("sin", "cos", "sqrt", "exp", "exp2", "log", "log2", "floor", "pow"):
+                        self.assertIn(f"llvm.{intrinsic}.", text)
+                    self.assertNotIn(" fast ", text)
+                    self.assertNotIn("contract", text)
+                flag = "MLIR_GPU_TEST_VULKAN" if target == Target.VULKAN else "MLIR_GPU_TEST_METAL"
+                if os.environ.get(flag) == "1":
+                    from mlir_gpu.viewer import load_program, render_metal_offscreen, render_offscreen
+
+                    program = load_program(manifest)
+                    validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
+                    image = (
+                        render_offscreen(program, 63, 47, validation)
+                        if target == Target.VULKAN else
+                        render_metal_offscreen(program, 63, 47, validation, TOOLS)
+                    )
+                    covered = [image.rgba[offset:offset + 4] for offset in range(0, len(image.rgba), 4)
+                               if image.rgba[offset:offset + 4] != bytes((5, 5, 10, 255))]
+                    self.assertGreater(len(covered), 63 * 47 * 0.6)
+                    self.assertTrue(all(pixel == bytes((255, 255, 255, 255)) for pixel in covered))
+
     def test_expanded_arithmetic_validates_and_executes_on_all_targets(self):
         for target in Target:
             with self.subTest(target=target.value), tempfile.TemporaryDirectory() as work:
