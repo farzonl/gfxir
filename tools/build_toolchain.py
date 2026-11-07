@@ -65,18 +65,18 @@ def _freeze_existing_build_targets(build: Path) -> None:
             if match:
                 targets = match.group(1).replace("$\n", " ").replace("$\r\n", " ").split()
                 rule = match.group(2)
-                if targets == ["build.ninja"] and rule == "RERUN_CMAKE":
-                    out.append("build build.ninja: phony\n")
+                if rule == "RERUN_CMAKE" or "build.ninja" in targets:
+                    out.append(f"build {' '.join(targets)}: phony\n")
                     changed = True
                     i += 1
                     continue
                 if (
-                    len(targets) == 1
+                    targets
                     and rule != "phony"
-                    and (targets[0].startswith("lib/") or targets[0].startswith("bin/"))
-                    and (build / targets[0]).is_file()
+                    and all(t.startswith("lib/") or t.startswith("bin/") for t in targets)
+                    and all((build / t).exists() for t in targets)
                 ):
-                    out.append(f"build {targets[0]}: phony\n")
+                    out.append(f"build {' '.join(targets)}: phony\n")
                     changed = True
                     i += 1
                     continue
@@ -129,7 +129,7 @@ def _prune_object_files(build: Path) -> None:
 def _ensure_toolchain_dependencies(source: Path, build: Path, jobs: int) -> None:
     _rewrite_stale_sdk_paths(build)
     cmake_text = (ROOT / "native/compiler/CMakeLists.txt").read_text()
-    required_libs = sorted(set(re.findall(r"\bMLIR[A-Za-z0-9_]+\b", cmake_text)))
+    required_libs = sorted(set(re.findall(r"\bMLIR[A-Za-z0-9]+\b", cmake_text)))
     missing_targets = [
         lib for lib in required_libs
         if not (build / "lib" / f"lib{lib}.a").is_file() and not (build / "lib" / f"{lib}.lib").is_file()
