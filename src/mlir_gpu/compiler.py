@@ -6,12 +6,12 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Sequence
 
-from .frontend import Pipeline, Stage
+from .frontend import Draw, Pipeline, Stage
 from .interfaces import verify_graphics_interface
 
 
@@ -23,6 +23,32 @@ class Target(Enum):
     VULKAN = "vulkan"
     DIRECTX = "directx"
     METAL = "metal"
+
+
+@dataclass(frozen=True)
+class _MLIRStage:
+    kind: str
+    name: str
+    source: Path
+
+
+@dataclass(frozen=True)
+class MLIRPipeline:
+    """Native MLIR stage sources using the same artifact and viewer contract."""
+
+    vertex: Path
+    fragment: Path
+    vertex_entry: str
+    fragment_entry: str
+    draw: Draw = field(default_factory=Draw)
+
+    def trace(self) -> tuple[_MLIRStage, _MLIRStage]:
+        if not isinstance(self.draw, Draw):
+            raise TypeError("MLIRPipeline draw must be a Draw object.")
+        return (
+            _MLIRStage("vertex", self.vertex_entry, Path(self.vertex)),
+            _MLIRStage("fragment", self.fragment_entry, Path(self.fragment)),
+        )
 
 
 PIPELINE_SCHEMA_VERSION = 3
@@ -108,14 +134,22 @@ def convert_dxil_to_metallib(dxil: Path, metallib: Path, entry_point: str, conve
     _check_binary(metallib, b"MTLB", 16)
 
 
-def _compile_stage(stage: Stage, target: Target, directory: Path, tools: dict[str, str]) -> str:
+def _compile_stage(stage: Stage | _MLIRStage, target: Target, directory: Path, tools: dict[str, str]) -> str:
     stem = stage.kind
-    source = directory / f"{stem}.json"
-    source.write_text(json.dumps(stage.to_dict(), allow_nan=False, indent=2) + "\n")
+    native = isinstance(stage, _MLIRStage)
+    source = directory / f"{stem}.{'mlir' if native else 'json'}"
+    if native:
+        try:
+            shutil.copyfile(stage.source, source)
+        except OSError as error:
+            raise CompileError(f"Cannot read native shader {stage.source}: {error}") from error
+    else:
+        source.write_text(json.dumps(stage.to_dict(), allow_nan=False, indent=2) + "\n")
     reflection = directory / f"{stem}.reflection.json"
     output = directory / f"{stem}.{'spv' if target == Target.VULKAN else 'll'}"
     _run([
-        tools["gfx-compile"], str(source), "--target", "vulkan" if target == Target.VULKAN else "directx",
+        tools["gfx-compile"], str(source), "--input-format", "mlir" if native else "json",
+        "--target", "vulkan" if target == Target.VULKAN else "directx",
         "--output", str(output), "--ir-output", str(directory / f"{stem}.mlir"),
         "--lowered-output", str(directory / f"{stem}.lowered.mlir"), "--reflection", str(reflection),
     ])
@@ -137,7 +171,7 @@ def _compile_stage(stage: Stage, target: Target, directory: Path, tools: dict[st
 
 
 def compile_pipeline(
-    pipeline: Pipeline,
+    pipeline: Pipeline | MLIRPipeline,
     target: Target,
     output: Path,
     toolchain: Toolchain | None = None,
@@ -162,6 +196,9 @@ def compile_pipeline(
             for stage in stages
         }
         verify_graphics_interface(interface)
+        for stage in stages:
+            if interface[stage.kind]["name"] != stage.name or interface[stage.kind]["stage"] != stage.kind:
+                raise CompileError(f"Reflected entry does not match the declared {stage.kind} stage {stage.name!r}.")
         manifest = {
             "schema_version": PIPELINE_SCHEMA_VERSION,
             "target": target.value,

@@ -2,6 +2,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Verifier.h"
@@ -39,8 +40,8 @@ void GfxDialect::initialize() {
 
 void mlir::gfx::registerGfxDialects(DialectRegistry &registry) {
   registry.insert<GfxDialect, arith::ArithDialect, func::FuncDialect,
-                  vector::VectorDialect, math::MathDialect, spirv::SPIRVDialect,
-                  LLVM::LLVMDialect>();
+                  vector::VectorDialect, math::MathDialect, scf::SCFDialect,
+                  spirv::SPIRVDialect, LLVM::LLVMDialect>();
   registerLLVMDialectTranslation(registry);
   registerBuiltinDialectTranslation(registry);
 }

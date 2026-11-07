@@ -18,7 +18,7 @@ generate shading-language source.
 | Path | Implementation | Verification |
 | --- | --- | --- |
 | Python → structured graph → native `gfx` MLIR | Implemented | TableGen/ODS operations, types, attributes, native builders and verifiers |
-| `gfx` → upstream MLIR SPIR-V → `.spv` | Implemented | Native conversion pass, upstream arithmetic/vector patterns and binary serializer; Vulkan 1.0 validation |
+| `gfx` → upstream MLIR SPIR-V → `.spv` | Implemented | Upstream arithmetic/vector/math/function/SCF conversion and binary serializer; Vulkan 1.0 validation |
 | `gfx` → MLIR LLVM → LLVM DirectX backend | Implemented | LLVM main/24.0.0git, modern DirectX intrinsics, upstream signature helpers and DXIL/container emission |
 | DXIL validation/signing | Microsoft native validator API | The compiler validates/signs LLVM-produced containers; no HLSL parser or textual IR patching |
 | DXIL → `.metallib` | Metal Shader Converter adapter | Tested with converter 3.0, preserving entry-point names |
@@ -69,7 +69,7 @@ implementation.
 This is the graphics-first starting point of the unified-dialect roadmap, not a
 claim that its later milestones are complete. Compute has a distinct entry-point
 contract from day one. Pointer-first/bindless memory lowering, shared host/device
-struct layouts, structured control flow, native host-language frontends, mesh/task
+struct layouts, Python structured control flow, native host-language frontends, mesh/task
 execution, ray queries and differentiation remain future work with explicit
 capability boundaries.
 
@@ -350,6 +350,46 @@ or `Vertex(position, varyings={"name": value, ...})`.
 through `Pipeline`; a fragment shader may also take no inputs. Fragment outputs
 are device values or a mapping of named render targets. The compiler links their
 interfaces from native reflection; the preview currently supports one `f32x4` target.
+
+### Native MLIR and Vulkan device loops
+
+`MLIRPipeline` accepts vertex/fragment MLIR files and their declared entry names,
+using the same validated artifact, reflection, and viewer pipeline as Python
+authoring. Entry names/stages must match native reflection. Missing files,
+malformed IR, unsupported target operations, and interface mismatches fail
+before publishing the output directory.
+
+Vulkan lowering now supports native `scf.for`, `scf.while`, `scf.if`, and
+direct calls to defined, nonrecursive helpers with at most one result.
+Helpers may return vectors; loops carry multiple scalars/vectors. Use structured
+regions, not raw multi-block CFGs or indirect/recursive calls. Shader IO belongs
+to the marked entry; helpers are ordinary functions. The compiler converts only
+the reachable call graph and resolves reflection by the marked entry, not
+function order. Upstream SPIR-V conversion performs function/signature and
+structured merge/loop legalization.
+
+[The Vulkan loop example](examples/vulkan_loops.py) loads a native
+[sphere marcher](examples/ir/sphere_march.mlir). It executes a bounded GPU while
+loop with early hit/miss termination, a distance helper, a nested conditional,
+and carried iteration/distance/hit/glow state:
+
+```sh
+LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
+  .venv/bin/python -m mlir_gpu examples/vulkan_loops.py \
+  --target vulkan --output build/vulkan-loops
+DYLD_LIBRARY_PATH=/usr/local/lib .venv/bin/mlir-gpu-view \
+  build/vulkan-loops/pipeline.json --width 256 --height 256 -frames 0 --validation
+```
+
+The example intentionally uses a fixed pixel camera centered at `(128, 128)`;
+it is not resize-aware or animated until frame resources land. It performs at
+most 64 iterations per pixel. Increasing the cap changes the loop bound, not
+shader-body duplication. The bound is authored in IR; the compiler does not
+guarantee termination for arbitrary native programs.
+
+Python `if`/loops on device values, DirectX/Metal structured-loop lowering, and
+the extended JSON region/function importer remain separate pending work.
+The native Vulkan example is not claimed to run on those other targets yet.
 
 ### Arithmetic and vectors
 

@@ -28,9 +28,9 @@ add_mlir_library(GfxCompiler
   DEPENDS GfxIncGen
   LINK_COMPONENTS FrontendHLSL
   LINK_LIBS PUBLIC
-  MLIRIR MLIRParser MLIRTransforms MLIRArithDialect MLIRFuncDialect MLIRVectorDialect MLIRMathDialect
+  MLIRIR MLIRParser MLIRTransforms MLIRArithDialect MLIRFuncDialect MLIRVectorDialect MLIRMathDialect MLIRSCFDialect
   MLIRSPIRVDialect MLIRLLVMDialect MLIRArithToSPIRV MLIRVectorToSPIRV
-  MLIRSPIRVSerialization MLIRArithToLLVM MLIRFuncToLLVM MLIRVectorToLLVMPass MLIRMathToLLVM MLIRMathToSPIRV
+  MLIRSPIRVSerialization MLIRArithToLLVM MLIRFuncToLLVM MLIRVectorToLLVMPass MLIRMathToLLVM MLIRMathToSPIRV MLIRSCFToSPIRV MLIRFuncToSPIRV
   MLIRReconcileUnrealizedCasts MLIRBuiltinToLLVMIRTranslation MLIRLLVMToLLVMIRTranslation MLIRTargetLLVMIRExport)
 
 add_llvm_executable(gfx-opt tools/gfx-opt.cpp)

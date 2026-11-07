@@ -4,7 +4,7 @@ import runpy
 import sys
 from pathlib import Path
 
-from .compiler import CompileError, Target, Toolchain, compile_pipeline
+from .compiler import CompileError, MLIRPipeline, Target, Toolchain, compile_pipeline
 from .frontend import Pipeline
 
 
@@ -19,8 +19,8 @@ def main() -> int:
     try:
         namespace = runpy.run_path(str(args.program))
         pipeline = namespace.get("pipeline")
-        if not isinstance(pipeline, Pipeline):
-            raise CompileError("The program must define 'pipeline = Pipeline(vertex_entry, fragment_entry)'.")
+        if not isinstance(pipeline, (Pipeline, MLIRPipeline)):
+            raise CompileError("The program must define a Pipeline or MLIRPipeline named 'pipeline'.")
         manifest = compile_pipeline(
             pipeline, Target(args.target), args.output, Toolchain(args.llvm_bin, args.tools_bin)
         )

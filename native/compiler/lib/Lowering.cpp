@@ -2,9 +2,11 @@
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ArithToSPIRV/ArithToSPIRV.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
+#include "mlir/Conversion/FuncToSPIRV/FuncToSPIRV.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/MathToSPIRV/MathToSPIRV.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+#include "mlir/Conversion/SCFToSPIRV/SCFToSPIRV.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
 #include "mlir/Conversion/VectorToSPIRV/VectorToSPIRV.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -14,13 +16,16 @@
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/SPIRV/Transforms/SPIRVConversion.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Frontend/HLSL/SemanticSignatures.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include <functional>
 
 namespace mlir::gfx {
 #define GEN_PASS_DEF_GFXTOSPIRV
@@ -49,16 +54,6 @@ LogicalResult graphicsEntry(ModuleOp module, func::FuncOp &function,
   return success();
 }
 
-class ReturnToSPIRV : public OpRewritePattern<func::ReturnOp> {
-public:
-  using OpRewritePattern::OpRewritePattern;
-  LogicalResult matchAndRewrite(func::ReturnOp op,
-                                PatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<spirv::ReturnOp>(op);
-    return success();
-  }
-};
-
 struct GfxVerifyPass : impl::GfxVerifyBase<GfxVerifyPass> {
   void runOnOperation() override {
     if (failed(verifyShaderModule(getOperation())))
@@ -77,9 +72,41 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
     }
     auto *context = module.getContext();
     auto location = function.getLoc();
+    llvm::SmallPtrSet<Operation *, 8> active, visited;
+    SmallVector<func::FuncOp> reachable;
+    std::function<LogicalResult(func::FuncOp)> visit =
+        [&](func::FuncOp current) -> LogicalResult {
+      if (active.contains(current))
+        return current.emitOpError("recursive shader calls are unsupported");
+      if (!visited.insert(current).second)
+        return success();
+      if (current.isExternal() || !current.getBody().hasOneBlock() ||
+          current.getFunctionType().getNumResults() > 1)
+        return current.emitOpError("Vulkan helpers require a single structured "
+                                   "body and at most one result");
+      active.insert(current);
+      auto calls = current.walk([&](func::CallOp call) {
+        auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
+        if (!callee || (callee != function && callee->hasAttr("gfx.stage"))) {
+          call.emitOpError("requires a defined ordinary shader helper");
+          return WalkResult::interrupt();
+        }
+        if (failed(visit(callee)))
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      });
+      active.erase(current);
+      reachable.push_back(current);
+      return calls.wasInterrupted() ? failure() : success();
+    };
+    if (failed(visit(function))) {
+      signalPassFailure();
+      return;
+    }
+    auto entryName = function.getSymName().str();
     OpBuilder builder(context);
     // SPIR-V 1.0 requires a componentwise predicate for vector selects.
-    function.walk([&](arith::SelectOp select) {
+    module.walk([&](arith::SelectOp select) {
       auto vectorType = dyn_cast<VectorType>(select.getType());
       if (vectorType && select.getCondition().getType().isInteger(1)) {
         builder.setInsertionPoint(select);
@@ -98,14 +125,16 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
     auto shader = spirv::ModuleOp::create(builder, location,
                                           spirv::AddressingModel::Logical,
                                           spirv::MemoryModel::GLSL450, version);
-    builder.setInsertionPointToEnd(shader.getBody());
-    auto converted = spirv::FuncOp::create(
-        builder, location, function.getSymName(), function.getFunctionType());
-    converted.getBody().takeBody(function.getBody());
-    function.erase();
+    function->removeAttr("gfx.stage");
+    for (auto helper : reachable)
+      helper->moveBefore(shader.getBody(), shader.getBody()->end());
+    for (auto helper :
+         llvm::make_early_inc_range(module.getOps<func::FuncOp>()))
+      helper.erase();
+    SymbolTable symbols(shader);
     SmallVector<Attribute> interface;
     SmallVector<Operation *> operations;
-    converted.walk([&](Operation *op) {
+    function.walk([&](Operation *op) {
       if (isa<BuiltinOp, InputOp, OutputOp, PositionOp>(op))
         operations.push_back(op);
     });
@@ -122,10 +151,11 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       auto pointerType =
           spirv::PointerType::get(type, input ? spirv::StorageClass::Input
                                               : spirv::StorageClass::Output);
-      builder.setInsertionPoint(converted);
+      builder.setInsertionPoint(function);
       auto variable = spirv::GlobalVariableOp::create(
           builder, op->getLoc(), pointerType,
           "interface_" + std::to_string(nextSymbol++));
+      symbols.insert(variable);
       if (isa<BuiltinOp>(op))
         variable->setAttr(
             "built_in",
@@ -172,6 +202,22 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       }
       op->erase();
     }
+    SPIRVTypeConverter converter(target);
+    RewritePatternSet patterns(context);
+    ScfToSPIRVContext scfContext;
+    arith::populateArithToSPIRVPatterns(converter, patterns);
+    populateMathToSPIRVPatterns(converter, patterns);
+    populateVectorToSPIRVPatterns(converter, patterns);
+    populateBuiltinFuncToSPIRVPatterns(converter, patterns);
+    populateFuncToSPIRVPatterns(converter, patterns);
+    populateSCFToSPIRVPatterns(converter, scfContext, patterns);
+    auto legality = SPIRVConversionTarget::get(target);
+    legality->addLegalOp<ModuleOp>();
+    if (failed(applyFullConversion(module, *legality, std::move(patterns)))) {
+      signalPassFailure();
+      return;
+    }
+    auto converted = shader.lookupSymbol<spirv::FuncOp>(entryName);
     builder.setInsertionPointToEnd(shader.getBody());
     spirv::EntryPointOp::create(builder, location,
                                 stage == Stage::Vertex
@@ -182,16 +228,6 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       spirv::ExecutionModeOp::create(builder, location, converted,
                                      spirv::ExecutionMode::OriginUpperLeft,
                                      ArrayRef<int32_t>{});
-    SPIRVTypeConverter converter(target);
-    RewritePatternSet patterns(context);
-    arith::populateArithToSPIRVPatterns(converter, patterns);
-    populateMathToSPIRVPatterns(converter, patterns);
-    populateVectorToSPIRVPatterns(converter, patterns);
-    patterns.add<ReturnToSPIRV>(context);
-    auto legality = SPIRVConversionTarget::get(target);
-    legality->addLegalOp<ModuleOp>();
-    if (failed(applyFullConversion(module, *legality, std::move(patterns))))
-      signalPassFailure();
   }
 };
 
