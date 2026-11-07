@@ -11,7 +11,7 @@
 using namespace mlir;
 using namespace mlir::gfx;
 
-static Type parseType(MLIRContext &context, StringRef name) {
+Type mlir::gfx::parseShaderType(MLIRContext &context, StringRef name) {
   if (name == "f32")
     return Float32Type::get(&context);
   if (name == "u32" || name == "i32")
@@ -32,7 +32,7 @@ static std::string typeName(Type type) {
   return type.isInteger(1) ? "bool" : "u32";
 }
 
-static bool symbolName(StringRef name) {
+bool mlir::gfx::isShaderSymbolName(StringRef name) {
   if (name.empty() || !(llvm::isAlpha(name.front()) || name.front() == '_'))
     return false;
   return llvm::all_of(name.drop_front(),
@@ -50,6 +50,17 @@ static InterpolationAttr interpolation(OpBuilder &builder,
 OwningOpRef<ModuleOp>
 mlir::gfx::importShader(MLIRContext &context,
                         const llvm::json::Object &source) {
+  if (source.get("schema_version")) {
+    auto version = source.getInteger("schema_version");
+    if (version && *version == 2)
+      return importStructuredShader(context, source);
+    if (!version || *version != 1) {
+      emitError(UnknownLoc::get(&context),
+                "supported shader input versions are 1 (flat graph) and "
+                "2 (structured module); migrate to a supported version");
+      return {};
+    }
+  }
   OpBuilder builder(&context);
   Location location = builder.getUnknownLoc();
   if (auto file = source.getString("source_file")) {
@@ -70,7 +81,7 @@ mlir::gfx::importShader(MLIRContext &context,
   auto inputDescriptions = source.getArray("inputs");
   auto outputDescriptions = source.getArray("outputs");
   auto nodes = source.getArray("nodes");
-  if (!name || !symbolName(*name) || !stage || !inputDescriptions ||
+  if (!name || !isShaderSymbolName(*name) || !stage || !inputDescriptions ||
       !outputDescriptions || !nodes)
     return error("shader requires a valid name, stage, inputs, outputs, and "
                  "typed node graph");
@@ -97,7 +108,7 @@ mlir::gfx::importShader(MLIRContext &context,
   for (const auto &description : *inputDescriptions) {
     auto io = description.getAsObject();
     auto typeString = io ? io->getString("type") : std::nullopt;
-    Type type = typeString ? parseType(context, *typeString) : Type{};
+    Type type = typeString ? parseShaderType(context, *typeString) : Type{};
     if (!io || !type)
       return error("input requires a supported scalar/vector type");
     if (auto builtinName = io->getString("builtin")) {
@@ -111,7 +122,7 @@ mlir::gfx::importShader(MLIRContext &context,
       auto label = io->getString("name");
       auto mode = interpolation(builder, *io);
       if (!index || *index < 0 || *index > INT32_MAX || !label ||
-          !symbolName(*label) || !mode)
+          !isShaderSymbolName(*label) || !mode)
         return error("input requires a nonnegative location, name, and "
                      "interpolation rule");
       inputs.push_back(InputOp::create(builder, location, type,
@@ -124,7 +135,7 @@ mlir::gfx::importShader(MLIRContext &context,
     auto node = description.getAsObject();
     auto operation = node ? node->getString("op") : std::nullopt;
     auto typeString = node ? node->getString("type") : std::nullopt;
-    Type type = typeString ? parseType(context, *typeString) : Type{};
+    Type type = typeString ? parseShaderType(context, *typeString) : Type{};
     if (!node || !operation || !type)
       return error("node requires a known operation and scalar/vector type");
     SmallVector<Value> arguments;
@@ -383,7 +394,8 @@ mlir::gfx::importShader(MLIRContext &context,
     if (!io || !id || *id < 0 || static_cast<uint64_t>(*id) >= values.size())
       return error("output must reference a valid graph value");
     auto typeString = io->getString("type");
-    if (!typeString || parseType(context, *typeString) != values[*id].getType())
+    if (!typeString ||
+        parseShaderType(context, *typeString) != values[*id].getType())
       return error("output type does not match its value");
     if (auto builtin = io->getString("builtin")) {
       if (*builtin != "position")
@@ -394,7 +406,7 @@ mlir::gfx::importShader(MLIRContext &context,
       auto label = io->getString("name");
       auto mode = interpolation(builder, *io);
       if (!index || *index < 0 || *index > INT32_MAX || !label ||
-          !symbolName(*label) || !mode)
+          !isShaderSymbolName(*label) || !mode)
         return error("output requires a nonnegative location, name, and "
                      "interpolation rule");
       OutputOp::create(builder, location, values[*id],

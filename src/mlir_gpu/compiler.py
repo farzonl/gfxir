@@ -34,7 +34,7 @@ class _MLIRStage:
 
 @dataclass(frozen=True)
 class MLIRPipeline:
-    """Native MLIR stage sources using the same artifact and viewer contract."""
+    """Textual MLIR or structured JSON using the same artifact/viewer contract."""
 
     vertex: Path
     fragment: Path
@@ -137,7 +137,8 @@ def convert_dxil_to_metallib(dxil: Path, metallib: Path, entry_point: str, conve
 def _compile_stage(stage: Stage | _MLIRStage, target: Target, directory: Path, tools: dict[str, str]) -> str:
     stem = stage.kind
     native = isinstance(stage, _MLIRStage)
-    source = directory / f"{stem}.{'mlir' if native else 'json'}"
+    input_format = "json" if not native or stage.source.suffix.lower() == ".json" else "mlir"
+    source = directory / f"{stem}.{input_format}"
     if native:
         try:
             shutil.copyfile(stage.source, source)
@@ -148,7 +149,7 @@ def _compile_stage(stage: Stage | _MLIRStage, target: Target, directory: Path, t
     reflection = directory / f"{stem}.reflection.json"
     output = directory / f"{stem}.{'spv' if target == Target.VULKAN else 'll'}"
     _run([
-        tools["gfx-compile"], str(source), "--input-format", "mlir" if native else "json",
+        tools["gfx-compile"], str(source), "--input-format", input_format,
         "--target", "vulkan" if target == Target.VULKAN else "directx",
         "--output", str(output), "--ir-output", str(directory / f"{stem}.mlir"),
         "--lowered-output", str(directory / f"{stem}.lowered.mlir"), "--reflection", str(reflection),

@@ -1,5 +1,6 @@
 #include "Gfx/Gfx.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
@@ -10,6 +11,7 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -41,9 +43,10 @@ void GfxDialect::initialize() {
 }
 
 void mlir::gfx::registerGfxDialects(DialectRegistry &registry) {
-  registry.insert<GfxDialect, arith::ArithDialect, func::FuncDialect,
-                  vector::VectorDialect, math::MathDialect, scf::SCFDialect,
-                  spirv::SPIRVDialect, LLVM::LLVMDialect>();
+  registry
+      .insert<GfxDialect, arith::ArithDialect, func::FuncDialect,
+              vector::VectorDialect, math::MathDialect, scf::SCFDialect,
+              cf::ControlFlowDialect, spirv::SPIRVDialect, LLVM::LLVMDialect>();
   registerLLVMDialectTranslation(registry);
   registerBuiltinDialectTranslation(registry);
   func::registerInlinerExtension(registry);
@@ -168,12 +171,25 @@ LogicalResult mlir::gfx::verifyShaderModule(ModuleOp module) {
         !function->hasAttr("gfx.workgroup_size"))
       return function.emitOpError(
           "compute entry points require gfx.workgroup_size");
-    llvm::SmallSet<int32_t, 8> inputs, outputs;
+    llvm::SmallDenseMap<int32_t, InputOp> inputs;
+    llvm::SmallSet<int32_t, 8> outputs;
     unsigned positions = 0;
     WalkResult result = function.walk([&](Operation *op) {
+      if (isa<InputOp, OutputOp, PositionOp, BuiltinOp>(op) &&
+          op->getBlock() != &function.getBody().front()) {
+        op->emitOpError("stage IO must be in the entry block, outside "
+                        "control-flow regions");
+        return WalkResult::interrupt();
+      }
       if (auto input = dyn_cast<InputOp>(op)) {
-        if (!inputs.insert(input.getLocation()).second) {
-          input.emitOpError("duplicate input location");
+        auto [existing, inserted] =
+            inputs.try_emplace(input.getLocation(), input);
+        if (!inserted &&
+            (existing->second.getValue().getType() !=
+                 input.getValue().getType() ||
+             existing->second.getName() != input.getName() ||
+             existing->second.getInterpolation() != input.getInterpolation())) {
+          input.emitOpError("conflicting declarations for input location");
           return WalkResult::interrupt();
         }
       } else if (auto output = dyn_cast<OutputOp>(op)) {
