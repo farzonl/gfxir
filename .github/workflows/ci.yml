@@ -33,7 +33,7 @@ jobs:
       - name: Install Python package and viewer dependencies
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install -e '.[viewer]' lit
+          python3 -m pip install -e '.[viewer,video]' lit
 
       - name: Install system packages (Linux)
         if: runner.os == 'Linux'
