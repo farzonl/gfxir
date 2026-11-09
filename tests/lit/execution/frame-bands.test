@@ -1,0 +1,3 @@
+# REQUIRES: image_execution
+# RUN: %python %S/Inputs/render_shader.py frame_bands %t.frame-bands.png --target GFXIR_LIT_EXECUTION_TARGETS --width 256 --height 256 --time 1.25
+# RUN: %python %S/Inputs/imgdiff.py %S/Inputs/goldens/common/frame-bands.png %t.frame-bands.png --target GFXIR_LIT_EXECUTION_TARGETS --rules %S/Inputs/golden-rules.yaml

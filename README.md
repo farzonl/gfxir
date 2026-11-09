@@ -87,9 +87,11 @@ capability boundaries.
 ## Try it
 
 Python 3.11+ is sufficient for the authoring API and host unit tests; the core
-Python package has no mandatory Python dependencies. Compilation requires the
-native compiler and a matching LLVM/MLIR toolchain. The installed Homebrew LLVM
-21 does not contain the DirectX backend. Build a separate pinned main checkout:
+Python package has no mandatory dependencies. The optional `test` extra supplies
+lit and the PNG/YAML libraries used by the execution-test pilot. Compilation
+requires the native compiler and a matching LLVM/MLIR toolchain. The installed
+Homebrew LLVM 21 does not contain the DirectX backend. Build a separate pinned
+main checkout:
 
 ```sh
 python3 tools/build_toolchain.py --jobs 8
@@ -239,6 +241,34 @@ core tools fail suite configuration rather than silently skipping compiler
 coverage. Optional tools (`spirv-val`, `llc`, `dxv`, `dxil-assemble`, and
 `metal-shaderconverter`) gate only the tests that need them via `REQUIRES`.
 No Python FileCheck replacement is used.
+
+The lit execution tests in [tests/lit/execution](tests/lit/execution) compile
+and render the triangle, quad, fragment-coordinate, and fixed-time frame-band
+examples offscreen, then compare their PNGs with checked-in shared goldens
+using CIE76 color difference rules. When Metal execution is enabled on macOS,
+the same lit tests also compile DXIL, convert it with Metal Shader Converter,
+render it through Metal, and compare the result to those same shared references.
+Each test has one render `RUN` line followed by one image-diff `RUN` line.
+Lit sets `GFXIR_LIT_EXECUTION_TARGETS` to the configured backends, and both
+commands use that list to render and compare each backend against the shared
+golden.
+Vulkan and Metal execution are independently gated by `MLIR_GPU_TEST_VULKAN=1`
+and `MLIR_GPU_TEST_METAL=1`; CI enables the applicable paths alongside the
+existing Python GPU tests. Install the test dependencies with
+`python -m pip install -e '.[viewer,video,test]'`. To capture a replacement
+golden, render the example to a new PNG path and review the image before
+replacing its reference; golden updates should not be used to bless an
+uninvestigated rendering change. Run the focused execution tests with:
+
+```sh
+PYTHONPATH="$PWD/src" LLVM_BIN="$PWD/.toolchains/llvm-build/bin" \
+  MLIR_GPU_TEST_VULKAN=1 MLIR_GPU_TEST_METAL=1 \
+  .venv/bin/lit -sv tests/lit/execution
+```
+
+Metal tests run on macOS only when the Metal converter, native viewer, and
+Metal-capable device are available; ensure `.tools/bin` and the converter's
+directory are on `PATH`.
 
 ```sh
 cmake --build .toolchains/llvm-build --target check-gfx

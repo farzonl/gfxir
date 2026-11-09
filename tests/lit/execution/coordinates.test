@@ -1,0 +1,3 @@
+# REQUIRES: image_execution
+# RUN: %python %S/Inputs/render_shader.py coordinates %t.coordinates.png --target GFXIR_LIT_EXECUTION_TARGETS --width 256 --height 256
+# RUN: %python %S/Inputs/imgdiff.py %S/Inputs/goldens/common/coordinates.png %t.coordinates.png --target GFXIR_LIT_EXECUTION_TARGETS --rules %S/Inputs/golden-rules.yaml
