@@ -4,6 +4,9 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -14,6 +17,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <glaze/glaze.hpp>
 
 using Microsoft::WRL::ComPtr;
 
@@ -31,6 +36,22 @@ static UINT number(const std::wstring& text, UINT maximum) {
     return static_cast<UINT>(value);
 }
 
+static double seconds(const std::wstring& text) {
+    if (text.empty())
+        throw std::runtime_error("Time must be finite, nonnegative f32 seconds");
+    size_t consumed = 0;
+    double result = 0;
+    try {
+        result = std::stod(text, &consumed);
+    } catch (...) {
+        throw std::runtime_error("Time must be finite, nonnegative f32 seconds");
+    }
+    if (consumed != text.size() || !std::isfinite(result) || result < 0 ||
+        result > 3.4028234663852886e38)
+        throw std::runtime_error("Time must be finite, nonnegative f32 seconds");
+    return result;
+}
+
 static std::vector<char> shader(const std::wstring& path) {
     std::ifstream input(std::filesystem::path(path), std::ios::binary);
     if (!input) throw std::runtime_error("Cannot open DXIL shader");
@@ -46,14 +67,14 @@ static std::string deviceName(const wchar_t* text) {
     std::vector<char> result(size);
     if (!WideCharToMultiByte(CP_UTF8, 0, text, -1, result.data(), size, nullptr, nullptr))
         throw std::runtime_error("Cannot encode the device name");
-    std::string escaped;
-    for (unsigned char byte : std::string(result.data())) {
-        if (byte == '"' || byte == '\\') escaped += '\\';
-        if (byte < 32) throw std::runtime_error("Invalid control character in device name");
-        escaped += static_cast<char>(byte);
-    }
-    return escaped;
+    return std::string(result.data());
 }
+
+struct ReadbackReport {
+    std::string device;
+    UINT width;
+    UINT height;
+};
 
 struct Event {
     HANDLE handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -80,6 +101,10 @@ class Renderer {
     UINT64 fenceValue = 0;
     UINT vertexCount;
     std::string name;
+    bool hasFrameConstants = false;
+    bool hasFixedTime = false;
+    double fixedTime = 0.0;
+    std::chrono::steady_clock::time_point started;
 
     void validationErrors() {
         if (!diagnostics) return;
@@ -125,10 +150,21 @@ class Renderer {
         commands->ResourceBarrier(1, &transition);
     }
 
-    void draw(ID3D12Resource* target, UINT width, UINT height) {
+    void draw(ID3D12Resource* target, UINT width, UINT height, double elapsed) {
         auto handle = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         device->CreateRenderTargetView(target, nullptr, handle);
         commands->SetGraphicsRootSignature(root.Get());
+        if (hasFrameConstants) {
+            if (!std::isfinite(elapsed) || elapsed < 0 || elapsed > 3.4028234663852886e38)
+                throw std::runtime_error("Invalid elapsed frame time");
+            const float constants[4] = {
+                static_cast<float>(elapsed),
+                0.0f,
+                static_cast<float>(width),
+                static_cast<float>(height),
+            };
+            commands->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
+        }
         D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
         D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
         commands->RSSetViewports(1, &viewport);
@@ -148,8 +184,10 @@ class Renderer {
     }
 
 public:
-    Renderer(const std::wstring& vertex, const std::wstring& fragment, UINT count, bool validation)
-        : vertexCount(count) {
+    Renderer(const std::wstring& vertex, const std::wstring& fragment, UINT count, bool validation,
+             bool hasTime = false, double time = 0.0)
+        : vertexCount(count), hasFixedTime(hasTime), fixedTime(time),
+          started(std::chrono::steady_clock::now()) {
         if (validation) {
             ComPtr<ID3D12Debug1> debug;
             check(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)),
@@ -167,7 +205,7 @@ public:
             check(status, "EnumAdapterByGpuPreference");
             DXGI_ADAPTER_DESC1 description{};
             check(adapter->GetDesc1(&description), "GetDesc1");
-            if (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+            if ((description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || description.VendorId == 0x1414) continue;
             status = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device));
             if (status == DXGI_ERROR_UNSUPPORTED || status == E_INVALIDARG) continue;
             check(status, "D3D12CreateDevice");
@@ -188,18 +226,43 @@ public:
         check(device->CreateCommandQueue(&queueDescription, IID_PPV_ARGS(&queue)), "CreateCommandQueue");
         check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
               "CreateCommandAllocator");
-        D3D12_ROOT_SIGNATURE_DESC rootDescription{};
-        rootDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-        ComPtr<ID3DBlob> serialized, errors;
-        HRESULT status = D3D12SerializeRootSignature(
-            &rootDescription, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
-        if (FAILED(status) && errors)
-            throw std::runtime_error(std::string(static_cast<const char*>(errors->GetBufferPointer()),
-                                                errors->GetBufferSize()));
-        check(status, "D3D12SerializeRootSignature");
-        check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
-                                          IID_PPV_ARGS(&root)), "CreateRootSignature");
+
         auto vs = shader(vertex), ps = shader(fragment);
+
+        for (const auto* bytecode : {&vs, &ps}) {
+            ComPtr<ID3D12VersionedRootSignatureDeserializer> deserializer;
+            if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(
+                    bytecode->data(), bytecode->size(), IID_PPV_ARGS(&deserializer)))) {
+                const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc =
+                    deserializer->GetUnconvertedRootSignatureDesc();
+                UINT numParams = (desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_1)
+                                     ? desc->Desc_1_1.NumParameters
+                                     : desc->Desc_1_0.NumParameters;
+                HRESULT status = device->CreateRootSignature(
+                    0, bytecode->data(), bytecode->size(), IID_PPV_ARGS(&root));
+                if (SUCCEEDED(status)) {
+                    hasFrameConstants = numParams > 0;
+                    break;
+                }
+                if (diagnostics) diagnostics->ClearStoredMessages();
+            }
+        }
+
+        if (!root) {
+            D3D12_ROOT_SIGNATURE_DESC rootDescription{};
+            rootDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+            ComPtr<ID3DBlob> serialized, errors;
+            HRESULT status = D3D12SerializeRootSignature(
+                &rootDescription, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
+            if (FAILED(status) && errors)
+                throw std::runtime_error(std::string(static_cast<const char*>(errors->GetBufferPointer()),
+                                                    errors->GetBufferSize()));
+            check(status, "D3D12SerializeRootSignature");
+            check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                              IID_PPV_ARGS(&root)), "CreateRootSignature");
+        }
+
         D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
         description.pRootSignature = root.Get();
         description.VS = {vs.data(), vs.size()};
@@ -225,7 +288,7 @@ public:
         description.NumRenderTargets = 1;
         description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         description.SampleDesc.Count = 1;
-        status = device->CreateGraphicsPipelineState(&description, IID_PPV_ARGS(&pipeline));
+        HRESULT status = device->CreateGraphicsPipelineState(&description, IID_PPV_ARGS(&pipeline));
         validationErrors();
         check(status, "CreateGraphicsPipelineState (compiled DXIL)");
         D3D12_DESCRIPTOR_HEAP_DESC heap{};
@@ -265,8 +328,9 @@ public:
         storage.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &storage,
             D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)), "Create readback buffer");
+        double elapsed = hasFixedTime ? fixedTime : 0.0;
         begin();
-        draw(target.Get(), width, height);
+        draw(target.Get(), width, height, elapsed);
         barrier(target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
         source.pResource = target.Get();
@@ -276,10 +340,10 @@ public:
         destination.PlacedFootprint = footprint;
         commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
         submit();
+        std::vector<char> rgba(static_cast<size_t>(width) * height * 4);
         void* mapped = nullptr;
         D3D12_RANGE range{0, static_cast<SIZE_T>(size)};
         check(buffer->Map(0, &range, &mapped), "Map readback");
-        std::vector<char> rgba(static_cast<size_t>(width) * height * 4);
         for (UINT row = 0; row < height; ++row)
             std::memcpy(rgba.data() + static_cast<size_t>(row) * width * 4,
                         static_cast<char*>(mapped) + footprint.Offset +
@@ -292,8 +356,7 @@ public:
         output.write(rgba.data(), rgba.size());
         output.close();
         if (!output) throw std::runtime_error("Cannot write RGBA readback output");
-        std::cout << "{\"device\":\"" << name << "\",\"width\":" << width
-                  << ",\"height\":" << height << "}\n";
+        std::cout << glz::write_json(ReadbackReport{name, width, height}).value_or("{}") << "\n";
     }
 
     void window(HWND window, UINT width, UINT height, UINT limit) {
@@ -347,12 +410,14 @@ public:
                 width = currentWidth;
                 height = currentHeight;
             }
+            double elapsed = hasFixedTime ? fixedTime :
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             ComPtr<ID3D12Resource> target;
             check(swapchain->GetBuffer(swapchain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&target)),
                   "Get swapchain buffer");
             begin();
             barrier(target.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            draw(target.Get(), width, height);
+            draw(target.Get(), width, height, elapsed);
             barrier(target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
             submit();
             HRESULT status = swapchain->Present(1, 0);
@@ -388,13 +453,14 @@ int wmain(int argc, wchar_t** argv) {
         for (int index = 1; index < argc; ++index) {
             std::wstring key = argv[index];
             if (key == L"--validation") {
+                if (validation) throw std::runtime_error("Missing or duplicate native viewer argument");
                 validation = true;
                 continue;
             }
             if (key == L"-frames") key = L"--frames";
             if (key != L"--vertex" && key != L"--fragment" && key != L"--width" &&
                 key != L"--height" && key != L"--frames" && key != L"--vertex-count" &&
-                key != L"--readback")
+                key != L"--readback" && key != L"--time")
                 throw std::runtime_error("Unknown native DirectX viewer argument");
             if (++index == argc || !options.emplace(key, argv[index]).second)
                 throw std::runtime_error("Missing or duplicate native viewer argument");
@@ -409,7 +475,12 @@ int wmain(int argc, wchar_t** argv) {
             throw std::runtime_error("Dimensions must be positive; vertex count must be a positive multiple of three");
         if (options.count(L"--readback") && options.count(L"--frames"))
             throw std::runtime_error("--readback and --frames are mutually exclusive");
-        Renderer renderer(options.at(L"--vertex"), options.at(L"--fragment"), count, validation);
+
+        bool hasTime = options.count(L"--time") != 0;
+        double fixedTime = hasTime ? seconds(options.at(L"--time")) : 0.0;
+
+        Renderer renderer(options.at(L"--vertex"), options.at(L"--fragment"), count, validation,
+                          hasTime, fixedTime);
         if (options.count(L"--readback")) {
             renderer.readback(width, height, options.at(L"--readback"));
         } else {

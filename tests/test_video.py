@@ -3,12 +3,13 @@ import io
 import os
 import runpy
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mlir_gpu import Target, compile_pipeline
+from mlir_gpu import Target, Toolchain, compile_pipeline
 from mlir_gpu.viewer import (
     GraphicsProgram, RenderedImage, Shader, ViewerError, _Vulkan, _video_encoder,
     export_mp4, load_program, main, render_offscreen,
@@ -28,6 +29,14 @@ class FakeEncoder:
     def __init__(self, arguments, **kwargs):
         self.arguments = arguments
         self.stdin = io.BytesIO()
+        self.written_bytes = bytearray()
+        orig_write = self.stdin.write
+
+        def record_write(data):
+            self.written_bytes.extend(data)
+            return orig_write(data)
+
+        self.stdin.write = record_write
         self.returncode = None
         self.terminated = False
         self.payload = b"\0\0\0\x20ftypisom" + bytes(32)
@@ -141,6 +150,49 @@ class VideoTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), b"keep")
         self.assertEqual(list(self.directory.iterdir()), [self.path])
 
+    def test_mp4_publication_falls_back_when_link_fails(self):
+        with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):
+            with patch("mlir_gpu.viewer._offscreen_renderer", side_effect=self.renderer):
+                with patch("mlir_gpu.viewer.os.link", side_effect=PermissionError("hard link forbidden")) as mock_link:
+                    self.assertEqual(export_mp4(self.program, self.path, 16, 12, duration=0.25, fps=4), 1)
+                    mock_link.assert_called_once()
+        self.assertTrue(self.path.is_file())
+        self.assertEqual(list(self.directory.iterdir()), [self.path])
+
+    def test_mp4_publication_falls_back_to_copy_when_link_and_rename_fail(self):
+        with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):
+            with patch("mlir_gpu.viewer._offscreen_renderer", side_effect=self.renderer):
+                with patch("mlir_gpu.viewer.os.link", side_effect=PermissionError("hard link forbidden")):
+                    with patch("mlir_gpu.viewer.os.rename", side_effect=OSError("cross-device link")):
+                        self.assertEqual(export_mp4(self.program, self.path, 16, 12, duration=0.25, fps=4), 1)
+        self.assertTrue(self.path.is_file())
+        self.assertEqual(list(self.directory.iterdir()), [self.path])
+
+    def test_mp4_publication_race_with_link_permission_error_never_overwrites(self):
+        def race(*args, **kwargs):
+            encoder = self.encoder(*args, **kwargs)
+            encoder.on_wait = lambda: self.path.write_bytes(b"keep")
+            return encoder
+
+        with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), patch("mlir_gpu.viewer.subprocess.Popen", side_effect=race):
+            with patch("mlir_gpu.viewer._offscreen_renderer", side_effect=self.renderer):
+                with patch("mlir_gpu.viewer.os.link", side_effect=PermissionError("hard link forbidden")):
+                    with self.assertRaisesRegex(ViewerError, "already exists"):
+                        export_mp4(self.program, self.path, 16, 12, duration=0.25, fps=4)
+        self.assertEqual(self.path.read_bytes(), b"keep")
+        self.assertEqual(list(self.directory.iterdir()), [self.path])
+
+    def test_mp4_publication_copy_failure_cleans_up_destination(self):
+        with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):
+            with patch("mlir_gpu.viewer._offscreen_renderer", side_effect=self.renderer):
+                with patch("mlir_gpu.viewer.os.link", side_effect=PermissionError("hard link forbidden")):
+                    with patch("mlir_gpu.viewer.os.rename", side_effect=OSError("cross-device link")):
+                        with patch("mlir_gpu.viewer.shutil.copyfileobj", side_effect=OSError("disk full")):
+                            with self.assertRaisesRegex(ViewerError, "Failed to publish MP4 output"):
+                                export_mp4(self.program, self.path, 16, 12, duration=0.25, fps=4)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(list(self.directory.iterdir()), [])
+
     def test_render_and_invalid_encoder_output_fail_without_partial_video(self):
         @contextlib.contextmanager
         def failed(*args):
@@ -210,18 +262,293 @@ class VideoTests(unittest.TestCase):
                     main()
                 self.assertEqual(error.exception.code, 2)
 
-    def test_directx_video_preserves_metal_routing_and_rejects_unsupported_windows_export(self):
+    def test_directx_video_routing_on_windows_and_macos_and_rejects_linux(self):
         program = GraphicsProgram(self.program.vertex, self.program.fragment, target="directx")
-        with patch("mlir_gpu.viewer.sys.platform", "win32"), patch("mlir_gpu.viewer._video_encoder") as encoder:
+        # 1. On Windows, export succeeds and routes through _directx_offscreen_renderer
+        with patch("mlir_gpu.viewer.sys.platform", "win32"):
+            with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), \
+                 patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):
+                with patch("mlir_gpu.viewer._directx_offscreen_renderer", side_effect=self.renderer) as render:
+                    self.assertEqual(export_mp4(program, self.path, 16, 12, duration=0.5, fps=4, start_time=1.25), 2)
+                    render.assert_called_once_with(program, 16, 12, False)
+        self.assertEqual(self.times, [1.25, 1.5])
+        self.assertTrue(self.cleaned)
+        self.assertTrue(self.path.is_file())
+        self.path.unlink()
+        self.times.clear()
+        self.cleaned = False
+
+        # 2. On Linux (non-Windows/non-macOS), rejects with ViewerError before launching encoder
+        with patch("mlir_gpu.viewer.sys.platform", "linux"), patch("mlir_gpu.viewer._video_encoder") as encoder:
             with self.assertRaisesRegex(ViewerError, "Native DirectX 12 MP4"):
                 export_mp4(program, self.path, 16, 12)
             encoder.assert_not_called()
+
+        # 3. On macOS, continues routing through _metal_offscreen_renderer
         with patch("mlir_gpu.viewer.sys.platform", "darwin"):
-            with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):
+            with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), \
+                 patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):
                 with patch("mlir_gpu.viewer._metal_offscreen_renderer", side_effect=self.renderer) as render:
                     self.assertEqual(export_mp4(program, self.path, 16, 12, duration=0.5, fps=4, start_time=1.25), 2)
                     render.assert_called_once_with(program, 16, 12, False)
         self.assertEqual(self.times, [1.25, 1.5])
+
+    # Backward compatibility alias
+    test_directx_video_preserves_metal_routing_and_rejects_unsupported_windows_export = (
+        test_directx_video_routing_on_windows_and_macos_and_rejects_linux
+    )
+
+    def test_directx_video_export_frame_count_dimensions_and_piping(self):
+        program = GraphicsProgram(self.program.vertex, self.program.fragment, target="directx")
+        width, height = 32, 24
+        duration, fps, start_time = 0.75, 4, 10.0
+        expected_frames = 3
+        expected_times = [10.0, 10.25, 10.5]
+        frame_size = width * height * 4
+        rendered_payloads = [bytes([(i * 37) % 256] * frame_size) for i in range(expected_frames)]
+        frame_idx = 0
+
+        @contextlib.contextmanager
+        def mock_dx_renderer(prog, w, h, val):
+            self.assertEqual(prog, program)
+            self.assertEqual((w, h), (width, height))
+            self.assertFalse(val)
+
+            def render(t):
+                nonlocal frame_idx
+                self.times.append(t)
+                p = rendered_payloads[frame_idx]
+                frame_idx += 1
+                return RenderedImage(w, h, p, "DirectX 12 (NVIDIA)")
+
+            try:
+                yield render
+            finally:
+                self.cleaned = True
+
+        with patch("mlir_gpu.viewer.sys.platform", "win32"):
+            with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), \
+                 patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):
+                with patch("mlir_gpu.viewer._directx_offscreen_renderer", side_effect=mock_dx_renderer) as mock_render:
+                    count = export_mp4(
+                        program, self.path, width, height,
+                        duration=duration, fps=fps, start_time=start_time, validation=False,
+                    )
+                    self.assertEqual(count, expected_frames)
+                    mock_render.assert_called_once_with(program, width, height, False)
+
+        self.assertEqual(self.times, expected_times)
+        self.assertTrue(self.cleaned)
+        self.assertTrue(self.path.is_file())
+
+        encoder = self.encoders[-1]
+        args = encoder.arguments
+        self.assertIn("-video_size", args)
+        self.assertEqual(args[args.index("-video_size") + 1], f"{width}x{height}")
+        self.assertIn("-framerate", args)
+        self.assertEqual(args[args.index("-framerate") + 1], str(fps))
+        self.assertIn("-frames:v", args)
+        self.assertEqual(args[args.index("-frames:v") + 1], str(expected_frames))
+        self.assertIn("-pix_fmt", args)
+        self.assertEqual(args[args.index("-pix_fmt") + 1], "yuv420p")
+        self.assertIn("-c:v", args)
+        self.assertEqual(args[args.index("-c:v") + 1], "libx264")
+        self.assertIn("-movflags", args)
+        self.assertEqual(args[args.index("-movflags") + 1], "+faststart")
+        self.assertEqual(encoder.written_bytes, b"".join(rendered_payloads))
+
+    def test_directx_video_export_validation_propagation(self):
+        program = GraphicsProgram(self.program.vertex, self.program.fragment, target="directx")
+        with patch("mlir_gpu.viewer.sys.platform", "win32"):
+            with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), \
+                 patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):
+                with patch("mlir_gpu.viewer._directx_offscreen_renderer", side_effect=self.renderer) as render:
+                    count = export_mp4(program, self.path, 16, 12, duration=0.25, fps=4, validation=True)
+                    self.assertEqual(count, 1)
+                    render.assert_called_once_with(program, 16, 12, True)
+
+    def test_directx_video_export_frame_shape_mismatch_terminates_encoder(self):
+        program = GraphicsProgram(self.program.vertex, self.program.fragment, target="directx")
+
+        @contextlib.contextmanager
+        def wrong_shape(*args):
+            yield lambda t: RenderedImage(15, 12, bytes(15 * 12 * 4), "DirectX 12")
+
+        with patch("mlir_gpu.viewer.sys.platform", "win32"):
+            with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), \
+                 patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):
+                with patch("mlir_gpu.viewer._directx_offscreen_renderer", side_effect=wrong_shape):
+                    with self.assertRaisesRegex(ViewerError, "RGBA frame"):
+                        export_mp4(program, self.path, 16, 12, duration=0.5, fps=4)
+        self.assertTrue(self.encoders[-1].terminated)
+        self.assertFalse(self.path.exists())
+
+    def test_directx_video_export_render_failure_terminates_encoder_and_cleans_up(self):
+        program = GraphicsProgram(self.program.vertex, self.program.fragment, target="directx")
+        call_count = 0
+
+        @contextlib.contextmanager
+        def failing_renderer(*args):
+            def render(t):
+                nonlocal call_count
+                call_count += 1
+                if call_count >= 2:
+                    raise ViewerError("DirectX 12 GPU command list failed (0x887A0005)")
+                return RenderedImage(16, 12, bytes(16 * 12 * 4), "DirectX 12")
+
+            yield render
+
+        with patch("mlir_gpu.viewer.sys.platform", "win32"):
+            with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), \
+                 patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):
+                with patch("mlir_gpu.viewer._directx_offscreen_renderer", side_effect=failing_renderer):
+                    with self.assertRaisesRegex(ViewerError, "DirectX 12 GPU command list failed"):
+                        export_mp4(program, self.path, 16, 12, duration=1.0, fps=4)
+        self.assertTrue(self.encoders[-1].terminated)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(list(self.directory.iterdir()), [])
+
+    def test_directx_video_export_broken_pipe_during_streaming(self):
+        program = GraphicsProgram(self.program.vertex, self.program.fragment, target="directx")
+
+        class BrokenPipeStdin(io.BytesIO):
+            def write(self, data):
+                raise BrokenPipeError("Encoder pipe closed unexpectedly")
+
+        def broken_encoder(*args, **kwargs):
+            enc = self.encoder(*args, **kwargs)
+            enc.stdin = BrokenPipeStdin()
+            enc.returncode = 1
+            return enc
+
+        with patch("mlir_gpu.viewer.sys.platform", "win32"):
+            with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), \
+                 patch("mlir_gpu.viewer.subprocess.Popen", side_effect=broken_encoder):
+                with patch("mlir_gpu.viewer._directx_offscreen_renderer", side_effect=self.renderer):
+                    with self.assertRaisesRegex(ViewerError, "MP4 encoder failed"):
+                        export_mp4(program, self.path, 16, 12, duration=0.5, fps=4)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(list(self.directory.iterdir()), [])
+
+    def test_directx_video_export_with_frame_parameters(self):
+        from test_parameters import FRAME_REFLECTION
+        program = GraphicsProgram(
+            self.program.vertex, self.program.fragment, target="directx",
+            parameters=FRAME_REFLECTION,
+        )
+        with patch("mlir_gpu.viewer.sys.platform", "win32"):
+            with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), \
+                 patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):
+                with patch("mlir_gpu.viewer._directx_offscreen_renderer", side_effect=self.renderer) as render:
+                    count = export_mp4(program, self.path, 16, 12, duration=0.25, fps=4)
+                    self.assertEqual(count, 1)
+                    render.assert_called_once_with(program, 16, 12, False)
+
+    def test_offscreen_renderer_delegates_to_directx_on_windows(self):
+        from mlir_gpu.viewer import _offscreen_renderer
+        program = GraphicsProgram(self.program.vertex, self.program.fragment, target="directx")
+        with patch("mlir_gpu.viewer.sys.platform", "win32"):
+            with patch("mlir_gpu.viewer._directx_offscreen_renderer", side_effect=self.renderer) as dx_render:
+                with _offscreen_renderer(program, 16, 12, False) as render:
+                    image = render(2.5)
+                    self.assertEqual((image.width, image.height), (16, 12))
+                dx_render.assert_called_once_with(program, 16, 12, False)
+        self.assertEqual(self.times, [2.5])
+
+    def test_directx_video_exact_time_stepping(self):
+        """Verify that DirectX video export queries exact timestamps start_time + i / fps."""
+        program = GraphicsProgram(self.program.vertex, self.program.fragment, target="directx")
+        width, height = 32, 24
+        duration, fps, start_time = 0.5, 10, 1.0  # 5 frames: 1.0, 1.1, 1.2, 1.3, 1.4
+        expected_times = [round(1.0 + i * 0.1, 7) for i in range(5)]
+        recorded_times = []
+
+        @contextlib.contextmanager
+        def mock_dx(prog, w, h, val):
+            def render(t):
+                recorded_times.append(round(t, 7))
+                return RenderedImage(w, h, bytes(w * h * 4), "DirectX 12")
+            yield render
+
+        with patch("mlir_gpu.viewer.sys.platform", "win32"):
+            with patch("mlir_gpu.viewer._video_encoder", return_value="ffmpeg"), \
+                 patch("mlir_gpu.viewer.subprocess.Popen", side_effect=self.encoder):
+                with patch("mlir_gpu.viewer._directx_offscreen_renderer", side_effect=mock_dx):
+                    count = export_mp4(program, self.path, width, height, duration=duration, fps=fps, start_time=start_time)
+                    self.assertEqual(count, 5)
+
+        self.assertEqual(recorded_times, expected_times)
+
+
+@unittest.skipUnless(
+    sys.platform == "win32" and os.environ.get("MLIR_GPU_TEST_DIRECTX") == "1" and encoder_available(),
+    "Enable DirectX tests on Windows and install FFmpeg for native DirectX video verification",
+)
+class DirectXVideoRenderingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if sys.platform != "win32":
+            raise unittest.SkipTest("DirectX rendering requires Windows")
+        cls.tools = Toolchain(
+            Path(os.environ["LLVM_BIN"]) if "LLVM_BIN" in os.environ else None,
+            Path(os.environ["GPU_TOOLS_BIN"]) if "GPU_TOOLS_BIN" in os.environ else None,
+        )
+        try:
+            cls.tools.find("mlir-gpu-directx-view")
+        except Exception:
+            raise unittest.SkipTest("mlir-gpu-directx-view binary not found")
+        work = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(work.cleanup)
+        cls.directory = Path(work.name)
+        cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
+
+        from mlir_gpu import FrameParameters, Pipeline, fragment, fullscreen_vertex, vec4
+
+        @fragment
+        def moving_pattern(frame: FrameParameters):
+            return vec4(frame.resolution / 255.0, frame.time / 4.0, 1.0)
+
+        pipe = Pipeline(fullscreen_vertex, moving_pattern)
+        manifest = compile_pipeline(pipe, Target.DIRECTX, cls.directory / "dx_pipe", cls.tools)
+        cls.program = load_program(manifest)
+
+    def test_real_directx_mp4_animation_and_decoding(self):
+        from mlir_gpu.viewer import render_directx_offscreen
+        output = self.directory / "dx_animation.mp4"
+        width, height = 64, 48
+        duration, fps, start_time = 1.0, 4, 0.0
+        expected_frames = 4
+
+        count = export_mp4(
+            self.program, output, width, height,
+            duration=duration, fps=fps, start_time=start_time,
+            validation=self.validation,
+        )
+        self.assertEqual(count, expected_frames)
+        self.assertTrue(output.is_file())
+
+        decoded = subprocess.run(
+            [_video_encoder(), "-hide_banner", "-i", str(output), "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"],
+            capture_output=True, check=True,
+        )
+        report = decoded.stderr.decode()
+        self.assertIn("Video: h264", report)
+        self.assertIn(f"{width}x{height}", report)
+        self.assertIn("4 fps", report)
+        self.assertIn("Duration: 00:00:01.00", report)
+
+        frame_size = width * height * 4
+        self.assertEqual(len(decoded.stdout), expected_frames * frame_size)
+
+        frame0 = decoded.stdout[:frame_size]
+        frame3 = decoded.stdout[-frame_size:]
+        self.assertNotEqual(frame0, frame3, "Frame 0 and Frame 3 must differ due to animation")
+
+        for idx, t in enumerate([0.0, 0.25, 0.5, 0.75]):
+            expected = render_directx_offscreen(self.program, width, height, self.validation, self.tools, time=t).rgba
+            actual = decoded.stdout[idx * frame_size:(idx + 1) * frame_size]
+            mean_diff = sum(abs(a - b) for i, (a, b) in enumerate(zip(actual, expected)) if i % 4 != 3) / (width * height * 3)
+            self.assertLess(mean_diff, 8.0)
 
 
 @unittest.skipUnless(os.environ.get("MLIR_GPU_TEST_VULKAN") == "1" and encoder_available(),
