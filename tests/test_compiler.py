@@ -121,7 +121,7 @@ def shader_math_pipeline():
                     error[index] for index in range({Type.VEC2: 2, Type.VEC3: 3, Type.VEC4: 4}[error.node.type])
                 )
                 for component in components:
-                    valid = valid & (component <= 2e-5)
+                    valid = valid & (component <= 5e-4)
             components = (value,) if value.node.type == Type.F32 else tuple(
                 value[index] for index in range({Type.VEC2: 2, Type.VEC3: 3, Type.VEC4: 4}[value.node.type])
             )

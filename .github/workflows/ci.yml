@@ -55,11 +55,10 @@ jobs:
 
       - name: Cache GPU SDK dependencies
         id: cache-gpu-sdk
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .sdk
           key: gpu-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0-msc1.1
-          save-always: true
 
       - name: Install DirectXShaderCompiler SDK (Linux)
         if: runner.os == 'Linux' && steps.cache-gpu-sdk.outputs.cache-hit != 'true'
@@ -96,9 +95,16 @@ jobs:
           cp -a /tmp/msc-bins/lib/libmetalirconverter* .sdk/lib/
           rm -rf /tmp/msc /tmp/msc-bins
 
+      - name: Save GPU SDK dependencies cache
+        if: steps.cache-gpu-sdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: gpu-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0-msc1.1
+
       - name: Cache compiled gfx compiler & LLVM runtime binaries
         id: cache-compiler-binaries
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             .toolchains/llvm-build/bin/gfx-opt
@@ -108,18 +114,16 @@ jobs:
             .toolchains/llvm-build/bin/FileCheck
             .toolchains/llvm-build/bin/split-file
           key: gfx-compiler-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/llvm-revision.txt', 'tools/build_toolchain.py', 'native/compiler/**') }}
-          save-always: true
 
       - name: Cache pinned LLVM/MLIR toolchain SDK
         id: cache-llvm
         if: steps.cache-compiler-binaries.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             .toolchains/llvm-project
             .toolchains/llvm-build
           key: llvm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/llvm-revision.txt') }}
-          save-always: true
 
       - name: Build pinned LLVM/MLIR toolchain and gfx compiler
         if: steps.cache-compiler-binaries.outputs.cache-hit != 'true' && steps.cache-llvm.outputs.cache-hit != 'true'
@@ -127,19 +131,40 @@ jobs:
           JOBS="$(python3 -c 'import os; print(os.cpu_count() or 4)')"
           python3 tools/build_toolchain.py --jobs "$JOBS"
 
+      - name: Save pinned LLVM/MLIR toolchain SDK cache
+        if: steps.cache-compiler-binaries.outputs.cache-hit != 'true' && steps.cache-llvm.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .toolchains/llvm-project
+            .toolchains/llvm-build
+          key: llvm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/llvm-revision.txt') }}
+
       - name: Rebuild native/compiler against cached LLVM/MLIR toolchain
         if: steps.cache-compiler-binaries.outputs.cache-hit != 'true' && steps.cache-llvm.outputs.cache-hit == 'true'
         run: |
           JOBS="$(python3 -c 'import os; print(os.cpu_count() or 4)')"
           python3 tools/build_toolchain.py --jobs "$JOBS" --compiler-only
 
+      - name: Save compiled gfx compiler & LLVM runtime binaries cache
+        if: steps.cache-compiler-binaries.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .toolchains/llvm-build/bin/gfx-opt
+            .toolchains/llvm-build/bin/gfx-compile
+            .toolchains/llvm-build/bin/llc
+            .toolchains/llvm-build/bin/llvm-config
+            .toolchains/llvm-build/bin/FileCheck
+            .toolchains/llvm-build/bin/split-file
+          key: gfx-compiler-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/llvm-revision.txt', 'tools/build_toolchain.py', 'native/compiler/**') }}
+
       - name: Cache native helper binaries (dxv, dxil-assemble, mlir-gpu-metal-view)
         id: cache-native-tools
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .tools/bin
           key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm', 'native/directx_viewer.cpp') }}
-          save-always: true
 
       - name: Build native helper binaries
         if: steps.cache-native-tools.outputs.cache-hit != 'true'
@@ -156,6 +181,13 @@ jobs:
             "${EXTRA_ARGS[@]}"
           cmake --build build/native
           cmake --install build/native
+
+      - name: Save native helper binaries cache
+        if: steps.cache-native-tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .tools/bin
+          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm', 'native/directx_viewer.cpp') }}
 
       - name: Run unit, compiler integration, and Vulkan rendering tests (Linux)
         if: runner.os == 'Linux'
@@ -219,11 +251,10 @@ jobs:
 
       - name: Cache GPU SDK dependencies (DirectXShaderCompiler)
         id: cache-gpu-sdk
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .sdk
           key: gpu-sdk-Windows-x64-dxc1.9.2609
-          save-always: true
 
       - name: Install DirectXShaderCompiler SDK (Windows)
         if: steps.cache-gpu-sdk.outputs.cache-hit != 'true'
@@ -255,9 +286,16 @@ jobs:
             Copy-Item -Path .sdk/inc/* -Destination .sdk/include -Recurse -Force
           }
 
+      - name: Save GPU SDK dependencies cache (DirectXShaderCompiler)
+        if: steps.cache-gpu-sdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: gpu-sdk-Windows-x64-dxc1.9.2609
+
       - name: Cache compiled gfx compiler & LLVM runtime binaries
         id: cache-compiler-binaries
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             .toolchains/llvm-build/bin/gfx-opt.exe
@@ -267,18 +305,16 @@ jobs:
             .toolchains/llvm-build/bin/FileCheck.exe
             .toolchains/llvm-build/bin/split-file.exe
           key: gfx-compiler-bins-Windows-x64-${{ hashFiles('tools/llvm-revision.txt', 'tools/build_toolchain.py', 'native/compiler/**') }}
-          save-always: true
 
       - name: Cache pinned LLVM/MLIR toolchain SDK
         id: cache-llvm
         if: steps.cache-compiler-binaries.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             .toolchains/llvm-project
             .toolchains/llvm-build
           key: llvm-toolchain-Windows-x64-${{ hashFiles('tools/llvm-revision.txt') }}
-          save-always: true
 
       - name: Build pinned LLVM/MLIR toolchain and gfx compiler
         if: steps.cache-compiler-binaries.outputs.cache-hit != 'true' && steps.cache-llvm.outputs.cache-hit != 'true'
@@ -286,19 +322,40 @@ jobs:
           $jobs = [System.Environment]::ProcessorCount
           python tools/build_toolchain.py --jobs $jobs
 
+      - name: Save pinned LLVM/MLIR toolchain SDK cache
+        if: steps.cache-compiler-binaries.outputs.cache-hit != 'true' && steps.cache-llvm.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .toolchains/llvm-project
+            .toolchains/llvm-build
+          key: llvm-toolchain-Windows-x64-${{ hashFiles('tools/llvm-revision.txt') }}
+
       - name: Rebuild native/compiler against cached LLVM/MLIR toolchain
         if: steps.cache-compiler-binaries.outputs.cache-hit != 'true' && steps.cache-llvm.outputs.cache-hit == 'true'
         run: |
           $jobs = [System.Environment]::ProcessorCount
           python tools/build_toolchain.py --jobs $jobs --compiler-only
 
+      - name: Save compiled gfx compiler & LLVM runtime binaries cache
+        if: steps.cache-compiler-binaries.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .toolchains/llvm-build/bin/gfx-opt.exe
+            .toolchains/llvm-build/bin/gfx-compile.exe
+            .toolchains/llvm-build/bin/llc.exe
+            .toolchains/llvm-build/bin/llvm-config.exe
+            .toolchains/llvm-build/bin/FileCheck.exe
+            .toolchains/llvm-build/bin/split-file.exe
+          key: gfx-compiler-bins-Windows-x64-${{ hashFiles('tools/llvm-revision.txt', 'tools/build_toolchain.py', 'native/compiler/**') }}
+
       - name: Cache native helper binaries (dxv, dxil-assemble, mlir-gpu-directx-view)
         id: cache-native-tools
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .tools/bin
           key: native-tools-bins-Windows-x64-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/directx_viewer.cpp') }}
-          save-always: true
 
       - name: Build native helper binaries
         if: steps.cache-native-tools.outputs.cache-hit != 'true'
@@ -310,23 +367,68 @@ jobs:
           cmake --build build/native
           cmake --install build/native
 
+      - name: Save native helper binaries cache
+        if: steps.cache-native-tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .tools/bin
+          key: native-tools-bins-Windows-x64-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/directx_viewer.cpp') }}
+
+      - name: Cache pinned SwiftShader SDK
+        id: cache-swiftshader
+        uses: actions/cache/restore@v4
+        with:
+          path: .sdk/swiftshader
+          key: swiftshader-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/swiftshader-revision.txt', 'tools/setup_swiftshader.py') }}
+          restore-keys: |
+            swiftshader-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/swiftshader-revision.txt') }}
+            swiftshader-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup pinned SwiftShader ICD and binaries
+        run: |
+          python tools/setup_swiftshader.py
+
+      - name: Save pinned SwiftShader SDK cache
+        if: steps.cache-swiftshader.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk/swiftshader
+          key: swiftshader-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/swiftshader-revision.txt', 'tools/setup_swiftshader.py') }}
+
       - name: Report WARP driver and device capabilities
         run: |
           & "$env:GITHUB_WORKSPACE/.tools/bin/mlir-gpu-directx-view.exe" --warp --report-capabilities
 
-      - name: Run Windows WARP offscreen and compiler tests
+      - name: Report SwiftShader driver and device capabilities
+        env:
+          PYTHONPATH: "${{ github.workspace }}/src"
+          VK_ICD_FILENAMES: "${{ github.workspace }}/.sdk/swiftshader/vk_swiftshader_icd.json"
+          VK_DRIVER_FILES: "${{ github.workspace }}/.sdk/swiftshader/vk_swiftshader_icd.json"
+        run: |
+          $env:PATH = "$env:GITHUB_WORKSPACE\.sdk\swiftshader;$env:PATH"
+          python -m mlir_gpu.viewer --provider swiftshader --report-capabilities
+
+      - name: Run Windows WARP and SwiftShader offscreen and compiler tests
         env:
           PYTHONPATH: "${{ github.workspace }}/src;${{ github.workspace }}/tests"
           LLVM_BIN: "${{ github.workspace }}/.toolchains/llvm-build/bin"
+          GPU_TOOLS_BIN: "${{ github.workspace }}/.tools/bin"
           MLIR_GPU_TEST_DIRECTX: "1"
           MLIR_GPU_TEST_WARP: "1"
+          MLIR_GPU_TEST_VULKAN: "1"
+          MLIR_GPU_TEST_SWIFTSHADER: "1"
           MLIR_GPU_TEST_VALIDATION: "1"
+          VK_ICD_FILENAMES: "${{ github.workspace }}/.sdk/swiftshader/vk_swiftshader_icd.json"
+          VK_DRIVER_FILES: "${{ github.workspace }}/.sdk/swiftshader/vk_swiftshader_icd.json"
         run: |
-          $env:PATH = "$env:GITHUB_WORKSPACE\.toolchains\llvm-build\bin;$env:GITHUB_WORKSPACE\.tools\bin;$env:GITHUB_WORKSPACE\.sdk\bin;$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:PATH"
+          $env:PATH = "$env:GITHUB_WORKSPACE\.toolchains\llvm-build\bin;$env:GITHUB_WORKSPACE\.tools\bin;$env:GITHUB_WORKSPACE\.sdk\bin;$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:GITHUB_WORKSPACE\.sdk\swiftshader;$env:PATH"
           Write-Host "Running Lit test suite..."
           lit -sv tests/lit
           Write-Host "Running dedicated CI WARP verification test suite..."
           python -m unittest discover -s tests -p "test_ci_warp.py" -v
-          Write-Host "Running full Python test suite with WARP offscreen execution..."
+          Write-Host "Running dedicated CI SwiftShader verification test suite..."
+          python -m unittest discover -s tests -p "test_swiftshader.py" -v
+          Write-Host "Running full Python test suite with WARP and SwiftShader offscreen execution..."
           python -m unittest discover -s tests -p "test_*.py" -v
+
 
