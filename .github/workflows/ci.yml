@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -60,6 +59,7 @@ jobs:
         with:
           path: .sdk
           key: gpu-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0-msc1.1
+          save-always: true
 
       - name: Install DirectXShaderCompiler SDK (Linux)
         if: runner.os == 'Linux' && steps.cache-gpu-sdk.outputs.cache-hit != 'true'
@@ -108,6 +108,7 @@ jobs:
             .toolchains/llvm-build/bin/FileCheck
             .toolchains/llvm-build/bin/split-file
           key: gfx-compiler-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/llvm-revision.txt', 'tools/build_toolchain.py', 'native/compiler/**') }}
+          save-always: true
 
       - name: Cache pinned LLVM/MLIR toolchain SDK
         id: cache-llvm
@@ -118,6 +119,7 @@ jobs:
             .toolchains/llvm-project
             .toolchains/llvm-build
           key: llvm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/llvm-revision.txt') }}
+          save-always: true
 
       - name: Build pinned LLVM/MLIR toolchain and gfx compiler
         if: steps.cache-compiler-binaries.outputs.cache-hit != 'true' && steps.cache-llvm.outputs.cache-hit != 'true'
@@ -136,7 +138,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .tools/bin
-          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm') }}
+          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm', 'native/directx_viewer.cpp') }}
+          save-always: true
 
       - name: Build native helper binaries
         if: steps.cache-native-tools.outputs.cache-hit != 'true'
@@ -186,3 +189,144 @@ jobs:
           fi
           lit -sv tests/lit
           python3 -m unittest discover -s tests -v
+
+  test-windows-warp:
+    name: Windows WARP Offscreen Execution
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python package and viewer dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[viewer,video]' lit
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Cache GPU SDK dependencies (DirectXShaderCompiler)
+        id: cache-gpu-sdk
+        uses: actions/cache@v4
+        with:
+          path: .sdk
+          key: gpu-sdk-Windows-x64-dxc1.9.2609
+          save-always: true
+
+      - name: Install DirectXShaderCompiler SDK (Windows)
+        if: steps.cache-gpu-sdk.outputs.cache-hit != 'true'
+        run: |
+          New-Item -ItemType Directory -Force -Path .sdk
+          $dxcUrls = @(
+            "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip",
+            "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_28.zip"
+          )
+          $downloaded = $false
+          foreach ($url in $dxcUrls) {
+            try {
+              Write-Host "Attempting download from $url..."
+              Invoke-WebRequest -Uri $url -OutFile dxc.zip -ErrorAction Stop
+              $downloaded = $true
+              break
+            } catch {
+              Write-Warning "Download from $url failed: $_"
+            }
+          }
+          if (-not $downloaded) {
+            throw "Failed to download pinned DirectXShaderCompiler release v1.9.2609"
+          }
+          Expand-Archive -Path dxc.zip -DestinationPath .sdk -Force
+          Remove-Item dxc.zip
+          if (Test-Path .sdk/inc) {
+            New-Item -ItemType Directory -Force -Path .sdk/include/dxc
+            Copy-Item -Path .sdk/inc/* -Destination .sdk/include/dxc -Recurse -Force
+            Copy-Item -Path .sdk/inc/* -Destination .sdk/include -Recurse -Force
+          }
+
+      - name: Cache compiled gfx compiler & LLVM runtime binaries
+        id: cache-compiler-binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            .toolchains/llvm-build/bin/gfx-opt.exe
+            .toolchains/llvm-build/bin/gfx-compile.exe
+            .toolchains/llvm-build/bin/llc.exe
+            .toolchains/llvm-build/bin/llvm-config.exe
+            .toolchains/llvm-build/bin/FileCheck.exe
+            .toolchains/llvm-build/bin/split-file.exe
+          key: gfx-compiler-bins-Windows-x64-${{ hashFiles('tools/llvm-revision.txt', 'tools/build_toolchain.py', 'native/compiler/**') }}
+          save-always: true
+
+      - name: Cache pinned LLVM/MLIR toolchain SDK
+        id: cache-llvm
+        if: steps.cache-compiler-binaries.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            .toolchains/llvm-project
+            .toolchains/llvm-build
+          key: llvm-toolchain-Windows-x64-${{ hashFiles('tools/llvm-revision.txt') }}
+          save-always: true
+
+      - name: Build pinned LLVM/MLIR toolchain and gfx compiler
+        if: steps.cache-compiler-binaries.outputs.cache-hit != 'true' && steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          $jobs = [System.Environment]::ProcessorCount
+          python tools/build_toolchain.py --jobs $jobs
+
+      - name: Rebuild native/compiler against cached LLVM/MLIR toolchain
+        if: steps.cache-compiler-binaries.outputs.cache-hit != 'true' && steps.cache-llvm.outputs.cache-hit == 'true'
+        run: |
+          $jobs = [System.Environment]::ProcessorCount
+          python tools/build_toolchain.py --jobs $jobs --compiler-only
+
+      - name: Cache native helper binaries (dxv, dxil-assemble, mlir-gpu-directx-view)
+        id: cache-native-tools
+        uses: actions/cache@v4
+        with:
+          path: .tools/bin
+          key: native-tools-bins-Windows-x64-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/directx_viewer.cpp') }}
+          save-always: true
+
+      - name: Build native helper binaries
+        if: steps.cache-native-tools.outputs.cache-hit != 'true'
+        run: |
+          cmake -S . -B build/native -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE/.sdk" `
+            -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE/.tools"
+          cmake --build build/native
+          cmake --install build/native
+
+      - name: Report WARP driver and device capabilities
+        run: |
+          & "$env:GITHUB_WORKSPACE/.tools/bin/mlir-gpu-directx-view.exe" --warp --report-capabilities
+
+      - name: Run Windows WARP offscreen and compiler tests
+        env:
+          PYTHONPATH: "${{ github.workspace }}/src;${{ github.workspace }}/tests"
+          LLVM_BIN: "${{ github.workspace }}/.toolchains/llvm-build/bin"
+          MLIR_GPU_TEST_DIRECTX: "1"
+          MLIR_GPU_TEST_WARP: "1"
+          MLIR_GPU_TEST_VALIDATION: "1"
+        run: |
+          $env:PATH = "$env:GITHUB_WORKSPACE\.toolchains\llvm-build\bin;$env:GITHUB_WORKSPACE\.tools\bin;$env:GITHUB_WORKSPACE\.sdk\bin;$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:PATH"
+          Write-Host "Running Lit test suite..."
+          lit -sv tests/lit
+          Write-Host "Running dedicated CI WARP verification test suite..."
+          python -m unittest discover -s tests -p "test_ci_warp.py" -v
+          Write-Host "Running full Python test suite with WARP offscreen execution..."
+          python -m unittest discover -s tests -p "test_*.py" -v
+

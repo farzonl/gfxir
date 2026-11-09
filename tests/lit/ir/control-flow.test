@@ -2,9 +2,9 @@
 # RUN: %gfx-opt %repo/examples/ir/sphere_march.mlir --convert-gfx-to-spirv | %FileCheck %s --check-prefix=SPIRV --implicit-check-not=scf. --implicit-check-not=func.call
 # RUN: %gfx-opt %repo/tests/ir/structured_graphics.mlir --gfx-to-directx | %FileCheck %s --check-prefix=DX --implicit-check-not=scf. --implicit-check-not=func.call --implicit-check-not=@contribution --implicit-check-not=@sphere_distance
 # RUN: %gfx-opt %repo/examples/ir/sphere_march.mlir --gfx-to-directx | %FileCheck %s --check-prefix=DX --implicit-check-not=scf. --implicit-check-not=func.call --implicit-check-not=@contribution --implicit-check-not=@sphere_distance
-# RUN: sed 's/module {/module { func.func private @unused() { return }/' %repo/examples/ir/sphere_march.mlir > %t
+# RUN: %python -c "import sys; from pathlib import Path; Path(sys.argv[2]).write_text(Path(sys.argv[1]).read_text().replace('module {', 'module { func.func private @unused() { return }', 1))" %repo/examples/ir/sphere_march.mlir %t
 # RUN: %gfx-opt %t --convert-gfx-to-spirv | %FileCheck %s --check-prefix=UNUSED --implicit-check-not=@unused
-# RUN: sed 's/sphere_distance/interface_0/g' %repo/examples/ir/sphere_march.mlir > %t
+# RUN: %python -c "import sys; from pathlib import Path; Path(sys.argv[2]).write_text(Path(sys.argv[1]).read_text().replace('sphere_distance', 'interface_0'))" %repo/examples/ir/sphere_march.mlir %t
 # RUN: %gfx-opt %t --convert-gfx-to-spirv | %FileCheck %s --check-prefix=NAME
 # SPIRV-DAG: spirv.mlir.loop
 # SPIRV-DAG: spirv.mlir.selection

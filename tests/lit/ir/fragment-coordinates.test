@@ -1,9 +1,9 @@
 # RUN: %gfx-opt %repo/tests/ir/fragment_coordinates.mlir --gfx-verify | %FileCheck %s --check-prefix=VERIFY
 # RUN: %gfx-opt %repo/tests/ir/fragment_coordinates.mlir --convert-gfx-to-spirv | %FileCheck %s --check-prefix=SPIRV
 # RUN: %gfx-opt %repo/tests/ir/fragment_coordinates.mlir --gfx-to-directx | %FileCheck %s --check-prefix=DX
-# RUN: sed 's/#gfx.stage<fragment>/#gfx.stage<vertex>/' %repo/tests/ir/fragment_coordinates.mlir > %t
+# RUN: %python -c "import sys; from pathlib import Path; Path(sys.argv[2]).write_text(Path(sys.argv[1]).read_text().replace('#gfx.stage<fragment>', '#gfx.stage<vertex>'))" %repo/tests/ir/fragment_coordinates.mlir %t
 # RUN: not %gfx-opt %t --gfx-verify 2>&1 | %FileCheck %s --check-prefix=INVALID
-# RUN: sed 's/vector<2xf32>/vector<3xf32>/g' %repo/tests/ir/fragment_coordinates.mlir > %t
+# RUN: %python -c "import sys; from pathlib import Path; Path(sys.argv[2]).write_text(Path(sys.argv[1]).read_text().replace('vector<2xf32>', 'vector<3xf32>'))" %repo/tests/ir/fragment_coordinates.mlir %t
 # RUN: not %gfx-opt %t --gfx-verify 2>&1 | %FileCheck %s --check-prefix=INVALID
 # VERIFY: fragment_coord
 # SPIRV: built_in("FragCoord")

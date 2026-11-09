@@ -22,8 +22,7 @@
 # RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=MATH
 # RUN: %python %S/../Inputs/graph.py reference --stage 0 > %t.json
 # RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=REFERENCE
-# RUN: not test -e %t.bin
-# RUN: not test -e %t.reflection
+# RUN: %python -c "import sys; from pathlib import Path; assert not Path(sys.argv[1]).exists() and not Path(sys.argv[2]).exists()" %t.bin %t.reflection
 # BROADCAST: one matching scalar
 # CAST: i32/u32 scalars
 # LITERAL: literal

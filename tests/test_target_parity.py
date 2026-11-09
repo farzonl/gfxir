@@ -85,7 +85,9 @@ class TargetParityTests(unittest.TestCase):
                         for offset in range(0, len(image.rgba), 4)
                     )
                     self.assertGreater(sum(masks[target]), width * height * 0.01)
-                    if name == "quad":
+                    if name == "triangle":
+                        self.assertAlmostEqual(sum(masks[target]) / (width * height), 0.18, delta=0.01)
+                    elif name == "quad":
                         self.assertAlmostEqual(sum(masks[target]) / (width * height), 0.64, delta=0.01)
                         for x, y in ((width // 3, height // 3), (2 * width // 3, 2 * height // 3)):
                             u = ((x + 0.5) / width * 2 - 1 + 0.8) / 1.6
