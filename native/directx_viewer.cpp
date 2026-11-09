@@ -179,11 +179,14 @@ static std::string queryFeatureLevel(ID3D12Device* device) {
 }
 
 static std::string queryShaderModel(ID3D12Device* device) {
-    const UINT candidateModels[] = {
-        0x69, 0x68, 0x67, 0x66, 0x65, 0x64, 0x63, 0x62, 0x61, 0x60, 0x51
+    const D3D_SHADER_MODEL candidateModels[] = {
+        D3D_SHADER_MODEL_6_9, D3D_SHADER_MODEL_6_8, D3D_SHADER_MODEL_6_7,
+        D3D_SHADER_MODEL_6_6, D3D_SHADER_MODEL_6_5, D3D_SHADER_MODEL_6_4,
+        D3D_SHADER_MODEL_6_3, D3D_SHADER_MODEL_6_2, D3D_SHADER_MODEL_6_1,
+        D3D_SHADER_MODEL_6_0, D3D_SHADER_MODEL_5_1
     };
-    for (UINT smVal : candidateModels) {
-        D3D12_FEATURE_DATA_SHADER_MODEL data{static_cast<D3D_SHADER_MODEL>(smVal)};
+    for (D3D_SHADER_MODEL model : candidateModels) {
+        D3D12_FEATURE_DATA_SHADER_MODEL data{model};
         if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &data, sizeof(data)))) {
             UINT highest = static_cast<UINT>(data.HighestShaderModel);
             if (highest >= 0x51) {
