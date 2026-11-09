@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import importlib
@@ -231,6 +231,51 @@ def _metal_run(arguments: list[str], validation: bool, capture: bool) -> str:
     return _native_run(arguments, capture, "Metal", environment)
 
 
+VALID_PROVIDERS = {"hardware", "warp", "lavapipe", "swiftshader"}
+
+
+def _validate_provider(provider: str | None, backend: str) -> None:
+    if provider is None:
+        return
+    if not isinstance(provider, str) or provider not in VALID_PROVIDERS:
+        raise ValueError(
+            f"Unknown provider '{provider}'. Supported providers are: {', '.join(sorted(VALID_PROVIDERS))}."
+        )
+    if backend == "directx" and provider in ("lavapipe", "swiftshader"):
+        raise ValueError(
+            f"Provider '{provider}' is not supported by the DirectX 12 backend. Use 'hardware' or 'warp'."
+        )
+    if backend == "vulkan" and provider == "warp":
+        raise ValueError(
+            "Provider 'warp' is not supported by the Vulkan backend. Use 'lavapipe', 'swiftshader', or 'hardware'."
+        )
+    if backend == "metal":
+        raise ValueError(f"Provider '{provider}' is not supported by the Metal backend.")
+
+
+def _match_vulkan_device(properties, provider: str | None) -> bool:
+    if provider is None:
+        return True
+    raw_name = getattr(properties, "deviceName", b"")
+    name = raw_name.decode("utf-8", errors="replace") if isinstance(raw_name, bytes) else str(raw_name)
+    name_lower = name.lower()
+    vendor_id = getattr(properties, "vendorID", 0)
+    device_id = getattr(properties, "deviceID", 0)
+    device_type = getattr(properties, "deviceType", 0)
+
+    if provider == "lavapipe":
+        return vendor_id == 0x10005 or "llvmpipe" in name_lower or "lavapipe" in name_lower
+    elif provider == "swiftshader":
+        return vendor_id == 0x1AE0 or device_id == 0xC0DE or "swiftshader" in name_lower
+    elif provider == "hardware":
+        is_cpu = device_type == 4  # VK_PHYSICAL_DEVICE_TYPE_CPU
+        is_gpu = device_type in (1, 2)  # INTEGRATED_GPU, DISCRETE_GPU
+        is_sw_vendor = vendor_id in (0x10005, 0x1AE0) or device_id == 0xC0DE
+        is_sw_name = "llvmpipe" in name_lower or "lavapipe" in name_lower or "swiftshader" in name_lower
+        return is_gpu and not is_cpu and not is_sw_vendor and not is_sw_name
+    return False
+
+
 def _directx_run(arguments: list[str], validation: bool, capture: bool) -> str:
     return _native_run([*arguments, *(["--validation"] if validation else [])], capture, "DirectX 12")
 
@@ -275,40 +320,62 @@ def _readback_result(text: str, output: Path, width: int, height: int, backend: 
 @contextmanager
 def _directx_offscreen_renderer(
     program: GraphicsProgram, width: int, height: int, validation: bool, toolchain: Toolchain | None = None,
+    provider: str | None = None,
 ):
     _dimensions(width, height)
+    explicit_warp = provider == "warp"
+    if provider is None and os.environ.get("MLIR_GPU_TEST_WARP") == "1":
+        provider = "warp"
+    _validate_provider(provider, "directx")
     with _directx_shaders(program, toolchain or _preview_toolchain()) as (directory, arguments):
         output = directory / "readback.rgba"
+        warp_args = ["--warp"] if provider == "warp" else []
         def render(elapsed: float) -> RenderedImage:
             timing = ["--time", str(_time_value(elapsed))]
             text = _directx_run(
-                [*arguments, "--width", str(width), "--height", str(height), "--readback", str(output), *timing],
+                [*arguments, *warp_args, "--width", str(width), "--height", str(height), "--readback", str(output), *timing],
                 validation, True,
             )
-            return _readback_result(text, output, width, height, "DirectX 12")
+            image = _readback_result(text, output, width, height, "DirectX 12")
+            if explicit_warp and "basic render driver" not in image.device.lower():
+                raise ViewerError(
+                    "Requested provider 'warp' but returned device is not a software adapter. "
+                    "Accidental hardware/driver fallback rejected."
+                )
+            if provider == "hardware" and "basic render driver" in image.device.lower():
+                raise ViewerError(
+                    "Requested provider 'hardware' but returned device is a software adapter. "
+                    "Accidental hardware/driver fallback rejected."
+                )
+            return image
         yield render
 
 
 def render_directx_offscreen(
     program: GraphicsProgram, width: int = 640, height: int = 480,
     validation: bool = False, toolchain: Toolchain | None = None, time: float = 0.0,
+    provider: str | None = None,
 ) -> RenderedImage:
     elapsed = _time_value(time)
-    with _directx_offscreen_renderer(program, width, height, validation, toolchain) as render:
+    kwargs = {"provider": provider} if provider is not None else {}
+    with _directx_offscreen_renderer(program, width, height, validation, toolchain, **kwargs) as render:
         return render(elapsed)
 
 
 def show_directx_window(
     program: GraphicsProgram, width: int = 800, height: int = 600, frames: int = 0,
     validation: bool = False, toolchain: Toolchain | None = None, time: float | None = None,
+    provider: str | None = None,
 ) -> None:
     _dimensions(width, height)
+    _validate_provider(provider, "directx")
     if type(frames) is not int or frames < 0:
         raise ViewerError("Frame count must be a nonnegative integer (0 means until closed).")
     timing = ["--time", str(_time_value(time))] if time is not None else []
+    warp_args = ["--warp"] if provider == "warp" else []
     with _directx_shaders(program, toolchain or _preview_toolchain()) as (_, arguments):
         _directx_run(
-            [*arguments, "--width", str(width), "--height", str(height), "--frames", str(frames), *timing],
+            [*arguments, *warp_args, "--width", str(width), "--height", str(height), "--frames", str(frames), *timing],
             validation, False,
         )
 
@@ -376,7 +443,10 @@ def _api_errors():
 
 
 class _Vulkan:
-    def __init__(self, resources: ExitStack, window=None, glfw=None, validation: bool = False):
+    def __init__(self, resources: ExitStack, window=None, glfw=None, validation: bool = False, provider: str | None = None):
+        if provider is None and os.environ.get("MLIR_GPU_TEST_SWIFTSHADER") == "1":
+            provider = "swiftshader"
+        _validate_provider(provider, "vulkan")
         vk = self.vk = _binding("vulkan")
         self.resources = resources
         self.surface = None
@@ -396,25 +466,33 @@ class _Vulkan:
         debug_info = None
         if validation:
             available_layers = {layer.layerName for layer in vk.vkEnumerateInstanceLayerProperties()}
-            if "VK_LAYER_KHRONOS_validation" not in available_layers:
-                raise ViewerError("--validation requires VK_LAYER_KHRONOS_validation from the Vulkan SDK.")
-            if "VK_EXT_debug_utils" not in available:
-                raise ViewerError("--validation requires the VK_EXT_debug_utils extension.")
-            layers.append("VK_LAYER_KHRONOS_validation")
-            extensions.append("VK_EXT_debug_utils")
-
-            def report(severity, message_type, data, user):
-                message = vk.ffi.string(data.pMessage).decode("utf-8", errors="replace")
-                if severity & vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT:
-                    self.validation_errors.append(message)
-                print(f"Vulkan validation: {message}", file=sys.stderr)
-                return vk.VK_FALSE
-
-            debug_info = vk.VkDebugUtilsMessengerCreateInfoEXT(
-                messageSeverity=vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
-                messageType=vk.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | vk.VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | vk.VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
-                pfnUserCallback=report,
+            swiftshader_env = (
+                provider == "swiftshader"
+                or os.environ.get("MLIR_GPU_TEST_SWIFTSHADER") == "1"
+                or "swiftshader" in (os.environ.get("VK_ICD_FILENAMES") or os.environ.get("VK_DRIVER_FILES") or "").lower()
             )
+            if "VK_LAYER_KHRONOS_validation" not in available_layers:
+                if not swiftshader_env:
+                    raise ViewerError("--validation requires VK_LAYER_KHRONOS_validation from the Vulkan SDK.")
+            elif "VK_EXT_debug_utils" not in available:
+                if not swiftshader_env:
+                    raise ViewerError("--validation requires the VK_EXT_debug_utils extension.")
+            else:
+                layers.append("VK_LAYER_KHRONOS_validation")
+                extensions.append("VK_EXT_debug_utils")
+
+                def report(severity, message_type, data, user):
+                    message = vk.ffi.string(data.pMessage).decode("utf-8", errors="replace")
+                    if severity & vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT:
+                        self.validation_errors.append(message)
+                    print(f"Vulkan validation: {message}", file=sys.stderr)
+                    return vk.VK_FALSE
+
+                debug_info = vk.VkDebugUtilsMessengerCreateInfoEXT(
+                    messageSeverity=vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
+                    messageType=vk.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | vk.VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | vk.VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+                    pfnUserCallback=report,
+                )
         self.instance = vk.vkCreateInstance(vk.VkInstanceCreateInfo(
             pNext=debug_info,
             flags=flags,
@@ -446,12 +524,33 @@ class _Vulkan:
                         continue
                     if not self.instance_function("vkGetPhysicalDeviceSurfaceSupportKHR")(physical, index, self.surface):
                         continue
-                candidates.append((properties.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_CPU, physical, index, properties, device_extensions))
+                is_cpu = 1 if properties.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_CPU else 0
+                is_not_discrete = 0 if properties.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU else 1
+                candidates.append((is_cpu, is_not_discrete, physical, index, properties, device_extensions))
                 break
+
         if not candidates:
+            if provider is not None:
+                raise ViewerError(
+                    f"Requested provider '{provider}' was not found among available Vulkan physical devices. "
+                    "Accidental hardware/driver fallback rejected."
+                )
             raise ViewerError("No Vulkan device has a suitable graphics/presentation queue.")
-        _, self.physical, self.family, properties, device_extensions = sorted(candidates, key=lambda candidate: candidate[0])[0]
-        self.name = properties.deviceName
+
+        if provider is not None:
+            matching = [c for c in candidates if _match_vulkan_device(c[4], provider)]
+            if not matching:
+                raise ViewerError(
+                    f"Requested provider '{provider}' was not found among available Vulkan physical devices. "
+                    "Accidental hardware/driver fallback rejected."
+                )
+            selected = sorted(matching, key=lambda c: (c[0], c[1]))[0]
+        else:
+            selected = sorted(candidates, key=lambda c: (c[0], c[1]))[0]
+
+        _, _, self.physical, self.family, properties, device_extensions = selected
+        raw_name = properties.deviceName
+        self.name = (raw_name.decode("utf-8", errors="replace") if isinstance(raw_name, bytes) else str(raw_name)).rstrip("\x00")
         self.max_width = properties.limits.maxFramebufferWidth
         self.max_height = properties.limits.maxFramebufferHeight
         self.max_push_constants = properties.limits.maxPushConstantsSize
@@ -681,29 +780,38 @@ class _Vulkan:
         return command
 
 
-def render_offscreen(program: GraphicsProgram, width: int = 640, height: int = 480,
-                     validation: bool = False, time: float = 0.0) -> RenderedImage:
+def render_offscreen(
+    program: GraphicsProgram, width: int = 640, height: int = 480,
+    validation: bool = False, time: float = 0.0, provider: str | None = None,
+) -> RenderedImage:
     elapsed = _time_value(time)
-    with _offscreen_renderer(program, width, height, validation) as render:
+    kwargs = {"provider": provider} if provider is not None else {}
+    with _offscreen_renderer(program, width, height, validation, **kwargs) as render:
         return render(elapsed)
 
 
 @contextmanager
-def _offscreen_renderer(program: GraphicsProgram, width: int, height: int, validation: bool):
+def _offscreen_renderer(
+    program: GraphicsProgram, width: int, height: int, validation: bool, provider: str | None = None,
+):
     _dimensions(width, height)
     _frame_parameters(program.parameters)
     if program.target == "directx" and sys.platform != "darwin":
-        with _directx_offscreen_renderer(program, width, height, validation) as render:
+        kwargs = {"provider": provider} if provider is not None else {}
+        with _directx_offscreen_renderer(program, width, height, validation, **kwargs) as render:
             yield render
         return
     if program.target == "metal":
+        if provider is not None:
+            raise ValueError(f"Provider '{provider}' is not supported by the Metal backend.")
         with _metal_offscreen_renderer(program, width, height, validation) as render:
             yield render
         return
     if program.target != "vulkan":
         raise ViewerError("Vulkan rendering requires Vulkan artifacts; use the Metal preview for DXIL.")
+    vulkan_kwargs = {"provider": provider} if provider is not None else {}
     with _api_errors(), ExitStack() as resources:
-        gpu = _Vulkan(resources, validation=validation)
+        gpu = _Vulkan(resources, validation=validation, **vulkan_kwargs)
         vk = gpu.vk
         format = vk.VK_FORMAT_R8G8B8A8_UNORM
         image, view = gpu.image(resources, width, height, format)
@@ -734,6 +842,27 @@ def _offscreen_renderer(program: GraphicsProgram, width: int, height: int, valid
         yield render
 
 
+def render_vulkan_offscreen(
+    program: GraphicsProgram, width: int = 640, height: int = 480,
+    validation: bool = False, time: float = 0.0, provider: str | None = None,
+) -> RenderedImage:
+    _validate_provider(provider, "vulkan")
+    if program.target != "vulkan":
+        raise ViewerError("Vulkan rendering requires Vulkan artifacts; use the Metal preview for DXIL.")
+    return render_offscreen(program, width, height, validation, time=time, provider=provider)
+
+
+@contextmanager
+def _vulkan_offscreen_renderer(
+    program: GraphicsProgram, width: int, height: int, validation: bool, provider: str | None = None,
+):
+    _validate_provider(provider, "vulkan")
+    if program.target != "vulkan":
+        raise ViewerError("Vulkan rendering requires Vulkan artifacts; use the Metal preview for DXIL.")
+    with _offscreen_renderer(program, width, height, validation, provider=provider) as render:
+        yield render
+
+
 def _video_encoder() -> str:
     executable = shutil.which("ffmpeg")
     if executable:
@@ -751,7 +880,7 @@ def _video_encoder() -> str:
 
 def export_mp4(program: GraphicsProgram, path: Path, width: int = 640, height: int = 480,
                duration: float = 4.0, fps: int = 30, start_time: float = 0.0,
-               validation: bool = False) -> int:
+               validation: bool = False, provider: str | None = None) -> int:
     _dimensions(width, height)
     if width % 2 or height % 2:
         raise ViewerError("H.264 MP4 dimensions must be even for yuv420p.")
@@ -765,6 +894,7 @@ def export_mp4(program: GraphicsProgram, path: Path, width: int = 640, height: i
     _time_value(start + (count - 1) / fps)
     if program.target not in ("vulkan", "directx", "metal"):
         raise ViewerError("MP4 export requires Vulkan, DirectX, or Metal artifacts.")
+    _validate_provider(provider, program.target)
     if program.target == "directx" and sys.platform not in ("win32", "darwin"):
         raise ViewerError(
             "Native DirectX 12 MP4 export requires Windows; "
@@ -804,7 +934,8 @@ def export_mp4(program: GraphicsProgram, path: Path, width: int = 640, height: i
                     _directx_offscreen_renderer if program.target == "directx" and sys.platform != "darwin" else
                     _metal_offscreen_renderer
                 )
-                with renderer(program, width, height, validation) as render:
+                renderer_kwargs = {"provider": provider} if provider is not None else {}
+                with renderer(program, width, height, validation, **renderer_kwargs) as render:
                     for index in range(count):
                         image = render(start + index / fps)
                         if (image.width, image.height, len(image.rgba)) != (width, height, width * height * 4):
@@ -937,9 +1068,10 @@ def _swapchain(gpu, resources, program, width, height):
 
 
 def show_window(program: GraphicsProgram, width: int = 800, height: int = 600, frames: int = 0,
-                validation: bool = False, time: float | None = None) -> int:
+                validation: bool = False, time: float | None = None, provider: str | None = None) -> int:
     _dimensions(width, height)
     _frame_parameters(program.parameters)
+    _validate_provider(provider, "vulkan")
     frozen_time = _time_value(time) if time is not None else None
     if program.target != "vulkan":
         raise ViewerError("Vulkan rendering requires Vulkan artifacts; use the Metal preview for DXIL.")
@@ -958,7 +1090,8 @@ def show_window(program: GraphicsProgram, width: int = 800, height: int = 600, f
         if not window:
             raise ViewerError(f"GLFW window creation failed: {glfw.get_error()}.")
         resources.callback(glfw.destroy_window, window)
-        gpu = _Vulkan(resources, window, glfw, validation)
+        vulkan_kwargs = {"provider": provider} if provider is not None else {}
+        gpu = _Vulkan(resources, window, glfw, validation, **vulkan_kwargs)
         started = clock.monotonic()
         vk = gpu.vk
         presented = 0
@@ -1018,14 +1151,310 @@ def show_window(program: GraphicsProgram, width: int = 800, height: int = 600, f
         return presented
 
 
+def _parse_version_tuple(val: str) -> tuple[int, ...]:
+    cleaned = val.replace("feature_level_", "").replace("shader_model_", "").replace("_", ".").replace(":", ".")
+    parts = []
+    for part in cleaned.split("."):
+        try:
+            parts.append(int(part))
+        except ValueError:
+            pass
+    return tuple(parts)
+
+
+def get_device_capabilities(
+    backend: str = "directx",
+    provider: str | None = None,
+    toolchain: Toolchain | None = None,
+    required_capabilities: list[str] | set[str] | None = None,
+) -> dict:
+    if backend not in ("directx", "vulkan", "metal"):
+        raise ValueError(f"Unknown backend '{backend}'. Supported backends are: 'directx', 'vulkan', 'metal'.")
+    _validate_provider(provider, backend)
+
+    if backend == "metal":
+        if sys.platform != "darwin":
+            return {
+                "target": "metal",
+                "backend": "metal",
+                "provider": "hardware",
+                "status": "UNSUPPORTED",
+                "is_software": False,
+                "device_name": "Metal (unsupported on this platform)",
+                "missing_capabilities": ["darwin_platform"],
+                "unverified_capabilities": [],
+            }
+
+    if backend == "directx":
+        if sys.platform != "win32":
+            raise ViewerError("Native DirectX 12 preview requires Windows.")
+        if provider is None and os.environ.get("MLIR_GPU_TEST_WARP") == "1":
+            provider = "warp"
+        tc = toolchain or _preview_toolchain()
+        viewer_bin = tc.find("mlir-gpu-directx-view")
+        arguments = [str(viewer_bin), "--report-capabilities"]
+        if provider == "warp":
+            arguments.append("--warp")
+        try:
+            result = subprocess.run(arguments, capture_output=True, text=True, check=False)
+        except OSError as error:
+            raise ViewerError(f"Cannot start DirectX 12 capability query: {error}") from error
+        if result.returncode != 0:
+            diagnostics = (result.stderr or result.stdout or "").strip()
+            raise ViewerError(f"DirectX 12 capability query failed ({result.returncode}): {diagnostics}")
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise ViewerError(f"Invalid JSON returned by DirectX 12 capability query: {result.stdout}") from error
+
+        device_name = str(data.get("device_name") or data.get("adapter_name", ""))
+        is_software = (
+            bool(data.get("is_software"))
+            or bool(data.get("software_adapter"))
+            or int(data.get("vendor_id", 0)) == 5140
+            or "basic render driver" in device_name.lower()
+        )
+        if provider == "warp" and not is_software:
+            raise ViewerError(
+                "Requested provider 'warp' but returned device is not a software adapter. "
+                "Accidental hardware/driver fallback rejected."
+            )
+        if provider == "hardware" and is_software:
+            raise ViewerError(
+                "Requested provider 'hardware' but returned device is a software adapter. "
+                "Accidental hardware/driver fallback rejected."
+            )
+
+        feature_level = str(data.get("d3d12_feature_level") or data.get("feature_level", ""))
+        shader_model = str(data.get("shader_model") or data.get("highest_shader_model", ""))
+        missing_dx = []
+        unverified_dx = []
+        if required_capabilities:
+            device_fl_tuple = _parse_version_tuple(feature_level)
+            device_sm_tuple = _parse_version_tuple(shader_model)
+            for cap in required_capabilities:
+                if cap in (feature_level, shader_model):
+                    continue
+                if "feature_level" in cap or cap in ("11_0", "11_1", "12_0", "12_1", "12_2"):
+                    req_fl = _parse_version_tuple(cap)
+                    if req_fl and device_fl_tuple >= req_fl:
+                        continue
+                    missing_dx.append(cap)
+                elif "shader_model" in cap or (len(cap) == 3 and cap[1] == "_" and cap[0] == "6"):
+                    req_sm = _parse_version_tuple(cap)
+                    if req_sm and device_sm_tuple >= req_sm:
+                        continue
+                    missing_dx.append(cap)
+                elif cap in ("warp", "software") and not is_software:
+                    missing_dx.append(cap)
+                elif cap == "hardware" and is_software:
+                    missing_dx.append(cap)
+                else:
+                    unverified_dx.append(cap)
+        if missing_dx:
+            status_dx = "UNSUPPORTED"
+        elif unverified_dx:
+            status_dx = "UNVERIFIED"
+        else:
+            status_dx = "EXECUTED"
+        return {
+            "target": "directx",
+            "backend": "directx",
+            "provider": "warp" if is_software else "hardware",
+            "device_name": device_name,
+            "adapter_name": device_name,
+            "vendor_id": int(data.get("vendor_id", 0)),
+            "device_id": int(data.get("device_id", 0)),
+            "subsystem_id": int(data.get("subsystem_id", 0)),
+            "revision": int(data.get("revision", 0)),
+            "dedicated_video_memory": int(data.get("dedicated_video_memory", 0)),
+            "dedicated_memory": int(data.get("dedicated_video_memory", 0)),
+            "dedicated_system_memory": int(data.get("dedicated_system_memory", 0)),
+            "shared_system_memory": int(data.get("shared_system_memory", 0)),
+            "is_software": is_software,
+            "software_adapter": is_software,
+            "d3d12_feature_level": feature_level,
+            "feature_level": feature_level,
+            "shader_model": shader_model,
+            "highest_shader_model": str(data.get("highest_shader_model") or shader_model),
+            "status": status_dx,
+            "missing_capabilities": missing_dx,
+            "unverified_capabilities": unverified_dx,
+        }
+
+    # Vulkan backend
+    if provider is None and os.environ.get("MLIR_GPU_TEST_SWIFTSHADER") == "1":
+        provider = "swiftshader"
+    with _api_errors(), ExitStack() as resources:
+        vk = _binding("vulkan")
+        extensions = []
+        available = {extension.extensionName for extension in vk.vkEnumerateInstanceExtensionProperties(None)}
+        flags = 0
+        if "VK_KHR_portability_enumeration" in available:
+            extensions.append("VK_KHR_portability_enumeration")
+            flags = getattr(vk, "VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR", 1)
+        if "VK_KHR_get_physical_device_properties2" in available:
+            extensions.append("VK_KHR_get_physical_device_properties2")
+        instance = vk.vkCreateInstance(vk.VkInstanceCreateInfo(
+            flags=flags,
+            pApplicationInfo=vk.VkApplicationInfo(pApplicationName="mlir-gpu capabilities", apiVersion=vk.VK_API_VERSION_1_0),
+            ppEnabledExtensionNames=extensions,
+            ppEnabledLayerNames=[],
+        ), None)
+        resources.callback(vk.vkDestroyInstance, instance, None)
+
+        candidates = []
+        for physical in vk.vkEnumeratePhysicalDevices(instance):
+            properties = vk.vkGetPhysicalDeviceProperties(physical)
+            for index, queue in enumerate(vk.vkGetPhysicalDeviceQueueFamilyProperties(physical)):
+                if not queue.queueCount or not queue.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT:
+                    continue
+                device_extensions = {item.extensionName for item in vk.vkEnumerateDeviceExtensionProperties(physical, None)}
+                is_cpu = 1 if properties.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_CPU else 0
+                is_not_discrete = 0 if properties.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU else 1
+                candidates.append((is_cpu, is_not_discrete, physical, index, properties, device_extensions))
+                break
+
+        if not candidates:
+            if provider is not None:
+                raise ViewerError(
+                    f"Requested provider '{provider}' was not found among available Vulkan physical devices. "
+                    "Accidental hardware/driver fallback rejected."
+                )
+            raise ViewerError("No Vulkan device has a suitable graphics/presentation queue.")
+
+        if provider is not None:
+            matching = [c for c in candidates if _match_vulkan_device(c[4], provider)]
+            if not matching:
+                raise ViewerError(
+                    f"Requested provider '{provider}' was not found among available Vulkan physical devices. "
+                    "Accidental hardware/driver fallback rejected."
+                )
+            selected = sorted(matching, key=lambda c: (c[0], c[1]))[0]
+        else:
+            selected = sorted(candidates, key=lambda c: (c[0], c[1]))[0]
+
+        _, _, physical, family, properties, device_extensions = selected
+        raw_name = properties.deviceName
+        name = (raw_name.decode("utf-8", errors="replace") if isinstance(raw_name, bytes) else str(raw_name)).rstrip("\x00")
+        type_names = {0: "other", 1: "integrated_gpu", 2: "discrete_gpu", 3: "virtual", 4: "cpu"}
+        device_id = getattr(properties, "deviceID", 0)
+        vendor_id = getattr(properties, "vendorID", 0)
+        device_type = getattr(properties, "deviceType", 0)
+        is_software = (
+            device_type == vk.VK_PHYSICAL_DEVICE_TYPE_CPU
+            or vendor_id in (0x10005, 0x1AE0)
+            or device_id == 0xC0DE
+            or "llvmpipe" in name.lower() or "lavapipe" in name.lower() or "swiftshader" in name.lower()
+        )
+        resolved_provider = (
+            "lavapipe" if (vendor_id == 0x10005 or "llvmpipe" in name.lower() or "lavapipe" in name.lower())
+            else "swiftshader" if (vendor_id == 0x1AE0 or device_id == 0xC0DE or "swiftshader" in name.lower())
+            else "hardware"
+        )
+        limits_dict = {
+            "max_push_constants_size": properties.limits.maxPushConstantsSize,
+            "max_framebuffer_width": properties.limits.maxFramebufferWidth,
+            "max_framebuffer_height": properties.limits.maxFramebufferHeight,
+        }
+
+        missing = []
+        unverified = []
+        if required_capabilities:
+            cap_aliases = {
+                "ray_tracing": {"VK_KHR_ray_tracing_pipeline", "VK_NV_ray_tracing", "VK_KHR_ray_query"},
+                "mesh_shaders": {"VK_EXT_mesh_shader", "VK_NV_mesh_shader"},
+                "mesh_shader": {"VK_EXT_mesh_shader", "VK_NV_mesh_shader"},
+                "variable_rate_shading": {"VK_KHR_fragment_shading_rate", "VK_NV_shading_rate_image"},
+                "dynamic_rendering": {"VK_KHR_dynamic_rendering"},
+            }
+            features = None
+            if hasattr(vk, "vkGetPhysicalDeviceFeatures"):
+                try:
+                    features = vk.vkGetPhysicalDeviceFeatures(physical)
+                except Exception:
+                    features = None
+
+            for cap in required_capabilities:
+                if cap in device_extensions:
+                    continue
+                if cap in cap_aliases:
+                    if any(ext in device_extensions for ext in cap_aliases[cap]):
+                        continue
+                    missing.append(cap)
+                    continue
+                if cap.startswith("max_push_constants_size:"):
+                    try:
+                        val = int(cap.split(":", 1)[1])
+                        if properties.limits.maxPushConstantsSize >= val:
+                            continue
+                        else:
+                            missing.append(cap)
+                            continue
+                    except ValueError:
+                        pass
+                matched_feature = False
+                if features is not None:
+                    camel = "".join(part.capitalize() if i > 0 else part for i, part in enumerate(cap.split("_")))
+                    val = getattr(features, cap, None)
+                    if val is None:
+                        val = getattr(features, camel, None)
+                    if type(val) in (bool, int):
+                        matched_feature = True
+                        if val:
+                            continue
+                        else:
+                            missing.append(cap)
+                            continue
+                if cap.startswith("VK_") or cap in cap_aliases or matched_feature:
+                    missing.append(cap)
+                elif cap in ("lavapipe", "swiftshader", "software") and not is_software:
+                    missing.append(cap)
+                elif cap == "hardware" and is_software:
+                    missing.append(cap)
+                else:
+                    unverified.append(cap)
+
+        if missing:
+            status = "UNSUPPORTED"
+        elif unverified:
+            status = "UNVERIFIED"
+        else:
+            status = "EXECUTED"
+        return {
+            "target": "vulkan",
+            "backend": "vulkan",
+            "provider": resolved_provider,
+            "device_name": name,
+            "vendor_id": int(vendor_id),
+            "device_id": int(device_id),
+            "device_type": type_names.get(device_type, "unknown"),
+            "driver_version": str(getattr(properties, "driverVersion", 0)),
+            "api_version": f"{properties.apiVersion >> 22}.{(properties.apiVersion >> 12) & 0x3FF}.{properties.apiVersion & 0xFFF}",
+            "is_software": is_software,
+            "limits": limits_dict,
+            "max_push_constants_size": properties.limits.maxPushConstantsSize,
+            "max_framebuffer_width": properties.limits.maxFramebufferWidth,
+            "max_framebuffer_height": properties.limits.maxFramebufferHeight,
+            "extensions": sorted(device_extensions),
+            "status": status,
+            "missing_capabilities": missing,
+            "unverified_capabilities": unverified,
+        }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Open a live Vulkan, DirectX 12 (Windows), or Metal preview window by default.",
         epilog="Use -frames 0 to keep the window open, --output for PNG, or --video for MP4 on Vulkan/Metal.",
     )
-    parser.add_argument("manifest", type=Path, help="Compiled Vulkan, DirectX, or Metal pipeline.json")
+    parser.add_argument("manifest", type=Path, nargs="?", default=None, help="Compiled Vulkan, DirectX, or Metal pipeline.json")
     parser.add_argument("--width", type=int, default=800)
     parser.add_argument("--height", type=int, default=600)
+    parser.add_argument("--provider", choices=["hardware", "warp", "lavapipe", "swiftshader"],
+                        help="Explicitly select rendering provider (hardware, warp, lavapipe, swiftshader)")
+    parser.add_argument("--report-capabilities", action="store_true",
+                        help="Report device capabilities as JSON and exit")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--output", type=Path, help="Render an offscreen PNG instead of opening a window (new file)")
     mode.add_argument("--video", type=Path, help="Export a fixed-time GPU animation to MP4 (new file)")
@@ -1037,14 +1466,27 @@ def main() -> int:
     args = parser.parse_args()
     if args.video is None and (args.duration is not None or args.fps is not None):
         parser.error("--duration and --fps require --video")
+    if args.manifest is None:
+        if args.report_capabilities:
+            backend = "vulkan" if args.provider in ("lavapipe", "swiftshader") else ("directx" if sys.platform == "win32" else "vulkan")
+            caps = get_device_capabilities(backend=backend, provider=args.provider)
+            print(json.dumps(caps, indent=2))
+            return 0
+        parser.error("the following arguments are required: manifest")
     try:
         program = load_program(args.manifest)
+        if args.report_capabilities:
+            caps = get_device_capabilities(backend=program.target, provider=args.provider)
+            print(json.dumps(caps, indent=2))
+            return 0
         timing = {"time": args.time} if args.time is not None else {}
+        provider_kwargs = {"provider": args.provider} if args.provider is not None else {}
         if args.video:
             fps = args.fps if args.fps is not None else 30
             count = export_mp4(program, args.video, args.width, args.height,
                                args.duration if args.duration is not None else 4.0,
-                               fps, args.time if args.time is not None else 0.0, args.validation)
+                               fps, args.time if args.time is not None else 0.0, args.validation,
+                               **provider_kwargs)
             print(f"Exported {count} frames at {fps} fps: {args.video}")
         elif args.output:
             if args.output.exists():
@@ -1054,15 +1496,17 @@ def main() -> int:
                 render_directx_offscreen if program.target == "directx" and sys.platform != "darwin" else
                 render_metal_offscreen
             )
-            image = render(program, args.width, args.height, args.validation, **timing)
+            image = render(program, args.width, args.height, args.validation, **provider_kwargs, **timing)
             write_png(args.output, image)
             print(f"Rendered {image.width}x{image.height} on {image.device}: {args.output}")
         elif program.target == "vulkan":
-            count = show_window(program, args.width, args.height, args.frames, args.validation, **timing)
+            count = show_window(program, args.width, args.height, args.frames, args.validation, **provider_kwargs, **timing)
             print(f"Presented {count} Vulkan frames.")
         elif program.target == "directx" and sys.platform != "darwin":
-            show_directx_window(program, args.width, args.height, args.frames, args.validation, **timing)
+            show_directx_window(program, args.width, args.height, args.frames, args.validation, **provider_kwargs, **timing)
         else:
+            if args.provider is not None:
+                raise ValueError(f"Provider '{args.provider}' is not supported by the Metal backend.")
             show_metal_window(program, args.width, args.height, args.frames, args.validation, **timing)
     except (ViewerError, CompileError, OSError, ValueError) as error:
         print(f"mlir-gpu-view: {error}", file=sys.stderr)
