@@ -1,3 +1,4 @@
+// REQUIRES: spirv-val
 # RUN: %python %S/Inputs/pipeline.py frame vulkan %t.frame-vulkan | %FileCheck %s --check-prefixes=COMMON,FRAME
 # RUN: %python %S/Inputs/pipeline.py material vulkan %t.material-vulkan | %FileCheck %s --check-prefixes=COMMON,MATERIAL
 # RUN: %python %S/Inputs/pipeline.py visibility vulkan %t.visibility | %FileCheck %s --check-prefix=VISIBILITY
