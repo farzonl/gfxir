@@ -70,12 +70,6 @@ static std::string deviceName(const wchar_t* text) {
     return std::string(result.data());
 }
 
-struct ReadbackReport {
-    std::string device;
-    UINT width;
-    UINT height;
-};
-
 struct Event {
     HANDLE handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     Event() {
@@ -85,6 +79,187 @@ struct Event {
     Event(const Event&) = delete;
     Event& operator=(const Event&) = delete;
 };
+
+struct SelectedDevice {
+    ComPtr<IDXGIFactory6> factory;
+    ComPtr<IDXGIAdapter1> adapter;
+    ComPtr<ID3D12Device> device;
+    DXGI_ADAPTER_DESC1 description{};
+    std::string name;
+};
+
+static bool isSoftwareAdapter(const DXGI_ADAPTER_DESC1& desc) {
+    return (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || desc.VendorId == 0x1414;
+}
+
+static SelectedDevice createDirectXDevice(bool warp, bool validation) {
+    if (validation) {
+        ComPtr<ID3D12Debug1> debug;
+        check(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)),
+              "D3D12 debug layer (install Windows Graphics Tools)");
+        debug->EnableDebugLayer();
+        debug->SetEnableGPUBasedValidation(TRUE);
+    }
+    SelectedDevice result;
+    check(CreateDXGIFactory2(validation ? DXGI_CREATE_FACTORY_DEBUG : 0, IID_PPV_ARGS(&result.factory)),
+          "CreateDXGIFactory2");
+
+    if (warp) {
+        HRESULT status = result.factory->EnumWarpAdapter(IID_PPV_ARGS(&result.adapter));
+        if (FAILED(status)) {
+            throw std::runtime_error("DirectX WARP software adapter is unavailable. Accidental hardware/driver fallback rejected.");
+        }
+        check(result.adapter->GetDesc1(&result.description), "GetDesc1");
+        if (!isSoftwareAdapter(result.description)) {
+            throw std::runtime_error("WARP adapter enumeration did not return a software adapter. Accidental hardware/driver fallback rejected.");
+        }
+        status = D3D12CreateDevice(result.adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&result.device));
+        if (status == DXGI_ERROR_UNSUPPORTED || status == E_INVALIDARG || FAILED(status)) {
+            throw std::runtime_error("Failed to create DirectX 12 device on WARP adapter. Accidental hardware/driver fallback rejected.");
+        }
+        D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+        check(result.device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)),
+              "Check Shader Model support");
+        if (model.HighestShaderModel < D3D_SHADER_MODEL_6_6) {
+            throw std::runtime_error("DirectX WARP adapter does not support Shader Model 6.6. Accidental hardware/driver fallback rejected.");
+        }
+        result.name = deviceName(result.description.Description);
+    } else {
+        for (UINT index = 0;; ++index) {
+            ComPtr<IDXGIAdapter1> candidate;
+            HRESULT status = result.factory->EnumAdapterByGpuPreference(
+                index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate));
+            if (status == DXGI_ERROR_NOT_FOUND) break;
+            check(status, "EnumAdapterByGpuPreference");
+            DXGI_ADAPTER_DESC1 candidateDesc{};
+            check(candidate->GetDesc1(&candidateDesc), "GetDesc1");
+            if (isSoftwareAdapter(candidateDesc)) continue;
+            status = D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&result.device));
+            if (status == DXGI_ERROR_UNSUPPORTED || status == E_INVALIDARG) continue;
+            check(status, "D3D12CreateDevice");
+            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+            check(result.device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)),
+                  "Check Shader Model support");
+            if (model.HighestShaderModel < D3D_SHADER_MODEL_6_6) {
+                result.device.Reset();
+                continue;
+            }
+            result.adapter = candidate;
+            result.description = candidateDesc;
+            result.name = deviceName(result.description.Description);
+            break;
+        }
+        if (!result.device) throw std::runtime_error("No DirectX 12 GPU supporting Shader Model 6.6 is available");
+    }
+    return result;
+}
+
+static std::string queryFeatureLevel(ID3D12Device* device) {
+    const D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_12_2,
+        D3D_FEATURE_LEVEL_12_1,
+        D3D_FEATURE_LEVEL_12_0,
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+    };
+    D3D12_FEATURE_DATA_FEATURE_LEVELS data{};
+    data.NumFeatureLevels = static_cast<UINT>(sizeof(levels) / sizeof(levels[0]));
+    data.pFeatureLevelsRequested = levels;
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &data, sizeof(data)))) {
+        switch (data.MaxSupportedFeatureLevel) {
+            case D3D_FEATURE_LEVEL_12_2: return "12_2";
+            case D3D_FEATURE_LEVEL_12_1: return "12_1";
+            case D3D_FEATURE_LEVEL_12_0: return "12_0";
+            case D3D_FEATURE_LEVEL_11_1: return "11_1";
+            case D3D_FEATURE_LEVEL_11_0: return "11_0";
+            default: break;
+        }
+    }
+    return "unknown";
+}
+
+static std::string queryShaderModel(ID3D12Device* device) {
+    const D3D_SHADER_MODEL candidateModels[] = {
+        D3D_SHADER_MODEL_6_9, D3D_SHADER_MODEL_6_8, D3D_SHADER_MODEL_6_7,
+        D3D_SHADER_MODEL_6_6, D3D_SHADER_MODEL_6_5, D3D_SHADER_MODEL_6_4,
+        D3D_SHADER_MODEL_6_3, D3D_SHADER_MODEL_6_2, D3D_SHADER_MODEL_6_1,
+        D3D_SHADER_MODEL_6_0, D3D_SHADER_MODEL_5_1
+    };
+    for (D3D_SHADER_MODEL model : candidateModels) {
+        D3D12_FEATURE_DATA_SHADER_MODEL data{model};
+        if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &data, sizeof(data)))) {
+            UINT highest = static_cast<UINT>(data.HighestShaderModel);
+            if (highest >= 0x51) {
+                UINT major = highest >> 4;
+                UINT minor = highest & 0xF;
+                return std::to_string(major) + "_" + std::to_string(minor);
+            }
+        }
+    }
+    return "unknown";
+}
+
+struct CapabilitiesReport {
+    std::string provider;
+    std::string adapter_name;
+    std::string device_name;
+    std::string device;
+    UINT vendor_id;
+    UINT device_id;
+    UINT subsystem_id;
+    UINT revision;
+    uint64_t dedicated_memory;
+    uint64_t dedicated_video_memory;
+    uint64_t dedicated_system_memory;
+    uint64_t shared_system_memory;
+    bool software_adapter;
+    bool is_software;
+    std::string feature_level;
+    std::string d3d12_feature_level;
+    std::string shader_model;
+    std::string highest_shader_model;
+};
+
+struct ReadbackReport {
+    std::string device;
+    UINT width;
+    UINT height;
+};
+
+static void reportDeviceCapabilities(bool warp, bool validation) {
+    SelectedDevice dev = createDirectXDevice(warp, validation);
+    std::string featureLevel = queryFeatureLevel(dev.device.Get());
+    std::string shaderModel = queryShaderModel(dev.device.Get());
+    std::string featureLevelDot = featureLevel;
+    size_t underscore = featureLevelDot.find('_');
+    if (underscore != std::string::npos) featureLevelDot[underscore] = '.';
+    std::string shaderModelDot = shaderModel;
+    underscore = shaderModelDot.find('_');
+    if (underscore != std::string::npos) shaderModelDot[underscore] = '.';
+    bool isSoftware = isSoftwareAdapter(dev.description) || warp;
+
+    CapabilitiesReport report{
+        warp ? "warp" : "hardware",
+        dev.name,
+        dev.name,
+        dev.name,
+        dev.description.VendorId,
+        dev.description.DeviceId,
+        dev.description.SubSysId,
+        dev.description.Revision,
+        static_cast<uint64_t>(dev.description.DedicatedVideoMemory),
+        static_cast<uint64_t>(dev.description.DedicatedVideoMemory),
+        static_cast<uint64_t>(dev.description.DedicatedSystemMemory),
+        static_cast<uint64_t>(dev.description.SharedSystemMemory),
+        isSoftware,
+        isSoftware,
+        featureLevelDot,
+        featureLevel,
+        shaderModel,
+        shaderModelDot,
+    };
+    std::cout << glz::write_json(report).value_or("{}") << "\n" << std::flush;
+}
 
 class Renderer {
     ComPtr<IDXGIFactory6> factory;
@@ -185,41 +360,13 @@ class Renderer {
 
 public:
     Renderer(const std::wstring& vertex, const std::wstring& fragment, UINT count, bool validation,
-             bool hasTime = false, double time = 0.0)
+             bool warp = false, bool hasTime = false, double time = 0.0)
         : vertexCount(count), hasFixedTime(hasTime), fixedTime(time),
           started(std::chrono::steady_clock::now()) {
-        if (validation) {
-            ComPtr<ID3D12Debug1> debug;
-            check(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)),
-                  "D3D12 debug layer (install Windows Graphics Tools)");
-            debug->EnableDebugLayer();
-            debug->SetEnableGPUBasedValidation(TRUE);
-        }
-        check(CreateDXGIFactory2(validation ? DXGI_CREATE_FACTORY_DEBUG : 0, IID_PPV_ARGS(&factory)),
-              "CreateDXGIFactory2");
-        for (UINT index = 0;; ++index) {
-            ComPtr<IDXGIAdapter1> adapter;
-            HRESULT status = factory->EnumAdapterByGpuPreference(
-                index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter));
-            if (status == DXGI_ERROR_NOT_FOUND) break;
-            check(status, "EnumAdapterByGpuPreference");
-            DXGI_ADAPTER_DESC1 description{};
-            check(adapter->GetDesc1(&description), "GetDesc1");
-            if ((description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || description.VendorId == 0x1414) continue;
-            status = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device));
-            if (status == DXGI_ERROR_UNSUPPORTED || status == E_INVALIDARG) continue;
-            check(status, "D3D12CreateDevice");
-            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
-            check(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)),
-                  "Check Shader Model support");
-            if (model.HighestShaderModel < D3D_SHADER_MODEL_6_6) {
-                device.Reset();
-                continue;
-            }
-            name = deviceName(description.Description);
-            break;
-        }
-        if (!device) throw std::runtime_error("No DirectX 12 GPU supporting Shader Model 6.6 is available");
+        auto dev = createDirectXDevice(warp, validation);
+        factory = std::move(dev.factory);
+        device = std::move(dev.device);
+        name = std::move(dev.name);
         if (validation) check(device.As(&diagnostics), "Get D3D12 validation queue");
         D3D12_COMMAND_QUEUE_DESC queueDescription{};
         queueDescription.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -450,11 +597,23 @@ int wmain(int argc, wchar_t** argv) {
     try {
         std::map<std::wstring, std::wstring> options;
         bool validation = false;
+        bool warp = false;
+        bool reportCapabilities = false;
         for (int index = 1; index < argc; ++index) {
             std::wstring key = argv[index];
             if (key == L"--validation") {
                 if (validation) throw std::runtime_error("Missing or duplicate native viewer argument");
                 validation = true;
+                continue;
+            }
+            if (key == L"--warp") {
+                if (warp) throw std::runtime_error("Missing or duplicate native viewer argument");
+                warp = true;
+                continue;
+            }
+            if (key == L"--report-capabilities") {
+                if (reportCapabilities) throw std::runtime_error("Missing or duplicate native viewer argument");
+                reportCapabilities = true;
                 continue;
             }
             if (key == L"-frames") key = L"--frames";
@@ -464,6 +623,10 @@ int wmain(int argc, wchar_t** argv) {
                 throw std::runtime_error("Unknown native DirectX viewer argument");
             if (++index == argc || !options.emplace(key, argv[index]).second)
                 throw std::runtime_error("Missing or duplicate native viewer argument");
+        }
+        if (reportCapabilities) {
+            reportDeviceCapabilities(warp, validation);
+            return 0;
         }
         if (!options.count(L"--vertex") || !options.count(L"--fragment"))
             throw std::runtime_error("--vertex and --fragment DXIL paths are required");
@@ -480,7 +643,7 @@ int wmain(int argc, wchar_t** argv) {
         double fixedTime = hasTime ? seconds(options.at(L"--time")) : 0.0;
 
         Renderer renderer(options.at(L"--vertex"), options.at(L"--fragment"), count, validation,
-                          hasTime, fixedTime);
+                          warp, hasTime, fixedTime);
         if (options.count(L"--readback")) {
             renderer.readback(width, height, options.at(L"--readback"));
         } else {

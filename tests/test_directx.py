@@ -291,6 +291,7 @@ class DirectXRenderingTests(unittest.TestCase):
             viewer_bin = self.tools.find("mlir-gpu-directx-view")
             cmd = [
                 viewer_bin,
+                *(["--warp"] if os.environ.get("MLIR_GPU_TEST_WARP") == "1" else []),
                 "--vertex", str(vertex_dxil),
                 "--fragment", str(fragment_dxil),
                 "--vertex-count", "3",
