@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import importlib
@@ -246,11 +246,7 @@ def _directx_shaders(program: GraphicsProgram, toolchain: Toolchain):
         raise ViewerError("Native DirectX 12 preview requires Windows.")
     if program.target != "directx":
         raise ViewerError("The DirectX 12 viewer requires DirectX artifacts.")
-    if program.parameters is not None:
-        raise ViewerError(
-            "Native DirectX 12 preview does not implement frame parameter resources yet; "
-            "use Vulkan or DXIL-to-Metal on macOS for parameterized shaders."
-        )
+    _frame_parameters(program.parameters)
     with tempfile.TemporaryDirectory(prefix="mlir-gpu-directx-") as work:
         directory = Path(work)
         arguments = [toolchain.find("mlir-gpu-directx-view")]
@@ -258,7 +254,8 @@ def _directx_shaders(program: GraphicsProgram, toolchain: Toolchain):
             path = directory / f"{stage}.dxil"
             path.write_bytes(shader.code)
             arguments.extend([f"--{stage}", str(path)])
-        yield directory, [*arguments, "--vertex-count", str(program.draw.vertex_count)]
+        arguments.extend(["--vertex-count", str(program.draw.vertex_count)])
+        yield directory, arguments
 
 
 def _readback_result(text: str, output: Path, width: int, height: int, backend: str) -> RenderedImage:
@@ -275,19 +272,30 @@ def _readback_result(text: str, output: Path, width: int, height: int, backend: 
     return RenderedImage(width, height, rgba, report["device"])
 
 
+@contextmanager
+def _directx_offscreen_renderer(
+    program: GraphicsProgram, width: int, height: int, validation: bool, toolchain: Toolchain | None = None,
+):
+    _dimensions(width, height)
+    with _directx_shaders(program, toolchain or _preview_toolchain()) as (directory, arguments):
+        output = directory / "readback.rgba"
+        def render(elapsed: float) -> RenderedImage:
+            timing = ["--time", str(_time_value(elapsed))]
+            text = _directx_run(
+                [*arguments, "--width", str(width), "--height", str(height), "--readback", str(output), *timing],
+                validation, True,
+            )
+            return _readback_result(text, output, width, height, "DirectX 12")
+        yield render
+
+
 def render_directx_offscreen(
     program: GraphicsProgram, width: int = 640, height: int = 480,
     validation: bool = False, toolchain: Toolchain | None = None, time: float = 0.0,
 ) -> RenderedImage:
-    _dimensions(width, height)
-    _time_value(time)
-    with _directx_shaders(program, toolchain or _preview_toolchain()) as (directory, arguments):
-        output = directory / "readback.rgba"
-        text = _directx_run(
-            [*arguments, "--width", str(width), "--height", str(height), "--readback", str(output)],
-            validation, True,
-        )
-        return _readback_result(text, output, width, height, "DirectX 12")
+    elapsed = _time_value(time)
+    with _directx_offscreen_renderer(program, width, height, validation, toolchain) as render:
+        return render(elapsed)
 
 
 def show_directx_window(
@@ -295,13 +303,12 @@ def show_directx_window(
     validation: bool = False, toolchain: Toolchain | None = None, time: float | None = None,
 ) -> None:
     _dimensions(width, height)
-    if time is not None:
-        _time_value(time)
     if type(frames) is not int or frames < 0:
         raise ViewerError("Frame count must be a nonnegative integer (0 means until closed).")
+    timing = ["--time", str(_time_value(time))] if time is not None else []
     with _directx_shaders(program, toolchain or _preview_toolchain()) as (_, arguments):
         _directx_run(
-            [*arguments, "--width", str(width), "--height", str(height), "--frames", str(frames)],
+            [*arguments, "--width", str(width), "--height", str(height), "--frames", str(frames), *timing],
             validation, False,
         )
 
@@ -685,6 +692,14 @@ def render_offscreen(program: GraphicsProgram, width: int = 640, height: int = 4
 def _offscreen_renderer(program: GraphicsProgram, width: int, height: int, validation: bool):
     _dimensions(width, height)
     _frame_parameters(program.parameters)
+    if program.target == "directx" and sys.platform != "darwin":
+        with _directx_offscreen_renderer(program, width, height, validation) as render:
+            yield render
+        return
+    if program.target == "metal":
+        with _metal_offscreen_renderer(program, width, height, validation) as render:
+            yield render
+        return
     if program.target != "vulkan":
         raise ViewerError("Vulkan rendering requires Vulkan artifacts; use the Metal preview for DXIL.")
     with _api_errors(), ExitStack() as resources:
@@ -750,9 +765,9 @@ def export_mp4(program: GraphicsProgram, path: Path, width: int = 640, height: i
     _time_value(start + (count - 1) / fps)
     if program.target not in ("vulkan", "directx", "metal"):
         raise ViewerError("MP4 export requires Vulkan, DirectX, or Metal artifacts.")
-    if program.target == "directx" and sys.platform != "darwin":
+    if program.target == "directx" and sys.platform not in ("win32", "darwin"):
         raise ViewerError(
-            "Native DirectX 12 MP4 export is not implemented yet; "
+            "Native DirectX 12 MP4 export requires Windows; "
             "use Vulkan or DXIL-to-Metal on macOS for video export."
         )
     _frame_parameters(program.parameters)
@@ -784,7 +799,11 @@ def export_mp4(program: GraphicsProgram, path: Path, width: int = 640, height: i
             raise ViewerError(f"Cannot start the MP4 encoder: {error}") from error
         with encoder:
             try:
-                renderer = _offscreen_renderer if program.target == "vulkan" else _metal_offscreen_renderer
+                renderer = (
+                    _offscreen_renderer if program.target == "vulkan" else
+                    _directx_offscreen_renderer if program.target == "directx" and sys.platform != "darwin" else
+                    _metal_offscreen_renderer
+                )
                 with renderer(program, width, height, validation) as render:
                     for index in range(count):
                         image = render(start + index / fps)
@@ -822,6 +841,30 @@ def export_mp4(program: GraphicsProgram, path: Path, width: int = 640, height: i
             os.link(output, path)
         except FileExistsError as error:
             raise ViewerError(f"Output already exists; choose a new MP4 path: {path}") from error
+        except (PermissionError, OSError):
+            if path.exists():
+                raise ViewerError(f"Output already exists; choose a new MP4 path: {path}")
+            moved = False
+            if sys.platform == "win32":
+                try:
+                    os.rename(output, path)
+                    moved = True
+                except FileExistsError as error:
+                    raise ViewerError(f"Output already exists; choose a new MP4 path: {path}") from error
+                except OSError:
+                    moved = False
+            if not moved:
+                try:
+                    with open(path, "xb") as out_file, output.open("rb") as in_file:
+                        shutil.copyfileobj(in_file, out_file)
+                except FileExistsError as error:
+                    raise ViewerError(f"Output already exists; choose a new MP4 path: {path}") from error
+                except Exception as error:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise ViewerError(f"Failed to publish MP4 output to {path}: {error}") from error
     return count
 
 

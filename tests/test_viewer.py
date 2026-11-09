@@ -192,10 +192,68 @@ class ViewerTests(unittest.TestCase):
         with patch("mlir_gpu.viewer.sys.platform", "win32"), patch.object(Toolchain, "find") as find:
             for render in (render_directx_offscreen, show_directx_window):
                 with self.subTest(render=render.__name__):
-                    with self.assertRaisesRegex(ViewerError, "frame parameter resources"):
+                    with self.assertRaisesRegex(ViewerError, "Invalid frame parameter resource"):
                         render(parameterized)
                     with self.assertRaisesRegex(ViewerError, "Time"):
                         render(program, time=float("nan"))
+            find.assert_not_called()
+
+    def test_directx_parameterized_offscreen_passes_time(self):
+        from test_parameters import FRAME_REFLECTION
+        program = self.native_program("directx")
+        parameterized = type(program)(
+            program.vertex, program.fragment, program.target, program.draw,
+            parameters=FRAME_REFLECTION,
+        )
+
+        def mock_renderer(arguments, validation, capture):
+            self.assertNotIn("--frame-layout", arguments)
+            self.assertIn("--time", arguments)
+            self.assertEqual(arguments[arguments.index("--time") + 1], "2.5")
+            readback_path = Path(arguments[arguments.index("--readback") + 1])
+            readback_path.write_bytes(bytes([10, 20, 30, 255]))
+            return '{"device":"D3D12 Test GPU","width":1,"height":1}'
+
+        with patch("mlir_gpu.viewer.sys.platform", "win32"), patch.object(Toolchain, "find", side_effect=lambda name: name):
+            with patch("mlir_gpu.viewer._directx_run", side_effect=mock_renderer):
+                image = render_directx_offscreen(parameterized, 1, 1, time=2.5)
+        self.assertEqual(image.width, 1)
+        self.assertEqual(image.height, 1)
+        self.assertEqual(image.rgba, bytes([10, 20, 30, 255]))
+
+    def test_directx_parameterized_window_passes_fixed_time(self):
+        from test_parameters import FRAME_REFLECTION
+        program = self.native_program("directx")
+        parameterized = type(program)(
+            program.vertex, program.fragment, program.target, program.draw,
+            parameters=FRAME_REFLECTION,
+        )
+
+        with patch("mlir_gpu.viewer.sys.platform", "win32"), patch.object(Toolchain, "find", side_effect=lambda name: name):
+            with patch("mlir_gpu.viewer._directx_run") as renderer:
+                show_directx_window(parameterized, 800, 600, frames=10, time=3.0)
+                arguments, validation, capture = renderer.call_args.args
+                self.assertNotIn("--frame-layout", arguments)
+                self.assertIn("--time", arguments)
+                self.assertEqual(arguments[arguments.index("--time") + 1], "3.0")
+                self.assertIn("--frames", arguments)
+                self.assertEqual(arguments[arguments.index("--frames") + 1], "10")
+
+    def test_directx_custom_parameter_block_rejected_before_launch(self):
+        import copy
+        from test_parameters import FRAME_REFLECTION
+        program = self.native_program("directx")
+        custom_block = copy.deepcopy(FRAME_REFLECTION)
+        custom_block["name"] = "material"
+        parameterized = type(program)(
+            program.vertex, program.fragment, program.target, program.draw,
+            parameters=custom_block,
+        )
+        with patch("mlir_gpu.viewer.sys.platform", "win32"), patch.object(Toolchain, "find") as find:
+            for render in (render_directx_offscreen, show_directx_window):
+                with self.subTest(render=render.__name__):
+                    with self.assertRaisesRegex(ViewerError, "supplies FrameParameters only"):
+                        render(parameterized)
             find.assert_not_called()
 
     def test_directx_native_readback_uses_original_dxil_and_draw_count(self):

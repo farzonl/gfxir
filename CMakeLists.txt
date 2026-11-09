@@ -23,9 +23,19 @@ endforeach()
 target_compile_definitions(dxil-assemble PRIVATE MLIR_GPU_ASSEMBLE=1)
 
 if(WIN32)
+  include(FetchContent)
+  FetchContent_Declare(
+    glaze
+    GIT_REPOSITORY https://github.com/stephenberry/glaze.git
+    GIT_TAG v9.1.0
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(glaze)
+
   add_executable(mlir-gpu-directx-view native/directx_viewer.cpp)
+  set_target_properties(mlir-gpu-directx-view PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
   target_compile_definitions(mlir-gpu-directx-view PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
-  target_link_libraries(mlir-gpu-directx-view PRIVATE d3d12 dxgi user32)
+  target_link_libraries(mlir-gpu-directx-view PRIVATE d3d12 dxgi user32 glaze::glaze)
   install(TARGETS mlir-gpu-directx-view RUNTIME DESTINATION bin)
 
   find_file(DXC_RUNTIME dxcompiler.dll HINTS
