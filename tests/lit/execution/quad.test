@@ -1,0 +1,3 @@
+# REQUIRES: image_execution
+# RUN: %python %S/Inputs/render_shader.py quad %t.quad.png --target GFXIR_LIT_EXECUTION_TARGETS
+# RUN: %python %S/Inputs/imgdiff.py %S/Inputs/goldens/common/quad.png %t.quad.png --target GFXIR_LIT_EXECUTION_TARGETS --rules %S/Inputs/golden-rules.yaml

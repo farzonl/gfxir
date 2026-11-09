@@ -32,7 +32,7 @@ jobs:
       - name: Install Python package and viewer dependencies
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install -e '.[viewer,video]' lit
+          python3 -m pip install -e '.[viewer,video,test]'
 
       - name: Install system packages (Linux)
         if: runner.os == 'Linux'
@@ -242,7 +242,7 @@ jobs:
       - name: Install Python package and viewer dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e '.[viewer,video]' lit
+          python -m pip install -e '.[viewer,video,test]'
 
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -430,5 +430,4 @@ jobs:
           python -m unittest discover -s tests -p "test_swiftshader.py" -v
           Write-Host "Running full Python test suite with WARP and SwiftShader offscreen execution..."
           python -m unittest discover -s tests -p "test_*.py" -v
-
 
