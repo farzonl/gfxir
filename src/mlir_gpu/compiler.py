@@ -376,12 +376,13 @@ def _compile_stage(
 
 
 def compile_pipeline(
-    pipeline: Pipeline | MLIRPipeline,
+    pipeline: Pipeline | MLIRPipeline | Any,
     target: Target,
     output: Path,
     toolchain: Toolchain | None = None,
     target_profile: TargetProfile | str | None = None,
-) -> Path:
+    reflection_path: Path | None = None,
+) -> Path | dict:
     if not isinstance(target, Target):
         raise TypeError("target must be a Target.")
     if target_profile is None:
@@ -397,12 +398,69 @@ def compile_pipeline(
     output = Path(output).absolute()
     if output.exists():
         raise CompileError(f"Output already exists; choose a new directory: {output}")
-    stages = pipeline.trace()
+
+    is_compute_entry = hasattr(pipeline, "kind") and getattr(pipeline, "kind") == "compute"
+    if is_compute_entry:
+        stages = [pipeline.trace()]
+    else:
+        stages = pipeline.trace()
+
     tools = (toolchain or Toolchain()).preflight(target)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".mlir-gpu-", dir=output.parent) as scratch:
         directory = Path(scratch) / "pipeline"
         directory.mkdir()
+
+        if is_compute_entry:
+            # Validate output suffix against target
+            if target == Target.VULKAN:
+                if output.suffix != ".spv":
+                    raise CompileError(
+                        f"Target.VULKAN compute output must have '.spv' extension, got: {output.name}"
+                    )
+            elif target == Target.DIRECTX:
+                if output.suffix not in (".dxil", ".ll"):
+                    raise CompileError(
+                        f"Target.DIRECTX compute output must have '.dxil' or '.ll' extension, got: {output.name}"
+                    )
+            elif target == Target.METAL:
+                if output.suffix != ".metallib":
+                    raise CompileError(
+                        f"Target.METAL compute output must have '.metallib' extension, got: {output.name}"
+                    )
+
+            stage = stages[0]
+            try:
+                binary = _compile_stage(stage, target, directory, tools, target_profile=profile)
+            except TypeError as err:
+                if "unexpected keyword argument 'target_profile'" in str(err):
+                    binary = _compile_stage(stage, target, directory, tools)
+                else:
+                    raise
+
+            if target == Target.VULKAN:
+                shutil.copyfile(directory / f"{stage.kind}.spv", output)
+            elif target == Target.DIRECTX:
+                if output.suffix == ".ll":
+                    shutil.copyfile(directory / f"{stage.kind}.ll", output)
+                else:
+                    shutil.copyfile(directory / f"{stage.kind}.dxil", output)
+            elif target == Target.METAL:
+                shutil.copyfile(directory / f"{stage.kind}.metallib", output)
+
+            if reflection_path is not None:
+                reflection_path = Path(reflection_path).absolute()
+                reflection_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(directory / f"{stage.kind}.reflection.json", reflection_path)
+
+            return {
+                "target": target.value,
+                "target_profile": profile.to_dict(),
+                "stage": stage.kind,
+                "entry_point": stage.name,
+                "binary": str(output),
+            }
+
         entries = []
         for stage in stages:
             try:

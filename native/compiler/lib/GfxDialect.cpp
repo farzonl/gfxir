@@ -688,6 +688,227 @@ LogicalResult PositionOp::verify() {
   return success();
 }
 
+Attribute AccessModeAttr::parse(AsmParser &parser, Type type) {
+  if (parser.parseLess())
+    return {};
+  std::string keyword;
+  llvm::SMLoc loc = parser.getCurrentLocation();
+  if (parser.parseKeywordOrString(&keyword))
+    return {};
+  if (parser.parseGreater())
+    return {};
+  auto maybe = symbolizeAccessMode(keyword);
+  if (!maybe) {
+    parser.emitError(loc, "expected ::mlir::gfx::AccessMode to be one of: read_only, write_only, read_write");
+    return {};
+  }
+  return AccessModeAttr::get(parser.getContext(), *maybe, type);
+}
+
+void AccessModeAttr::print(AsmPrinter &printer) const {
+  printer << "<" << stringifyAccessMode(getValue()) << ">";
+}
+
+ParseResult BufferBindingOp::parse(OpAsmParser &parser, OperationState &result) {
+  IntegerAttr setAttr;
+  IntegerAttr bindingAttr;
+  StringAttr nameAttr;
+  AccessModeAttr accessAttr;
+  PtrType ptrType;
+
+  if (parser.parseCustomAttributeWithFallback(setAttr, parser.getBuilder().getIntegerType(32)) ||
+      parser.parseComma() ||
+      parser.parseCustomAttributeWithFallback(bindingAttr, parser.getBuilder().getIntegerType(32)) ||
+      parser.parseComma() ||
+      parser.parseCustomAttributeWithFallback(nameAttr, parser.getBuilder().getType<NoneType>()) ||
+      parser.parseComma())
+    return failure();
+
+  llvm::SMLoc accessLoc = parser.getCurrentLocation();
+  if (parser.parseCustomAttributeWithFallback(accessAttr, parser.getBuilder().getType<NoneType>()))
+    return failure();
+
+  if (setAttr)
+    result.getOrAddProperties<BufferBindingOp::Properties>().set = setAttr;
+  if (bindingAttr)
+    result.getOrAddProperties<BufferBindingOp::Properties>().binding = bindingAttr;
+  if (nameAttr)
+    result.getOrAddProperties<BufferBindingOp::Properties>().name = nameAttr;
+  if (accessAttr)
+    result.getOrAddProperties<BufferBindingOp::Properties>().access = accessAttr;
+
+  if (accessAttr && accessAttr.getType()) {
+    if (!isa<PtrType>(accessAttr.getType()))
+      return parser.emitError(accessLoc, "result #0 must be !gfx.ptr, but got '") << accessAttr.getType() << "'";
+    ptrType = cast<PtrType>(accessAttr.getType());
+  } else {
+    if (parser.parseColon())
+      return failure();
+    llvm::SMLoc typeLoc = parser.getCurrentLocation();
+    Type rawType;
+    if (parser.parseType(rawType))
+      return failure();
+    if (!isa<PtrType>(rawType))
+      return parser.emitError(typeLoc, "result #0 must be !gfx.ptr, but got '") << rawType << "'";
+    ptrType = cast<PtrType>(rawType);
+  }
+
+  result.addTypes(ptrType);
+  return success();
+}
+
+void BufferBindingOp::print(OpAsmPrinter &printer) {
+  printer << ' ' << getSet() << ", " << getBinding() << ", " << getNameAttr() << ", "
+          << "#gfx.access_mode<" << stringifyAccessMode(getAccess().getValue()) << "> : "
+          << getResult().getType();
+}
+
+LogicalResult BufferBindingOp::verify() {
+  if (getSetAttr().getInt() < 0)
+    return emitOpError("buffer binding set index must be non-negative, got ") << getSetAttr().getInt();
+  if (getBindingAttr().getInt() < 0)
+    return emitOpError("buffer binding slot index must be non-negative, got ") << getBindingAttr().getInt();
+  if (getName().empty())
+    return emitOpError("buffer name must not be empty");
+
+  auto ptrType = cast<PtrType>(getResult().getType());
+  if (ptrType.getStorageClass() != StorageClass::Global)
+    return emitOpError("buffer binding must produce a pointer with 'global' storage class, got '")
+           << stringifyStorageClass(ptrType.getStorageClass()) << "'";
+
+  return success();
+}
+
+LogicalResult PtrOffsetOp::verify() {
+  auto ptrType = cast<PtrType>(getPtr().getType());
+  auto resType = cast<PtrType>(getResult().getType());
+
+  if (resType.getElementType() != ptrType.getElementType())
+    return emitOpError("result pointer element type ")
+           << resType.getElementType()
+           << " does not match source pointer element type "
+           << ptrType.getElementType();
+
+  if (resType.getStorageClass() != ptrType.getStorageClass())
+    return emitOpError("result pointer storage class '")
+           << stringifyStorageClass(resType.getStorageClass())
+           << "' does not match source pointer storage class '"
+           << stringifyStorageClass(ptrType.getStorageClass()) << "'";
+
+  return success();
+}
+
+static Operation *getRootPointerDefiningOp(Value ptr) {
+  Operation *current = ptr.getDefiningOp();
+  while (auto offsetOp = dyn_cast_or_null<PtrOffsetOp>(current))
+    current = offsetOp.getPtr().getDefiningOp();
+  return current;
+}
+
+LogicalResult LoadOp::verify() {
+  auto ptrType = cast<PtrType>(getPtr().getType());
+
+  if (getResult().getType() != ptrType.getElementType())
+    return emitOpError("load result type ")
+           << getResult().getType()
+           << " does not match pointer element type "
+           << ptrType.getElementType();
+
+  if (getAlignment().has_value()) {
+    int32_t align = *getAlignment();
+    if (align <= 0 || !llvm::isPowerOf2_32(align))
+      return emitOpError("load alignment must be a power of two, got ") << align;
+    uint32_t natural = getNaturalAlignment(ptrType.getElementType());
+    if (natural > 0 && static_cast<uint32_t>(align) < natural)
+      return emitOpError("load alignment (") << align
+             << ") is smaller than natural alignment of pointee type (" << natural << ")";
+  }
+
+  Operation *root = getRootPointerDefiningOp(getPtr());
+  if (auto binding = dyn_cast_or_null<BufferBindingOp>(root)) {
+    if (binding.getAccess() == AccessMode::WriteOnly)
+      return emitOpError("cannot load from write-only buffer binding '")
+             << binding.getName() << "'";
+  }
+
+  return success();
+}
+
+ParseResult StoreOp::parse(OpAsmParser &parser, OperationState &result) {
+  OpAsmParser::UnresolvedOperand valueOperand;
+  OpAsmParser::UnresolvedOperand ptrOperand;
+  IntegerAttr alignmentAttr;
+  Type valueType;
+  Type ptrType;
+
+  if (parser.parseOperand(valueOperand) ||
+      parser.parseComma() ||
+      parser.parseOperand(ptrOperand))
+    return failure();
+
+  if (succeeded(parser.parseOptionalComma())) {
+    if (parser.parseKeyword("alignment") ||
+        parser.parseEqual() ||
+        parser.parseCustomAttributeWithFallback(alignmentAttr, parser.getBuilder().getIntegerType(32)))
+      return failure();
+    if (alignmentAttr)
+      result.getOrAddProperties<StoreOp::Properties>().alignment = alignmentAttr;
+  }
+
+  if (parser.parseOptionalAttrDict(result.attributes) ||
+      parser.parseColon() ||
+      parser.parseType(valueType) ||
+      parser.parseComma() ||
+      parser.parseType(ptrType))
+    return failure();
+
+  if (parser.resolveOperand(valueOperand, valueType, result.operands) ||
+      parser.resolveOperand(ptrOperand, ptrType, result.operands))
+    return failure();
+
+  return success();
+}
+
+void StoreOp::print(OpAsmPrinter &printer) {
+  printer << ' ' << getValue() << ", " << getPtr();
+  if (getAlignment().has_value())
+    printer << ", alignment = " << *getAlignment();
+  printer.printOptionalAttrDict((*this)->getDiscardableAttrDictionary().getValue());
+  printer << " : " << getValue().getType() << ", " << getPtr().getType();
+}
+
+LogicalResult StoreOp::verify() {
+  auto ptrType = cast<PtrType>(getPtr().getType());
+
+  if (getValue().getType() != ptrType.getElementType())
+    return emitOpError("stored value type ")
+           << getValue().getType()
+           << " does not match pointer element type "
+           << ptrType.getElementType();
+
+  if (ptrType.getStorageClass() == StorageClass::PushConstant)
+    return emitOpError("cannot store into read-only storage class 'push_constant'");
+
+  if (getAlignment().has_value()) {
+    int32_t align = *getAlignment();
+    if (align <= 0 || !llvm::isPowerOf2_32(align))
+      return emitOpError("store alignment must be a power of two, got ") << align;
+    uint32_t natural = getNaturalAlignment(ptrType.getElementType());
+    if (natural > 0 && static_cast<uint32_t>(align) < natural)
+      return emitOpError("store alignment (") << align
+             << ") is smaller than natural alignment of pointee type (" << natural << ")";
+  }
+
+  Operation *root = getRootPointerDefiningOp(getPtr());
+  if (auto binding = dyn_cast_or_null<BufferBindingOp>(root)) {
+    if (binding.getAccess() == AccessMode::ReadOnly)
+      return emitOpError("cannot store to read-only buffer binding '")
+             << binding.getName() << "'";
+  }
+
+  return success();
+}
+
 LogicalResult mlir::gfx::verifyShaderModule(ModuleOp module,
                                             const TargetProfile &profile) {
   if (failed(verify(module)))

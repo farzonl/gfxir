@@ -165,12 +165,20 @@ int main(int argc, char **argv) {
         stream << "\n";
       })))
     return 1;
+  auto initialReflection = gfx::reflectShader(*module);
   PassManager manager(&context);
   manager.addPass(createCanonicalizerPass());
   manager.addPass(createCSEPass());
   if (failed(manager.run(*module)))
     return 1;
   auto reflection = gfx::reflectShader(*module);
+  for (const auto &buf : initialReflection.buffers) {
+    if (llvm::none_of(reflection.buffers, [&](const auto &b) {
+          return b.set == buf.set && b.binding == buf.binding;
+        })) {
+      reflection.buffers.push_back(buf);
+    }
+  }
   manager.clear();
   if (target == "vulkan")
     manager.addPass(gfx::createGfxToSPIRVPass(profile));
@@ -203,8 +211,19 @@ int main(int argc, char **argv) {
         })))
       return 1;
   }
+  auto reflectionObj = gfx::serializeReflection(reflection);
+  if (auto *buffers = reflectionObj.getArray("buffers")) {
+    for (size_t i = 0; i < buffers->size() && i < reflection.buffers.size(); ++i) {
+      if (auto *bufObj = (*buffers)[i].getAsObject()) {
+        std::string typeStr;
+        llvm::raw_string_ostream os(typeStr);
+        reflection.buffers[i].elementType.print(os);
+        (*bufObj)["element_type"] = typeStr;
+      }
+    }
+  }
   if (failed(writeFile(reflectionOutput, [&](auto &stream) {
-        stream << llvm::json::Value(gfx::serializeReflection(reflection))
+        stream << llvm::json::Value(std::move(reflectionObj))
                << "\n";
       })))
     return 1;

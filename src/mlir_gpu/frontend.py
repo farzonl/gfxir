@@ -152,6 +152,127 @@ class PointerType:
         return f"!gfx.ptr<{elem_str}, {self.storage_class.value}>"
 
 
+class AccessMode(Enum):
+    READ_ONLY = "read_only"
+    WRITE_ONLY = "write_only"
+    READ_WRITE = "read_write"
+
+    @classmethod
+    def from_str(cls, val: str) -> AccessMode:
+        for m in cls:
+            if m.value == val:
+                return m
+        raise ValueError(f"Invalid buffer access mode: {val!r}")
+
+
+def _normalize_buffer_element_type(elem: Any) -> Type:
+    if isinstance(elem, Type):
+        return elem
+    if elem is float or elem is Type.F32 or elem == "f32":
+        return Type.F32
+    if elem is int or elem is Type.I32 or elem in ("i32", "si32"):
+        return Type.I32
+    if elem is Type.U32 or elem == "u32":
+        return Type.U32
+    if elem is bool or elem is Type.BOOL or elem == "bool":
+        return Type.BOOL
+    if isinstance(elem, str):
+        try:
+            return Type.from_schema(elem)
+        except ValueError:
+            pass
+        for t in Type:
+            if t.value == elem:
+                return t
+    raise TypeError(f"Invalid or unsupported buffer element type: {elem!r}")
+
+
+@dataclass(frozen=True)
+class BufferBinding:
+    element_type: Type
+    access: AccessMode = AccessMode.READ_WRITE
+    storage_class: StorageClass = StorageClass.GLOBAL
+    set: int = 0
+    binding: int | None = None
+    name: str = ""
+    shape: tuple[int, ...] | None = None
+    alignment: int | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.element_type, Type):
+            norm = _normalize_buffer_element_type(self.element_type)
+            object.__setattr__(self, "element_type", norm)
+
+        if isinstance(self.access, str):
+            mode = AccessMode.from_str(self.access)
+            object.__setattr__(self, "access", mode)
+        elif not isinstance(self.access, AccessMode):
+            raise TypeError(f"access mode must be AccessMode or str, got {type(self.access).__name__}")
+
+        if not isinstance(self.storage_class, StorageClass):
+            raise TypeError(f"storage_class must be StorageClass, got {type(self.storage_class).__name__}")
+
+        if self.set < 0:
+            raise ValueError(f"descriptor set index must be non-negative, got {self.set}")
+        if self.binding is not None and self.binding < 0:
+            raise ValueError(f"descriptor binding index must be non-negative, got {self.binding}")
+
+    def __str__(self) -> str:
+        elem_name = (
+            self.element_type.value
+            if isinstance(self.element_type, Type)
+            else str(self.element_type)
+        )
+        return f"Buffer[{elem_name}, {self.access.value}]"
+
+
+BufferType = BufferBinding
+
+
+class Buffer:
+    """Generic Buffer descriptor for compute shader kernel parameters.
+
+    Usage:
+        def kernel(a: Buffer[Type.F32, "read_only"],
+                   b: Buffer[Type.F32, "write_only"]):
+            ...
+    """
+
+    def __class_getitem__(cls, item: Any) -> BufferBinding:
+        if isinstance(item, tuple):
+            if len(item) == 2:
+                elem, acc = item
+                mode = AccessMode.from_str(acc) if isinstance(acc, str) else acc
+                norm_elem = _normalize_buffer_element_type(elem)
+                return BufferBinding(element_type=norm_elem, access=mode)
+            elif len(item) == 3:
+                elem, acc, extra = item
+                mode = AccessMode.from_str(acc) if isinstance(acc, str) else acc
+                norm_elem = _normalize_buffer_element_type(elem)
+                if isinstance(extra, int):
+                    return BufferBinding(element_type=norm_elem, access=mode, binding=extra)
+                elif isinstance(extra, (tuple, list)):
+                    return BufferBinding(element_type=norm_elem, access=mode, shape=tuple(extra))
+                raise TypeError(f"Third parameter to Buffer must be int binding or tuple shape, got {type(extra).__name__}")
+            raise TypeError(f"Buffer[...] expects 1 to 3 parameters, got {len(item)}")
+        norm_elem = _normalize_buffer_element_type(item)
+        return BufferBinding(element_type=norm_elem, access=AccessMode.READ_WRITE)
+
+
+@dataclass(frozen=True)
+class ReflectedBufferBinding:
+    name: str
+    set_index: int
+    binding_index: int
+    access: AccessMode
+    pointer_type: PointerType
+
+
+f32 = Type.F32
+i32 = Type.I32
+u32 = Type.U32
+
+
 @dataclass(frozen=True)
 class Node:
     op: str
@@ -168,6 +289,10 @@ class Value:
 
     def __init__(self, node: Node):
         self.node = node
+
+    @property
+    def type(self) -> Type:
+        return self.node.type
 
     def __bool__(self) -> bool:
         raise TypeError("Device values cannot control Python if/loops; use select().")
@@ -275,7 +400,8 @@ class Value:
         size = VECTOR_SIZES.get(self.node.type)
         if size is None or type(index) is not int or not 0 <= index < size:
             raise TypeError("Vector extraction requires an in-range constant integer component.")
-        return Value(Node("extract", Type.F32, (self.node,), literal=index))
+        elem_type = Type.I32 if self.node.type == "vector<3xi32>" else Type.F32
+        return Value(Node("extract", elem_type, (self.node,), literal=index))
 
     def __eq__(self, other: object) -> Value:
         if not isinstance(other, (Value, float, int)):
@@ -319,7 +445,11 @@ def _node(value: Value | float | int, expected: Type | None = None) -> Node:
     return _literal(value, expected)
 
 
-VECTOR_SIZES = {Type.VEC2: 2, Type.VEC3: 3, Type.VEC4: 4}
+VECTOR_SIZES = {Type.VEC2: 2, Type.VEC3: 3, Type.VEC4: 4, "vector<3xi32>": 3}
+
+
+def global_invocation_id() -> Value:
+    return Value(Node("builtin", "vector<3xi32>", (), literal="global_invocation_id"))
 
 
 def _operands(lhs: Value | float | int, rhs: Value | float | int,
@@ -501,6 +631,10 @@ class Stage:
     source_line: int
     structured_input: dict | None = None
 
+    @property
+    def structured(self) -> dict | None:
+        return self.structured_input
+
     def to_dict(self) -> dict:
         if self.structured_input is not None:
             return self.structured_input
@@ -533,10 +667,65 @@ class Stage:
         }
 
 
+def resolve_annotation(fn: Callable, annotation: Any) -> Any:
+    if not isinstance(annotation, str):
+        return annotation
+    eval_globals = {
+        "Buffer": Buffer,
+        "BufferBinding": BufferBinding,
+        "BufferType": BufferType,
+        "AccessMode": AccessMode,
+        "Type": Type,
+        "PointerType": PointerType,
+        "StorageClass": StorageClass,
+        "FragmentCoord": FragmentCoord,
+        "f32": f32,
+        "i32": i32,
+        "u32": u32,
+    }
+    if hasattr(fn, "__globals__"):
+        eval_globals.update(fn.__globals__)
+    eval_locals = {}
+    if hasattr(fn, "__closure__") and fn.__closure__ and hasattr(fn, "__code__"):
+        for var, cell in zip(fn.__code__.co_freevars, fn.__closure__):
+            try:
+                eval_locals[var] = cell.cell_contents
+            except (ValueError, AttributeError):
+                pass
+    try:
+        return eval(annotation, eval_globals, eval_locals)
+    except Exception:
+        if hasattr(fn, "__globals__"):
+            return fn.__globals__.get(annotation, annotation)
+        return annotation
+
+
 @dataclass(frozen=True)
 class Entry:
     function: Callable
     kind: str
+    workgroup_size: tuple[int, int, int] = (1, 1, 1)
+
+    @property
+    def reflected_buffer_bindings(self) -> list[ReflectedBufferBinding]:
+        results = []
+        binding_counter = 0
+        for param in inspect.signature(self.function).parameters.values():
+            ann = resolve_annotation(self.function, param.annotation)
+            if isinstance(ann, BufferBinding):
+                set_idx = ann.set
+                binding_idx = ann.binding if ann.binding is not None else binding_counter
+                binding_counter = max(binding_counter + 1, binding_idx + 1)
+                mode = ann.access if isinstance(ann.access, AccessMode) else AccessMode.from_str(ann.access)
+                elem_type = ann.element_type if isinstance(ann.element_type, Type) else Type.from_schema(str(ann.element_type))
+                results.append(ReflectedBufferBinding(
+                    name=param.name,
+                    set_index=set_idx,
+                    binding_index=binding_idx,
+                    access=mode,
+                    pointer_type=PointerType(elem_type, ann.storage_class, ann.alignment),
+                ))
+        return results
 
     def trace(self, varying_interface: tuple[ShaderIO, ...] | None = None) -> Stage:
         name = self.function.__name__
@@ -546,18 +735,35 @@ class Entry:
         from .parameters import ParameterBlock
         parameter_blocks = {}
         for parameter in parameters:
-            annotation = parameter.annotation
-            if isinstance(annotation, str):
-                annotation = self.function.__globals__.get(annotation, annotation)
+            annotation = resolve_annotation(self.function, parameter.annotation)
             if isinstance(annotation, ParameterBlock):
                 parameter_blocks[parameter.name] = annotation
+
+        if self.kind == "compute":
+            interfaces = ()
+            input_nodes = ()
+            from .ast_frontend import ASTLowering
+            lowering = ASTLowering(self.function, input_nodes, interfaces, parameter_blocks, workgroup_size=self.workgroup_size)
+            structured_data = lowering.module(name, "compute", (), (), workgroup_size=self.workgroup_size)
+            return Stage(
+                name=name,
+                kind="compute",
+                inputs=(),
+                outputs=(),
+                input_interface=(),
+                output_interface=(),
+                source_file=inspect.getsourcefile(self.function) or "",
+                source_line=inspect.getsourcelines(self.function)[1] if inspect.getsourcefile(self.function) else 0,
+                structured_input=structured_data,
+            )
+
         raster_parameters = [parameter for parameter in parameters if parameter.name not in parameter_blocks]
         if any(parameter.kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
                for parameter in parameters):
             raise TypeError("Entry points require positional device arguments.")
         coordinate_parameters = {
             parameter.name for parameter in parameters
-            if parameter.annotation is FragmentCoord or parameter.annotation == "FragmentCoord"
+            if resolve_annotation(self.function, parameter.annotation) is FragmentCoord or parameter.annotation == "FragmentCoord"
         }
         if self.kind == "vertex":
             if coordinate_parameters:
@@ -661,6 +867,33 @@ class FragmentCoord:
 
 def fragment(function: Callable) -> Entry:
     return Entry(function, "fragment")
+
+
+def compute(
+    function_or_workgroup_size: Any = None,
+    *,
+    workgroup_size: tuple[int, int, int] = (1, 1, 1),
+) -> Any:
+    """Decorator declaring a compute shader entry point with workgroup dimensions."""
+    if callable(function_or_workgroup_size):
+        return Entry(function_or_workgroup_size, "compute", workgroup_size=workgroup_size)
+
+    size = (
+        function_or_workgroup_size
+        if function_or_workgroup_size is not None
+        else workgroup_size
+    )
+    if isinstance(size, int):
+        size = (size, 1, 1)
+    elif isinstance(size, (tuple, list)) and len(size) in (1, 2, 3):
+        size = (*size, *(1 for _ in range(3 - len(size))))
+    else:
+        raise TypeError("workgroup_size must be a 1D, 2D, or 3D integer tuple.")
+
+    def decorator(fn: Callable) -> Entry:
+        return Entry(fn, "compute", workgroup_size=tuple(size))
+
+    return decorator
 
 
 @dataclass(frozen=True)

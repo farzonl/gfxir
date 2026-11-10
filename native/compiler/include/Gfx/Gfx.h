@@ -39,12 +39,21 @@ struct InterfaceElement {
   Interpolation interpolation;
 };
 
+struct BufferInterfaceElement {
+  std::string name;
+  uint32_t set;
+  uint32_t binding;
+  AccessMode access;
+  Type elementType;
+};
+
 struct ShaderInterface {
   std::string name;
   Stage stage;
   SmallVector<InterfaceElement> inputs;
   SmallVector<InterfaceElement> outputs;
   ParameterBlockAttr parameters;
+  SmallVector<BufferInterfaceElement> buffers;
 };
 
 struct ParameterFieldLayout {

@@ -71,4 +71,22 @@ def Gfx_ResourceKind : I32EnumAttr<"ResourceKind", "opaque bindless resource kin
   let cppNamespace = "::mlir::gfx";
   let genSpecializedAttr = 0;
 }
+
+def Gfx_AccessMode : I32EnumAttr<"AccessMode", "buffer access permissions", [
+  I32EnumAttrCase<"ReadOnly", 0, "read_only">,
+  I32EnumAttrCase<"WriteOnly", 1, "write_only">,
+  I32EnumAttrCase<"ReadWrite", 2, "read_write">
+]> {
+  let cppNamespace = "::mlir::gfx";
+  let genSpecializedAttr = 0;
+}
+
+def Gfx_AccessModeAttr : AttrDef<Gfx_Dialect, "AccessMode"> {
+  let mnemonic = "access_mode";
+  let parameters = (ins "AccessMode":$value, OptionalParameter<"::mlir::Type">:$type);
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDeclaration = [{
+    operator AccessMode() const { return getValue(); }
+  }];
+}
 #endif
