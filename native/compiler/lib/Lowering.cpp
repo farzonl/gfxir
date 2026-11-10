@@ -731,6 +731,99 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
         helper.setPrivate();
     OpBuilder builder(module.getContext());
 
+    struct BoundBufferSlot {
+      int32_t set;
+      int32_t binding;
+      AccessMode access;
+    };
+    SmallVector<BoundBufferSlot> allBufferSlots;
+    auto recordSlot = [&](int32_t set, int32_t binding, AccessMode access) {
+      for (const auto &existing : allBufferSlots) {
+        if (existing.set == set && existing.binding == binding)
+          return;
+      }
+      allBufferSlots.push_back({set, binding, access});
+    };
+
+    struct EntryArgBuffer {
+      unsigned argIndex;
+      BufferInterfaceElement info;
+    };
+    SmallVector<EntryArgBuffer> entryArgBuffers;
+    for (unsigned i = 0; i < function.getNumArguments(); ++i) {
+      if (auto info = getArgumentBufferBinding(function, i)) {
+        entryArgBuffers.push_back({i, *info});
+        recordSlot(info->set, info->binding, info->access);
+      }
+    }
+    module.walk([&](BufferBindingOp bindingOp) {
+      recordSlot(bindingOp.getSet(), bindingOp.getBinding(),
+                 bindingOp.getAccess());
+    });
+    llvm::sort(allBufferSlots, [](const BoundBufferSlot &a,
+                                  const BoundBufferSlot &b) {
+      return std::tie(a.set, a.binding) < std::tie(b.set, b.binding);
+    });
+    DenseMap<std::pair<int32_t, int32_t>, uint32_t> compactRegBySlot;
+    uint32_t nextUAVReg = 0;
+    uint32_t nextSRVReg = 0;
+    for (const auto &slot : allBufferSlots) {
+      uint32_t reg =
+          (slot.access == AccessMode::ReadOnly) ? nextSRVReg++ : nextUAVReg++;
+      compactRegBySlot[{slot.set, slot.binding}] = reg;
+    }
+
+    auto emitRawBufferBasePtr = [&](Location loc, AccessMode access,
+                                    uint32_t compactReg) -> Value {
+      unsigned int isWriteable = (access == AccessMode::ReadOnly) ? 0u : 1u;
+      unsigned int isROV = 0u;
+      auto handleType = LLVM::LLVMTargetExtType::get(
+          module.getContext(), "dx.RawBuffer",
+          ArrayRef<Type>{builder.getI8Type()},
+          ArrayRef<unsigned int>{isWriteable, isROV});
+      auto integer = [&](uint32_t value) -> Value {
+        return LLVM::ConstantOp::create(builder, loc, builder.getI32Type(),
+                                        builder.getI32IntegerAttr(value));
+      };
+      auto pointerType = LLVM::LLVMPointerType::get(module.getContext());
+      auto nullVal = LLVM::ZeroOp::create(builder, loc, pointerType);
+      auto handle = LLVM::CallIntrinsicOp::create(
+          builder, loc, handleType,
+          builder.getStringAttr("llvm.dx.resource.handlefrombinding"),
+          ValueRange{integer(0), integer(compactReg), integer(1), integer(0),
+                     nullVal});
+      auto resPtrType = LLVM::LLVMPointerType::get(module.getContext(), 1);
+      auto pointer = LLVM::CallIntrinsicOp::create(
+          builder, loc, resPtrType,
+          builder.getStringAttr("llvm.dx.resource.getpointer"),
+          ValueRange{handle.getResult(0), integer(0)});
+      return pointer.getResult(0);
+    };
+
+    if (!entryArgBuffers.empty()) {
+      llvm::BitVector erasedArgs(function.getNumArguments());
+      for (const auto &argBuf : entryArgBuffers) {
+        erasedArgs.set(argBuf.argIndex);
+        BlockArgument argVal = function.getArgument(argBuf.argIndex);
+        if (!argVal.use_empty()) {
+          builder.setInsertionPointToStart(&function.getBody().front());
+          uint32_t compactReg =
+              compactRegBySlot[{argBuf.info.set, argBuf.info.binding}];
+          Value basePtr = emitRawBufferBasePtr(function.getLoc(),
+                                               argBuf.info.access, compactReg);
+          Value castPtr = UnrealizedConversionCastOp::create(
+                              builder, function.getLoc(),
+                              TypeRange{argVal.getType()}, ValueRange{basePtr})
+                              .getResult(0);
+          argVal.replaceAllUsesWith(castPtr);
+        }
+      }
+      if (failed(function.eraseArguments(erasedArgs))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
     std::function<Type(Type)> convertGfxPtr = [&](Type t) -> Type {
       if (auto ptr = dyn_cast<gfx::PtrType>(t)) {
         unsigned addrSpace = 0;
@@ -839,23 +932,36 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
         bool fragmentCoord =
             isa<BuiltinOp>(op) &&
             cast<BuiltinOp>(op).getKind() == Builtin::FragmentCoord;
-        bool globalInvocationId =
-            isa<BuiltinOp>(op) &&
-            cast<BuiltinOp>(op).getKind() == Builtin::GlobalInvocationId;
-        if (globalInvocationId) {
+        StringRef computeIntrinsic;
+        if (auto builtinOp = dyn_cast<BuiltinOp>(op)) {
+          switch (builtinOp.getKind()) {
+          case Builtin::GlobalInvocationId:
+            computeIntrinsic = "llvm.dx.thread.id";
+            break;
+          case Builtin::LocalInvocationId:
+            computeIntrinsic = "llvm.dx.thread.id.in.group";
+            break;
+          case Builtin::WorkgroupId:
+            computeIntrinsic = "llvm.dx.group.id";
+            break;
+          default:
+            break;
+          }
+        }
+        if (!computeIntrinsic.empty()) {
           Value id0 = LLVM::CallIntrinsicOp::create(
                           builder, op->getLoc(), builder.getI32Type(),
-                          builder.getStringAttr("llvm.dx.thread.id"),
+                          builder.getStringAttr(computeIntrinsic),
                           ValueRange{integer(0, 32)})
                           .getResult(0);
           Value id1 = LLVM::CallIntrinsicOp::create(
                           builder, op->getLoc(), builder.getI32Type(),
-                          builder.getStringAttr("llvm.dx.thread.id"),
+                          builder.getStringAttr(computeIntrinsic),
                           ValueRange{integer(1, 32)})
                           .getResult(0);
           Value id2 = LLVM::CallIntrinsicOp::create(
                           builder, op->getLoc(), builder.getI32Type(),
-                          builder.getStringAttr("llvm.dx.thread.id"),
+                          builder.getStringAttr(computeIntrinsic),
                           ValueRange{integer(2, 32)})
                           .getResult(0);
           Value vec = LLVM::UndefOp::create(builder, op->getLoc(),
@@ -898,34 +1004,11 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
     for (Operation *op : bufferOps) {
       builder.setInsertionPoint(op);
       if (auto binding = dyn_cast<BufferBindingOp>(op)) {
-        auto gfxPtrType = cast<gfx::PtrType>(binding.getResult().getType());
-        Type elemType = convertGfxPtr(gfxPtrType.getElementType());
-        int32_t isWriteable = (binding.getAccess() == AccessMode::ReadOnly) ? 0 : 1;
-        int32_t isROV = 0;
-        auto handleType = LLVM::LLVMTargetExtType::get(
-            module.getContext(), "dx.RawBuffer",
-            ArrayRef<Type>{elemType},
-            ArrayRef<unsigned int>{static_cast<unsigned int>(isWriteable),
-                                   static_cast<unsigned int>(isROV)});
-        auto integer = [&](uint32_t value) -> Value {
-          return LLVM::ConstantOp::create(builder, op->getLoc(),
-                                          builder.getI32Type(),
-                                          builder.getI32IntegerAttr(value));
-        };
-        auto pointerType = LLVM::LLVMPointerType::get(module.getContext());
-        auto nullVal = LLVM::ZeroOp::create(builder, op->getLoc(), pointerType);
-        auto handle = LLVM::CallIntrinsicOp::create(
-            builder, op->getLoc(), handleType,
-            builder.getStringAttr("llvm.dx.resource.handlefrombinding"),
-            ValueRange{integer(binding.getSet()),
-                       integer(binding.getBinding()),
-                       integer(1), integer(0), nullVal});
-        auto resPtrType = LLVM::LLVMPointerType::get(module.getContext(), 1);
-        auto pointer = LLVM::CallIntrinsicOp::create(
-            builder, op->getLoc(), resPtrType,
-            builder.getStringAttr("llvm.dx.resource.getpointer"),
-            ValueRange{handle.getResult(0), integer(0)});
-        op->getResult(0).replaceAllUsesWith(pointer.getResult(0));
+        uint32_t compactReg =
+            compactRegBySlot[{binding.getSet(), binding.getBinding()}];
+        Value pointer =
+            emitRawBufferBasePtr(op->getLoc(), binding.getAccess(), compactReg);
+        op->getResult(0).replaceAllUsesWith(pointer);
         op->erase();
       } else if (isa<PtrOffsetOp>(op)) {
         Value ptr = op->getOperand(0);
@@ -1022,11 +1105,22 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
     else
       triple = "dxil-pc-shadermodel6.6-compute";
     module->setAttr("llvm.target_triple", builder.getStringAttr(triple));
-    if (stage == Stage::Compute && wgSizeAttr) {
-      auto dims = wgSizeAttr.asArrayRef();
-      std::string numthreads =
-          llvm::formatv("{0},{1},{2}", dims[0], dims[1], dims[2]).str();
+    if (stage == Stage::Compute) {
+      std::string numthreads = "1,1,1";
+      if (wgSizeAttr) {
+        auto dims = wgSizeAttr.asArrayRef();
+        numthreads =
+            llvm::formatv("{0},{1},{2}", dims[0], dims[1], dims[2]).str();
+      }
       module->setAttr("hlsl.numthreads", builder.getStringAttr(numthreads));
+      SmallVector<Attribute, 2> passthroughAttrs{
+          builder.getArrayAttr({builder.getStringAttr("hlsl.shader"),
+                                builder.getStringAttr("compute")}),
+          builder.getArrayAttr({builder.getStringAttr("hlsl.numthreads"),
+                                builder.getStringAttr(numthreads)}),
+      };
+      function->setAttr("llvm.passthrough",
+                        builder.getArrayAttr(passthroughAttrs));
     }
   }
 };
@@ -1104,17 +1198,51 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
         {rootsig::RegisterType::BReg, 0}};
     elements.push_back(constants);
   }
-  for (const auto &buf : reflection.buffers) {
+  if (!reflection.buffers.empty()) {
     namespace rootsig = llvm::hlsl::rootsig;
-    auto regType = (buf.access == AccessMode::ReadOnly) ? rootsig::RegisterType::TReg
-                                                        : rootsig::RegisterType::UReg;
-    rootsig::RootDescriptor desc;
-    desc.Type = (buf.access == AccessMode::ReadOnly) ? llvm::dxil::ResourceClass::SRV
-                                                     : llvm::dxil::ResourceClass::UAV;
-    desc.Reg = rootsig::Register{regType, static_cast<uint32_t>(buf.binding)};
-    desc.Space = static_cast<uint32_t>(buf.set);
-    desc.setDefaultFlags(llvm::dxbc::RootSignatureVersion::V1_1);
-    elements.push_back(desc);
+    SmallVector<BufferInterfaceElement> uniqueBuffers;
+    for (const auto &buf : reflection.buffers) {
+      bool exists = llvm::any_of(uniqueBuffers, [&](const auto &existing) {
+        return existing.set == buf.set && existing.binding == buf.binding;
+      });
+      if (!exists)
+        uniqueBuffers.push_back(buf);
+    }
+    uint32_t uavCount = 0;
+    uint32_t srvCount = 0;
+    for (const auto &buf : uniqueBuffers) {
+      if (buf.access == AccessMode::ReadOnly)
+        ++srvCount;
+      else
+        ++uavCount;
+    }
+    uint32_t numClauses = 0;
+    if (uavCount > 0) {
+      rootsig::DescriptorTableClause uavClause;
+      uavClause.Type = llvm::dxil::ResourceClass::UAV;
+      uavClause.Reg = rootsig::Register{rootsig::RegisterType::UReg, 0};
+      uavClause.NumDescriptors = uavCount;
+      uavClause.Space = 0;
+      uavClause.setDefaultFlags(llvm::dxbc::RootSignatureVersion::V1_1);
+      elements.push_back(uavClause);
+      ++numClauses;
+    }
+    if (srvCount > 0) {
+      rootsig::DescriptorTableClause srvClause;
+      srvClause.Type = llvm::dxil::ResourceClass::SRV;
+      srvClause.Reg = rootsig::Register{rootsig::RegisterType::TReg, 0};
+      srvClause.NumDescriptors = srvCount;
+      srvClause.Space = 0;
+      srvClause.setDefaultFlags(llvm::dxbc::RootSignatureVersion::V1_1);
+      elements.push_back(srvClause);
+      ++numClauses;
+    }
+    if (numClauses > 0) {
+      rootsig::DescriptorTable table;
+      table.Visibility = llvm::dxbc::ShaderVisibility::All;
+      table.NumClauses = numClauses;
+      elements.push_back(table);
+    }
   }
   if (!elements.empty()) {
     namespace rootsig = llvm::hlsl::rootsig;
@@ -1175,12 +1303,12 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
     };
     signatures(reflection.inputs, inputs, true);
     signatures(reflection.outputs, outputs, false);
+    translated->getOrInsertNamedMetadata("dx.semantic.signatures")
+        ->addOperand(
+            llvm::MDNode::get(context, {llvm::ValueAsMetadata::get(function),
+                                        llvm::MDNode::get(context, inputs),
+                                        llvm::MDNode::get(context, outputs)}));
   }
-  translated->getOrInsertNamedMetadata("dx.semantic.signatures")
-      ->addOperand(
-          llvm::MDNode::get(context, {llvm::ValueAsMetadata::get(function),
-                                      llvm::MDNode::get(context, inputs),
-                                      llvm::MDNode::get(context, outputs)}));
   auto integer = [&](unsigned value) -> llvm::Metadata * {
     return llvm::ConstantAsMetadata::get(
         llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), value));
