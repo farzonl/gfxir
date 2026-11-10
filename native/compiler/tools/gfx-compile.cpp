@@ -23,8 +23,7 @@ static llvm::cl::opt<std::string> target("target", llvm::cl::Required,
 static llvm::cl::opt<std::string> output("output", llvm::cl::Required);
 static llvm::cl::opt<std::string> irOutput("ir-output");
 static llvm::cl::opt<std::string> loweredOutput("lowered-output");
-static llvm::cl::opt<std::string> reflectionOutput("reflection",
-                                                   llvm::cl::Required);
+static llvm::cl::opt<std::string> reflectionOutput("reflection");
 static llvm::cl::opt<std::string>
     targetProfile("target-profile",
                   llvm::cl::desc("Path to target profile JSON file or inline JSON string"));
@@ -211,22 +210,24 @@ int main(int argc, char **argv) {
         })))
       return 1;
   }
-  auto reflectionObj = gfx::serializeReflection(reflection);
-  if (auto *buffers = reflectionObj.getArray("buffers")) {
-    for (size_t i = 0; i < buffers->size() && i < reflection.buffers.size(); ++i) {
-      if (auto *bufObj = (*buffers)[i].getAsObject()) {
-        std::string typeStr;
-        llvm::raw_string_ostream os(typeStr);
-        reflection.buffers[i].elementType.print(os);
-        (*bufObj)["element_type"] = typeStr;
+  if (!reflectionOutput.empty()) {
+    auto reflectionObj = gfx::serializeReflection(reflection);
+    if (auto *buffers = reflectionObj.getArray("buffers")) {
+      for (size_t i = 0; i < buffers->size() && i < reflection.buffers.size(); ++i) {
+        if (auto *bufObj = (*buffers)[i].getAsObject()) {
+          std::string typeStr;
+          llvm::raw_string_ostream os(typeStr);
+          reflection.buffers[i].elementType.print(os);
+          (*bufObj)["element_type"] = typeStr;
+        }
       }
     }
+    if (failed(writeFile(reflectionOutput, [&](auto &stream) {
+          stream << llvm::json::Value(std::move(reflectionObj))
+                 << "\n";
+        })))
+      return 1;
   }
-  if (failed(writeFile(reflectionOutput, [&](auto &stream) {
-        stream << llvm::json::Value(std::move(reflectionObj))
-               << "\n";
-      })))
-    return 1;
   if (!cHeaderOutput.empty() &&
       failed(writeFile(cHeaderOutput, [&](auto &stream) {
         (void)gfx::emitCHeader(reflection, stream);

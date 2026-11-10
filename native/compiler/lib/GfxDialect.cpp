@@ -366,6 +366,98 @@ LogicalResult GfxDialect::verifyOperationAttribute(Operation *op,
   return success();
 }
 
+std::optional<BufferInterfaceElement>
+mlir::gfx::getArgumentBufferBinding(func::FuncOp function, unsigned argIndex) {
+  if (!function || argIndex >= function.getNumArguments())
+    return std::nullopt;
+  auto bindingAttr =
+      function.getArgAttrOfType<IntegerAttr>(argIndex, "gfx.binding");
+  if (!bindingAttr)
+    return std::nullopt;
+  auto ptrType = dyn_cast<PtrType>(function.getArgument(argIndex).getType());
+  if (!ptrType || ptrType.getStorageClass() != StorageClass::Global)
+    return std::nullopt;
+  int64_t rawBinding = bindingAttr.getInt();
+  if (rawBinding < 0)
+    return std::nullopt;
+  uint32_t set = 0;
+  if (auto setAttr =
+          function.getArgAttrOfType<IntegerAttr>(argIndex, "gfx.set")) {
+    if (setAttr.getInt() < 0)
+      return std::nullopt;
+    set = static_cast<uint32_t>(setAttr.getInt());
+  }
+  AccessMode access = AccessMode::ReadWrite;
+  if (auto bufAccess = function.getArgAttrOfType<BufferAccessAttr>(
+          argIndex, "gfx.buffer_access")) {
+    access = bufAccess.getValue();
+  } else if (auto accessMode = function.getArgAttrOfType<AccessModeAttr>(
+                 argIndex, "gfx.access_mode")) {
+    access = accessMode.getValue();
+  } else if (auto altAccessMode = function.getArgAttrOfType<AccessModeAttr>(
+                 argIndex, "gfx.buffer_access")) {
+    access = altAccessMode.getValue();
+  }
+  std::string name;
+  if (auto nameAttr =
+          function.getArgAttrOfType<StringAttr>(argIndex, "gfx.name")) {
+    name = nameAttr.getValue().str();
+  } else {
+    name = "buffer_" + std::to_string(rawBinding);
+  }
+  return BufferInterfaceElement{name, set, static_cast<uint32_t>(rawBinding),
+                                access, ptrType.getElementType()};
+}
+
+LogicalResult GfxDialect::verifyRegionArgAttribute(Operation *op,
+                                                   unsigned regionIndex,
+                                                   unsigned argIndex,
+                                                   NamedAttribute attribute) {
+  auto function = dyn_cast<func::FuncOp>(op);
+  if (!function || regionIndex != 0 || argIndex >= function.getNumArguments())
+    return op->emitOpError(
+        "gfx argument attributes are only valid on func.func arguments");
+
+  StringRef attrName = attribute.getName().getValue();
+  auto ptrType = dyn_cast<PtrType>(function.getArgument(argIndex).getType());
+  if (!ptrType || ptrType.getStorageClass() != StorageClass::Global) {
+    return op->emitOpError("argument attribute '")
+           << attrName
+           << "' requires a device pointer in 'global' storage class";
+  }
+
+  if (attrName == "gfx.binding") {
+    auto intAttr = dyn_cast<IntegerAttr>(attribute.getValue());
+    if (!intAttr || !intAttr.getType().isInteger(32) || intAttr.getInt() < 0)
+      return op->emitOpError(
+          "gfx.binding requires a non-negative 32-bit integer attribute");
+    return success();
+  }
+  if (attrName == "gfx.set") {
+    auto intAttr = dyn_cast<IntegerAttr>(attribute.getValue());
+    if (!intAttr || !intAttr.getType().isInteger(32) || intAttr.getInt() < 0)
+      return op->emitOpError(
+          "gfx.set requires a non-negative 32-bit integer attribute");
+    return success();
+  }
+  if (attrName == "gfx.buffer_access" || attrName == "gfx.access_mode") {
+    if (!isa<BufferAccessAttr, AccessModeAttr>(attribute.getValue()))
+      return op->emitOpError("'")
+             << attrName
+             << "' requires a #gfx.buffer_access or #gfx.access_mode attribute";
+    return success();
+  }
+  if (attrName == "gfx.name") {
+    auto strAttr = dyn_cast<StringAttr>(attribute.getValue());
+    if (!strAttr || strAttr.getValue().empty())
+      return op->emitOpError("gfx.name requires a non-empty string attribute");
+    return success();
+  }
+
+  return op->emitOpError("unknown gfx argument attribute: ")
+         << attribute.getName();
+}
+
 LogicalResult mlir::gfx::getStd430Layout(Type type, uint32_t &size,
                                          uint32_t &alignment) {
   if (type.isF16()) {
@@ -716,6 +808,56 @@ ParseResult BufferBindingOp::parse(OpAsmParser &parser, OperationState &result) 
   AccessModeAttr accessAttr;
   PtrType ptrType;
 
+  // Support formal keyword syntax:
+  //   gfx.buffer_binding @name [set(S)] binding(B) access(mode) : !gfx.ptr<T, global>
+  if (succeeded(parser.parseOptionalSymbolName(nameAttr))) {
+    int32_t setVal = 0;
+    if (succeeded(parser.parseOptionalKeyword("set"))) {
+      if (parser.parseLParen() || parser.parseInteger(setVal) ||
+          parser.parseRParen())
+        return failure();
+    }
+    int32_t bindingVal = 0;
+    if (parser.parseKeyword("binding") || parser.parseLParen() ||
+        parser.parseInteger(bindingVal) || parser.parseRParen())
+      return failure();
+
+    std::string modeKeyword;
+    llvm::SMLoc modeLoc = parser.getCurrentLocation();
+    if (parser.parseKeyword("access") || parser.parseLParen() ||
+        parser.parseKeywordOrString(&modeKeyword) || parser.parseRParen())
+      return failure();
+    auto maybeMode = symbolizeAccessMode(modeKeyword);
+    if (!maybeMode) {
+      return parser.emitError(
+          modeLoc,
+          "expected ::mlir::gfx::AccessMode to be one of: read_only, write_only, read_write");
+    }
+    setAttr = parser.getBuilder().getI32IntegerAttr(setVal);
+    bindingAttr = parser.getBuilder().getI32IntegerAttr(bindingVal);
+    accessAttr =
+        AccessModeAttr::get(parser.getContext(), *maybeMode, Type{});
+
+    if (parser.parseColon())
+      return failure();
+    llvm::SMLoc typeLoc = parser.getCurrentLocation();
+    Type rawType;
+    if (parser.parseType(rawType))
+      return failure();
+    if (!isa<PtrType>(rawType))
+      return parser.emitError(typeLoc, "result #0 must be !gfx.ptr, but got '")
+             << rawType << "'";
+    ptrType = cast<PtrType>(rawType);
+
+    auto &props = result.getOrAddProperties<BufferBindingOp::Properties>();
+    props.set = setAttr;
+    props.binding = bindingAttr;
+    props.name = nameAttr;
+    props.access = accessAttr;
+    result.addTypes(ptrType);
+    return success();
+  }
+
   if (parser.parseCustomAttributeWithFallback(setAttr, parser.getBuilder().getIntegerType(32)) ||
       parser.parseComma() ||
       parser.parseCustomAttributeWithFallback(bindingAttr, parser.getBuilder().getIntegerType(32)) ||
@@ -725,8 +867,19 @@ ParseResult BufferBindingOp::parse(OpAsmParser &parser, OperationState &result) 
     return failure();
 
   llvm::SMLoc accessLoc = parser.getCurrentLocation();
-  if (parser.parseCustomAttributeWithFallback(accessAttr, parser.getBuilder().getType<NoneType>()))
+  Attribute rawAccessAttr;
+  if (parser.parseAttribute(rawAccessAttr))
     return failure();
+  if (auto am = dyn_cast<AccessModeAttr>(rawAccessAttr)) {
+    accessAttr = am;
+  } else if (auto ba = dyn_cast<BufferAccessAttr>(rawAccessAttr)) {
+    accessAttr =
+        AccessModeAttr::get(parser.getContext(), ba.getValue(), Type{});
+  } else {
+    return parser.emitError(
+        accessLoc,
+        "expected #gfx.access_mode or #gfx.buffer_access attribute");
+  }
 
   if (setAttr)
     result.getOrAddProperties<BufferBindingOp::Properties>().set = setAttr;
@@ -798,11 +951,35 @@ LogicalResult PtrOffsetOp::verify() {
   return success();
 }
 
-static Operation *getRootPointerDefiningOp(Value ptr) {
-  Operation *current = ptr.getDefiningOp();
-  while (auto offsetOp = dyn_cast_or_null<PtrOffsetOp>(current))
-    current = offsetOp.getPtr().getDefiningOp();
-  return current;
+static Value getRootPointerValue(Value ptr) {
+  while (auto offsetOp = ptr.getDefiningOp<PtrOffsetOp>())
+    ptr = offsetOp.getPtr();
+  return ptr;
+}
+
+static std::optional<AccessMode> getBlockArgumentAccessMode(Value rootVal,
+                                                            std::string &label) {
+  auto blockArg = dyn_cast<BlockArgument>(rootVal);
+  if (!blockArg)
+    return std::nullopt;
+  Operation *parentOp = blockArg.getOwner() ? blockArg.getOwner()->getParentOp()
+                                            : nullptr;
+  auto funcOp = dyn_cast_or_null<func::FuncOp>(parentOp);
+  if (!funcOp || blockArg.getOwner() != &funcOp.getBody().front())
+    return std::nullopt;
+  unsigned argIdx = blockArg.getArgNumber();
+  if (auto nameAttr = funcOp.getArgAttrOfType<StringAttr>(argIdx, "gfx.name"))
+    label = nameAttr.getValue().str();
+  else
+    label = "arg" + std::to_string(argIdx);
+
+  if (auto ba = funcOp.getArgAttrOfType<BufferAccessAttr>(argIdx, "gfx.buffer_access"))
+    return ba.getValue();
+  if (auto am = funcOp.getArgAttrOfType<AccessModeAttr>(argIdx, "gfx.access_mode"))
+    return am.getValue();
+  if (auto am2 = funcOp.getArgAttrOfType<AccessModeAttr>(argIdx, "gfx.buffer_access"))
+    return am2.getValue();
+  return std::nullopt;
 }
 
 LogicalResult LoadOp::verify() {
@@ -824,11 +1001,18 @@ LogicalResult LoadOp::verify() {
              << ") is smaller than natural alignment of pointee type (" << natural << ")";
   }
 
-  Operation *root = getRootPointerDefiningOp(getPtr());
-  if (auto binding = dyn_cast_or_null<BufferBindingOp>(root)) {
+  Value rootVal = getRootPointerValue(getPtr());
+  if (auto binding = rootVal.getDefiningOp<BufferBindingOp>()) {
     if (binding.getAccess() == AccessMode::WriteOnly)
       return emitOpError("cannot load from write-only buffer binding '")
              << binding.getName() << "'";
+  } else {
+    std::string argLabel;
+    if (auto mode = getBlockArgumentAccessMode(rootVal, argLabel)) {
+      if (*mode == AccessMode::WriteOnly)
+        return emitOpError("cannot load from write-only buffer argument '")
+               << argLabel << "'";
+    }
   }
 
   return success();
@@ -856,10 +1040,15 @@ ParseResult StoreOp::parse(OpAsmParser &parser, OperationState &result) {
   }
 
   if (parser.parseOptionalAttrDict(result.attributes) ||
-      parser.parseColon() ||
-      parser.parseType(valueType) ||
+      parser.parseColon())
+    return failure();
+
+  bool hasParens = succeeded(parser.parseOptionalLParen());
+  if (parser.parseType(valueType) ||
       parser.parseComma() ||
       parser.parseType(ptrType))
+    return failure();
+  if (hasParens && parser.parseRParen())
     return failure();
 
   if (parser.resolveOperand(valueOperand, valueType, result.operands) ||
@@ -899,11 +1088,18 @@ LogicalResult StoreOp::verify() {
              << ") is smaller than natural alignment of pointee type (" << natural << ")";
   }
 
-  Operation *root = getRootPointerDefiningOp(getPtr());
-  if (auto binding = dyn_cast_or_null<BufferBindingOp>(root)) {
+  Value rootVal = getRootPointerValue(getPtr());
+  if (auto binding = rootVal.getDefiningOp<BufferBindingOp>()) {
     if (binding.getAccess() == AccessMode::ReadOnly)
       return emitOpError("cannot store to read-only buffer binding '")
              << binding.getName() << "'";
+  } else {
+    std::string argLabel;
+    if (auto mode = getBlockArgumentAccessMode(rootVal, argLabel)) {
+      if (*mode == AccessMode::ReadOnly)
+        return emitOpError("cannot store to read-only buffer argument '")
+               << argLabel << "'";
+    }
   }
 
   return success();

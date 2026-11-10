@@ -89,4 +89,13 @@ def Gfx_AccessModeAttr : AttrDef<Gfx_Dialect, "AccessMode"> {
     operator AccessMode() const { return getValue(); }
   }];
 }
+
+def Gfx_BufferAccessAttr : AttrDef<Gfx_Dialect, "BufferAccess"> {
+  let mnemonic = "buffer_access";
+  let parameters = (ins EnumParameter<Gfx_AccessMode>:$value);
+  let assemblyFormat = "`<` $value `>`";
+  let extraClassDeclaration = [{
+    operator AccessMode() const { return getValue(); }
+  }];
+}
 #endif

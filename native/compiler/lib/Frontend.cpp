@@ -472,7 +472,18 @@ ShaderInterface mlir::gfx::reflectShader(ModuleOp module) {
       {},
       {},
       {},
-      {}};
+      {},
+      std::nullopt};
+  if (auto wgAttr =
+          function->getAttrOfType<DenseI32ArrayAttr>("gfx.workgroup_size")) {
+    auto dims = wgAttr.asArrayRef();
+    if (dims.size() == 3)
+      result.workgroupSize = std::array<int32_t, 3>{dims[0], dims[1], dims[2]};
+  }
+  for (unsigned i = 0; i < function.getNumArguments(); ++i) {
+    if (auto argBuf = getArgumentBufferBinding(function, i))
+      result.buffers.push_back(*argBuf);
+  }
   SmallVector<func::FuncOp> pending{function};
   llvm::SmallPtrSet<Operation *, 8> visited;
   bool reachedParamOp = false;

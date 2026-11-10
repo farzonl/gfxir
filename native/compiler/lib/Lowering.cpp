@@ -25,12 +25,14 @@
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Frontend/HLSL/RootSignatureMetadata.h"
 #include "llvm/Frontend/HLSL/SemanticSignatures.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/MathExtras.h"
 #include <functional>
 
 namespace mlir::gfx {
@@ -149,10 +151,19 @@ struct LoadPattern : OpConversionPattern<gfx::LoadOp> {
       return failure();
     spirv::MemoryAccessAttr memAccess;
     IntegerAttr alignmentAttr;
+    auto spvPtrType = dyn_cast<spirv::PointerType>(adaptor.getPtr().getType());
+    bool isBDA = spvPtrType && spvPtrType.getStorageClass() ==
+                                   spirv::StorageClass::PhysicalStorageBuffer;
     if (op.getAlignment().has_value()) {
       memAccess = spirv::MemoryAccessAttr::get(
           rewriter.getContext(), spirv::MemoryAccess::Aligned);
       alignmentAttr = rewriter.getI32IntegerAttr(*op.getAlignment());
+    } else if (isBDA) {
+      auto gfxPtrType = cast<gfx::PtrType>(op.getPtr().getType());
+      uint32_t align = std::max<uint32_t>(gfxPtrType.getEffectiveAlignment(), 4u);
+      memAccess = spirv::MemoryAccessAttr::get(
+          rewriter.getContext(), spirv::MemoryAccess::Aligned);
+      alignmentAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(align));
     }
     rewriter.replaceOpWithNewOp<spirv::LoadOp>(
         op, resType, adaptor.getPtr(), memAccess, alignmentAttr);
@@ -166,16 +177,37 @@ struct StorePattern : OpConversionPattern<gfx::StoreOp> {
                                 ConversionPatternRewriter &rewriter) const override {
     spirv::MemoryAccessAttr memAccess;
     IntegerAttr alignmentAttr;
+    auto spvPtrType = dyn_cast<spirv::PointerType>(adaptor.getPtr().getType());
+    bool isBDA = spvPtrType && spvPtrType.getStorageClass() ==
+                                   spirv::StorageClass::PhysicalStorageBuffer;
     if (op.getAlignment().has_value()) {
       memAccess = spirv::MemoryAccessAttr::get(
           rewriter.getContext(), spirv::MemoryAccess::Aligned);
       alignmentAttr = rewriter.getI32IntegerAttr(*op.getAlignment());
+    } else if (isBDA) {
+      auto gfxPtrType = cast<gfx::PtrType>(op.getPtr().getType());
+      uint32_t align = std::max<uint32_t>(gfxPtrType.getEffectiveAlignment(), 4u);
+      memAccess = spirv::MemoryAccessAttr::get(
+          rewriter.getContext(), spirv::MemoryAccess::Aligned);
+      alignmentAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(align));
     }
     rewriter.replaceOpWithNewOp<spirv::StoreOp>(
         op, adaptor.getPtr(), adaptor.getValue(), memAccess, alignmentAttr);
     return success();
   }
 };
+
+static bool isBoundEntryPointerRoot(Value root, func::FuncOp entryFunction) {
+  if (root.getDefiningOp<BufferBindingOp>())
+    return true;
+  if (auto blockArg = dyn_cast<BlockArgument>(root)) {
+    if (blockArg.getOwner() == &entryFunction.getBody().front()) {
+      return getArgumentBufferBinding(entryFunction, blockArg.getArgNumber())
+          .has_value();
+    }
+  }
+  return false;
+}
 
 struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
   TargetProfile profile;
@@ -214,15 +246,21 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
     });
     builder.setInsertionPointToStart(module.getBody());
 
-    bool enableBDA = profile.supportsCapability("PhysicalStorageBuffer64");
-    if (auto reqCaps = module->getAttrOfType<ArrayAttr>("gfx.required_capabilities")) {
-      for (auto cap : reqCaps) {
+    bool enableBDA = profile.supportsCapability("PhysicalStorageBuffer64") ||
+                     profile.supportsCapability("buffer_device_address");
+    auto checkBDACapAttr = [&](ArrayAttr capsAttr) {
+      if (!capsAttr)
+        return;
+      for (auto cap : capsAttr) {
         if (auto str = dyn_cast<StringAttr>(cap)) {
-          if (str.getValue().equals_insensitive("PhysicalStorageBuffer64"))
+          if (str.getValue().equals_insensitive("PhysicalStorageBuffer64") ||
+              str.getValue().equals_insensitive("buffer_device_address"))
             enableBDA = true;
         }
       }
-    }
+    };
+    checkBDACapAttr(module->getAttrOfType<ArrayAttr>("gfx.required_capabilities"));
+    checkBDACapAttr(function->getAttrOfType<ArrayAttr>("gfx.required_capabilities"));
 
     spirv::AddressingModel addressingModel =
         enableBDA ? spirv::AddressingModel::PhysicalStorageBuffer64
@@ -251,7 +289,7 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
             Value root = offsetOp.getPtr();
             while (auto parentOffset = root.getDefiningOp<PtrOffsetOp>())
               root = parentOffset.getPtr();
-            if (!root.getDefiningOp<BufferBindingOp>())
+            if (!isBoundEntryPointerRoot(root, function))
               usesVariablePointers = true;
           }
         });
@@ -283,6 +321,16 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
     auto shader = spirv::ModuleOp::create(builder, location,
                                           addressingModel,
                                           spirv::MemoryModel::GLSL450, version);
+    struct EntryArgBuffer {
+      unsigned argIndex;
+      BufferInterfaceElement info;
+    };
+    SmallVector<EntryArgBuffer> entryArgBuffers;
+    for (unsigned i = 0; i < function.getNumArguments(); ++i) {
+      if (auto info = getArgumentBufferBinding(function, i))
+        entryArgBuffers.push_back({i, *info});
+    }
+
     function->removeAttr("gfx.stage");
     function->removeAttr("gfx.workgroup_size");
     function->removeAttr("gfx.shared_memory_bytes");
@@ -299,43 +347,140 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
          llvm::make_early_inc_range(module.getOps<func::FuncOp>()))
       helper.erase();
     SymbolTable symbols(shader);
+    SPIRVTypeConverter converter(target);
+    converter.addConversion([&](gfx::PtrType ptrType) -> std::optional<Type> {
+      Type elemType = converter.convertType(ptrType.getElementType());
+      if (!elemType)
+        return std::nullopt;
+      spirv::StorageClass sc;
+      switch (ptrType.getStorageClass()) {
+      case StorageClass::Global:
+        sc = enableBDA ? spirv::StorageClass::PhysicalStorageBuffer
+                       : spirv::StorageClass::StorageBuffer;
+        break;
+      case StorageClass::Workgroup:
+        sc = spirv::StorageClass::Workgroup;
+        break;
+      case StorageClass::Private:
+        sc = spirv::StorageClass::Function;
+        break;
+      case StorageClass::PushConstant:
+        sc = spirv::StorageClass::PushConstant;
+        break;
+      }
+      return spirv::PointerType::get(elemType, sc);
+    });
+
+    SmallVector<BufferBindingOp> bufferBindings;
+    shader.walk([&](BufferBindingOp op) { bufferBindings.push_back(op); });
+
     auto parameters =
         module->getAttrOfType<ParameterBlockAttr>("gfx.parameters");
     spirv::GlobalVariableOp parameterVariable;
     bool readsParameters = false;
     shader.walk([&](ParameterOp) { readsParameters = true; });
-    if (readsParameters) {
-      auto layout = parameterLayout(parameters);
+    bool hasBDAPushConstants =
+        enableBDA && (!entryArgBuffers.empty() || !bufferBindings.empty());
+    ParameterLayout paramLayout;
+    if (readsParameters && parameters)
+      paramLayout = parameterLayout(parameters);
+
+    auto createBufferBlockStructType =
+        [&](Type origElemType, AccessMode access) -> spirv::StructType {
+      Type elemType = converter.convertType(origElemType);
+      if (!elemType)
+        elemType = origElemType;
+      uint32_t elemSize = 4, elemAlign = 4;
+      uint32_t stride = 4;
+      if (succeeded(getStd430Layout(origElemType, elemSize, elemAlign)) &&
+          elemSize > 0 && elemAlign > 0) {
+        stride = llvm::alignTo(elemSize, elemAlign);
+      } else if (auto vecType = dyn_cast<VectorType>(elemType)) {
+        stride = static_cast<uint32_t>(vecType.getNumElements()) *
+                 (vecType.getElementTypeBitWidth() / 8);
+      } else if (elemType.isIntOrFloat()) {
+        stride = elemType.getIntOrFloatBitWidth() / 8;
+      }
+      auto rtArray = spirv::RuntimeArrayType::get(elemType, stride);
+      SmallVector<spirv::StructType::MemberDecorationInfo, 1> memberDecos;
+      if (access == AccessMode::ReadOnly) {
+        memberDecos.emplace_back(0, spirv::Decoration::NonWritable,
+                                 builder.getUnitAttr());
+      }
+      return spirv::StructType::get(
+          {rtArray}, {0}, memberDecos,
+          {spirv::StructType::StructDecorationInfo(spirv::Decoration::Block,
+                                                   builder.getUnitAttr())});
+    };
+
+    SmallVector<uint32_t> bdaArgMemberIndices;
+    SmallVector<uint32_t> bdaOpMemberIndices;
+    if (readsParameters || hasBDAPushConstants) {
       SmallVector<Type> types;
       SmallVector<uint32_t> offsets;
-      for (const auto &field : layout.fields) {
-        types.push_back(field.field.getType());
-        offsets.push_back(field.offset);
+      uint32_t nextOffset = 0;
+      if (readsParameters) {
+        for (const auto &field : paramLayout.fields) {
+          types.push_back(field.field.getType());
+          offsets.push_back(field.offset);
+        }
+        nextOffset = paramLayout.size;
       }
-      auto structure = spirv::StructType::get(types, offsets);
+      if (hasBDAPushConstants) {
+        nextOffset = llvm::alignTo(nextOffset, 8u);
+        for (const auto &argBuf : entryArgBuffers) {
+          auto blockStruct = createBufferBlockStructType(
+              argBuf.info.elementType, argBuf.info.access);
+          bdaArgMemberIndices.push_back(static_cast<uint32_t>(types.size()));
+          types.push_back(spirv::PointerType::get(
+              blockStruct, spirv::StorageClass::PhysicalStorageBuffer));
+          offsets.push_back(nextOffset);
+          nextOffset += 8;
+        }
+        for (auto op : bufferBindings) {
+          auto ptrType = cast<PtrType>(op.getResult().getType());
+          auto blockStruct = createBufferBlockStructType(
+              ptrType.getElementType(), op.getAccess());
+          bdaOpMemberIndices.push_back(static_cast<uint32_t>(types.size()));
+          types.push_back(spirv::PointerType::get(
+              blockStruct, spirv::StorageClass::PhysicalStorageBuffer));
+          offsets.push_back(nextOffset);
+          nextOffset += 8;
+        }
+      }
+      auto structure =
+          hasBDAPushConstants
+              ? spirv::StructType::get(
+                    types, offsets, {},
+                    {spirv::StructType::StructDecorationInfo(
+                        spirv::Decoration::Block, builder.getUnitAttr())})
+              : spirv::StructType::get(types, offsets);
       auto pointer =
           spirv::PointerType::get(structure, spirv::StorageClass::PushConstant);
       builder.setInsertionPoint(function);
       parameterVariable = spirv::GlobalVariableOp::create(
           builder, location, pointer, "parameters");
       symbols.insert(parameterVariable);
-      SmallVector<ParameterOp> reads;
-      shader.walk([&](ParameterOp op) { reads.push_back(op); });
-      for (auto op : reads) {
-        auto field = llvm::find_if(layout.fields, [&](const auto &field) {
-          return field.field.getName() == op.getField();
-        });
-        builder.setInsertionPoint(op);
-        auto address =
-            spirv::AddressOfOp::create(builder, op.getLoc(), parameterVariable);
-        auto index = spirv::ConstantOp::create(
-            builder, op.getLoc(), builder.getI32Type(),
-            builder.getI32IntegerAttr(field - layout.fields.begin()));
-        auto member = spirv::AccessChainOp::create(builder, op.getLoc(),
-                                                   address, ValueRange{index});
-        auto value = spirv::LoadOp::create(builder, op.getLoc(), member);
-        op.getValue().replaceAllUsesWith(value);
-        op.erase();
+      if (readsParameters) {
+        SmallVector<ParameterOp> reads;
+        shader.walk([&](ParameterOp op) { reads.push_back(op); });
+        for (auto op : reads) {
+          auto field = llvm::find_if(paramLayout.fields, [&](const auto &field) {
+            return field.field.getName() == op.getField();
+          });
+          builder.setInsertionPoint(op);
+          auto address =
+              spirv::AddressOfOp::create(builder, op.getLoc(), parameterVariable);
+          auto index = spirv::ConstantOp::create(
+              builder, op.getLoc(), builder.getI32Type(),
+              builder.getI32IntegerAttr(
+                  static_cast<int32_t>(field - paramLayout.fields.begin())));
+          auto member = spirv::AccessChainOp::create(builder, op.getLoc(),
+                                                     address, ValueRange{index});
+          auto value = spirv::LoadOp::create(builder, op.getLoc(), member);
+          op.getValue().replaceAllUsesWith(value);
+          op.erase();
+        }
       }
     }
     module->removeAttr("gfx.parameters");
@@ -353,9 +498,6 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       bool fragmentCoord =
           isa<BuiltinOp>(op) &&
           cast<BuiltinOp>(op).getKind() == Builtin::FragmentCoord;
-      bool globalInvocationId =
-          isa<BuiltinOp>(op) &&
-          cast<BuiltinOp>(op).getKind() == Builtin::GlobalInvocationId;
       if (fragmentCoord)
         type = VectorType::get({4}, builder.getF32Type());
       auto pointerType =
@@ -366,14 +508,27 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
           builder, op->getLoc(), pointerType,
           "interface_" + std::to_string(nextSymbol++));
       symbols.insert(variable);
-      if (isa<BuiltinOp>(op))
-        variable->setAttr(
-            "built_in",
-            builder.getStringAttr(
-                fragmentCoord ? "FragCoord"
-                              : (globalInvocationId ? "GlobalInvocationId"
-                                                    : "VertexIndex")));
-      else if (isa<PositionOp>(op))
+      if (auto builtinOp = dyn_cast<BuiltinOp>(op)) {
+        StringRef builtinName = "VertexIndex";
+        switch (builtinOp.getKind()) {
+        case Builtin::VertexIndex:
+          builtinName = "VertexIndex";
+          break;
+        case Builtin::FragmentCoord:
+          builtinName = "FragCoord";
+          break;
+        case Builtin::GlobalInvocationId:
+          builtinName = "GlobalInvocationId";
+          break;
+        case Builtin::LocalInvocationId:
+          builtinName = "LocalInvocationId";
+          break;
+        case Builtin::WorkgroupId:
+          builtinName = "WorkgroupId";
+          break;
+        }
+        variable->setAttr("built_in", builder.getStringAttr(builtinName));
+      } else if (isa<PositionOp>(op))
         variable->setAttr("built_in", builder.getStringAttr("Position"));
       else {
         int32_t index = input ? cast<InputOp>(op).getLocation()
@@ -415,59 +570,86 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       }
       op->erase();
     }
-    SPIRVTypeConverter converter(target);
-    converter.addConversion([&](gfx::PtrType ptrType) -> std::optional<Type> {
-      Type elemType = converter.convertType(ptrType.getElementType());
-      if (!elemType)
-        return std::nullopt;
-      spirv::StorageClass sc;
-      switch (ptrType.getStorageClass()) {
-      case StorageClass::Global:
-        sc = enableBDA ? spirv::StorageClass::PhysicalStorageBuffer
-                       : spirv::StorageClass::StorageBuffer;
-        break;
-      case StorageClass::Workgroup:
-        sc = spirv::StorageClass::Workgroup;
-        break;
-      case StorageClass::Private:
-        sc = spirv::StorageClass::Function;
-        break;
-      case StorageClass::PushConstant:
-        sc = spirv::StorageClass::PushConstant;
-        break;
-      }
-      return spirv::PointerType::get(elemType, sc);
-    });
-    SmallVector<BufferBindingOp> bufferBindings;
-    shader.walk([&](BufferBindingOp op) { bufferBindings.push_back(op); });
-    for (auto op : bufferBindings) {
-      auto ptrType = cast<PtrType>(op.getResult().getType());
-      Type elemType = converter.convertType(ptrType.getElementType());
-      if (!elemType)
-        elemType = ptrType.getElementType();
-      uint32_t byteSize = 4;
-      if (auto vecType = dyn_cast<VectorType>(elemType)) {
-        byteSize = vecType.getNumElements() * (vecType.getElementTypeBitWidth() / 8);
-      } else if (elemType.isIntOrFloat()) {
-        byteSize = elemType.getIntOrFloatBitWidth() / 8;
-      }
-      auto rtArray = spirv::RuntimeArrayType::get(elemType, byteSize);
-      auto structType = spirv::StructType::get(
-          {rtArray}, {0}, {},
-          {spirv::StructType::StructDecorationInfo(spirv::Decoration::Block,
-                                                   builder.getUnitAttr())});
-      auto varPtrType =
-          spirv::PointerType::get(structType, spirv::StorageClass::StorageBuffer);
+
+    auto createStorageBufferGlobal = [&](Location loc, Type origElemType,
+                                         StringRef symName, uint32_t set,
+                                         uint32_t binding,
+                                         AccessMode access) -> spirv::GlobalVariableOp {
+      auto structType = createBufferBlockStructType(origElemType, access);
+      auto varPtrType = spirv::PointerType::get(
+          structType, spirv::StorageClass::StorageBuffer);
       builder.setInsertionPoint(function);
-      auto var = spirv::GlobalVariableOp::create(builder, op.getLoc(),
-                                                 varPtrType, op.getName());
-      var->setAttr("descriptor_set", builder.getI32IntegerAttr(op.getSet()));
-      var->setAttr("binding", builder.getI32IntegerAttr(op.getBinding()));
+      auto var = spirv::GlobalVariableOp::create(builder, loc, varPtrType,
+                                                 symName);
+      var->setAttr("descriptor_set",
+                   builder.getI32IntegerAttr(static_cast<int32_t>(set)));
+      var->setAttr("binding",
+                   builder.getI32IntegerAttr(static_cast<int32_t>(binding)));
       symbols.insert(var);
-      builder.setInsertionPoint(op);
-      auto addr = spirv::AddressOfOp::create(builder, op.getLoc(), var);
-      op.getResult().replaceAllUsesWith(addr);
-      op.erase();
+      return var;
+    };
+
+    if (!entryArgBuffers.empty()) {
+      llvm::BitVector erasedArgs(function.getNumArguments());
+      for (size_t idx = 0; idx < entryArgBuffers.size(); ++idx) {
+        const auto &argBuf = entryArgBuffers[idx];
+        erasedArgs.set(argBuf.argIndex);
+        BlockArgument argVal = function.getArgument(argBuf.argIndex);
+        if (enableBDA) {
+          builder.setInsertionPointToStart(&function.getBody().front());
+          auto address = spirv::AddressOfOp::create(builder, location,
+                                                    parameterVariable);
+          auto memberIdx = spirv::ConstantOp::create(
+              builder, location, builder.getI32Type(),
+              builder.getI32IntegerAttr(
+                  static_cast<int32_t>(bdaArgMemberIndices[idx])));
+          auto member = spirv::AccessChainOp::create(
+              builder, location, address, ValueRange{memberIdx});
+          Value bdaPtr = spirv::LoadOp::create(builder, location, member);
+          argVal.replaceAllUsesWith(bdaPtr);
+        } else {
+          auto var = createStorageBufferGlobal(
+              location, argBuf.info.elementType, argBuf.info.name,
+              argBuf.info.set, argBuf.info.binding, argBuf.info.access);
+          if (!argVal.use_empty()) {
+            builder.setInsertionPointToStart(&function.getBody().front());
+            auto addr = spirv::AddressOfOp::create(builder, location, var);
+            argVal.replaceAllUsesWith(addr);
+          }
+        }
+      }
+      if (failed(function.eraseArguments(erasedArgs))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
+    for (size_t idx = 0; idx < bufferBindings.size(); ++idx) {
+      auto op = bufferBindings[idx];
+      if (enableBDA) {
+        builder.setInsertionPoint(op);
+        auto address = spirv::AddressOfOp::create(builder, op.getLoc(),
+                                                  parameterVariable);
+        auto memberIdx = spirv::ConstantOp::create(
+            builder, op.getLoc(), builder.getI32Type(),
+            builder.getI32IntegerAttr(
+                static_cast<int32_t>(bdaOpMemberIndices[idx])));
+        auto member = spirv::AccessChainOp::create(builder, op.getLoc(),
+                                                   address,
+                                                   ValueRange{memberIdx});
+        Value bdaPtr = spirv::LoadOp::create(builder, op.getLoc(), member);
+        op.getResult().replaceAllUsesWith(bdaPtr);
+        op.erase();
+      } else {
+        auto ptrType = cast<PtrType>(op.getResult().getType());
+        auto var = createStorageBufferGlobal(
+            op.getLoc(), ptrType.getElementType(), op.getName(), op.getSet(),
+            op.getBinding(), op.getAccess());
+        builder.setInsertionPoint(op);
+        auto addr = spirv::AddressOfOp::create(builder, op.getLoc(), var);
+        op.getResult().replaceAllUsesWith(addr);
+        op.erase();
+      }
     }
     RewritePatternSet patterns(context);
     ScfToSPIRVContext scfContext;
