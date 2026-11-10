@@ -3,6 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tests/lit/execution/Inputs"))
+from execution_targets import target_output_path
+
 try:
     from PIL import Image
     from imgdiff import compare, compare_targets
