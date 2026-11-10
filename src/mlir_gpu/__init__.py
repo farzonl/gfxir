@@ -22,6 +22,7 @@ from .frontend import (
     BufferType,
     ComputePipeline,
     Dispatch,
+    DepthStencil,
     Draw,
     FragmentCoord,
     GlobalInvocationId,
@@ -96,9 +97,9 @@ mat4x2, mat4x3, mat4x4 = Type.MAT4X2, Type.MAT4X3, Type.MAT4X4
 
 __all__ = [
     "AccessMode", "Buffer", "BufferBinding", "BufferType", "CompileError", "ComputeDispatchResult",
-    "ComputePipeline", "ComputeProgram", "DIRECTX_SM60", "DIRECTX_SM66", "Dispatch", "Draw",
-    "DrawCall", "FragmentCoord", "FrameParameters", "GlobalInvocationId", "HIGH_END_COMPUTE",
-    "ImageDiffError", "ImageDiffResult", "LocalInvocationId", "MLIRPipeline",
+    "ComputePipeline", "ComputeProgram", "DIRECTX_SM60", "DIRECTX_SM66", "DepthStencil", "Dispatch",
+    "Draw", "DrawCall", "FragmentCoord", "FrameParameters", "GlobalInvocationId",
+    "HIGH_END_COMPUTE", "ImageDiffError", "ImageDiffResult", "LocalInvocationId", "MLIRPipeline",
     "MULTI_DRAW_SCHEMA_VERSION", "MultiDrawManifest", "PRESETS", "ParameterBlock", "Pipeline",
     "PointerType", "ReflectedBufferBinding", "RenderedImage", "StorageClass", "StructField",
     "Target", "TargetProfile", "Toolchain", "Type", "VULKAN_PORTABLE_1_0", "Value", "Vertex",

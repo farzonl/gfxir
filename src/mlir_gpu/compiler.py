@@ -11,7 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .frontend import ComputePipeline, Dispatch, Draw, Pipeline, Stage
+from .frontend import ComputePipeline, DepthStencil, Dispatch, Draw, Pipeline, Stage
 from .interfaces import reflect_pipeline_parameters, verify_graphics_interface
 from .parameters import verify_parameters
 
@@ -233,6 +233,14 @@ class MLIRPipeline:
     vertex_entry: str
     fragment_entry: str
     draw: Draw = field(default_factory=Draw)
+    depth_stencil: DepthStencil | None = None
+
+    def __post_init__(self):
+        if self.depth_stencil is not None:
+            if isinstance(self.depth_stencil, dict):
+                object.__setattr__(self, "depth_stencil", DepthStencil(**self.depth_stencil))
+            elif not isinstance(self.depth_stencil, DepthStencil):
+                raise TypeError("depth_stencil must be a DepthStencil instance or dict.")
 
     def trace(self) -> tuple[_MLIRStage, _MLIRStage]:
         if not isinstance(self.draw, Draw):
@@ -700,6 +708,8 @@ def compile_pipeline(
         }
         if parameters:
             manifest["parameters"] = parameters
+        if getattr(pipeline, "depth_stencil", None) is not None:
+            manifest["depth_stencil"] = pipeline.depth_stencil.to_dict()
         (directory / "pipeline.json").write_text(json.dumps(manifest, indent=2) + "\n")
         directory.rename(output)
     return output / "pipeline.json"
