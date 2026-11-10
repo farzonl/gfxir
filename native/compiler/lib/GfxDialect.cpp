@@ -7,14 +7,17 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVTypes.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::gfx;
@@ -43,6 +46,239 @@ void GfxDialect::initialize() {
       >();
 }
 
+uint32_t mlir::gfx::getTypeSize(Type type) {
+  if (!type)
+    return 0;
+  if (type.isF32() || type.isInteger(32))
+    return 4;
+  if (type.isF16() || type.isInteger(16))
+    return 2;
+  if (type.isF64() || type.isInteger(64))
+    return 8;
+  if (type.isInteger(8) || type.isInteger(1))
+    return 1;
+  if (auto vector = dyn_cast<VectorType>(type)) {
+    if (vector.getRank() == 1)
+      return vector.getNumElements() * getTypeSize(vector.getElementType());
+  }
+  return 0;
+}
+
+//=============================================================================
+// std430 Natural Alignment with Cycle Safety
+//=============================================================================
+static uint32_t getNaturalAlignmentImpl(Type type, llvm::SmallPtrSetImpl<Type> &visiting) {
+  if (!type)
+    return 0;
+  if (type.isF32() || type.isInteger(32))
+    return 4;
+  if (type.isF16() || type.isInteger(16))
+    return 2;
+  if (type.isF64() || type.isInteger(64))
+    return 8;
+  if (type.isInteger(8) || type.isInteger(1))
+    return 1;
+  if (auto vector = dyn_cast<VectorType>(type)) {
+    if (vector.getRank() != 1)
+      return 0;
+    uint32_t elemAlign = getNaturalAlignmentImpl(vector.getElementType(), visiting);
+    if (elemAlign == 0)
+      return 0;
+    uint32_t numElements = vector.getNumElements();
+    // std430 alignment rules: vec2 = 2 * scalar, vec3 and vec4 = 4 * scalar
+    uint32_t factor = (numElements == 3 || numElements == 4) ? 4 : numElements;
+    return factor * elemAlign;
+  }
+
+  // Cycle detection: recursive by-value struct has no finite alignment
+  if (!visiting.insert(type).second)
+    return 0;
+
+  uint32_t maxAlign = 0;
+  if (auto spirvStruct = dyn_cast<spirv::StructType>(type)) {
+    maxAlign = 1;
+    for (Type member : spirvStruct.getElementTypes()) {
+      uint32_t memberAlign = getNaturalAlignmentImpl(member, visiting);
+      if (memberAlign == 0) {
+        maxAlign = 0;
+        break;
+      }
+      maxAlign = std::max(maxAlign, memberAlign);
+    }
+  } else if (auto llvmStruct = dyn_cast<LLVM::LLVMStructType>(type)) {
+    if (!llvmStruct.isOpaque()) {
+      maxAlign = 1;
+      for (Type member : llvmStruct.getBody()) {
+        uint32_t memberAlign = getNaturalAlignmentImpl(member, visiting);
+        if (memberAlign == 0) {
+          maxAlign = 0;
+          break;
+        }
+        maxAlign = std::max(maxAlign, memberAlign);
+      }
+    }
+  } else if (auto tuple = dyn_cast<TupleType>(type)) {
+    maxAlign = 1;
+    for (Type member : tuple.getTypes()) {
+      uint32_t memberAlign = getNaturalAlignmentImpl(member, visiting);
+      if (memberAlign == 0) {
+        maxAlign = 0;
+        break;
+      }
+      maxAlign = std::max(maxAlign, memberAlign);
+    }
+  }
+
+  visiting.erase(type);
+  return maxAlign;
+}
+
+uint32_t mlir::gfx::getNaturalAlignment(Type type) {
+  llvm::SmallPtrSet<Type, 8> visiting;
+  return getNaturalAlignmentImpl(type, visiting);
+}
+
+//=============================================================================
+// Recursive Pointee Type Validation with Cycle Detection & Memoization
+//=============================================================================
+static bool isValidPointeeTypeImpl(Type type,
+                                   llvm::SmallPtrSetImpl<Type> &visiting,
+                                   llvm::SmallPtrSetImpl<Type> &visited) {
+  if (!type)
+    return false;
+  // Disallow nested pointers (gfx, llvm, and spirv pointers)
+  if (isa<PtrType, LLVM::LLVMPointerType, spirv::PointerType>(type))
+    return false;
+  // Disallow opaque resource handles
+  if (isa<HandleType>(type))
+    return false;
+  if (auto vector = dyn_cast<VectorType>(type)) {
+    if (vector.getRank() != 1)
+      return false;
+    uint32_t numElements = vector.getNumElements();
+    if (numElements < 2 || numElements > 4)
+      return false;
+    Type elem = vector.getElementType();
+    return elem.isF32() || elem.isInteger(32) || elem.isF16() ||
+           elem.isInteger(16) || elem.isF64() || elem.isInteger(64) ||
+           elem.isInteger(8) || elem.isInteger(1);
+  }
+  if (type.isF32() || type.isInteger(32) || type.isF16() ||
+      type.isInteger(16) || type.isF64() || type.isInteger(64) ||
+      type.isInteger(8) || type.isInteger(1))
+    return true;
+
+  // Memoization: if already validated as legal, return true immediately
+  if (visited.contains(type))
+    return true;
+
+  // Cycle detection: if type is an active ancestor on the current stack, reject
+  if (!visiting.insert(type).second)
+    return false;
+
+  bool valid = false;
+  if (auto llvmStruct = dyn_cast<LLVM::LLVMStructType>(type)) {
+    if (!llvmStruct.isOpaque()) {
+      valid = llvm::all_of(llvmStruct.getBody(), [&](Type member) {
+        return isValidPointeeTypeImpl(member, visiting, visited);
+      });
+    }
+  } else if (auto spirvStruct = dyn_cast<spirv::StructType>(type)) {
+    valid = llvm::all_of(spirvStruct.getElementTypes(), [&](Type member) {
+      return isValidPointeeTypeImpl(member, visiting, visited);
+    });
+  } else if (auto tuple = dyn_cast<TupleType>(type)) {
+    valid = llvm::all_of(tuple.getTypes(), [&](Type member) {
+      return isValidPointeeTypeImpl(member, visiting, visited);
+    });
+  }
+
+  visiting.erase(type);
+  if (valid)
+    visited.insert(type);
+  return valid;
+}
+
+bool mlir::gfx::isValidPointeeType(Type type) {
+  llvm::SmallPtrSet<Type, 8> visiting;
+  llvm::SmallPtrSet<Type, 16> visited;
+  return isValidPointeeTypeImpl(type, visiting, visited);
+}
+
+Type PtrType::parse(AsmParser &parser) {
+  if (parser.parseLess())
+    return {};
+
+  Type elementType;
+  llvm::SMLoc loc = parser.getCurrentLocation();
+  if (parser.parseType(elementType))
+    return {};
+
+  if (parser.parseComma())
+    return {};
+
+  std::string storageKeyword;
+  llvm::SMLoc storageLoc = parser.getCurrentLocation();
+  if (failed(parser.parseKeywordOrString(&storageKeyword)))
+    return {};
+  auto maybeStorage = symbolizeStorageClass(storageKeyword);
+  if (!maybeStorage) {
+    parser.emitError(storageLoc, "expected ::mlir::gfx::StorageClass to be one of: ")
+        << "global, workgroup, private, push_constant";
+    return {};
+  }
+
+  uint32_t alignment = 0;
+  if (succeeded(parser.parseOptionalComma())) {
+    llvm::SMLoc alignLoc = parser.getCurrentLocation();
+    if (parser.parseInteger(alignment))
+      return {};
+    if (!llvm::isPowerOf2_32(alignment)) {
+      parser.emitError(alignLoc, "pointer alignment must be a power of two, got ")
+          << alignment;
+      return {};
+    }
+  }
+
+  if (parser.parseGreater())
+    return {};
+
+  return parser.getChecked<PtrType>(loc, parser.getContext(), elementType,
+                                    *maybeStorage, alignment);
+}
+
+void PtrType::print(AsmPrinter &printer) const {
+  printer << "<" << getElementType() << ", "
+          << stringifyStorageClass(getStorageClass());
+  if (getAlignment() != 0)
+    printer << ", " << getAlignment();
+  printer << ">";
+}
+
+uint32_t PtrType::getEffectiveAlignment() const {
+  uint32_t explicitAlign = getAlignment();
+  return explicitAlign != 0 ? explicitAlign : getNaturalAlignment(getElementType());
+}
+
+LogicalResult PtrType::verify(function_ref<InFlightDiagnostic()> emitError,
+                              Type elementType, StorageClass storageClass,
+                              uint32_t alignment) {
+  if (!isValidPointeeType(elementType))
+    return emitError() << "pointer element type must be a valid shader data type, got "
+                       << elementType;
+
+  if (alignment != 0) {
+    if (!llvm::isPowerOf2_32(alignment))
+      return emitError() << "pointer alignment must be a power of two, got " << alignment;
+    uint32_t natural = getNaturalAlignment(elementType);
+    if (natural > 0 && alignment < natural)
+      return emitError() << "pointer alignment (" << alignment
+                         << ") is smaller than the natural alignment of pointee type ("
+                         << natural << ")";
+  }
+  return success();
+}
+
 void mlir::gfx::registerGfxDialects(DialectRegistry &registry) {
   registry
       .insert<GfxDialect, arith::ArithDialect, func::FuncDialect,
@@ -64,13 +300,31 @@ LogicalResult GfxDialect::verifyOperationAttribute(Operation *op,
                                                    NamedAttribute attribute) {
   if (attribute.getName() == "gfx.stage") {
     auto function = dyn_cast<func::FuncOp>(op);
-    if (!function || !isa<StageAttr>(attribute.getValue()))
+    auto stageAttr = dyn_cast<StageAttr>(attribute.getValue());
+    if (!function || !stageAttr)
       return op->emitOpError(
           "gfx.stage requires a typed stage attribute on func.func");
-    if (!function.getFunctionType().getInputs().empty() ||
-        !function.getFunctionType().getResults().empty())
-      return op->emitOpError("entry points use gfx interface operations, not "
-                             "host function arguments/results");
+    if (stageAttr.getValue() == Stage::Compute) {
+      if (!function.getFunctionType().getResults().empty())
+        return op->emitOpError("compute entry points must not have return values");
+      for (Type input : function.getFunctionType().getInputs()) {
+        if (!isa<PtrType>(input))
+          return op->emitOpError(
+              "compute entry point arguments must be device pointers");
+      }
+    } else {
+      for (Type input : function.getFunctionType().getInputs()) {
+        if (auto ptr = dyn_cast<PtrType>(input)) {
+          if (ptr.getStorageClass() == StorageClass::Workgroup)
+            return op->emitOpError(
+                "workgroup pointers are only allowed in compute entry points");
+        }
+      }
+      if (!function.getFunctionType().getInputs().empty() ||
+          !function.getFunctionType().getResults().empty())
+        return op->emitOpError("entry points use gfx interface operations, not "
+                               "host function arguments/results");
+    }
     if (function.isExternal())
       return op->emitOpError("entry points must have a body");
   } else if (attribute.getName() == "gfx.workgroup_size") {
@@ -301,6 +555,38 @@ LogicalResult mlir::gfx::verifyShaderModule(ModuleOp module,
           return failure();
       }
     }
+    for (Type argType : function.getArgumentTypes()) {
+      if (auto ptr = dyn_cast<PtrType>(argType)) {
+        if (ptr.getStorageClass() == StorageClass::Workgroup &&
+            stage.getValue() != Stage::Compute) {
+          return function.emitOpError(
+              "workgroup pointers are only allowed in compute entry points");
+        }
+      }
+    }
+    WalkResult ptrCheck = function.walk([&](Operation *op) {
+      auto checkType = [&](Type t) -> LogicalResult {
+        if (auto ptr = dyn_cast<PtrType>(t)) {
+          if (ptr.getStorageClass() == StorageClass::Workgroup &&
+              stage.getValue() != Stage::Compute) {
+            return op->emitOpError(
+                "workgroup pointers are only allowed in compute entry points");
+          }
+        }
+        return success();
+      };
+      for (Type operandType : op->getOperandTypes()) {
+        if (failed(checkType(operandType)))
+          return WalkResult::interrupt();
+      }
+      for (Type resultType : op->getResultTypes()) {
+        if (failed(checkType(resultType)))
+          return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (ptrCheck.wasInterrupted())
+      return failure();
     llvm::SmallDenseMap<int32_t, InputOp> inputs;
     llvm::SmallSet<int32_t, 8> outputs;
     unsigned positions = 0;

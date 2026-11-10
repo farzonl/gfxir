@@ -1,4 +1,4 @@
-"""Unit tests for TargetProfile capability profiles and feature requirements (Issue #43)."""
+"""Unit tests for TargetProfile capability profiles and feature requirements."""
 
 from __future__ import annotations
 
