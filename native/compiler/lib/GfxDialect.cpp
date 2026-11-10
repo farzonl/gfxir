@@ -13,6 +13,7 @@
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -63,7 +64,10 @@ uint32_t mlir::gfx::getTypeSize(Type type) {
   return 0;
 }
 
-uint32_t mlir::gfx::getNaturalAlignment(Type type) {
+//=============================================================================
+// std430 Natural Alignment with Cycle Safety
+//=============================================================================
+static uint32_t getNaturalAlignmentImpl(Type type, llvm::SmallPtrSetImpl<Type> &visiting) {
   if (!type)
     return 0;
   if (type.isF32() || type.isInteger(32))
@@ -77,7 +81,7 @@ uint32_t mlir::gfx::getNaturalAlignment(Type type) {
   if (auto vector = dyn_cast<VectorType>(type)) {
     if (vector.getRank() != 1)
       return 0;
-    uint32_t elemAlign = getNaturalAlignment(vector.getElementType());
+    uint32_t elemAlign = getNaturalAlignmentImpl(vector.getElementType(), visiting);
     if (elemAlign == 0)
       return 0;
     uint32_t numElements = vector.getNumElements();
@@ -85,32 +89,65 @@ uint32_t mlir::gfx::getNaturalAlignment(Type type) {
     uint32_t factor = (numElements == 3 || numElements == 4) ? 4 : numElements;
     return factor * elemAlign;
   }
+
+  // Cycle detection: recursive by-value struct has no finite alignment
+  if (!visiting.insert(type).second)
+    return 0;
+
+  uint32_t maxAlign = 0;
   if (auto spirvStruct = dyn_cast<spirv::StructType>(type)) {
-    uint32_t maxAlign = 1;
-    for (Type member : spirvStruct.getElementTypes())
-      maxAlign = std::max(maxAlign, getNaturalAlignment(member));
-    return maxAlign;
+    maxAlign = 1;
+    for (Type member : spirvStruct.getElementTypes()) {
+      uint32_t memberAlign = getNaturalAlignmentImpl(member, visiting);
+      if (memberAlign == 0) {
+        maxAlign = 0;
+        break;
+      }
+      maxAlign = std::max(maxAlign, memberAlign);
+    }
+  } else if (auto llvmStruct = dyn_cast<LLVM::LLVMStructType>(type)) {
+    if (!llvmStruct.isOpaque()) {
+      maxAlign = 1;
+      for (Type member : llvmStruct.getBody()) {
+        uint32_t memberAlign = getNaturalAlignmentImpl(member, visiting);
+        if (memberAlign == 0) {
+          maxAlign = 0;
+          break;
+        }
+        maxAlign = std::max(maxAlign, memberAlign);
+      }
+    }
+  } else if (auto tuple = dyn_cast<TupleType>(type)) {
+    maxAlign = 1;
+    for (Type member : tuple.getTypes()) {
+      uint32_t memberAlign = getNaturalAlignmentImpl(member, visiting);
+      if (memberAlign == 0) {
+        maxAlign = 0;
+        break;
+      }
+      maxAlign = std::max(maxAlign, memberAlign);
+    }
   }
-  if (auto llvmStruct = dyn_cast<LLVM::LLVMStructType>(type)) {
-    uint32_t maxAlign = 1;
-    for (Type member : llvmStruct.getBody())
-      maxAlign = std::max(maxAlign, getNaturalAlignment(member));
-    return maxAlign;
-  }
-  if (auto tuple = dyn_cast<TupleType>(type)) {
-    uint32_t maxAlign = 1;
-    for (Type member : tuple.getTypes())
-      maxAlign = std::max(maxAlign, getNaturalAlignment(member));
-    return maxAlign;
-  }
-  return 0;
+
+  visiting.erase(type);
+  return maxAlign;
 }
 
-bool mlir::gfx::isValidPointeeType(Type type) {
+uint32_t mlir::gfx::getNaturalAlignment(Type type) {
+  llvm::SmallPtrSet<Type, 8> visiting;
+  return getNaturalAlignmentImpl(type, visiting);
+}
+
+//=============================================================================
+// Recursive Pointee Type Validation with Cycle Detection & Memoization
+//=============================================================================
+static bool isValidPointeeTypeImpl(Type type,
+                                   llvm::SmallPtrSetImpl<Type> &visiting,
+                                   llvm::SmallPtrSetImpl<Type> &visited) {
   if (!type)
     return false;
-  // Disallow nested pointers
-  if (isa<PtrType>(type))
+  // Disallow nested pointers (gfx, llvm, and spirv pointers)
+  if (isa<PtrType, LLVM::LLVMPointerType, spirv::PointerType>(type))
     return false;
   // Disallow opaque resource handles
   if (isa<HandleType>(type))
@@ -130,9 +167,92 @@ bool mlir::gfx::isValidPointeeType(Type type) {
       type.isInteger(16) || type.isF64() || type.isInteger(64) ||
       type.isInteger(8) || type.isInteger(1))
     return true;
-  if (isa<spirv::StructType, LLVM::LLVMStructType, TupleType>(type))
+
+  // Memoization: if already validated as legal, return true immediately
+  if (visited.contains(type))
     return true;
-  return false;
+
+  // Cycle detection: if type is an active ancestor on the current stack, reject
+  if (!visiting.insert(type).second)
+    return false;
+
+  bool valid = false;
+  if (auto llvmStruct = dyn_cast<LLVM::LLVMStructType>(type)) {
+    if (!llvmStruct.isOpaque()) {
+      valid = llvm::all_of(llvmStruct.getBody(), [&](Type member) {
+        return isValidPointeeTypeImpl(member, visiting, visited);
+      });
+    }
+  } else if (auto spirvStruct = dyn_cast<spirv::StructType>(type)) {
+    valid = llvm::all_of(spirvStruct.getElementTypes(), [&](Type member) {
+      return isValidPointeeTypeImpl(member, visiting, visited);
+    });
+  } else if (auto tuple = dyn_cast<TupleType>(type)) {
+    valid = llvm::all_of(tuple.getTypes(), [&](Type member) {
+      return isValidPointeeTypeImpl(member, visiting, visited);
+    });
+  }
+
+  visiting.erase(type);
+  if (valid)
+    visited.insert(type);
+  return valid;
+}
+
+bool mlir::gfx::isValidPointeeType(Type type) {
+  llvm::SmallPtrSet<Type, 8> visiting;
+  llvm::SmallPtrSet<Type, 16> visited;
+  return isValidPointeeTypeImpl(type, visiting, visited);
+}
+
+Type PtrType::parse(AsmParser &parser) {
+  if (parser.parseLess())
+    return {};
+
+  Type elementType;
+  llvm::SMLoc loc = parser.getCurrentLocation();
+  if (parser.parseType(elementType))
+    return {};
+
+  if (parser.parseComma())
+    return {};
+
+  std::string storageKeyword;
+  llvm::SMLoc storageLoc = parser.getCurrentLocation();
+  if (failed(parser.parseKeywordOrString(&storageKeyword)))
+    return {};
+  auto maybeStorage = symbolizeStorageClass(storageKeyword);
+  if (!maybeStorage) {
+    parser.emitError(storageLoc, "expected ::mlir::gfx::StorageClass to be one of: ")
+        << "global, workgroup, private, push_constant";
+    return {};
+  }
+
+  uint32_t alignment = 0;
+  if (succeeded(parser.parseOptionalComma())) {
+    llvm::SMLoc alignLoc = parser.getCurrentLocation();
+    if (parser.parseInteger(alignment))
+      return {};
+    if (!llvm::isPowerOf2_32(alignment)) {
+      parser.emitError(alignLoc, "pointer alignment must be a power of two, got ")
+          << alignment;
+      return {};
+    }
+  }
+
+  if (parser.parseGreater())
+    return {};
+
+  return parser.getChecked<PtrType>(loc, parser.getContext(), elementType,
+                                    *maybeStorage, alignment);
+}
+
+void PtrType::print(AsmPrinter &printer) const {
+  printer << "<" << getElementType() << ", "
+          << stringifyStorageClass(getStorageClass());
+  if (getAlignment() != 0)
+    printer << ", " << getAlignment();
+  printer << ">";
 }
 
 uint32_t PtrType::getEffectiveAlignment() const {

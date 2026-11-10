@@ -136,6 +136,11 @@ class TestPointerTypeRejections(unittest.TestCase):
                     PointerType(Type.F32, StorageClass.GLOBAL, alignment=align)
                 self.assertIn("power of two", str(ctx.exception).lower())
 
+    def test_alignment_zero_explicit_message(self):
+        with self.assertRaises(ValueError) as ctx:
+            PointerType(Type.F32, StorageClass.GLOBAL, alignment=0)
+        self.assertEqual(str(ctx.exception), "pointer alignment must be a power of two, got 0")
+
     def test_sub_natural_alignment_rejected(self):
         # f32 natural is 4; alignment 2 is sub-natural:
         with self.assertRaises(ValueError) as ctx:
@@ -208,6 +213,66 @@ class TestPointerMLIRRoundTrip(unittest.TestCase):
             self.assertNotEqual(res.returncode, 0)
             self.assertIn("power of two", res.stderr)
 
+    def test_alignment_zero_rejected_by_compiler(self):
+        mlir_content = """module {
+  func.func private @bad(!gfx.ptr<f32, global, 0>)
+}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "bad_align0.mlir"
+            path.write_text(mlir_content, encoding="utf-8")
+            res = subprocess.run([str(GFX_OPT), str(path)], capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("pointer alignment must be a power of two, got 0", res.stderr)
+
+    def test_struct_with_nested_pointer_rejected_by_compiler(self):
+        mlir_content = """module {
+  func.func private @bad(!gfx.ptr<!llvm.struct<(!gfx.ptr<f32, global>)>, global>)
+}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "bad_struct_ptr.mlir"
+            path.write_text(mlir_content, encoding="utf-8")
+            res = subprocess.run([str(GFX_OPT), str(path)], capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("pointer element type must be a valid shader data type", res.stderr)
+
+    def test_struct_with_handle_rejected_by_compiler(self):
+        mlir_content = """module {
+  func.func private @bad(!gfx.ptr<!llvm.struct<(!gfx.handle<texture_2d>)>, global>)
+}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "bad_struct_handle.mlir"
+            path.write_text(mlir_content, encoding="utf-8")
+            res = subprocess.run([str(GFX_OPT), str(path)], capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("pointer element type must be a valid shader data type", res.stderr)
+
+    def test_struct_with_illegal_vector_rejected_by_compiler(self):
+        mlir_content = """module {
+  func.func private @bad(!gfx.ptr<!llvm.struct<(vector<16xf32>)>, global>)
+}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "bad_struct_vec.mlir"
+            path.write_text(mlir_content, encoding="utf-8")
+            res = subprocess.run([str(GFX_OPT), str(path)], capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("pointer element type must be a valid shader data type", res.stderr)
+
+    def test_spirv_struct_with_nested_pointer_rejected_by_compiler(self):
+        mlir_content = """module {
+  func.func private @bad(!gfx.ptr<!spirv.struct<(!spirv.ptr<f32, StorageBuffer>)>, global>)
+}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "bad_spirv_struct_ptr.mlir"
+            path.write_text(mlir_content, encoding="utf-8")
+            res = subprocess.run([str(GFX_OPT), str(path)], capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("pointer element type must be a valid shader data type", res.stderr)
+
 
 @unittest.skipUnless(HAS_GFX_COMPILE, "gfx-compile tool required")
 class TestCrossTargetPointerLowering(unittest.TestCase):
@@ -279,6 +344,60 @@ class TestCrossTargetPointerLowering(unittest.TestCase):
             ], capture_output=True, text=True)
             self.assertEqual(res_pass.returncode, 0, msg=res_pass.stderr)
             self.assertTrue(out.is_file())
+
+    def test_directx_pointer_lowering(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "dx.mlir"
+            src.write_text(self.COMPUTE_DESCRIPTOR_MLIR, encoding="utf-8")
+            res = subprocess.run([
+                str(GFX_OPT), str(src), "--gfx-to-directx"
+            ], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            self.assertIn('hlsl.numthreads = "8,8,1"', res.stdout)
+            self.assertIn("!llvm.ptr<1>", res.stdout)
+
+    def test_directx_all_storage_classes_lowering(self):
+        mlir_all_classes = """module {
+  func.func @compute_main(%arg0: !gfx.ptr<f32, global>,
+                          %arg1: !gfx.ptr<f32, workgroup>,
+                          %arg2: !gfx.ptr<f32, private>,
+                          %arg3: !gfx.ptr<f32, push_constant>) attributes {
+    gfx.stage = #gfx.stage<compute>,
+    gfx.workgroup_size = array<i32: 8, 8, 1>
+  } {
+    return
+  }
+}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "dx_classes.mlir"
+            src.write_text(mlir_all_classes, encoding="utf-8")
+            res = subprocess.run([
+                str(GFX_OPT), str(src), "--gfx-to-directx"
+            ], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            self.assertIn("%arg0: !llvm.ptr<1>", res.stdout)
+            self.assertIn("%arg1: !llvm.ptr<3>", res.stdout)
+            self.assertIn("%arg2: !llvm.ptr", res.stdout)
+            self.assertIn("%arg3: !llvm.ptr<2>", res.stdout)
+
+    def test_directx_compile_compute_attribute(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "dx_comp.mlir"
+            out = Path(tmpdir) / "out.ll"
+            refl = Path(tmpdir) / "out.json"
+            src.write_text(self.COMPUTE_DESCRIPTOR_MLIR, encoding="utf-8")
+            res = subprocess.run([
+                str(GFX_COMPILE), str(src),
+                "--input-format=mlir",
+                "--target=directx",
+                "--output", str(out),
+                "--reflection", str(refl)
+            ], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            self.assertTrue(out.is_file())
+            ll_content = out.read_text(encoding="utf-8")
+            self.assertIn('"hlsl.shader"="compute"', ll_content)
 
 
 if __name__ == "__main__":

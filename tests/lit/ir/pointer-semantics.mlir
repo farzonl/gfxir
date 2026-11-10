@@ -4,6 +4,7 @@
 // RUN: %gfx-opt %t/tier1_storage_classes.mlir | %FileCheck %s --check-prefix=CHECK-TIER1-STORAGE
 // RUN: %gfx-opt %t/tier1_alignments.mlir | %FileCheck %s --check-prefix=CHECK-TIER1-ALIGN
 // RUN: %gfx-opt %t/tier1_structs.mlir | %FileCheck %s --check-prefix=CHECK-TIER1-STRUCTS
+// RUN: not %gfx-opt %t/tier2_align_npot_0.mlir 2>&1 | %FileCheck %s --check-prefix=ERR-ALIGN-NPOT-0
 // RUN: not %gfx-opt %t/tier2_align_npot_3.mlir 2>&1 | %FileCheck %s --check-prefix=ERR-ALIGN-NPOT
 // RUN: not %gfx-opt %t/tier2_align_npot_5.mlir 2>&1 | %FileCheck %s --check-prefix=ERR-ALIGN-NPOT
 // RUN: not %gfx-opt %t/tier2_align_npot_6.mlir 2>&1 | %FileCheck %s --check-prefix=ERR-ALIGN-NPOT
@@ -12,6 +13,10 @@
 // RUN: not %gfx-opt %t/tier2_subnatural_vec4.mlir 2>&1 | %FileCheck %s --check-prefix=ERR-SUBNATURAL-VEC4
 // RUN: not %gfx-opt %t/tier2_subnatural_f64.mlir 2>&1 | %FileCheck %s --check-prefix=ERR-SUBNATURAL-F64
 // RUN: not %gfx-opt %t/tier2_nested_pointer.mlir 2>&1 | %FileCheck %s --check-prefix=ERR-NESTED-PTR
+// RUN: not %gfx-opt %t/tier2_struct_nested_pointer.mlir 2>&1 | %FileCheck %s --check-prefix=ERR-STRUCT-PTR
+// RUN: not %gfx-opt %t/tier2_struct_handle.mlir 2>&1 | %FileCheck %s --check-prefix=ERR-STRUCT-HANDLE
+// RUN: not %gfx-opt %t/tier2_struct_bad_vector.mlir 2>&1 | %FileCheck %s --check-prefix=ERR-STRUCT-VEC
+// RUN: not %gfx-opt %t/tier2_spirv_struct_nested_pointer.mlir 2>&1 | %FileCheck %s --check-prefix=ERR-SPIRV-STRUCT-PTR
 // RUN: not %gfx-opt %t/tier2_domain_mismatch.mlir 2>&1 | %FileCheck %s --check-prefix=ERR-DOMAIN-MISMATCH
 // RUN: not %gfx-opt %t/tier2_stage_workgroup_vertex.mlir 2>&1 | %FileCheck %s --check-prefix=ERR-STAGE-WORKGROUP
 // RUN: %gfx-opt %t/tier3_spirv_default.mlir --convert-gfx-to-spirv | %FileCheck %s --check-prefix=CHECK-SPIRV-DEFAULT
@@ -31,12 +36,17 @@
 // CHECK-TIER1-ALIGN: func.func private @aligned_ptrs(!gfx.ptr<f32, global, 4>, !gfx.ptr<f32, global, 16>, !gfx.ptr<f32, global, 64>, !gfx.ptr<vector<4xf32>, global, 32>)
 // CHECK-TIER1-STRUCTS: func.func private @struct_ptrs(!gfx.ptr<!llvm.struct<(f32, i32)>, global>, !gfx.ptr<!llvm.struct<(f32, vector<4xf32>)>, global, 16>)
 
+// ERR-ALIGN-NPOT-0: pointer alignment must be a power of two, got 0
 // ERR-ALIGN-NPOT: pointer alignment must be a power of two
 // ERR-SUBNATURAL-F32: pointer alignment (2) is smaller than the natural alignment of pointee type (4)
 // ERR-SUBNATURAL-VEC2: pointer alignment (4) is smaller than the natural alignment of pointee type (8)
 // ERR-SUBNATURAL-VEC4: pointer alignment (8) is smaller than the natural alignment of pointee type (16)
 // ERR-SUBNATURAL-F64: pointer alignment (4) is smaller than the natural alignment of pointee type (8)
 // ERR-NESTED-PTR: pointer element type must be a valid shader data type
+// ERR-STRUCT-PTR: pointer element type must be a valid shader data type, got '!llvm.struct<(!gfx.ptr<f32, global>)>'
+// ERR-STRUCT-HANDLE: pointer element type must be a valid shader data type, got '!llvm.struct<(!gfx.handle<texture_2d>)>'
+// ERR-STRUCT-VEC: pointer element type must be a valid shader data type, got '!llvm.struct<(vector<16xf32>)>'
+// ERR-SPIRV-STRUCT-PTR: pointer element type must be a valid shader data type, got '!spirv.struct<(!spirv.ptr<f32, StorageBuffer>)>'
 // ERR-DOMAIN-MISMATCH: doesn't match function result type
 // ERR-STAGE-WORKGROUP: workgroup pointers are only allowed in compute entry points
 
@@ -45,6 +55,7 @@
 // CHECK-SPIRV-DEFAULT: spirv.ExecutionMode @compute_main "LocalSize", 8, 8, 1
 // ERR-BDA-NOCAP: target capability profile does not support required capability 'PhysicalStorageBuffer64'
 // CHECK-DX-DEFAULT: module attributes {hlsl.numthreads = "8,8,1"
+// CHECK-DX-DEFAULT: llvm.func @compute_main(%arg0: !llvm.ptr<1>)
 
 // CHECK-TIER4-VECADD: func.func @vector_add(%arg0: !gfx.ptr<f32, global>, %arg1: !gfx.ptr<f32, global>, %arg2: !gfx.ptr<f32, global>)
 // CHECK-TIER4-TILED: func.func @tiled_reduction(%arg0: !gfx.ptr<vector<4xf32>, global>, %arg1: !gfx.ptr<f32, workgroup>)
@@ -106,6 +117,11 @@ module {
 // TIER 2: BOUNDARY & CORNER CASES (VERIFIER NEGATIVE TESTS)
 // =============================================================================
 
+//--- tier2_align_npot_0.mlir
+module {
+  func.func private @bad_align_0(!gfx.ptr<f32, global, 0>)
+}
+
 //--- tier2_align_npot_3.mlir
 module {
   func.func private @bad_align_3(!gfx.ptr<f32, global, 3>)
@@ -144,6 +160,26 @@ module {
 //--- tier2_nested_pointer.mlir
 module {
   func.func private @nested_ptr(!gfx.ptr<!gfx.ptr<f32, global>, global>)
+}
+
+//--- tier2_struct_nested_pointer.mlir
+module {
+  func.func private @struct_nested_ptr(!gfx.ptr<!llvm.struct<(!gfx.ptr<f32, global>)>, global>)
+}
+
+//--- tier2_struct_handle.mlir
+module {
+  func.func private @struct_handle(!gfx.ptr<!llvm.struct<(!gfx.handle<texture_2d>)>, global>)
+}
+
+//--- tier2_struct_bad_vector.mlir
+module {
+  func.func private @struct_bad_vec(!gfx.ptr<!llvm.struct<(vector<16xf32>)>, global>)
+}
+
+//--- tier2_spirv_struct_nested_pointer.mlir
+module {
+  func.func private @spirv_struct_nested_ptr(!gfx.ptr<!spirv.struct<(!spirv.ptr<f32, StorageBuffer>)>, global>)
 }
 
 //--- tier2_domain_mismatch.mlir

@@ -616,8 +616,13 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
     module.emitError("translated module is missing the reflected entry point");
     return {};
   }
+  const char *shaderKind = "pixel";
+  if (reflection.stage == Stage::Vertex)
+    shaderKind = "vertex";
+  else if (reflection.stage == Stage::Compute)
+    shaderKind = "compute";
+  function->addFnAttr("hlsl.shader", shaderKind);
   bool vertex = reflection.stage == Stage::Vertex;
-  function->addFnAttr("hlsl.shader", vertex ? "vertex" : "pixel");
   if (reflection.parameters) {
     namespace rootsig = llvm::hlsl::rootsig;
     rootsig::RootConstants constants{
@@ -668,9 +673,12 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
                   : io.interpolation == Interpolation::NoPerspective
                       ? llvm::dxbc::PSV::InterpolationMode::LinearNoperspective
                       : llvm::dxbc::PSV::InterpolationMode::Linear;
+      llvm::Triple::EnvironmentType stageEnv =
+          vertex ? llvm::Triple::Vertex
+                 : (reflection.stage == Stage::Compute ? llvm::Triple::Compute
+                                                       : llvm::Triple::Pixel);
       element.InterpMode = llvm::hlsl::normalizeInterpolationMode(
-          mode, component, kind,
-          vertex ? llvm::Triple::Vertex : llvm::Triple::Pixel,
+          mode, component, kind, stageEnv,
           input ? llvm::hlsl::IOType::In : llvm::hlsl::IOType::Out);
       elements.push_back(element.toMetadata(context));
     }

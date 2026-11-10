@@ -9,11 +9,17 @@ def Gfx_PtrType : TypeDef<Gfx_Dialect, "Ptr"> {
   let parameters = (ins "::mlir::Type":$elementType,
                         EnumParameter<Gfx_StorageClass>:$storageClass,
                         DefaultValuedParameter<"uint32_t", "0">:$alignment);
-  let assemblyFormat = "`<` $elementType `,` $storageClass ( `,` $alignment^ )? `>`";
+  let hasCustomAssemblyFormat = 1;
   let genVerifyDecl = 1;
   let extraClassDeclaration = [{
     uint32_t getEffectiveAlignment() const;
   }];
+  let builders = [
+    TypeBuilder<(ins "::mlir::Type":$elementType,
+                     "::mlir::gfx::StorageClass":$storageClass), [{
+      return $_get($_ctxt, elementType, storageClass, /*alignment=*/0);
+    }]>
+  ];
 }
 
 def Gfx_HandleType : TypeDef<Gfx_Dialect, "Handle"> {
