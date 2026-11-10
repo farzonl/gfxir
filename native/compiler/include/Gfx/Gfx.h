@@ -9,6 +9,8 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/JSON.h"
+#include <array>
+#include <optional>
 #include <variant>
 
 #include "Gfx/GfxDialect.h.inc"
@@ -55,6 +57,33 @@ struct ParameterLayout {
 ParameterLayout parameterLayout(ParameterBlockAttr block);
 llvm::json::Object serializeParameters(ParameterBlockAttr block, Stage stage);
 
+struct TargetProfile {
+  uint32_t spirv_version = 0x10000; // 1.0 default (0xMMmm00)
+  uint32_t shader_model = 0x60;     // 6.0 default (0xMm)
+  llvm::SmallVector<std::string, 8> required_capabilities;
+  std::array<uint32_t, 3> max_workgroup_size = {1024, 1024, 64};
+  uint32_t max_workgroup_invocations = 1024;
+  uint32_t max_shared_memory_bytes = 32768;
+
+  bool supportsCapability(llvm::StringRef cap) const;
+  llvm::LogicalResult verifyWorkgroupSize(llvm::ArrayRef<int32_t> dims,
+                                          mlir::Location loc) const;
+  llvm::LogicalResult verifySharedMemory(uint32_t bytes,
+                                         mlir::Location loc) const;
+  llvm::LogicalResult verifyCapability(llvm::StringRef cap,
+                                       mlir::Location loc) const;
+
+  static TargetProfile getDefaultVulkan();
+  static TargetProfile getDefaultDirectX();
+  static llvm::Expected<TargetProfile> fromJson(const llvm::json::Object &object);
+  llvm::json::Object toJson() const;
+
+  static std::optional<uint32_t> parseSpirvVersion(llvm::StringRef str);
+  static std::optional<uint32_t> parseShaderModel(llvm::StringRef str);
+  static std::string formatSpirvVersion(uint32_t version);
+  static std::string formatShaderModel(uint32_t model);
+};
+
 std::unique_ptr<Pass> createGfxToSPIRVPass();
 std::unique_ptr<Pass> createGfxToLLVMPass();
 std::unique_ptr<Pass> createGfxVerifyPass();
@@ -64,7 +93,8 @@ void registerGfxPipelines();
 #include "Gfx/GfxPasses.h.inc"
 
 void registerGfxDialects(DialectRegistry &registry);
-LogicalResult verifyShaderModule(ModuleOp module);
+LogicalResult verifyShaderModule(ModuleOp module,
+                                 const TargetProfile &profile = TargetProfile());
 Type parseShaderType(MLIRContext &context, StringRef name);
 bool isShaderSymbolName(StringRef name);
 Value buildPortablePow(OpBuilder &builder, Location location, Value base,

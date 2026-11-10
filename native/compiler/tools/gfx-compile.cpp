@@ -25,6 +25,24 @@ static llvm::cl::opt<std::string> irOutput("ir-output");
 static llvm::cl::opt<std::string> loweredOutput("lowered-output");
 static llvm::cl::opt<std::string> reflectionOutput("reflection",
                                                    llvm::cl::Required);
+static llvm::cl::opt<std::string>
+    targetProfile("target-profile",
+                  llvm::cl::desc("Path to target profile JSON file or inline JSON string"));
+static llvm::cl::opt<std::string>
+    spirvVersion("spirv-version",
+                 llvm::cl::desc("Target SPIR-V version (e.g. 1.0, 1.3, 1.5)"));
+static llvm::cl::opt<std::string>
+    shaderModel("shader-model",
+                llvm::cl::desc("Target DirectX shader model (e.g. 6.0, 6.5, 6.6)"));
+static llvm::cl::list<std::string>
+    requiredCapabilities("required-capability",
+                         llvm::cl::desc("Target capability supported by profile"));
+static llvm::cl::opt<uint32_t>
+    maxWorkgroupInvocations("max-workgroup-invocations",
+                            llvm::cl::desc("Override max workgroup invocations (default 1024)"));
+static llvm::cl::opt<uint32_t>
+    maxSharedMemoryBytes("max-shared-memory-bytes",
+                         llvm::cl::desc("Override max shared memory bytes (default 32768)"));
 
 static LogicalResult writeFile(StringRef path,
                                function_ref<void(llvm::raw_ostream &)> writer) {
@@ -78,7 +96,66 @@ int main(int argc, char **argv) {
     }
     module = gfx::importShader(context, *object);
   }
-  if (!module || failed(gfx::verifyShaderModule(*module)))
+  gfx::TargetProfile profile;
+  if (!targetProfile.empty()) {
+    std::string content;
+    if (llvm::sys::fs::exists(targetProfile)) {
+      auto buffer = llvm::MemoryBuffer::getFile(targetProfile);
+      if (!buffer) {
+        llvm::errs() << "gfx-compile: failed to read target profile: "
+                     << buffer.getError().message() << "\n";
+        return 1;
+      }
+      content = (*buffer)->getBuffer().str();
+    } else {
+      content = targetProfile;
+    }
+    auto parsed = llvm::json::parse(content);
+    if (!parsed || !parsed->getAsObject()) {
+      llvm::errs() << "gfx-compile: target-profile must be valid JSON object\n";
+      return 1;
+    }
+    auto loaded = gfx::TargetProfile::fromJson(*parsed->getAsObject());
+    if (!loaded) {
+      llvm::errs() << "gfx-compile: " << llvm::toString(loaded.takeError())
+                   << "\n";
+      return 1;
+    }
+    profile = *loaded;
+  } else {
+    profile = (target == "vulkan") ? gfx::TargetProfile::getDefaultVulkan()
+                                   : gfx::TargetProfile::getDefaultDirectX();
+  }
+
+  if (!spirvVersion.empty()) {
+    auto parsed = gfx::TargetProfile::parseSpirvVersion(spirvVersion);
+    if (!parsed) {
+      llvm::errs() << "gfx-compile: unrecognized spirv-version: "
+                   << spirvVersion << "\n";
+      return 1;
+    }
+    profile.spirv_version = *parsed;
+  }
+  if (!shaderModel.empty()) {
+    auto parsed = gfx::TargetProfile::parseShaderModel(shaderModel);
+    if (!parsed) {
+      llvm::errs() << "gfx-compile: unrecognized shader-model: " << shaderModel
+                   << "\n";
+      return 1;
+    }
+    profile.shader_model = *parsed;
+  }
+  // Add CLI required capabilities to active profile
+  for (const auto &cap : requiredCapabilities) {
+    if (!profile.supportsCapability(cap))
+      profile.required_capabilities.push_back(cap);
+  }
+  if (maxWorkgroupInvocations.getNumOccurrences() > 0)
+    profile.max_workgroup_invocations = maxWorkgroupInvocations;
+  if (maxSharedMemoryBytes.getNumOccurrences() > 0)
+    profile.max_shared_memory_bytes = maxSharedMemoryBytes;
+
+  if (!module || failed(gfx::verifyShaderModule(*module, profile)))
     return 1;
   if (!irOutput.empty() && failed(writeFile(irOutput, [&](auto &stream) {
         module->print(stream);

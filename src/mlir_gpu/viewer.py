@@ -18,7 +18,16 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-from .compiler import CompileError, PIPELINE_SCHEMA_VERSION, RASTER_CONVENTION, Toolchain, _check_binary, _run, convert_dxil_to_metallib
+from .compiler import (
+    CompileError,
+    PIPELINE_SCHEMA_VERSION,
+    RASTER_CONVENTION,
+    TargetProfile,
+    Toolchain,
+    _check_binary,
+    _run,
+    convert_dxil_to_metallib,
+)
 from .frontend import Draw
 from .interfaces import reflect_pipeline_parameters, verify_graphics_interface
 from .parameters import FrameParameters, pack_parameters, verify_parameters
@@ -1167,10 +1176,24 @@ def get_device_capabilities(
     provider: str | None = None,
     toolchain: Toolchain | None = None,
     required_capabilities: list[str] | set[str] | None = None,
+    target_profile: TargetProfile | dict | None = None,
 ) -> dict:
     if backend not in ("directx", "vulkan", "metal"):
         raise ValueError(f"Unknown backend '{backend}'. Supported backends are: 'directx', 'vulkan', 'metal'.")
     _validate_provider(provider, backend)
+
+    profile_obj: TargetProfile | None = None
+    if target_profile is not None:
+        profile_obj = (
+            target_profile
+            if isinstance(target_profile, TargetProfile)
+            else TargetProfile.from_dict(target_profile)
+        )
+        req_list = list(required_capabilities or [])
+        for cap in profile_obj.required_capabilities:
+            if cap not in req_list:
+                req_list.append(cap)
+        required_capabilities = req_list
 
     if backend == "metal":
         if sys.platform != "darwin":
@@ -1257,7 +1280,7 @@ def get_device_capabilities(
             status_dx = "UNVERIFIED"
         else:
             status_dx = "EXECUTED"
-        return {
+        ret_dx = {
             "target": "directx",
             "backend": "directx",
             "provider": "warp" if is_software else "hardware",
@@ -1277,10 +1300,21 @@ def get_device_capabilities(
             "feature_level": feature_level,
             "shader_model": shader_model,
             "highest_shader_model": str(data.get("highest_shader_model") or shader_model),
+            "max_workgroup_size": list(data.get("max_workgroup_size", [1024, 1024, 64])),
+            "max_workgroup_invocations": int(data.get("max_workgroup_invocations", 1024)),
+            "max_shared_memory_bytes": int(data.get("max_shared_memory_bytes", 32768)),
             "status": status_dx,
             "missing_capabilities": missing_dx,
             "unverified_capabilities": unverified_dx,
         }
+        if profile_obj is not None:
+            matched, extra_missing = match_device_profile(ret_dx, profile_obj)
+            for m in extra_missing:
+                if m not in ret_dx["missing_capabilities"]:
+                    ret_dx["missing_capabilities"].append(m)
+            if not matched:
+                ret_dx["status"] = "UNSUPPORTED"
+        return ret_dx
 
     # Vulkan backend
     if provider is None and os.environ.get("MLIR_GPU_TEST_SWIFTSHADER") == "1":
@@ -1352,10 +1386,17 @@ def get_device_capabilities(
             else "swiftshader" if (vendor_id == 0x1AE0 or device_id == 0xC0DE or "swiftshader" in name.lower())
             else "hardware"
         )
+        vk_wg = getattr(properties.limits, "maxComputeWorkGroupSize", [1024, 1024, 64])
+        max_workgroup_size = [int(vk_wg[0]), int(vk_wg[1]), int(vk_wg[2])]
+        max_workgroup_invocations = int(getattr(properties.limits, "maxComputeWorkGroupInvocations", 1024))
+        max_shared_memory_bytes = int(getattr(properties.limits, "maxComputeSharedMemorySize", 32768))
         limits_dict = {
             "max_push_constants_size": properties.limits.maxPushConstantsSize,
             "max_framebuffer_width": properties.limits.maxFramebufferWidth,
             "max_framebuffer_height": properties.limits.maxFramebufferHeight,
+            "max_workgroup_size": max_workgroup_size,
+            "max_workgroup_invocations": max_workgroup_invocations,
+            "max_shared_memory_bytes": max_shared_memory_bytes,
         }
 
         missing = []
@@ -1421,7 +1462,7 @@ def get_device_capabilities(
             status = "UNVERIFIED"
         else:
             status = "EXECUTED"
-        return {
+        ret_vk = {
             "target": "vulkan",
             "backend": "vulkan",
             "provider": resolved_provider,
@@ -1436,11 +1477,39 @@ def get_device_capabilities(
             "max_push_constants_size": properties.limits.maxPushConstantsSize,
             "max_framebuffer_width": properties.limits.maxFramebufferWidth,
             "max_framebuffer_height": properties.limits.maxFramebufferHeight,
+            "max_workgroup_size": max_workgroup_size,
+            "max_workgroup_invocations": max_workgroup_invocations,
+            "max_shared_memory_bytes": max_shared_memory_bytes,
             "extensions": sorted(device_extensions),
             "status": status,
             "missing_capabilities": missing,
             "unverified_capabilities": unverified,
         }
+        if profile_obj is not None:
+            matched, extra_missing = match_device_profile(ret_vk, profile_obj)
+            for m in extra_missing:
+                if m not in ret_vk["missing_capabilities"]:
+                    ret_vk["missing_capabilities"].append(m)
+            if not matched:
+                ret_vk["status"] = "UNSUPPORTED"
+        return ret_vk
+
+
+def match_device_profile(device_caps: dict[str, Any], profile: TargetProfile) -> tuple[bool, list[str]]:
+    """Match device capabilities against a TargetProfile and return (satisfied, missing_features)."""
+    missing: list[str] = []
+    dev_wg = device_caps.get("max_workgroup_size", [0, 0, 0])
+    for axis, dev_dim, req_dim in zip(("X", "Y", "Z"), dev_wg, profile.max_workgroup_size):
+        if dev_dim < req_dim:
+            missing.append(f"max_workgroup_size_{axis}: required {req_dim}, device has {dev_dim}")
+    dev_inv = int(device_caps.get("max_workgroup_invocations", 0))
+    if dev_inv < profile.max_workgroup_invocations:
+        missing.append(f"max_workgroup_invocations: required {profile.max_workgroup_invocations}, device has {dev_inv}")
+    dev_shmem = int(device_caps.get("max_shared_memory_bytes", 0))
+    if dev_shmem < profile.max_shared_memory_bytes:
+        missing.append(f"max_shared_memory_bytes: required {profile.max_shared_memory_bytes}, device has {dev_shmem}")
+    missing.extend(profile.check_capabilities(device_caps))
+    return (len(missing) == 0, missing)
 
 
 def main() -> int:

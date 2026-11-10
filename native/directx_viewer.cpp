@@ -218,6 +218,9 @@ struct CapabilitiesReport {
     std::string d3d12_feature_level;
     std::string shader_model;
     std::string highest_shader_model;
+    std::array<uint32_t, 3> max_workgroup_size = {1024, 1024, 64};
+    uint32_t max_workgroup_invocations = 1024;
+    uint32_t max_shared_memory_bytes = 32768;
 };
 
 struct ReadbackReport {
@@ -257,6 +260,9 @@ static void reportDeviceCapabilities(bool warp, bool validation) {
         featureLevel,
         shaderModel,
         shaderModelDot,
+        std::array<uint32_t, 3>{1024, 1024, 64},
+        1024,
+        32768,
     };
     std::cout << glz::write_json(report).value_or("{}") << "\n" << std::flush;
 }
