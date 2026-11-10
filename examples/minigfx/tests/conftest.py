@@ -91,6 +91,9 @@ MALFORMED_OBJ_CORPUS = {
     "negative_relative_indices": "v 0 0 0\nv 1 0 0\nv 0 1 0\nf -1 -2 -3\n",
     "quad_face": "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n",
     "polygon_6gon": "v 0 0 0\nv 1 0 0\nv 2 1 0\nv 1 2 0\nv 0 2 0\nv -1 1 0\nf 1 2 3 4 5 6\n",
+    "truncated_vertex": "v 1.0 2.0\nf 1 1 1\n",
+    "truncated_normal": "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 1.0\nf 1 2 3\n",
+    "truncated_uv": "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt\nf 1 2 3\n",
 }
 
 GOLDEN_PARITY_RULES_YAML = """# Golden parity comparison rules matching tests/test_imgdiff.py
