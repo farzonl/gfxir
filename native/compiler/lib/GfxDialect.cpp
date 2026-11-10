@@ -86,6 +86,26 @@ LogicalResult GfxDialect::verifyOperationAttribute(Operation *op,
     if (!isa<ModuleOp>(op) || !isa<ParameterBlockAttr>(attribute.getValue()))
       return op->emitOpError("gfx.parameters requires a typed parameter block "
                              "on the shader module");
+  } else if (attribute.getName() == "gfx.required_capabilities") {
+    auto array = dyn_cast<ArrayAttr>(attribute.getValue());
+    if ((!isa<ModuleOp>(op) && !isa<func::FuncOp>(op)) || !array)
+      return op->emitOpError(
+          "gfx.required_capabilities requires an array of string attributes "
+          "on a module or function");
+    for (Attribute elem : array) {
+      if (!isa<StringAttr>(elem))
+        return op->emitOpError(
+            "gfx.required_capabilities elements must be string attributes");
+    }
+  } else if (attribute.getName() == "gfx.shared_memory_bytes") {
+    auto function = dyn_cast<func::FuncOp>(op);
+    auto stage = op->getAttrOfType<StageAttr>("gfx.stage");
+    auto bytes = dyn_cast<IntegerAttr>(attribute.getValue());
+    if (!function || !stage || stage.getValue() != Stage::Compute || !bytes ||
+        bytes.getInt() < 0)
+      return op->emitOpError(
+          "gfx.shared_memory_bytes requires a non-negative integer on a "
+          "compute entry point");
   } else {
     return op->emitOpError("unknown gfx attribute: ") << attribute.getName();
   }
@@ -251,6 +271,16 @@ LogicalResult mlir::gfx::verifyShaderModule(ModuleOp module,
 
   unsigned entries = 0;
   for (auto function : module.getOps<func::FuncOp>()) {
+    if (auto funcCaps =
+            function->getAttrOfType<ArrayAttr>("gfx.required_capabilities")) {
+      for (auto capAttr : funcCaps) {
+        if (auto strAttr = dyn_cast<StringAttr>(capAttr)) {
+          if (failed(profile.verifyCapability(strAttr.getValue(),
+                                              function.getLoc())))
+            return failure();
+        }
+      }
+    }
     auto stage = function->getAttrOfType<StageAttr>("gfx.stage");
     if (!stage)
       continue;
@@ -269,16 +299,6 @@ LogicalResult mlir::gfx::verifyShaderModule(ModuleOp module,
         if (failed(profile.verifySharedMemory(sharedAttr.getInt(),
                                               function.getLoc())))
           return failure();
-      }
-      if (auto funcCaps =
-              function->getAttrOfType<ArrayAttr>("gfx.required_capabilities")) {
-        for (auto capAttr : funcCaps) {
-          if (auto strAttr = dyn_cast<StringAttr>(capAttr)) {
-            if (failed(profile.verifyCapability(strAttr.getValue(),
-                                                function.getLoc())))
-              return failure();
-          }
-        }
       }
     }
     llvm::SmallDenseMap<int32_t, InputOp> inputs;

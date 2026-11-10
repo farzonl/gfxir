@@ -145,6 +145,7 @@ int main(int argc, char **argv) {
     }
     profile.shader_model = *parsed;
   }
+  // Add CLI required capabilities to active profile
   for (const auto &cap : requiredCapabilities) {
     if (!profile.supportsCapability(cap))
       profile.required_capabilities.push_back(cap);

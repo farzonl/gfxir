@@ -17,6 +17,8 @@
 // RUN: not %gfx-opt %t/invalid_rank_2.mlir --gfx-verify 2>&1 | %FileCheck %s --check-prefix=ERR-POSITIVE
 // RUN: not %gfx-opt %t/invalid_stage_vertex.mlir --gfx-verify 2>&1 | %FileCheck %s --check-prefix=ERR-STAGE
 // RUN: not %gfx-opt %t/missing_workgroup_size.mlir --gfx-verify 2>&1 | %FileCheck %s --check-prefix=ERR-MISSING
+// RUN: %gfx-compile %t/valid_invocations_profile.mlir --input-format mlir --target vulkan --max-workgroup-invocations 64 --output %t/valid_inv.spv --reflection %t/valid_inv.refl
+// RUN: not %gfx-compile %t/invalid_invocations_profile.mlir --input-format mlir --target vulkan --max-workgroup-invocations 64 --output %t/invalid_inv.spv --reflection %t/invalid_inv.refl 2>&1 | %FileCheck %s --check-prefix=ERR-INV-OVERRIDE
 
 // CHECK-VALID-MIN: gfx.workgroup_size = array<i32: 1, 1, 1>
 // CHECK-VALID-WARP: gfx.workgroup_size = array<i32: 64, 1, 1>
@@ -33,6 +35,7 @@
 // ERR-INVOCATIONS: total workgroup invocations (1056) exceeds target profile limit (1024)
 // ERR-STAGE: gfx.workgroup_size requires three positive dimensions on a compute entry point
 // ERR-MISSING: compute entry points require gfx.workgroup_size
+// ERR-INV-OVERRIDE: total workgroup invocations (128) exceeds target profile limit (64)
 
 //--- valid_min.mlir
 module {
@@ -208,6 +211,26 @@ module {
 module {
   func.func @compute_main() attributes {
     gfx.stage = #gfx.stage<compute>
+  } {
+    return
+  }
+}
+
+//--- valid_invocations_profile.mlir
+module {
+  func.func @compute_main() attributes {
+    gfx.stage = #gfx.stage<compute>,
+    gfx.workgroup_size = array<i32: 8, 8, 1>
+  } {
+    return
+  }
+}
+
+//--- invalid_invocations_profile.mlir
+module {
+  func.func @compute_main() attributes {
+    gfx.stage = #gfx.stage<compute>,
+    gfx.workgroup_size = array<i32: 8, 16, 1>
   } {
     return
   }

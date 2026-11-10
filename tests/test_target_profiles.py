@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
+import runpy
+import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
-from unittest.mock import MagicMock, patch
+from pathlib import Path
 
 from mlir_gpu import (
     DIRECTX_SM60,
@@ -16,7 +19,67 @@ from mlir_gpu import (
     CompileError,
     Target,
     TargetProfile,
+    Toolchain,
+    compile_pipeline,
 )
+from mlir_gpu.compiler import _MLIRStage, _compile_stage
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_LLVM_BIN = ROOT / ".toolchains" / "llvm-build" / "bin"
+LLVM_BIN = Path(os.environ["LLVM_BIN"]) if "LLVM_BIN" in os.environ else (
+    DEFAULT_LLVM_BIN if DEFAULT_LLVM_BIN.is_dir() else None
+)
+GPU_TOOLS_BIN = Path(os.environ["GPU_TOOLS_BIN"]) if "GPU_TOOLS_BIN" in os.environ else None
+TOOLS = Toolchain(llvm_bin=LLVM_BIN, tools_bin=GPU_TOOLS_BIN)
+
+try:
+    TOOLS.find("gfx-compile")
+    HAS_GFX_COMPILE = True
+except Exception:
+    HAS_GFX_COMPILE = False
+
+
+VALID_COMPUTE_MLIR = """module {
+  func.func @compute_main() attributes {
+    gfx.stage = #gfx.stage<compute>,
+    gfx.workgroup_size = array<i32: 8, 8, 1>
+  } {
+    %id = gfx.builtin <global_invocation_id> : vector<3xi32>
+    return
+  }
+}
+"""
+
+CAPABILITY_COMPUTE_MLIR = """module attributes {gfx.required_capabilities = ["Float64"]} {
+  func.func @compute_main() attributes {
+    gfx.stage = #gfx.stage<compute>,
+    gfx.workgroup_size = array<i32: 8, 8, 1>
+  } {
+    return
+  }
+}
+"""
+
+INVOCATIONS_COMPUTE_MLIR = """module {
+  func.func @compute_main() attributes {
+    gfx.stage = #gfx.stage<compute>,
+    gfx.workgroup_size = array<i32: 16, 16, 1>
+  } {
+    return
+  }
+}
+"""
+
+SHARED_MEMORY_COMPUTE_MLIR = """module {
+  func.func @compute_main() attributes {
+    gfx.stage = #gfx.stage<compute>,
+    gfx.workgroup_size = array<i32: 8, 8, 1>,
+    gfx.shared_memory_bytes = 65536 : i32
+  } {
+    return
+  }
+}
+"""
 
 
 class TestTargetProfileDefaultsAndPresets(unittest.TestCase):
@@ -289,32 +352,154 @@ class TestTargetProfileViewerIntegration(unittest.TestCase):
         self.assertTrue(any("shared_memory" in m for m in missing))
 
 
+@unittest.skipUnless(HAS_GFX_COMPILE, "gfx-compile binary not available")
 class TestTargetProfileCompilerIntegration(unittest.TestCase):
-    """Verify target profile handling in compiler pipeline."""
+    """Verify target profile handling in compiler pipeline with genuine native execution."""
 
-    @patch("mlir_gpu.compiler._run")
-    def test_compile_stage_forwards_target_profile(self, mock_run):
-        import tempfile
-        from pathlib import Path
-        from mlir_gpu.compiler import _compile_stage
-        mock_run.return_value = "ok"
+    def setUp(self):
+        self.tools = TOOLS.preflight(Target.VULKAN)
 
-        stage_mock = MagicMock()
-        stage_mock.kind = "compute"
-        stage_mock.name = "compute_main"
-        stage_mock.to_dict.return_value = {"functions": []}
+    def test_compile_compute_shader_valid_workgroup_success(self):
+        """Compile a compute shader with valid workgroup size and profile -> succeeds."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            shader_path = tmp_path / "valid_compute.mlir"
+            shader_path.write_text(VALID_COMPUTE_MLIR)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            tools = {"gfx-compile": "gfx-compile", "spirv-val": "spirv-val"}
-            profile = TargetProfile(spirv_version="1.3")
+            stage = _MLIRStage(kind="compute", name="compute_main", source=shader_path)
+            profile = TargetProfile(
+                spirv_version="1.0",
+                max_workgroup_size=(1024, 1024, 64),
+                max_workgroup_invocations=1024,
+                max_shared_memory_bytes=32768,
+            )
 
-            with patch("mlir_gpu.compiler._check_binary"):
-                _compile_stage(stage_mock, Target.VULKAN, tmp_path, tools, target_profile=profile)
+            binary = _compile_stage(stage, Target.VULKAN, tmp_path, self.tools, target_profile=profile)
+            self.assertEqual(binary, "compute.spv")
+            out_file = tmp_path / binary
+            self.assertTrue(out_file.is_file())
+            data = out_file.read_bytes()
+            self.assertGreater(len(data), 20)
+            self.assertTrue(data.startswith(b"\x03\x02\x23\x07"))
 
-            calls = mock_run.call_args_list
-            compile_call_args = calls[0][0][0]
-            self.assertIn("--target-profile", compile_call_args)
+    def test_compile_compute_shader_requiring_capabilities_profile_lacking_rejected(self):
+        """Compile a compute shader requiring capabilities with a profile lacking them -> raises CompileError."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            shader_path = tmp_path / "cap_compute.mlir"
+            shader_path.write_text(CAPABILITY_COMPUTE_MLIR)
+
+            stage = _MLIRStage(kind="compute", name="compute_main", source=shader_path)
+            profile = TargetProfile(required_capabilities=("Shader",))
+
+            with self.assertRaises(CompileError) as ctx:
+                _compile_stage(stage, Target.VULKAN, tmp_path, self.tools, target_profile=profile)
+
+            diagnostic = str(ctx.exception)
+            self.assertIn("target capability profile does not support required capability 'Float64'", diagnostic)
+
+    def test_compile_compute_shader_requiring_capabilities_profile_satisfied_succeeds(self):
+        """Compile a compute shader requiring capabilities with a profile supporting them -> succeeds."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            shader_path = tmp_path / "cap_compute.mlir"
+            shader_path.write_text(CAPABILITY_COMPUTE_MLIR)
+
+            stage = _MLIRStage(kind="compute", name="compute_main", source=shader_path)
+            profile = TargetProfile(required_capabilities=("Shader", "Float64"))
+
+            binary = _compile_stage(stage, Target.VULKAN, tmp_path, self.tools, target_profile=profile)
+            self.assertEqual(binary, "compute.spv")
+            self.assertTrue((tmp_path / binary).is_file())
+
+    def test_compile_compute_shader_exceeding_profile_workgroup_invocations_rejected(self):
+        """Compile a compute shader exceeding profile workgroup invocations -> raises CompileError."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            shader_path = tmp_path / "invocations_compute.mlir"
+            shader_path.write_text(INVOCATIONS_COMPUTE_MLIR)
+
+            stage = _MLIRStage(kind="compute", name="compute_main", source=shader_path)
+            profile = TargetProfile(max_workgroup_invocations=128)
+
+            with self.assertRaises(CompileError) as ctx:
+                _compile_stage(stage, Target.VULKAN, tmp_path, self.tools, target_profile=profile)
+
+            diagnostic = str(ctx.exception)
+            self.assertIn("total workgroup invocations (256) exceeds target profile limit (128)", diagnostic)
+
+    def test_compile_compute_shader_exceeding_profile_dimension_rejected(self):
+        """Compile a compute shader exceeding a single profile dimension -> raises CompileError."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            shader_path = tmp_path / "dim_compute.mlir"
+            shader_path.write_text("""module {
+  func.func @compute_main() attributes {
+    gfx.stage = #gfx.stage<compute>,
+    gfx.workgroup_size = array<i32: 512, 1, 1>
+  } {
+    return
+  }
+}
+""")
+            stage = _MLIRStage(kind="compute", name="compute_main", source=shader_path)
+            profile = TargetProfile(max_workgroup_size=(256, 1024, 64))
+
+            with self.assertRaises(CompileError) as ctx:
+                _compile_stage(stage, Target.VULKAN, tmp_path, self.tools, target_profile=profile)
+
+            diagnostic = str(ctx.exception)
+            self.assertIn("workgroup X dimension (512) exceeds target profile limit (256)", diagnostic)
+
+    def test_compile_compute_shader_exceeding_profile_shared_memory_rejected(self):
+        """Compile a compute shader exceeding profile shared memory -> raises CompileError."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            shader_path = tmp_path / "shmem_compute.mlir"
+            shader_path.write_text(SHARED_MEMORY_COMPUTE_MLIR)
+
+            stage = _MLIRStage(kind="compute", name="compute_main", source=shader_path)
+            profile = TargetProfile(max_shared_memory_bytes=32768)
+
+            with self.assertRaises(CompileError) as ctx:
+                _compile_stage(stage, Target.VULKAN, tmp_path, self.tools, target_profile=profile)
+
+            diagnostic = str(ctx.exception)
+            self.assertIn("shared memory allocation (65536 bytes) exceeds target limit of 32768 bytes", diagnostic)
+
+    def test_compile_compute_shader_within_profile_shared_memory_succeeds(self):
+        """Compile a compute shader with shared memory within profile limit -> succeeds."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            shader_path = tmp_path / "shmem_compute.mlir"
+            shader_path.write_text(SHARED_MEMORY_COMPUTE_MLIR)
+
+            stage = _MLIRStage(kind="compute", name="compute_main", source=shader_path)
+            profile = TargetProfile(max_shared_memory_bytes=65536)
+
+            binary = _compile_stage(stage, Target.VULKAN, tmp_path, self.tools, target_profile=profile)
+            self.assertEqual(binary, "compute.spv")
+            self.assertTrue((tmp_path / binary).is_file())
+
+    def test_compile_pipeline_with_target_profile_e2e(self):
+        """Compile a complete graphics pipeline end-to-end with TargetProfile without mocks."""
+        tri = runpy.run_path(str(ROOT / "examples" / "triangle.py"))["pipeline"]
+        profile = TargetProfile.preset("HIGH_END_COMPUTE")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "pipeline_out"
+            manifest_path = compile_pipeline(
+                tri, Target.VULKAN, output_dir, toolchain=TOOLS, target_profile=profile
+            )
+            self.assertTrue(manifest_path.is_file())
+            manifest = json.loads(manifest_path.read_text())
+            self.assertEqual(manifest["target_profile"]["spirv_version"], "1.6")
+            self.assertEqual(manifest["target_profile"]["max_shared_memory_bytes"], 65536)
+            self.assertIn("subgroup_operations", manifest["target_profile"]["required_capabilities"])
+            for entry in manifest["entries"]:
+                binary_path = manifest_path.parent / entry["binary"]
+                self.assertTrue(binary_path.is_file())
+                self.assertGreater(binary_path.stat().st_size, 20)
 
 
 if __name__ == "__main__":

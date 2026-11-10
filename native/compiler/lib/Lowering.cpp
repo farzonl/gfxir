@@ -20,6 +20,7 @@
 #include "mlir/Dialect/SPIRV/Transforms/SPIRVConversion.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/Passes.h"
@@ -40,7 +41,7 @@ namespace mlir::gfx {
 namespace {
 LogicalResult graphicsEntry(ModuleOp module, func::FuncOp &function,
                             Stage &stage) {
-  if (failed(verifyShaderModule(module)))
+  if (failed(mlir::verify(module)))
     return failure();
   for (auto entry : module.getOps<func::FuncOp>())
     if (auto attribute = entry->getAttrOfType<StageAttr>("gfx.stage")) {
@@ -140,8 +141,16 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
                                           spirv::MemoryModel::GLSL450, version);
     function->removeAttr("gfx.stage");
     function->removeAttr("gfx.workgroup_size");
-    for (auto helper : reachable)
+    function->removeAttr("gfx.shared_memory_bytes");
+    function->removeAttr("gfx.required_capabilities");
+    module->removeAttr("gfx.required_capabilities");
+    for (auto helper : reachable) {
+      helper->removeAttr("gfx.stage");
+      helper->removeAttr("gfx.workgroup_size");
+      helper->removeAttr("gfx.shared_memory_bytes");
+      helper->removeAttr("gfx.required_capabilities");
       helper->moveBefore(shader.getBody(), shader.getBody()->end());
+    }
     for (auto helper :
          llvm::make_early_inc_range(module.getOps<func::FuncOp>()))
       helper.erase();
@@ -450,6 +459,9 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
     }
     function->removeAttr("gfx.stage");
     function->removeAttr("gfx.workgroup_size");
+    function->removeAttr("gfx.shared_memory_bytes");
+    function->removeAttr("gfx.required_capabilities");
+    module->removeAttr("gfx.required_capabilities");
     std::string triple;
     if (stage == Stage::Vertex)
       triple = "dxil-pc-shadermodel6.6-vertex";
