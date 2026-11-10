@@ -5,11 +5,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import runpy
 import subprocess
 import tempfile
 import unittest
 
-from mlir_gpu import Buffer, Target, Toolchain, Type, compute, global_invocation_id, vec4
+from mlir_gpu import (
+    Buffer,
+    ComputePipeline,
+    Dispatch,
+    GlobalInvocationId,
+    LocalInvocationId,
+    Target,
+    Toolchain,
+    Type,
+    WorkgroupId,
+    compute,
+    global_invocation_id,
+    local_invocation_id,
+    pack_parameters,
+    vec4,
+    workgroup_id,
+)
 from mlir_gpu.compiler import CompileError, compile_pipeline
 from test_support import ROOT, TOOLS
 
@@ -51,8 +68,18 @@ def assert_valid_spirv(test_case: unittest.TestCase, spv_path: Path, spirv_val_e
         )
 
 
+def assert_valid_metallib(test_case: unittest.TestCase, metallib_path: Path) -> None:
+    """Assert that a Metal library file exists, has MTLB magic, and meets minimum size."""
+    test_case.assertTrue(metallib_path.is_file(), f"Metal library not found: {metallib_path}")
+    raw_bytes = metallib_path.read_bytes()
+    test_case.assertGreaterEqual(len(raw_bytes), 16, f"Metal library too small: {metallib_path}")
+    test_case.assertTrue(
+        raw_bytes.startswith(b"MTLB"), f"Metal library {metallib_path.name} missing MTLB magic header"
+    )
+
+
 class TestComputeE2EIntegration(unittest.TestCase):
-    """End-to-end compilation and validation of compute kernels across Vulkan and DirectX."""
+    """End-to-end compilation and validation of compute kernels across Vulkan, DirectX, and Metal."""
 
     @classmethod
     def setUpClass(cls):
@@ -64,6 +91,10 @@ class TestComputeE2EIntegration(unittest.TestCase):
             cls.spirv_val = COMPUTE_TOOLS.find("spirv-val")
         except CompileError:
             cls.spirv_val = None
+        try:
+            cls.metal_converter = COMPUTE_TOOLS.find("metal-shaderconverter")
+        except CompileError:
+            cls.metal_converter = None
 
     def test_vector_add_compiles_to_vulkan_spv_and_validates(self):
         @compute(workgroup_size=(64, 1, 1))
@@ -597,6 +628,158 @@ class TestComputeE2EIntegration(unittest.TestCase):
             pipeline = MLIRComputePipeline(src_mlir)
             compile_pipeline(pipeline, Target.DIRECTX, dx_out, COMPUTE_TOOLS)
             assert_valid_dxil(self, dx_out, self.dxv)
+
+    def test_local_invocation_and_workgroup_ids_compile_to_vulkan_and_directx(self):
+        @compute(workgroup_size=(32, 4, 1))
+        def hierarchical_index_kernel(
+            gid: GlobalInvocationId,
+            lid: LocalInvocationId,
+            wgid: WorkgroupId,
+            out_annotated: Buffer[Type.U32, "write_only"],
+            out_intrinsic: Buffer[Type.U32, "write_only"],
+        ):
+            flat_idx = gid.y * 32 + gid.x
+            out_annotated[flat_idx] = wgid.x * 32 + lid.x
+            lid_fn = local_invocation_id()
+            wgid_fn = workgroup_id()
+            out_intrinsic[flat_idx] = wgid_fn.y * 4 + lid_fn.y
+
+        with tempfile.TemporaryDirectory() as td:
+            spv_out = Path(td) / "hier.spv"
+            compile_pipeline(hierarchical_index_kernel, Target.VULKAN, spv_out, COMPUTE_TOOLS)
+            assert_valid_spirv(self, spv_out, self.spirv_val)
+
+            dx_out = Path(td) / "hier.dxil"
+            compile_pipeline(hierarchical_index_kernel, Target.DIRECTX, dx_out, COMPUTE_TOOLS)
+            assert_valid_dxil(self, dx_out, self.dxv)
+
+    def test_mandelbrot_python_example_compiles_and_validates_across_backends(self):
+        example_ns = runpy.run_path(str(ROOT / "examples/mandelbrot_compute.py"))
+        mandelbrot_pipeline: ComputePipeline = example_ns["pipeline"]
+        mandelbrot_kernel = example_ns["mandelbrot_kernel"]
+
+        with tempfile.TemporaryDirectory() as td:
+            vk_dir = Path(td) / "vulkan_out"
+            vk_manifest_path = compile_pipeline(mandelbrot_pipeline, Target.VULKAN, vk_dir, COMPUTE_TOOLS)
+            vk_manifest = json.loads(vk_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(vk_manifest["schema_version"], 5)
+            self.assertEqual(vk_manifest["stage"], "compute")
+            self.assertEqual(vk_manifest["workgroup_size"], [16, 16, 1])
+            self.assertEqual(vk_manifest["dispatch"], {"grid": [16, 16, 1]})
+            self.assertEqual(len(vk_manifest["buffers"]), 1)
+            self.assertEqual(vk_manifest["buffers"][0]["name"], "output_buffer")
+            self.assertEqual(vk_manifest["buffers"][0]["access"], "write_only")
+            assert_valid_spirv(self, vk_dir / "compute.spv", self.spirv_val)
+
+            params_refl = vk_manifest["parameters"]
+            self.assertEqual(params_refl["name"], "mandelbrot_params")
+            self.assertEqual(params_refl["size"], 32)
+            packed = pack_parameters(
+                params_refl,
+                {
+                    "width": 256,
+                    "height": 256,
+                    "max_iterations": 100,
+                    "xmin": -2.0,
+                    "xmax": 1.0,
+                    "ymin": -1.5,
+                    "ymax": 1.5,
+                    "pitch": 256,
+                },
+            )
+            self.assertEqual(len(packed), 32)
+
+            dx_dir = Path(td) / "directx_out"
+            dx_manifest_path = compile_pipeline(mandelbrot_pipeline, Target.DIRECTX, dx_dir, COMPUTE_TOOLS)
+            dx_manifest = json.loads(dx_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(dx_manifest["schema_version"], 5)
+            self.assertEqual(dx_manifest["target"], "directx")
+            assert_valid_dxil(self, dx_dir / "compute.dxil", self.dxv)
+
+            dx_ll = Path(td) / "mandelbrot.ll"
+            compile_pipeline(mandelbrot_kernel, Target.DIRECTX, dx_ll, COMPUTE_TOOLS)
+            ll_text = dx_ll.read_text(encoding="utf-8")
+            self.assertIn('"hlsl.shader"="compute"', ll_text)
+            self.assertIn('"hlsl.numthreads"="16,16,1"', ll_text)
+            self.assertIn("RootConstants", ll_text)
+            self.assertIn("DescriptorTable", ll_text)
+            self.assertIn('!"UAV"', ll_text)
+
+            if self.metal_converter is not None:
+                mtl_dir = Path(td) / "metal_out"
+                mtl_manifest_path = compile_pipeline(mandelbrot_pipeline, Target.METAL, mtl_dir, COMPUTE_TOOLS)
+                mtl_manifest = json.loads(mtl_manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(mtl_manifest["target"], "metal")
+                self.assertEqual(mtl_manifest["backend_status"], "converted-binary")
+                assert_valid_metallib(self, mtl_dir / "compute.metallib")
+
+    def test_particle_life_python_example_compiles_and_validates_across_backends(self):
+        example_ns = runpy.run_path(str(ROOT / "examples/particle_life_compute.py"))
+        particle_pipeline: ComputePipeline = example_ns["pipeline"]
+        particle_kernel = example_ns["particle_life_step"]
+
+        with tempfile.TemporaryDirectory() as td:
+            vk_dir = Path(td) / "vulkan_out"
+            vk_manifest_path = compile_pipeline(particle_pipeline, Target.VULKAN, vk_dir, COMPUTE_TOOLS)
+            vk_manifest = json.loads(vk_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(vk_manifest["schema_version"], 5)
+            self.assertEqual(vk_manifest["stage"], "compute")
+            self.assertEqual(vk_manifest["workgroup_size"], [64, 1, 1])
+            self.assertEqual(vk_manifest["dispatch"], {"grid": [16, 1, 1]})
+            assert_valid_spirv(self, vk_dir / "compute.spv", self.spirv_val)
+
+            bufs = {b["name"]: b for b in vk_manifest["buffers"]}
+            self.assertEqual(len(bufs), 6)
+            self.assertEqual(bufs["in_pos"]["access"], "read_only")
+            self.assertEqual(bufs["in_vel"]["access"], "read_only")
+            self.assertEqual(bufs["in_species"]["access"], "read_only")
+            self.assertEqual(bufs["out_pos"]["access"], "write_only")
+            self.assertEqual(bufs["out_vel"]["access"], "write_only")
+            self.assertEqual(bufs["force_matrix"]["access"], "read_only")
+
+            params_refl = vk_manifest["parameters"]
+            self.assertEqual(params_refl["name"], "particle_life_params")
+            self.assertEqual(params_refl["size"], 36)
+            packed = pack_parameters(
+                params_refl,
+                {
+                    "count": 1024,
+                    "num_species": 4,
+                    "dt": 0.016,
+                    "friction": 5.0,
+                    "r_max": 80.0,
+                    "r_min": 16.0,
+                    "world_width": 800.0,
+                    "world_height": 600.0,
+                    "force_scale": 20.0,
+                },
+            )
+            self.assertEqual(len(packed), 36)
+
+            dx_dir = Path(td) / "directx_out"
+            dx_manifest_path = compile_pipeline(particle_pipeline, Target.DIRECTX, dx_dir, COMPUTE_TOOLS)
+            dx_manifest = json.loads(dx_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(dx_manifest["schema_version"], 5)
+            self.assertEqual(dx_manifest["target"], "directx")
+            assert_valid_dxil(self, dx_dir / "compute.dxil", self.dxv)
+
+            dx_ll = Path(td) / "particle_life.ll"
+            compile_pipeline(particle_kernel, Target.DIRECTX, dx_ll, COMPUTE_TOOLS)
+            ll_text = dx_ll.read_text(encoding="utf-8")
+            self.assertIn('"hlsl.shader"="compute"', ll_text)
+            self.assertIn('"hlsl.numthreads"="64,1,1"', ll_text)
+            self.assertIn("RootConstants", ll_text)
+            self.assertIn("DescriptorTable", ll_text)
+            self.assertIn('!"SRV"', ll_text)
+            self.assertIn('!"UAV"', ll_text)
+
+            if self.metal_converter is not None:
+                mtl_dir = Path(td) / "metal_out"
+                mtl_manifest_path = compile_pipeline(particle_pipeline, Target.METAL, mtl_dir, COMPUTE_TOOLS)
+                mtl_manifest = json.loads(mtl_manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(mtl_manifest["target"], "metal")
+                self.assertEqual(mtl_manifest["backend_status"], "converted-binary")
+                assert_valid_metallib(self, mtl_dir / "compute.metallib")
 
 
 if __name__ == "__main__":

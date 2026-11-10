@@ -691,6 +691,20 @@ ParameterBlockAttr::verify(llvm::function_ref<InFlightDiagnostic()> error,
   return success();
 }
 
+static Type toSignlessParameterValueType(Type type) {
+  if (auto intType = dyn_cast<IntegerType>(type)) {
+    if (!intType.isSignless())
+      return IntegerType::get(type.getContext(), intType.getWidth());
+    return type;
+  }
+  if (auto vecType = dyn_cast<VectorType>(type)) {
+    Type elem = toSignlessParameterValueType(vecType.getElementType());
+    if (elem != vecType.getElementType())
+      return VectorType::get(vecType.getShape(), elem);
+  }
+  return type;
+}
+
 LogicalResult ParameterOp::verify() {
   auto module = (*this)->getParentOfType<ModuleOp>();
   auto block = module
@@ -702,7 +716,8 @@ LogicalResult ParameterOp::verify() {
   for (auto attribute : block.getFields()) {
     auto field = cast<ParameterFieldAttr>(attribute);
     if (field.getName() == getField())
-      return field.getType() == getValue().getType()
+      return toSignlessParameterValueType(field.getType()) ==
+                     getValue().getType()
                  ? success()
                  : emitOpError(
                        "parameter result type does not match its field");

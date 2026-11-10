@@ -3,7 +3,32 @@ import runpy
 import unittest
 from pathlib import Path
 
-from mlir_gpu import Draw, Pipeline, Value, Vertex, fragment, i32, maximum, minimum, select, shader_math as sm, u32, vec2, vec3, vec4, vertex
+from mlir_gpu import (
+    Buffer,
+    ComputePipeline,
+    Dispatch,
+    Draw,
+    GlobalInvocationId,
+    LocalInvocationId,
+    Pipeline,
+    Value,
+    Vertex,
+    WorkgroupId,
+    compute,
+    fragment,
+    i32,
+    local_invocation_id,
+    maximum,
+    minimum,
+    select,
+    shader_math as sm,
+    u32,
+    vec2,
+    vec3,
+    vec4,
+    vertex,
+    workgroup_id,
+)
 from mlir_gpu.frontend import Node, Type
 
 
@@ -40,6 +65,7 @@ def evaluate(node: Node, argument):
         "min": lambda a, b: numeric_extreme(a, b, min),
         "max": lambda a, b: numeric_extreme(a, b, max),
         "and": lambda a, b: a & b, "or": lambda a, b: a | b, "xor": lambda a, b: a ^ b,
+        "rsqrt": lambda a: 1.0 / math.sqrt(a),
         **{name: getattr(math, name) for name in ("sin", "cos", "sqrt", "exp", "exp2", "log", "log2", "floor", "pow")},
     }
     operation = operations[node.op]
@@ -59,6 +85,7 @@ class FrontendTests(unittest.TestCase):
             ("sin", (-12.0, -0.25, 0.0, 0.25, 12.0)),
             ("cos", (-12.0, -0.25, 0.0, 0.25, 12.0)),
             ("sqrt", (0.0, 0.001, 0.25, 1.0, 64.0)),
+            ("rsqrt", (0.001, 0.25, 1.0, 64.0)),
             ("exp", (-12.0, -1.0, 0.0, 1.0, 6.0)),
             ("exp2", (-12.0, -1.0, 0.0, 1.0, 6.0)),
             ("log", (0.001, 0.25, 1.0, 64.0)),
@@ -70,7 +97,8 @@ class FrontendTests(unittest.TestCase):
                 result = operation(value)
                 self.assertEqual(result.node.op, name)
                 self.assertEqual(result.node.type, Type.F32)
-                expected = getattr(math, name)(result.node.args[0].literal)
+                arg_val = result.node.args[0].literal
+                expected = 1.0 / math.sqrt(arg_val) if name == "rsqrt" else getattr(math, name)(arg_val)
                 self.assertAlmostEqual(evaluate(result.node, None), expected)
             for constructor in (vec2, vec3, vec4):
                 vector = constructor(0.25)
@@ -81,6 +109,7 @@ class FrontendTests(unittest.TestCase):
         self.assertEqual(evaluate(sm.pow(vec3(0.0, 0.25, 1.0), 1.5).node, None), (0.0, 0.125, 1.0))
         for operation in (
             lambda: sm.sqrt(-1), lambda: sm.sqrt(vec3(-1, 0, 1)),
+            lambda: sm.rsqrt(0), lambda: sm.rsqrt(-1), lambda: sm.rsqrt(vec2(0, 1)),
             lambda: sm.log(0), lambda: sm.log2(-1),
             lambda: sm.pow(-1, 2), lambda: sm.pow(0, 0),
             lambda: sm.pow(vec2(0, 1), vec2(-1, 2)),
@@ -350,3 +379,60 @@ class FrontendTests(unittest.TestCase):
         entry.__name__ = "not-a-symbol"
         with self.assertRaisesRegex(ValueError, "entry-point name"):
             vertex(entry).trace()
+
+    def test_compute_coordinate_annotations_intrinsics_and_pipeline_validation(self):
+        @compute(workgroup_size=(16, 8, 1))
+        def annotated_kernel(
+            gid: GlobalInvocationId,
+            lid: LocalInvocationId,
+            wgid: WorkgroupId,
+            out: Buffer[Type.U32, "write_only"],
+        ):
+            out[gid.x] = lid.x + wgid.y
+
+        self.assertEqual(annotated_kernel.workgroup_size, (16, 8, 1))
+        traced = annotated_kernel.trace()
+        self.assertEqual(traced.kind, "compute")
+        source_dict = traced.to_dict()
+        self.assertEqual(source_dict["functions"][0]["workgroup_size"], [16, 8, 1])
+        source_text = str(source_dict)
+        self.assertIn("global_invocation_id", source_text)
+        self.assertIn("local_invocation_id", source_text)
+        self.assertIn("workgroup_id", source_text)
+
+        @compute(workgroup_size=(32, 1, 1))
+        def intrinsic_kernel(out: Buffer[Type.U32, "write_only"]):
+            lid = local_invocation_id()
+            wgid = workgroup_id()
+            out[lid.x] = wgid.x + lid.y
+
+        intrinsic_text = str(intrinsic_kernel.trace().to_dict())
+        self.assertIn("local_invocation_id", intrinsic_text)
+        self.assertIn("workgroup_id", intrinsic_text)
+
+        @vertex
+        def bad_vertex(gid: GlobalInvocationId):
+            return Vertex(vec4(0, 0, 0, 1))
+
+        with self.assertRaises(TypeError):
+            bad_vertex.trace()
+
+        @fragment
+        def bad_fragment(lid: LocalInvocationId):
+            return vec4(0, 0, 0, 1)
+
+        with self.assertRaises(TypeError):
+            bad_fragment.trace()
+
+        self.assertEqual(Dispatch(grid=16).to_dict(), {"grid": [16, 1, 1]})
+        self.assertEqual(Dispatch(grid=(8, 4)).to_dict(), {"grid": [8, 4, 1]})
+        self.assertEqual(Dispatch(grid=(8, 4, 2)).to_dict(), {"grid": [8, 4, 2]})
+        for invalid_grid in ((0, 1, 1), (-1, 1, 1), (True, 1, 1), (), (8, 4, 2, 1)):
+            with self.assertRaises((TypeError, ValueError)):
+                Dispatch(grid=invalid_grid)
+
+        cp = ComputePipeline(annotated_kernel, dispatch=Dispatch(grid=(4, 4, 1)))
+        self.assertEqual(len(cp.trace()), 1)
+        self.assertEqual(cp.trace()[0].name, "annotated_kernel")
+        with self.assertRaises(TypeError):
+            ComputePipeline(bad_vertex)

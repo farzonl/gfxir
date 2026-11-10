@@ -11,8 +11,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .frontend import Draw, Pipeline, Stage
+from .frontend import ComputePipeline, Dispatch, Draw, Pipeline, Stage
 from .interfaces import reflect_pipeline_parameters, verify_graphics_interface
+from .parameters import verify_parameters
 
 
 class CompileError(RuntimeError):
@@ -244,6 +245,7 @@ class MLIRPipeline:
 
 PIPELINE_SCHEMA_VERSION = 3
 PARAMETER_SCHEMA_VERSION = 4
+COMPUTE_SCHEMA_VERSION = 5
 RASTER_CONVENTION = {
     "clip_x": "right",
     "clip_y": "up",
@@ -360,7 +362,16 @@ def _compile_stage(
     ])
     if target == Target.VULKAN:
         _check_binary(output, b"\x03\x02\x23\x07", 20)
-        _run([tools["spirv-val"], "--target-env", "vulkan1.0", str(output)])
+        spirv_env = (
+            "vulkan1.2"
+            if target_profile is not None
+            and (
+                target_profile.supports_capability("buffer_device_address")
+                or target_profile.supports_capability("PhysicalStorageBuffer64")
+            )
+            else "vulkan1.0"
+        )
+        _run([tools["spirv-val"], "--target-env", spirv_env, str(output)])
         return output.name
     unsigned = directory / f"{stem}.unsigned.dxil"
     dxil = directory / f"{stem}.dxil"
@@ -376,7 +387,7 @@ def _compile_stage(
 
 
 def compile_pipeline(
-    pipeline: Pipeline | MLIRPipeline | Any,
+    pipeline: Pipeline | ComputePipeline | MLIRPipeline | Any,
     target: Target,
     output: Path,
     toolchain: Toolchain | None = None,
@@ -400,6 +411,7 @@ def compile_pipeline(
         raise CompileError(f"Output already exists; choose a new directory: {output}")
 
     is_compute_entry = hasattr(pipeline, "kind") and getattr(pipeline, "kind") == "compute"
+    is_compute_pipeline = isinstance(pipeline, ComputePipeline)
     if is_compute_entry:
         stages = [pipeline.trace()]
     else:
@@ -475,6 +487,40 @@ def compile_pipeline(
             stage.kind: json.loads((directory / f"{stage.kind}.reflection.json").read_text())
             for stage in stages
         }
+        if is_compute_pipeline:
+            stage = stages[0]
+            compute_refl = interface["compute"]
+            if compute_refl.get("name") != stage.name or compute_refl.get("stage") != "compute":
+                raise CompileError(
+                    f"Reflected entry does not match the declared compute stage {stage.name!r}."
+                )
+            if "parameters" in compute_refl:
+                verify_parameters(compute_refl["parameters"])
+            if reflection_path is not None:
+                reflection_path = Path(reflection_path).absolute()
+                reflection_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(directory / "compute.reflection.json", reflection_path)
+            manifest = {
+                "schema_version": COMPUTE_SCHEMA_VERSION,
+                "target": target.value,
+                "target_profile": profile.to_dict(),
+                "stage": "compute",
+                "entries": entries,
+                "interface": interface,
+                "workgroup_size": compute_refl.get(
+                    "workgroup_size", list(pipeline.compute.workgroup_size)
+                ),
+                "buffers": compute_refl.get("buffers", []),
+                "dispatch": pipeline.dispatch.to_dict(),
+                "runtime_verified": False,
+                "backend_status": "converted-binary" if target == Target.METAL else "validated-binary",
+            }
+            if "parameters" in compute_refl:
+                manifest["parameters"] = compute_refl["parameters"]
+            (directory / "pipeline.json").write_text(json.dumps(manifest, indent=2) + "\n")
+            directory.rename(output)
+            return output / "pipeline.json"
+
         verify_graphics_interface(interface)
         parameters = reflect_pipeline_parameters(interface)
         for stage in stages:

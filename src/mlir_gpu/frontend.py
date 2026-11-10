@@ -6,7 +6,7 @@ import re
 import struct
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 
 class Type(Enum):
@@ -220,9 +220,9 @@ def _normalize_buffer_element_type(elem: Any) -> Type:
         return elem
     if elem is float or elem is Type.F32 or elem == "f32":
         return Type.F32
-    if elem is int or elem is Type.I32 or elem in ("i32", "si32"):
+    if elem is int or elem is i32 or elem is Type.I32 or elem in ("i32", "si32"):
         return Type.I32
-    if elem is Type.U32 or elem == "u32":
+    if elem is u32 or elem is Type.U32 or elem == "u32":
         return Type.U32
     if elem is bool or elem is Type.BOOL or elem == "bool":
         return Type.BOOL
@@ -452,7 +452,7 @@ class Value:
         size = VECTOR_SIZES.get(self.node.type)
         if size is None or type(index) is not int or not 0 <= index < size:
             raise TypeError("Vector extraction requires an in-range constant integer component.")
-        elem_type = Type.I32 if self.node.type == "vector<3xi32>" else Type.F32
+        elem_type = Type.U32 if self.node.type == "vector<3xi32>" else Type.F32
         return Value(Node("extract", elem_type, (self.node,), literal=index))
 
     def __eq__(self, other: object) -> Value:
@@ -502,6 +502,14 @@ VECTOR_SIZES = {Type.VEC2: 2, Type.VEC3: 3, Type.VEC4: 4, "vector<3xi32>": 3}
 
 def global_invocation_id() -> Value:
     return Value(Node("builtin", "vector<3xi32>", (), literal="global_invocation_id"))
+
+
+def local_invocation_id() -> Value:
+    return Value(Node("builtin", "vector<3xi32>", (), literal="local_invocation_id"))
+
+
+def workgroup_id() -> Value:
+    return Value(Node("builtin", "vector<3xi32>", (), literal="workgroup_id"))
 
 
 def _operands(lhs: Value | float | int, rhs: Value | float | int,
@@ -731,6 +739,9 @@ def resolve_annotation(fn: Callable, annotation: Any) -> Any:
         "PointerType": PointerType,
         "StorageClass": StorageClass,
         "FragmentCoord": FragmentCoord,
+        "GlobalInvocationId": GlobalInvocationId,
+        "LocalInvocationId": LocalInvocationId,
+        "WorkgroupId": WorkgroupId,
         "f32": f32,
         "i32": i32,
         "u32": u32,
@@ -815,6 +826,10 @@ class Entry:
         if any(parameter.kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
                for parameter in parameters):
             raise TypeError("Entry points require positional device arguments.")
+        for parameter in parameters:
+            resolved_ann = resolve_annotation(self.function, parameter.annotation)
+            if resolved_ann in (GlobalInvocationId, LocalInvocationId, WorkgroupId):
+                raise TypeError("Compute invocation/workgroup ID parameters require a compute entry point.")
         coordinate_parameters = {
             parameter.name for parameter in parameters
             if resolve_annotation(self.function, parameter.annotation) is FragmentCoord or parameter.annotation == "FragmentCoord"
@@ -895,7 +910,7 @@ class Entry:
                 "input", "constant", "vec2", "vec3", "vec4", "extract", "select",
                 "eq", "cmp", "add", "sub", "mul", "div", "neg", "abs", "min", "max",
                 "and", "or", "xor", "cast", "broadcast",
-                "sin", "cos", "sqrt", "exp", "exp2", "log", "log2", "floor", "pow",
+                "sin", "cos", "sqrt", "rsqrt", "exp", "exp2", "log", "log2", "floor", "pow",
                 "ssa",
             }:
                 raise ValueError(f"Unsupported device operation: {node.op}.")
@@ -919,6 +934,18 @@ class FragmentCoord:
     """Annotate a fragment parameter to read top-left-origin pixel-center XY."""
 
 
+class GlobalInvocationId:
+    """Annotate a compute parameter to read the 3D global invocation coordinate."""
+
+
+class LocalInvocationId:
+    """Annotate a compute parameter to read the 3D workgroup-local invocation coordinate."""
+
+
+class WorkgroupId:
+    """Annotate a compute parameter to read the 3D workgroup coordinate."""
+
+
 def fragment(function: Callable) -> Entry:
     return Entry(function, "fragment")
 
@@ -937,17 +964,57 @@ def compute(
         if function_or_workgroup_size is not None
         else workgroup_size
     )
-    if isinstance(size, int):
+    if isinstance(size, int) and not isinstance(size, bool):
         size = (size, 1, 1)
     elif isinstance(size, (tuple, list)) and len(size) in (1, 2, 3):
+        if any(type(d) is not int or isinstance(d, bool) for d in size):
+            raise TypeError("workgroup_size dimensions must be integers.")
         size = (*size, *(1 for _ in range(3 - len(size))))
     else:
         raise TypeError("workgroup_size must be a 1D, 2D, or 3D integer tuple.")
+    if any(d <= 0 for d in size):
+        raise ValueError("workgroup_size dimensions must be positive integers.")
 
     def decorator(fn: Callable) -> Entry:
         return Entry(fn, "compute", workgroup_size=tuple(size))
 
     return decorator
+
+
+@dataclass(frozen=True)
+class Dispatch:
+    grid: tuple[int, int, int] = (1, 1, 1)
+
+    def __init__(self, grid: int | Sequence[int] = (1, 1, 1)):
+        if isinstance(grid, int) and not isinstance(grid, bool):
+            norm = (grid, 1, 1)
+        elif isinstance(grid, (tuple, list)) and len(grid) in (1, 2, 3):
+            if any(type(d) is not int or isinstance(d, bool) for d in grid):
+                raise TypeError("Dispatch grid dimensions must be integers.")
+            norm = (*grid, *(1 for _ in range(3 - len(grid))))
+        else:
+            raise TypeError("Dispatch grid must be a 1D, 2D, or 3D integer tuple.")
+        if any(d <= 0 or d > 65535 for d in norm):
+            raise ValueError(f"Dispatch grid dimensions must be in [1, 65535], got {norm}.")
+        object.__setattr__(self, "grid", tuple(norm))
+
+    def to_dict(self) -> dict[str, list[int]]:
+        return {"grid": list(self.grid)}
+
+
+@dataclass(frozen=True)
+class ComputePipeline:
+    compute: Entry
+    dispatch: Dispatch = field(default_factory=Dispatch)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.compute, Entry) or self.compute.kind != "compute":
+            raise TypeError("ComputePipeline requires a @compute entry point.")
+        if not isinstance(self.dispatch, Dispatch):
+            raise TypeError("ComputePipeline dispatch configuration must be a Dispatch object.")
+
+    def trace(self) -> tuple[Stage]:
+        return (self.compute.trace(),)
 
 
 @dataclass(frozen=True)

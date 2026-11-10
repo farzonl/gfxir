@@ -420,8 +420,24 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       SmallVector<uint32_t> offsets;
       uint32_t nextOffset = 0;
       if (readsParameters) {
+        auto toSignless = [](Type t) -> Type {
+          if (auto intTy = dyn_cast<IntegerType>(t)) {
+            if (!intTy.isSignless())
+              return IntegerType::get(t.getContext(), intTy.getWidth());
+            return t;
+          }
+          if (auto vecTy = dyn_cast<VectorType>(t)) {
+            if (auto intElem = dyn_cast<IntegerType>(vecTy.getElementType())) {
+              if (!intElem.isSignless())
+                return VectorType::get(
+                    vecTy.getShape(),
+                    IntegerType::get(t.getContext(), intElem.getWidth()));
+            }
+          }
+          return t;
+        };
         for (const auto &field : paramLayout.fields) {
-          types.push_back(field.field.getType());
+          types.push_back(toSignless(field.field.getType()));
           offsets.push_back(field.offset);
         }
         nextOffset = paramLayout.size;
@@ -865,6 +881,22 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
     module.walk([&](ParameterOp op) { reads.push_back(op); });
     if (!reads.empty()) {
       auto layout = parameterLayout(parameters);
+      auto toSignless = [](Type t) -> Type {
+        if (auto intTy = dyn_cast<IntegerType>(t)) {
+          if (!intTy.isSignless())
+            return IntegerType::get(t.getContext(), intTy.getWidth());
+          return t;
+        }
+        if (auto vecTy = dyn_cast<VectorType>(t)) {
+          if (auto intElem = dyn_cast<IntegerType>(vecTy.getElementType())) {
+            if (!intElem.isSignless())
+              return VectorType::get(
+                  vecTy.getShape(),
+                  IntegerType::get(t.getContext(), intElem.getWidth()));
+          }
+        }
+        return t;
+      };
       SmallVector<Type> members;
       uint32_t offset = 0;
       for (const auto &field : layout.fields) {
@@ -872,7 +904,7 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
           members.push_back(builder.getF32Type());
           offset += 4;
         }
-        members.push_back(field.field.getType());
+        members.push_back(toSignless(field.field.getType()));
         offset += field.size;
       }
       while (offset < layout.size) {
@@ -904,9 +936,9 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
             LLVM::LLVMPointerType::get(module.getContext(), 2),
             builder.getStringAttr("llvm.dx.resource.getpointer"),
             ValueRange{handle.getResult(0), integer(field->offset)});
-        auto value =
-            LLVM::LoadOp::create(builder, op.getLoc(), field->field.getType(),
-                                 pointer.getResult(0), field->alignment);
+        auto value = LLVM::LoadOp::create(
+            builder, op.getLoc(), toSignless(field->field.getType()),
+            pointer.getResult(0), field->alignment);
         op.getValue().replaceAllUsesWith(value);
         op.erase();
       }
@@ -1194,7 +1226,7 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
   if (reflection.parameters) {
     namespace rootsig = llvm::hlsl::rootsig;
     rootsig::RootConstants constants{
-        parameterLayout(reflection.parameters).size / 4,
+        (parameterLayout(reflection.parameters).size + 3) / 4,
         {rootsig::RegisterType::BReg, 0}};
     elements.push_back(constants);
   }

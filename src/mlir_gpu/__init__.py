@@ -16,8 +16,12 @@ from .frontend import (
     Buffer,
     BufferBinding,
     BufferType,
+    ComputePipeline,
+    Dispatch,
     Draw,
     FragmentCoord,
+    GlobalInvocationId,
+    LocalInvocationId,
     Pipeline,
     PointerType,
     ReflectedBufferBinding,
@@ -25,11 +29,13 @@ from .frontend import (
     Type,
     Value,
     Vertex,
+    WorkgroupId,
     compute,
     f32,
     fragment,
     global_invocation_id,
     i32,
+    local_invocation_id,
     maximum,
     minimum,
     natural_alignment,
@@ -39,6 +45,7 @@ from .frontend import (
     vec3,
     vec4,
     vertex,
+    workgroup_id,
 )
 from .graphics import fullscreen_vertex
 from .parameters import (
@@ -56,12 +63,14 @@ mat3x2, mat3x3, mat3x4 = Type.MAT3X2, Type.MAT3X3, Type.MAT3X4
 mat4x2, mat4x3, mat4x4 = Type.MAT4X2, Type.MAT4X3, Type.MAT4X4
 
 __all__ = [
-    "AccessMode", "Buffer", "BufferBinding", "BufferType", "CompileError",
-    "DIRECTX_SM60", "DIRECTX_SM66", "Draw", "FragmentCoord", "FrameParameters",
-    "HIGH_END_COMPUTE", "MLIRPipeline", "PRESETS", "ParameterBlock", "Pipeline", "PointerType",
-    "ReflectedBufferBinding", "StorageClass", "StructField", "Target", "TargetProfile", "Toolchain", "Type",
-    "VULKAN_PORTABLE_1_0", "Value", "Vertex", "compile_pipeline", "compute", "f32",
-    "fragment", "global_invocation_id", "i32", "is_struct", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4", "mat4x2", "mat4x3", "mat4x4", "maximum", "minimum",
-    "natural_alignment", "pack_parameters", "select", "struct", "u32", "fullscreen_vertex", "sdf",
-    "shader_math", "vec2", "vec3", "vec4", "vertex",
+    "AccessMode", "Buffer", "BufferBinding", "BufferType", "compile_pipeline", "CompileError",
+    "compute", "ComputePipeline", "DIRECTX_SM60", "DIRECTX_SM66", "Dispatch", "Draw", "f32",
+    "fragment", "FragmentCoord", "FrameParameters", "fullscreen_vertex", "global_invocation_id",
+    "GlobalInvocationId", "HIGH_END_COMPUTE", "i32", "is_struct", "local_invocation_id",
+    "LocalInvocationId", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4", "mat4x2",
+    "mat4x3", "mat4x4", "maximum", "minimum", "MLIRPipeline", "natural_alignment",
+    "pack_parameters", "ParameterBlock", "Pipeline", "PointerType", "PRESETS",
+    "ReflectedBufferBinding", "sdf", "select", "shader_math", "StorageClass", "struct",
+    "StructField", "Target", "TargetProfile", "Toolchain", "Type", "u32", "Value", "vec2", "vec3",
+    "vec4", "Vertex", "vertex", "VULKAN_PORTABLE_1_0", "workgroup_id", "WorkgroupId",
 ]

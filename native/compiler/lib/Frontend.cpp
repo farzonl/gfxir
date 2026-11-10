@@ -269,9 +269,10 @@ mlir::gfx::importShader(MLIRContext &context,
       } else
         return error("neg/abs requires a floating-point or signed value");
     } else if (*operation == "sin" || *operation == "cos" ||
-               *operation == "sqrt" || *operation == "exp" ||
-               *operation == "exp2" || *operation == "log" ||
-               *operation == "log2" || *operation == "floor") {
+               *operation == "sqrt" || *operation == "rsqrt" ||
+               *operation == "exp" || *operation == "exp2" ||
+               *operation == "log" || *operation == "log2" ||
+               *operation == "floor") {
       if (arguments.size() != 1 || arguments[0].getType() != type ||
           !(type.isF32() || isa<VectorType>(type)))
         return error(
@@ -282,6 +283,8 @@ mlir::gfx::importShader(MLIRContext &context,
         value = math::CosOp::create(builder, location, arguments[0]);
       else if (*operation == "sqrt")
         value = math::SqrtOp::create(builder, location, arguments[0]);
+      else if (*operation == "rsqrt")
+        value = math::RsqrtOp::create(builder, location, arguments[0]);
       else if (*operation == "exp")
         value = math::ExpOp::create(builder, location, arguments[0]);
       else if (*operation == "exp2")
@@ -561,6 +564,10 @@ mlir::gfx::serializeReflection(const ShaderInterface &reflection) {
                             {"stage", stringifyStage(reflection.stage)},
                             {"inputs", serialize(reflection.inputs)},
                             {"outputs", serialize(reflection.outputs)}};
+  if (reflection.stage == Stage::Compute && reflection.workgroupSize) {
+    const auto &wg = *reflection.workgroupSize;
+    result["workgroup_size"] = llvm::json::Array{wg[0], wg[1], wg[2]};
+  }
   if (reflection.parameters)
     result["parameters"] =
         serializeParameters(reflection.parameters, reflection.stage);
@@ -664,33 +671,23 @@ llvm::json::Object mlir::gfx::serializeParameters(ParameterBlockAttr block,
                                  {"size", static_cast<int64_t>(legacySize)}}}}}};
   }
 
-  llvm::json::Object bindings;
-  if (stage == Stage::Compute) {
-    bindings = llvm::json::Object{
-        {"vulkan",
-         llvm::json::Object{{"storage", "storage_buffer"}, {"set", 0}, {"binding", 0}}},
-        {"directx",
-         llvm::json::Object{{"storage", "structured_buffer"}, {"register", 0}, {"space", 0}}},
-        {"metal",
-         llvm::json::Object{{"storage", "buffer"}, {"buffer_index", 0}}}};
-  } else {
-    bindings = llvm::json::Object{
-        {"vulkan",
-         llvm::json::Object{{"storage", "push_constant"}, {"offset", 0}}},
-        {"directx",
-         llvm::json::Object{{"storage", "root_constants"},
-                            {"parameter_index", 0},
-                            {"register", 0},
-                            {"space", 0},
-                            {"num32bit_constants", static_cast<int64_t>((layout.size + 3) / 4)},
-                            {"visibility", "all"},
-                            {"root_signature_version", "1.1"}}},
-        {"metal",
-         llvm::json::Object{{"storage", "converter_argument_buffer"},
-                            {"buffer_index", 2},
-                            {"offset", 0},
-                            {"size", static_cast<int64_t>(layout.size)}}}};
-  }
+  llvm::json::Object bindings{
+      {"vulkan",
+       llvm::json::Object{{"storage", "push_constant"}, {"offset", 0}}},
+      {"directx",
+       llvm::json::Object{{"storage", "root_constants"},
+                          {"parameter_index", 0},
+                          {"register", 0},
+                          {"space", 0},
+                          {"num32bit_constants",
+                           static_cast<int64_t>((layout.size + 3) / 4)},
+                          {"visibility", "all"},
+                          {"root_signature_version", "1.1"}}},
+      {"metal",
+       llvm::json::Object{{"storage", "converter_argument_buffer"},
+                          {"buffer_index", 2},
+                          {"offset", 0},
+                          {"size", static_cast<int64_t>(layout.size)}}}};
 
   return llvm::json::Object{
       {"schema_version", 2},

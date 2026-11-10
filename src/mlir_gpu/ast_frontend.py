@@ -10,7 +10,11 @@ from types import FunctionType, ModuleType
 from typing import Callable
 
 from . import sdf, shader_math
-from .frontend import Entry, Node, Pipeline, Type, Value, Vertex, _node, maximum, minimum, select
+from .frontend import (
+    ComputePipeline, Entry, GlobalInvocationId, LocalInvocationId, Node, Pipeline,
+    Type, Value, Vertex, WorkgroupId, _node, global_invocation_id, local_invocation_id,
+    maximum, minimum, select, workgroup_id,
+)
 from .frontend import i32, u32, vec2, vec3, vec4
 from .parameters import _ParameterValues
 
@@ -100,7 +104,10 @@ class MatrixValue:
         return NotImplemented
 
 
-_INTRINSICS = {Node, Value, Vertex, i32, u32, vec2, vec3, vec4, select, maximum, minimum}
+_INTRINSICS = {
+    Node, Value, Vertex, i32, u32, vec2, vec3, vec4, select, maximum, minimum,
+    global_invocation_id, local_invocation_id, workgroup_id,
+}
 for _module in (shader_math, sdf):
     _INTRINSICS.update(
         value for name, value in vars(_module).items()
@@ -195,7 +202,7 @@ class _Builder:
                 "div": "arith.divf", "neg": "arith.negf" if floating else "arith.subi",
                 "abs": "math.absf" if floating else "math.absi",
                 "and": "arith.andi", "or": "arith.ori", "xor": "arith.xori",
-                **{name: f"math.{name}" for name in ("sin", "cos", "sqrt", "exp", "exp2", "log", "log2", "floor")},
+                **{name: f"math.{name}" for name in ("sin", "cos", "sqrt", "rsqrt", "exp", "exp2", "log", "log2", "floor")},
                 "pow": "math.powf",
             }.get(node.op)
             if op is None:
@@ -294,6 +301,11 @@ class ASTLowering:
 
         arguments = []
         raster = iter(inputs)
+        compute_builtins = {
+            GlobalInvocationId: "global_invocation_id",
+            LocalInvocationId: "local_invocation_id",
+            WorkgroupId: "workgroup_id",
+        }
         for parameter in inspect.signature(function).parameters.values():
             if parameter.name in self.buffer_bindings:
                 b_spec = self.buffer_bindings[parameter.name]
@@ -328,7 +340,25 @@ class ASTLowering:
                 )
                 self.structured = True
                 continue
+            resolved_ann = resolve_annotation(function, parameter.annotation)
+            if resolved_ann in compute_builtins:
+                if workgroup_size is None:
+                    self.fail("Compute invocation/workgroup ID parameters require a @compute entry point.")
+                ref, = self.root.raw(
+                    "gfx.builtin",
+                    [],
+                    types=["vector<3xi32>"],
+                    attributes={"kind": {"kind": "builtin", "value": compute_builtins[resolved_ann]}},
+                )
+                arguments.append(self.root.bind(ref, "vector<3xi32>"))
+                self.structured = True
+                continue
             if parameter.name not in parameters:
+                if workgroup_size is not None:
+                    self.fail(
+                        f"Compute entry parameter {parameter.name!r} requires a Buffer, ParameterBlock, "
+                        "GlobalInvocationId, LocalInvocationId, or WorkgroupId annotation."
+                    )
                 arguments.append(Value(next(raster)))
                 continue
             block = parameters[parameter.name]
@@ -494,6 +524,8 @@ class ASTLowering:
             target = Type.I32 if function is builtins.int else Type.F32
             if value.node.type == target:
                 return value
+            if value.node.type == Type.U32 and target == Type.I32:
+                return i32(value)
             op = {
                 (Type.F32, Type.I32): "arith.fptosi",
                 (Type.I32, Type.F32): "arith.sitofp",
@@ -617,7 +649,7 @@ class ASTLowering:
             if node.attr.startswith("_"):
                 self.fail("Private attributes and Python introspection are unsupported in device source.")
             owner = self.expression(node.value, env)
-            if not isinstance(owner, (Value, Node, ModuleType, Type, Vertex, Entry, Pipeline, _ParameterValues, MatrixValue)) and owner is not Type:
+            if not isinstance(owner, (Value, Node, ModuleType, Type, Vertex, Entry, Pipeline, ComputePipeline, _ParameterValues, MatrixValue)) and owner is not Type:
                 self.fail("Dynamic attributes on arbitrary Python objects are unsupported.")
             return getattr(owner, node.attr)
         if isinstance(node, (ast.Tuple, ast.List)):
@@ -921,7 +953,10 @@ class ASTLowering:
             lower, upper, stride = (0, args[0], 1) if len(args) == 1 else (*args, 1) if len(args) == 2 else args
             if type(stride) is not int or not stride or not -(2**31) <= stride < 2**31:
                 self.fail("range step must be a nonzero compile-time signed 32-bit integer.")
-            bounds = [self.lift(value, Type.I32) for value in (lower, upper, stride)]
+            bounds = [
+                i32(value) if isinstance(value, Value) and value.node.type == Type.U32 else self.lift(value, Type.I32)
+                for value in (lower, upper, stride)
+            ]
             index, limit, step = [parent.raw("arith.index_cast", [parent.emit(value.node)], ["index"])[0] for value in bounds]
         assigned = {item.id for statement in node.body for item in ast.walk(statement)
                     if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)}

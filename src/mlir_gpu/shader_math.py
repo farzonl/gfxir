@@ -25,7 +25,7 @@ def _unary(operation: str, value: Value | float) -> Value:
     for component in _known_components(node):
         if component is not None and (
             (operation == "sqrt" and component < 0)
-            or (operation in ("log", "log2") and component <= 0)
+            or (operation in ("rsqrt", "log", "log2") and component <= 0)
         ):
             raise ValueError(f"{operation} argument is outside its portable domain.")
     return Value(Node(operation, node.type, (node,)))
@@ -41,6 +41,10 @@ def cos(value: Value | float) -> Value:
 
 def sqrt(value: Value | float) -> Value:
     return _unary("sqrt", value)
+
+
+def rsqrt(value: Value | float) -> Value:
+    return _unary("rsqrt", value)
 
 
 def exp(value: Value | float) -> Value:
