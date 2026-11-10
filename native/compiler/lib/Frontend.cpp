@@ -4,8 +4,10 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Verifier.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include <cmath>
 #include <limits>
 
@@ -13,14 +15,29 @@ using namespace mlir;
 using namespace mlir::gfx;
 
 Type mlir::gfx::parseShaderType(MLIRContext &context, StringRef name) {
+  if (name == "f16")
+    return Float16Type::get(&context);
   if (name == "f32")
     return Float32Type::get(&context);
-  if (name == "u32" || name == "i32")
+  if (name == "f64")
+    return Float64Type::get(&context);
+  if (name == "i8" || name == "u8" || name == "ui8")
+    return IntegerType::get(&context, 8);
+  if (name == "i16" || name == "u16" || name == "ui16")
+    return IntegerType::get(&context, 16);
+  if (name == "i32" || name == "u32" || name == "ui32")
     return IntegerType::get(&context, 32);
-  if (name == "bool")
+  if (name == "i64" || name == "u64" || name == "ui64")
+    return IntegerType::get(&context, 64);
+  if (name == "bool" || name == "i1")
     return IntegerType::get(&context, 1);
-  if (name == "f32x2" || name == "f32x3" || name == "f32x4")
-    return VectorType::get({name.back() - '0'}, Float32Type::get(&context));
+
+  if (name.ends_with("x2") || name.ends_with("x3") || name.ends_with("x4")) {
+    int64_t count = name.back() - '0';
+    StringRef prefix = name.drop_back(2);
+    if (Type elemType = parseShaderType(context, prefix))
+      return VectorType::get({count}, elemType);
+  }
   return {};
 }
 
@@ -28,9 +45,27 @@ static std::string typeName(Type type) {
   if (auto vector = dyn_cast<VectorType>(type))
     return typeName(vector.getElementType()) + "x" +
            std::to_string(vector.getNumElements());
+  if (isa<ArrayType>(type))
+    return "array";
+  if (isa<StructType>(type))
+    return "struct";
+  if (type.isF16())
+    return "f16";
   if (type.isF32())
     return "f32";
-  return type.isInteger(1) ? "bool" : "u32";
+  if (type.isF64())
+    return "f64";
+  if (auto intType = dyn_cast<IntegerType>(type)) {
+    if (intType.getWidth() == 1)
+      return "bool";
+    if (intType.isUnsigned())
+      return "u" + std::to_string(intType.getWidth());
+    if (intType.isSigned())
+      return "i" + std::to_string(intType.getWidth());
+    return (intType.getWidth() == 32) ? "u32"
+                                      : "i" + std::to_string(intType.getWidth());
+  }
+  return "unknown";
 }
 
 bool mlir::gfx::isShaderSymbolName(StringRef name) {
@@ -439,11 +474,13 @@ ShaderInterface mlir::gfx::reflectShader(ModuleOp module) {
       {}};
   SmallVector<func::FuncOp> pending{function};
   llvm::SmallPtrSet<Operation *, 8> visited;
+  bool reachedParamOp = false;
   while (!pending.empty()) {
     auto current = pending.pop_back_val();
     if (!visited.insert(current).second)
       continue;
     current.walk([&](ParameterOp) {
+      reachedParamOp = true;
       result.parameters =
           module->getAttrOfType<ParameterBlockAttr>("gfx.parameters");
     });
@@ -451,6 +488,14 @@ ShaderInterface mlir::gfx::reflectShader(ModuleOp module) {
       if (auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee()))
         pending.push_back(callee);
     });
+  }
+  if (!reachedParamOp) {
+    bool anyParamOpInModule = false;
+    module.walk([&](ParameterOp) { anyParamOpInModule = true; });
+    if (!anyParamOpInModule) {
+      result.parameters =
+          module->getAttrOfType<ParameterBlockAttr>("gfx.parameters");
+    }
   }
   function.walk([&](Operation *op) {
     if (auto builtin = dyn_cast<BuiltinOp>(op)) {
@@ -503,43 +548,307 @@ mlir::gfx::serializeReflection(const ShaderInterface &reflection) {
   return result;
 }
 
+static llvm::json::Object serializeField(const ParameterFieldLayout &item,
+                                         bool isLegacyF32) {
+  llvm::json::Object fieldObj{
+      {"name", item.name},
+      {"type", typeName(item.type)},
+      {"offset", static_cast<int64_t>(item.offset)},
+      {"size", static_cast<int64_t>(item.size)},
+      {"alignment", static_cast<int64_t>(item.alignment)}};
+  if (!isLegacyF32) {
+    if (auto arr = dyn_cast<ArrayType>(item.type)) {
+      fieldObj["count"] = static_cast<int64_t>(arr.getCount());
+      fieldObj["stride"] = static_cast<int64_t>(item.stride);
+      fieldObj["element_type"] = typeName(arr.getElementType());
+      if (auto elemSt = dyn_cast<StructType>(arr.getElementType())) {
+        llvm::json::Array subFields;
+        for (const auto &sub : item.nestedFields)
+          subFields.push_back(serializeField(sub, false));
+        fieldObj["fields"] = std::move(subFields);
+      }
+    } else if (auto st = dyn_cast<StructType>(item.type)) {
+      llvm::json::Array subFields;
+      for (const auto &sub : item.nestedFields)
+        subFields.push_back(serializeField(sub, false));
+      fieldObj["fields"] = std::move(subFields);
+    }
+  }
+  return fieldObj;
+}
+
 llvm::json::Object mlir::gfx::serializeParameters(ParameterBlockAttr block,
                                                   Stage stage) {
   auto layout = parameterLayout(block);
+  bool isLegacyF32 = (stage != Stage::Compute);
+  for (const auto &item : layout.fields) {
+    if (auto vec = dyn_cast<VectorType>(item.type)) {
+      if (!vec.getElementType().isF32()) {
+        isLegacyF32 = false;
+        break;
+      }
+    } else if (!item.type.isF32()) {
+      isLegacyF32 = false;
+      break;
+    }
+  }
+  if (layout.size > 128)
+    isLegacyF32 = false;
+
   llvm::json::Array fields;
-  for (const auto &item : layout.fields)
-    fields.push_back(
-        llvm::json::Object{{"name", item.field.getName()},
-                           {"type", typeName(item.field.getType())},
-                           {"offset", item.offset},
-                           {"size", item.size},
-                           {"alignment", item.alignment}});
+  for (const auto &item : layout.fields) {
+    fields.push_back(serializeField(item, isLegacyF32));
+  }
+
+  if (isLegacyF32) {
+    uint32_t legacySize = (layout.size + 15) / 16 * 16;
+    return llvm::json::Object{
+        {"schema_version", 1},
+        {"name", block.getName()},
+        {"layout", "gfx-root-f32-v1"},
+        {"size", static_cast<int64_t>(legacySize)},
+        {"alignment", 16},
+        {"fields", std::move(fields)},
+        {"stages", llvm::json::Array{stringifyStage(stage)}},
+        {"ownership", "host"},
+        {"access", "read-only"},
+        {"addressable", false},
+        {"bindings",
+         llvm::json::Object{
+             {"vulkan",
+              llvm::json::Object{{"storage", "push_constant"}, {"offset", 0}}},
+             {"directx",
+              llvm::json::Object{{"storage", "root_constants"},
+                                 {"parameter_index", 0},
+                                 {"register", 0},
+                                 {"space", 0},
+                                 {"num32bit_constants", static_cast<int64_t>(legacySize / 4)},
+                                 {"visibility", "all"},
+                                 {"root_signature_version", "1.1"}}},
+             {"metal",
+              llvm::json::Object{{"storage", "converter_argument_buffer"},
+                                 {"buffer_index", 2},
+                                 {"offset", 0},
+                                 {"size", static_cast<int64_t>(legacySize)}}}}}};
+  }
+
+  llvm::json::Object bindings;
+  if (stage == Stage::Compute) {
+    bindings = llvm::json::Object{
+        {"vulkan",
+         llvm::json::Object{{"storage", "storage_buffer"}, {"set", 0}, {"binding", 0}}},
+        {"directx",
+         llvm::json::Object{{"storage", "structured_buffer"}, {"register", 0}, {"space", 0}}},
+        {"metal",
+         llvm::json::Object{{"storage", "buffer"}, {"buffer_index", 0}}}};
+  } else {
+    bindings = llvm::json::Object{
+        {"vulkan",
+         llvm::json::Object{{"storage", "push_constant"}, {"offset", 0}}},
+        {"directx",
+         llvm::json::Object{{"storage", "root_constants"},
+                            {"parameter_index", 0},
+                            {"register", 0},
+                            {"space", 0},
+                            {"num32bit_constants", static_cast<int64_t>((layout.size + 3) / 4)},
+                            {"visibility", "all"},
+                            {"root_signature_version", "1.1"}}},
+        {"metal",
+         llvm::json::Object{{"storage", "converter_argument_buffer"},
+                            {"buffer_index", 2},
+                            {"offset", 0},
+                            {"size", static_cast<int64_t>(layout.size)}}}};
+  }
+
   return llvm::json::Object{
-      {"schema_version", 1},
+      {"schema_version", 2},
       {"name", block.getName()},
-      {"layout", "gfx-root-f32-v1"},
-      {"size", layout.size},
-      {"alignment", 16},
+      {"layout", "gfx-std430-v1"},
+      {"size", static_cast<int64_t>(layout.size)},
+      {"alignment", static_cast<int64_t>(layout.alignment)},
       {"fields", std::move(fields)},
       {"stages", llvm::json::Array{stringifyStage(stage)}},
       {"ownership", "host"},
       {"access", "read-only"},
       {"addressable", false},
-      {"bindings",
-       llvm::json::Object{
-           {"vulkan",
-            llvm::json::Object{{"storage", "push_constant"}, {"offset", 0}}},
-           {"directx",
-            llvm::json::Object{{"storage", "root_constants"},
-                               {"parameter_index", 0},
-                               {"register", 0},
-                               {"space", 0},
-                               {"num32bit_constants", layout.size / 4},
-                               {"visibility", "all"},
-                               {"root_signature_version", "1.1"}}},
-           {"metal",
-            llvm::json::Object{{"storage", "converter_argument_buffer"},
-                               {"buffer_index", 2},
-                               {"offset", 0},
-                               {"size", layout.size}}}}}};
+      {"bindings", std::move(bindings)}};
+}
+
+static std::string cTypeNameForField(Type type, StringRef name, uint32_t &arrCount, bool &isVec3) {
+  arrCount = 0;
+  isVec3 = false;
+  if (type.isF16())
+    return "uint16_t";
+  if (type.isF32())
+    return "float";
+  if (type.isF64())
+    return "double";
+  if (auto intType = dyn_cast<IntegerType>(type)) {
+    unsigned width = intType.getWidth();
+    if (width == 1)
+      return "uint8_t";
+    if (intType.isUnsigned())
+      return "uint" + std::to_string(width) + "_t";
+    return "int" + std::to_string(width) + "_t";
+  }
+  if (auto vecType = dyn_cast<VectorType>(type)) {
+    int64_t count = vecType.getNumElements();
+    if (count == 3)
+      isVec3 = true;
+    arrCount = static_cast<uint32_t>(count);
+    uint32_t subArr = 0;
+    bool subVec3 = false;
+    return cTypeNameForField(vecType.getElementType(), name, subArr, subVec3);
+  }
+  if (auto st = dyn_cast<StructType>(type))
+    return st.getName().str();
+  return "uint8_t";
+}
+
+static void emitStructBody(ArrayRef<ParameterFieldLayout> fields,
+                           uint32_t structSize,
+                           llvm::raw_ostream &os,
+                           StringRef structName) {
+  uint32_t currentCursor = 0;
+  uint32_t padIndex = 0;
+  for (const auto &item : fields) {
+    if (item.offset > currentCursor) {
+      uint32_t gap = item.offset - currentCursor;
+      os << "    uint8_t _pad" << padIndex++ << "[" << gap << "];\n";
+      currentCursor = item.offset;
+    }
+    if (auto arr = dyn_cast<ArrayType>(item.type)) {
+      uint32_t elemArr = 0;
+      bool elemVec3 = false;
+      std::string elemBase = cTypeNameForField(arr.getElementType(), item.name, elemArr, elemVec3);
+      if (elemVec3) {
+        os << "    struct { " << elemBase << " v[3]; uint8_t _p[4]; } "
+           << item.name << "[" << arr.getCount() << "];\n";
+      } else if (elemArr > 0) {
+        os << "    " << elemBase << " " << item.name << "[" << arr.getCount()
+           << "][" << elemArr << "];\n";
+      } else {
+        os << "    " << elemBase << " " << item.name << "[" << arr.getCount()
+           << "];\n";
+      }
+    } else if (auto vec = dyn_cast<VectorType>(item.type)) {
+      uint32_t vecCount = 0;
+      bool isVec3 = false;
+      std::string baseType = cTypeNameForField(vec, item.name, vecCount, isVec3);
+      os << "    " << baseType << " " << item.name << "[" << vecCount << "];\n";
+    } else if (auto st = dyn_cast<StructType>(item.type)) {
+      os << "    " << st.getName() << " " << item.name << ";\n";
+    } else {
+      uint32_t dummy = 0;
+      bool dummyVec3 = false;
+      std::string scalarType = cTypeNameForField(item.type, item.name, dummy, dummyVec3);
+      os << "    " << scalarType << " " << item.name << ";\n";
+    }
+    currentCursor = item.offset + item.size;
+  }
+  if (currentCursor < structSize) {
+    uint32_t gap = structSize - currentCursor;
+    os << "    uint8_t _pad" << padIndex++ << "[" << gap << "];\n";
+  }
+}
+
+static void collectStructTypes(Type type, SmallVectorImpl<StructType> &structs,
+                               llvm::DenseSet<Type> &visited) {
+  if (auto arr = dyn_cast<ArrayType>(type)) {
+    collectStructTypes(arr.getElementType(), structs, visited);
+    return;
+  }
+  if (auto st = dyn_cast<StructType>(type)) {
+    if (visited.contains(st))
+      return;
+    for (auto attr : st.getFields()) {
+      auto field = cast<ParameterFieldAttr>(attr);
+      collectStructTypes(field.getType(), structs, visited);
+    }
+    if (visited.insert(st).second) {
+      structs.push_back(st);
+    }
+  }
+}
+
+LogicalResult mlir::gfx::emitCHeader(const ParameterLayout &layout,
+                                     llvm::raw_ostream &os,
+                                     llvm::StringRef structName) {
+  std::string upperName = structName.upper();
+  os << "/* Auto-generated by gfxir compiler std430 reflection engine. Do not edit. */\n";
+  os << "#ifndef " << upperName << "_H\n";
+  os << "#define " << upperName << "_H\n\n";
+  os << "#pragma once\n\n";
+  os << "#include <stddef.h>\n";
+  os << "#include <stdint.h>\n";
+  os << "#include <assert.h>\n\n";
+  os << "#if !defined(__cplusplus) && !defined(static_assert)\n";
+  os << "#  if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L\n";
+  os << "#    define static_assert _Static_assert\n";
+  os << "#  endif\n";
+  os << "#endif\n\n";
+  os << "#ifdef __cplusplus\n";
+  os << "extern \"C\" {\n";
+  os << "#endif\n\n";
+
+  // Collect and emit all referenced structs in topological order (innermost first)
+  SmallVector<StructType, 8> referencedStructs;
+  llvm::DenseSet<Type> visitedStructs;
+  for (const auto &item : layout.fields) {
+    collectStructTypes(item.type, referencedStructs, visitedStructs);
+  }
+
+  llvm::StringSet<> emittedNames;
+  for (auto st : referencedStructs) {
+    if (st.getName() == structName || !emittedNames.insert(st.getName()).second)
+      continue;
+    auto members = layoutStructMembers(st);
+    uint32_t stSize = 0, stAlign = 0;
+    (void)getStd430Layout(st, stSize, stAlign);
+
+    os << "typedef struct " << st.getName() << " {\n";
+    emitStructBody(members, stSize, os, st.getName());
+    os << "} " << st.getName() << ";\n\n";
+
+    for (const auto &sub : members) {
+      os << "static_assert(offsetof(" << st.getName() << ", " << sub.name
+         << ") == " << sub.offset << ", \"offset mismatch for " << sub.name << "\");\n";
+    }
+    os << "static_assert(sizeof(" << st.getName() << ") == " << stSize
+       << ", \"size mismatch for " << st.getName() << "\");\n\n";
+  }
+
+  // Primary struct
+  os << "typedef struct " << structName << " {\n";
+  emitStructBody(layout.fields, layout.size, os, structName);
+  os << "} " << structName << ";\n\n";
+
+  // Compile-time static assertions
+  for (const auto &item : layout.fields) {
+    os << "static_assert(offsetof(" << structName << ", " << item.name
+       << ") == " << item.offset << ", \"offset mismatch for " << item.name << "\");\n";
+  }
+  os << "static_assert(sizeof(" << structName << ") == " << layout.size
+     << ", \"size mismatch for " << structName << "\");\n\n";
+
+  os << "#ifdef __cplusplus\n";
+  os << "}\n";
+  os << "#endif\n\n";
+  os << "#endif // " << upperName << "_H\n";
+  return success();
+}
+
+LogicalResult mlir::gfx::emitCHeader(const ShaderInterface &reflection,
+                                     llvm::raw_ostream &os) {
+  if (reflection.parameters) {
+    auto layout = parameterLayout(reflection.parameters);
+    return emitCHeader(layout, os, reflection.parameters.getName());
+  }
+  os << "/* Auto-generated by gfx-compile std430 reflection engine. Do not edit. */\n";
+  os << "#ifndef GFX_NO_PARAMETERS_H\n";
+  os << "#define GFX_NO_PARAMETERS_H\n\n";
+  os << "#pragma once\n\n";
+  os << "/* No aggregate parameter blocks reflected. */\n\n";
+  os << "#endif // GFX_NO_PARAMETERS_H\n";
+  return success();
 }

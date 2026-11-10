@@ -65,7 +65,9 @@ private:
       auto number = value.getAsInteger();
       if (number &&
           (type.isIndex() || (*number >= INT32_MIN && *number <= UINT32_MAX)))
-        return TypedAttr(builder.getIntegerAttr(type, *number));
+        return TypedAttr(builder.getIntegerAttr(
+            type.isIndex() ? type : builder.getIntegerType(type.getIntOrFloatBitWidth()),
+            *number));
     }
     return error(loc, "attribute literal does not match its declared type");
   }
@@ -338,20 +340,102 @@ StructuredImporter::import(const llvm::json::Object &source) {
                       "offsets or backend bindings");
       return {};
     }
+    std::function<FailureOr<Type>(const llvm::json::Object &)> parseParamType =
+        [&](const llvm::json::Object &f) -> FailureOr<Type> {
+      auto typeVal = f.get("type");
+      if (!typeVal)
+        return failure();
+      if (auto typeStr = typeVal->getAsString()) {
+        if (*typeStr == "array") {
+          auto count = f.getInteger("count");
+          if (!count || *count < 1 || *count > INT32_MAX)
+            return failure();
+          auto elemVal = f.get("element_type");
+          if (!elemVal)
+            return failure();
+          Type elemType;
+          if (auto elemStr = elemVal->getAsString()) {
+            elemType = parseShaderType(*builder.getContext(), *elemStr);
+          } else if (auto elemObj = elemVal->getAsObject()) {
+            auto parsed = parseParamType(*elemObj);
+            if (succeeded(parsed))
+              elemType = *parsed;
+          }
+          if (!elemType)
+            return failure();
+          return ArrayType::get(builder.getContext(), elemType, static_cast<uint32_t>(*count));
+        }
+        if (*typeStr == "struct") {
+          auto structFields = f.getArray("fields");
+          if (!structFields)
+            return failure();
+          SmallVector<Attribute> nestedAttrs;
+          for (const auto &subItem : *structFields) {
+            auto subObj = subItem.getAsObject();
+            if (!subObj)
+              return failure();
+            auto subName = subObj->getString("name");
+            if (!subName || !isShaderSymbolName(*subName))
+              return failure();
+            auto subType = parseParamType(*subObj);
+            if (failed(subType))
+              return failure();
+            nestedAttrs.push_back(ParameterFieldAttr::get(builder.getContext(), *subName, *subType));
+          }
+          auto structName = f.getString("name");
+          return StructType::get(builder.getContext(), structName ? *structName : "struct",
+                                 builder.getArrayAttr(nestedAttrs));
+        }
+        if (*typeStr == "u8" || *typeStr == "ui8")
+          return IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+        if (*typeStr == "i8")
+          return IntegerType::get(builder.getContext(), 8, IntegerType::Signed);
+        if (*typeStr == "u16" || *typeStr == "ui16")
+          return IntegerType::get(builder.getContext(), 16, IntegerType::Unsigned);
+        if (*typeStr == "i16")
+          return IntegerType::get(builder.getContext(), 16, IntegerType::Signed);
+        if (*typeStr == "u32" || *typeStr == "ui32")
+          return IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned);
+        if (*typeStr == "i32")
+          return IntegerType::get(builder.getContext(), 32, IntegerType::Signed);
+        if (*typeStr == "u64" || *typeStr == "ui64")
+          return IntegerType::get(builder.getContext(), 64, IntegerType::Unsigned);
+        if (*typeStr == "i64")
+          return IntegerType::get(builder.getContext(), 64, IntegerType::Signed);
+        if (typeStr->ends_with("x2") || typeStr->ends_with("x3") || typeStr->ends_with("x4")) {
+          int64_t count = typeStr->back() - '0';
+          StringRef prefix = typeStr->drop_back(2);
+          llvm::json::Object subObj{{"type", prefix}};
+          auto sub = parseParamType(subObj);
+          if (succeeded(sub))
+            return VectorType::get({count}, *sub);
+        }
+        auto parsed = parseShaderType(*builder.getContext(), *typeStr);
+        if (!parsed)
+          return failure();
+        return parsed;
+      }
+      return failure();
+    };
+
     SmallVector<Attribute> attributes;
     for (const auto &item : *fields) {
       auto field = item.getAsObject();
       auto name = field ? field->getString("name") : std::nullopt;
-      auto typeName = field ? field->getString("type") : std::nullopt;
-      auto parsedType = typeName ? type(*typeName) : Type{};
-      if (!name || !parsedType || field->size() != 2) {
+      if (!field || !name || field->get("offset") || field->get("binding")) {
+        emitError(*loc,
+                  "parameter field requires only a name and supported type");
+        return {};
+      }
+      auto parsedType = parseParamType(*field);
+      if (failed(parsedType)) {
         emitError(*loc,
                   "parameter field requires only a name and supported type");
         return {};
       }
       auto attribute = ParameterFieldAttr::getChecked(
           [&] { return emitError(*loc); }, builder.getContext(), *name,
-          parsedType);
+          *parsedType);
       if (!attribute)
         return {};
       attributes.push_back(attribute);

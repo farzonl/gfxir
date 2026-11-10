@@ -1,0 +1,54 @@
+// RUN: %split-file %s %t
+// RUN: %gfx-compile %t/complex.json --target vulkan --output %t/complex.spv --reflection %t/complex.refl --c-header %t/complex.h
+// RUN: %FileCheck %s --check-prefix=CHECK-C-HEADER < %t/complex.h
+
+// CHECK-C-HEADER: #ifndef COMPLEX_BLOCK_H
+// CHECK-C-HEADER: #define COMPLEX_BLOCK_H
+// CHECK-C-HEADER-DAG: #include <stddef.h>
+// CHECK-C-HEADER-DAG: #include <stdint.h>
+// CHECK-C-HEADER-DAG: #include <assert.h>
+
+// CHECK-C-HEADER: typedef struct complex_block {
+// CHECK-C-HEADER-NEXT:     float a;
+// CHECK-C-HEADER-NEXT:     uint8_t _pad0[12];
+// CHECK-C-HEADER-NEXT:     float b[3];
+// CHECK-C-HEADER-NEXT:     float c;
+// CHECK-C-HEADER-NEXT:     float d[2];
+// CHECK-C-HEADER-NEXT:     int32_t e;
+// CHECK-C-HEADER-NEXT:     uint8_t _pad1[4];
+// CHECK-C-HEADER-NEXT: } complex_block;
+
+// CHECK-C-HEADER: static_assert(offsetof(complex_block, a) == 0, "offset mismatch for a");
+// CHECK-C-HEADER: static_assert(offsetof(complex_block, b) == 16, "offset mismatch for b");
+// CHECK-C-HEADER: static_assert(offsetof(complex_block, c) == 28, "offset mismatch for c");
+// CHECK-C-HEADER: static_assert(offsetof(complex_block, d) == 32, "offset mismatch for d");
+// CHECK-C-HEADER: static_assert(offsetof(complex_block, e) == 40, "offset mismatch for e");
+// CHECK-C-HEADER: static_assert(sizeof(complex_block) == 48, "size mismatch for complex_block");
+
+// CHECK-C-HEADER: #endif // COMPLEX_BLOCK_H
+
+//--- complex.json
+{
+  "schema_version": 2,
+  "parameters": {
+    "name": "complex_block",
+    "fields": [
+      {"name": "a", "type": "f32"},
+      {"name": "b", "type": "f32x3"},
+      {"name": "c", "type": "f32"},
+      {"name": "d", "type": "f32x2"},
+      {"name": "e", "type": "i32"}
+    ]
+  },
+  "functions": [{
+    "name": "complex_shader",
+    "stage": "fragment",
+    "results": [],
+    "body": {"blocks": [{"name": "entry", "arguments": [], "operations": [
+      {"op": "gfx.parameter", "results": [{"name": "p0", "type": "f32"}], "attributes": {"block": {"kind": "string", "value": "complex_block"}, "field": {"kind": "string", "value": "a"}}},
+      {"op": "vector.from_elements", "args": ["p0", "p0", "p0", "p0"], "results": [{"name": "color", "type": "f32x4"}]},
+      {"op": "gfx.output", "args": ["color"], "results": [], "attributes": {"location": {"kind": "literal", "type": "i32", "value": 0}, "name": {"kind": "string", "value": "target0"}, "interpolation": {"kind": "interpolation", "value": "perspective"}}},
+      {"op": "func.return"}
+    ]}]}
+  }]
+}

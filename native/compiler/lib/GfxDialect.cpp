@@ -366,32 +366,212 @@ LogicalResult GfxDialect::verifyOperationAttribute(Operation *op,
   return success();
 }
 
+LogicalResult mlir::gfx::getStd430Layout(Type type, uint32_t &size,
+                                         uint32_t &alignment) {
+  if (type.isF16()) {
+    size = 2;
+    alignment = 2;
+    return success();
+  }
+  if (type.isF32()) {
+    size = 4;
+    alignment = 4;
+    return success();
+  }
+  if (type.isF64()) {
+    size = 8;
+    alignment = 8;
+    return success();
+  }
+  if (auto intType = dyn_cast<IntegerType>(type)) {
+    unsigned width = intType.getWidth();
+    if (width == 1) {
+      size = 1;
+      alignment = 1;
+      return success();
+    }
+    if (width == 8) {
+      size = 1;
+      alignment = 1;
+      return success();
+    }
+    if (width == 16) {
+      size = 2;
+      alignment = 2;
+      return success();
+    }
+    if (width == 32) {
+      size = 4;
+      alignment = 4;
+      return success();
+    }
+    if (width == 64) {
+      size = 8;
+      alignment = 8;
+      return success();
+    }
+    return failure();
+  }
+  if (auto vecType = dyn_cast<VectorType>(type)) {
+    if (vecType.getRank() != 1)
+      return failure();
+    int64_t count = vecType.getNumElements();
+    if (count < 2 || count > 4)
+      return failure();
+    uint32_t elemSize = 0, elemAlign = 0;
+    if (failed(getStd430Layout(vecType.getElementType(), elemSize, elemAlign)))
+      return failure();
+    if (count == 2) {
+      size = 2 * elemSize;
+      alignment = 2 * elemAlign;
+    } else if (count == 3) {
+      size = 3 * elemSize;
+      alignment = 4 * elemAlign;
+    } else {
+      size = 4 * elemSize;
+      alignment = 4 * elemAlign;
+    }
+    return success();
+  }
+  if (auto arrType = dyn_cast<ArrayType>(type)) {
+    uint32_t elemSize = 0, elemAlign = 0;
+    if (failed(getStd430Layout(arrType.getElementType(), elemSize, elemAlign)))
+      return failure();
+    uint32_t stride = (elemSize + elemAlign - 1) / elemAlign * elemAlign;
+    size = arrType.getCount() * stride;
+    alignment = elemAlign;
+    return success();
+  }
+  if (auto structType = dyn_cast<StructType>(type)) {
+    uint32_t currentOffset = 0;
+    uint32_t maxAlign = 1;
+    for (auto attr : structType.getFields()) {
+      auto field = cast<ParameterFieldAttr>(attr);
+      uint32_t mSize = 0, mAlign = 0;
+      if (failed(getStd430Layout(field.getType(), mSize, mAlign)))
+        return failure();
+      maxAlign = std::max(maxAlign, mAlign);
+      currentOffset = (currentOffset + mAlign - 1) / mAlign * mAlign + mSize;
+    }
+    alignment = maxAlign;
+    size = (currentOffset + maxAlign - 1) / maxAlign * maxAlign;
+    return success();
+  }
+  if (auto tupleType = dyn_cast<TupleType>(type)) {
+    uint32_t currentOffset = 0;
+    uint32_t maxAlign = 1;
+    for (Type elem : tupleType.getTypes()) {
+      uint32_t mSize = 0, mAlign = 0;
+      if (failed(getStd430Layout(elem, mSize, mAlign)))
+        return failure();
+      maxAlign = std::max(maxAlign, mAlign);
+      currentOffset = (currentOffset + mAlign - 1) / mAlign * mAlign + mSize;
+    }
+    alignment = maxAlign;
+    size = (currentOffset + maxAlign - 1) / maxAlign * maxAlign;
+    return success();
+  }
+  return failure();
+}
+
 LogicalResult
 ParameterFieldAttr::verify(llvm::function_ref<InFlightDiagnostic()> error,
                            StringRef name, Type type) {
   if (!isShaderSymbolName(name))
     return error() << "parameter field requires a valid name";
-  if (type.isF32())
-    return success();
-  auto vector = dyn_cast<VectorType>(type);
-  if (!vector || vector.getRank() != 1 || !vector.getElementType().isF32() ||
-      vector.getNumElements() < 2 || vector.getNumElements() > 4)
-    return error() << "parameter fields currently support f32 and f32x2/3/4";
+  uint32_t size = 0, alignment = 0;
+  if (failed(getStd430Layout(type, size, alignment)))
+    return error() << "parameter fields require a supported std430 scalar, vector, array, or struct type";
   return success();
 }
 
+std::vector<ParameterFieldLayout> mlir::gfx::layoutStructMembers(StructType type) {
+  std::vector<ParameterFieldLayout> members;
+  uint32_t currentOffset = 0;
+  for (auto attr : type.getFields()) {
+    auto field = cast<ParameterFieldAttr>(attr);
+    ParameterFieldLayout item;
+    item.field = field;
+    item.name = field.getName().str();
+    item.type = field.getType();
+    if (auto arr = dyn_cast<ArrayType>(field.getType())) {
+      item.count = arr.getCount();
+      uint32_t elemSize = 0, elemAlign = 0;
+      if (succeeded(getStd430Layout(arr.getElementType(), elemSize, elemAlign))) {
+        item.stride = (elemSize + elemAlign - 1) / elemAlign * elemAlign;
+      }
+      if (auto elemSt = dyn_cast<StructType>(arr.getElementType())) {
+        item.nestedFields = layoutStructMembers(elemSt);
+      }
+    } else if (auto subSt = dyn_cast<StructType>(field.getType())) {
+      item.nestedFields = layoutStructMembers(subSt);
+    }
+    uint32_t fSize = 0, fAlign = 0;
+    if (succeeded(getStd430Layout(field.getType(), fSize, fAlign))) {
+      item.size = fSize;
+      item.alignment = fAlign;
+      uint32_t alignedOffset = (currentOffset + fAlign - 1) / fAlign * fAlign;
+      item.offset = alignedOffset;
+      if (!members.empty()) {
+        members.back().paddingAfter =
+            alignedOffset - (members.back().offset + members.back().size);
+      }
+      currentOffset = alignedOffset + fSize;
+      members.push_back(item);
+    }
+  }
+  uint32_t stSize = 0, stAlign = 0;
+  if (succeeded(getStd430Layout(type, stSize, stAlign)) && !members.empty()) {
+    members.back().paddingAfter =
+        stSize - (members.back().offset + members.back().size);
+  }
+  return members;
+}
+
 static ParameterLayout layoutFields(ArrayAttr fields) {
-  ParameterLayout layout{{}, 0};
+  ParameterLayout layout;
+  uint32_t currentOffset = 0;
+  uint32_t maxAlign = 1;
   for (auto attribute : fields) {
     auto field = cast<ParameterFieldAttr>(attribute);
-    auto vector = dyn_cast<VectorType>(field.getType());
-    uint32_t components = vector ? vector.getNumElements() : 1;
-    uint32_t alignment = components == 3 ? 16 : components * 4;
-    uint32_t offset = (layout.size + alignment - 1) / alignment * alignment;
-    layout.fields.push_back({field, offset, components * 4, alignment});
-    layout.size = offset + components * 4;
+    ParameterFieldLayout item;
+    item.field = field;
+    item.name = field.getName().str();
+    item.type = field.getType();
+    if (auto arr = dyn_cast<ArrayType>(field.getType())) {
+      item.count = arr.getCount();
+      uint32_t elemSize = 0, elemAlign = 0;
+      if (succeeded(getStd430Layout(arr.getElementType(), elemSize, elemAlign))) {
+        item.stride = (elemSize + elemAlign - 1) / elemAlign * elemAlign;
+      }
+      if (auto elemSt = dyn_cast<StructType>(arr.getElementType())) {
+        item.nestedFields = layoutStructMembers(elemSt);
+      }
+    } else if (auto st = dyn_cast<StructType>(field.getType())) {
+      item.nestedFields = layoutStructMembers(st);
+    }
+    uint32_t fSize = 0, fAlign = 0;
+    if (succeeded(getStd430Layout(field.getType(), fSize, fAlign))) {
+      item.size = fSize;
+      item.alignment = fAlign;
+      maxAlign = std::max(maxAlign, fAlign);
+      uint32_t alignedOffset = (currentOffset + fAlign - 1) / fAlign * fAlign;
+      item.offset = alignedOffset;
+      if (!layout.fields.empty()) {
+        layout.fields.back().paddingAfter =
+            alignedOffset - (layout.fields.back().offset + layout.fields.back().size);
+      }
+      currentOffset = alignedOffset + fSize;
+      layout.fields.push_back(item);
+    }
   }
-  layout.size = (layout.size + 15) / 16 * 16;
+  layout.alignment = maxAlign;
+  uint32_t totalSize = (currentOffset + maxAlign - 1) / maxAlign * maxAlign;
+  layout.size = totalSize;
+  if (!layout.fields.empty()) {
+    layout.fields.back().paddingAfter =
+        totalSize - (layout.fields.back().offset + layout.fields.back().size);
+  }
   return layout;
 }
 
