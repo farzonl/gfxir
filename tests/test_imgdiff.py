@@ -3,15 +3,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from PIL import Image
+try:
+    from PIL import Image
+    from imgdiff import compare, compare_targets
+except ImportError:
+    Image = None
+    compare = None
+    compare_targets = None
 
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tests/lit/execution/Inputs"))
-from execution_targets import target_output_path
-from imgdiff import compare, compare_targets
-
-
+@unittest.skipIf(Image is None, "Pillow is not installed")
 class ImageDiffTests(unittest.TestCase):
     def setUp(self):
         work = tempfile.TemporaryDirectory()

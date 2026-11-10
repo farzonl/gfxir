@@ -47,10 +47,11 @@ LogicalResult graphicsEntry(ModuleOp module, func::FuncOp &function,
       function = entry;
       stage = attribute.getValue();
     }
-  if (stage != Stage::Vertex && stage != Stage::Fragment)
+  if (stage != Stage::Vertex && stage != Stage::Fragment &&
+      stage != Stage::Compute)
     return function.emitOpError(
-        "this graphics-first lowering supports vertex and fragment stages; "
-        "compute/task/mesh require additional target legalization");
+        "this graphics-first lowering supports vertex, fragment, and compute stages; "
+        "task/mesh require additional target legalization");
   if (!function.getBody().hasOneBlock())
     return function.emitOpError(
         "this foundation supports single-block shaders; structured "
@@ -106,6 +107,8 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       signalPassFailure();
       return;
     }
+    DenseI32ArrayAttr wgSizeAttr =
+        function->getAttrOfType<DenseI32ArrayAttr>("gfx.workgroup_size");
     auto *context = module.getContext();
     auto location = function.getLoc();
     SmallVector<func::FuncOp> reachable;
@@ -136,6 +139,7 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
                                           spirv::AddressingModel::Logical,
                                           spirv::MemoryModel::GLSL450, version);
     function->removeAttr("gfx.stage");
+    function->removeAttr("gfx.workgroup_size");
     for (auto helper : reachable)
       helper->moveBefore(shader.getBody(), shader.getBody()->end());
     for (auto helper :
@@ -196,6 +200,9 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       bool fragmentCoord =
           isa<BuiltinOp>(op) &&
           cast<BuiltinOp>(op).getKind() == Builtin::FragmentCoord;
+      bool globalInvocationId =
+          isa<BuiltinOp>(op) &&
+          cast<BuiltinOp>(op).getKind() == Builtin::GlobalInvocationId;
       if (fragmentCoord)
         type = VectorType::get({4}, builder.getF32Type());
       auto pointerType =
@@ -209,7 +216,10 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       if (isa<BuiltinOp>(op))
         variable->setAttr(
             "built_in",
-            builder.getStringAttr(fragmentCoord ? "FragCoord" : "VertexIndex"));
+            builder.getStringAttr(
+                fragmentCoord ? "FragCoord"
+                              : (globalInvocationId ? "GlobalInvocationId"
+                                                    : "VertexIndex")));
       else if (isa<PositionOp>(op))
         variable->setAttr("built_in", builder.getStringAttr("Position"));
       else {
@@ -269,15 +279,24 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
     }
     auto converted = shader.lookupSymbol<spirv::FuncOp>(entryName);
     builder.setInsertionPointToEnd(shader.getBody());
-    spirv::EntryPointOp::create(builder, location,
-                                stage == Stage::Vertex
-                                    ? spirv::ExecutionModel::Vertex
-                                    : spirv::ExecutionModel::Fragment,
-                                converted, interface);
+    spirv::ExecutionModel model;
+    if (stage == Stage::Vertex)
+      model = spirv::ExecutionModel::Vertex;
+    else if (stage == Stage::Fragment)
+      model = spirv::ExecutionModel::Fragment;
+    else
+      model = spirv::ExecutionModel::GLCompute;
+    spirv::EntryPointOp::create(builder, location, model, converted, interface);
     if (stage == Stage::Fragment)
       spirv::ExecutionModeOp::create(builder, location, converted,
                                      spirv::ExecutionMode::OriginUpperLeft,
                                      ArrayRef<int32_t>{});
+    else if (stage == Stage::Compute) {
+      if (wgSizeAttr)
+        spirv::ExecutionModeOp::create(builder, location, converted,
+                                       spirv::ExecutionMode::LocalSize,
+                                       wgSizeAttr.asArrayRef());
+    }
   }
 };
 
@@ -290,6 +309,8 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
       signalPassFailure();
       return;
     }
+    DenseI32ArrayAttr wgSizeAttr =
+        function->getAttrOfType<DenseI32ArrayAttr>("gfx.workgroup_size");
     SmallVector<func::FuncOp> reachable;
     if (failed(collectGraphicsFunctions(module, function, reachable))) {
       signalPassFailure();
@@ -373,22 +394,52 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
       SmallVector<Value> arguments{integer(input ? inputId++ : outputId++, 32),
                                    integer(0, 32), integer(0, 8)};
       if (input) {
-        arguments.push_back(
-            LLVM::UndefOp::create(builder, op->getLoc(), builder.getI32Type()));
         bool fragmentCoord =
             isa<BuiltinOp>(op) &&
             cast<BuiltinOp>(op).getKind() == Builtin::FragmentCoord;
-        Type loadType = fragmentCoord
-                            ? VectorType::get({4}, builder.getF32Type())
-                            : op->getResult(0).getType();
-        auto value = LLVM::CallIntrinsicOp::create(
-            builder, op->getLoc(), loadType,
-            builder.getStringAttr("llvm.dx.load.input"), arguments);
-        Value result = value.getResult(0);
-        if (fragmentCoord)
-          result = vector::ShuffleOp::create(builder, op->getLoc(), result,
-                                             result, ArrayRef<int64_t>{0, 1});
-        op->getResult(0).replaceAllUsesWith(result);
+        bool globalInvocationId =
+            isa<BuiltinOp>(op) &&
+            cast<BuiltinOp>(op).getKind() == Builtin::GlobalInvocationId;
+        if (globalInvocationId) {
+          Value id0 = LLVM::CallIntrinsicOp::create(
+                          builder, op->getLoc(), builder.getI32Type(),
+                          builder.getStringAttr("llvm.dx.thread.id"),
+                          ValueRange{integer(0, 32)})
+                          .getResult(0);
+          Value id1 = LLVM::CallIntrinsicOp::create(
+                          builder, op->getLoc(), builder.getI32Type(),
+                          builder.getStringAttr("llvm.dx.thread.id"),
+                          ValueRange{integer(1, 32)})
+                          .getResult(0);
+          Value id2 = LLVM::CallIntrinsicOp::create(
+                          builder, op->getLoc(), builder.getI32Type(),
+                          builder.getStringAttr("llvm.dx.thread.id"),
+                          ValueRange{integer(2, 32)})
+                          .getResult(0);
+          Value vec = LLVM::UndefOp::create(builder, op->getLoc(),
+                                            op->getResult(0).getType());
+          vec = LLVM::InsertElementOp::create(builder, op->getLoc(), vec, id0,
+                                              integer(0, 32));
+          vec = LLVM::InsertElementOp::create(builder, op->getLoc(), vec, id1,
+                                              integer(1, 32));
+          vec = LLVM::InsertElementOp::create(builder, op->getLoc(), vec, id2,
+                                              integer(2, 32));
+          op->getResult(0).replaceAllUsesWith(vec);
+        } else {
+          arguments.push_back(
+              LLVM::UndefOp::create(builder, op->getLoc(), builder.getI32Type()));
+          Type loadType = fragmentCoord
+                              ? VectorType::get({4}, builder.getF32Type())
+                              : op->getResult(0).getType();
+          auto value = LLVM::CallIntrinsicOp::create(
+              builder, op->getLoc(), loadType,
+              builder.getStringAttr("llvm.dx.load.input"), arguments);
+          Value result = value.getResult(0);
+          if (fragmentCoord)
+            result = vector::ShuffleOp::create(builder, op->getLoc(), result,
+                                               result, ArrayRef<int64_t>{0, 1});
+          op->getResult(0).replaceAllUsesWith(result);
+        }
       } else {
         arguments.push_back(op->getOperand(0));
         LLVM::CallIntrinsicOp::create(
@@ -398,11 +449,21 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
       op->erase();
     }
     function->removeAttr("gfx.stage");
-    module->setAttr(
-        "llvm.target_triple",
-        builder.getStringAttr(stage == Stage::Vertex
-                                  ? "dxil-pc-shadermodel6.6-vertex"
-                                  : "dxil-pc-shadermodel6.6-pixel"));
+    function->removeAttr("gfx.workgroup_size");
+    std::string triple;
+    if (stage == Stage::Vertex)
+      triple = "dxil-pc-shadermodel6.6-vertex";
+    else if (stage == Stage::Fragment)
+      triple = "dxil-pc-shadermodel6.6-pixel";
+    else
+      triple = "dxil-pc-shadermodel6.6-compute";
+    module->setAttr("llvm.target_triple", builder.getStringAttr(triple));
+    if (stage == Stage::Compute && wgSizeAttr) {
+      auto dims = wgSizeAttr.asArrayRef();
+      std::string numthreads =
+          llvm::formatv("{0},{1},{2}", dims[0], dims[1], dims[2]).str();
+      module->setAttr("hlsl.numthreads", builder.getStringAttr(numthreads));
+    }
   }
 };
 } // namespace
