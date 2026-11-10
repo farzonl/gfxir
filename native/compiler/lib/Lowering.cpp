@@ -15,6 +15,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVAttributes.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/SPIRV/Transforms/SPIRVConversion.h"
@@ -100,6 +101,10 @@ struct GfxVerifyPass : impl::GfxVerifyBase<GfxVerifyPass> {
 };
 
 struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
+  TargetProfile profile;
+  GfxToSPIRVPass() = default;
+  explicit GfxToSPIRVPass(const TargetProfile &profile) : profile(profile) {}
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
     func::FuncOp function;
@@ -131,13 +136,35 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       }
     });
     builder.setInsertionPointToStart(module.getBody());
+
+    bool enableBDA = profile.supportsCapability("PhysicalStorageBuffer64");
+    if (auto reqCaps = module->getAttrOfType<ArrayAttr>("gfx.required_capabilities")) {
+      for (auto cap : reqCaps) {
+        if (auto str = dyn_cast<StringAttr>(cap)) {
+          if (str.getValue().equals_insensitive("PhysicalStorageBuffer64"))
+            enableBDA = true;
+        }
+      }
+    }
+
+    spirv::AddressingModel addressingModel =
+        enableBDA ? spirv::AddressingModel::PhysicalStorageBuffer64
+                  : spirv::AddressingModel::Logical;
+
+    SmallVector<spirv::Capability, 4> capabilities = {spirv::Capability::Shader};
+    SmallVector<spirv::Extension, 2> extensions;
+    if (enableBDA) {
+      capabilities.push_back(spirv::Capability::PhysicalStorageBufferAddresses);
+      extensions.push_back(spirv::Extension::SPV_KHR_physical_storage_buffer);
+    }
+
     auto version = spirv::VerCapExtAttr::get(
-        spirv::Version::V_1_0, {spirv::Capability::Shader}, {}, context);
+        spirv::Version::V_1_0, capabilities, extensions, context);
     auto target = spirv::TargetEnvAttr::get(
         version, spirv::getDefaultResourceLimits(context),
         spirv::ClientAPI::Vulkan);
     auto shader = spirv::ModuleOp::create(builder, location,
-                                          spirv::AddressingModel::Logical,
+                                          addressingModel,
                                           spirv::MemoryModel::GLSL450, version);
     function->removeAttr("gfx.stage");
     function->removeAttr("gfx.workgroup_size");
@@ -272,6 +299,28 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       op->erase();
     }
     SPIRVTypeConverter converter(target);
+    converter.addConversion([&](gfx::PtrType ptrType) -> std::optional<Type> {
+      Type elemType = converter.convertType(ptrType.getElementType());
+      if (!elemType)
+        return std::nullopt;
+      spirv::StorageClass sc;
+      switch (ptrType.getStorageClass()) {
+      case StorageClass::Global:
+        sc = enableBDA ? spirv::StorageClass::PhysicalStorageBuffer
+                       : spirv::StorageClass::StorageBuffer;
+        break;
+      case StorageClass::Workgroup:
+        sc = spirv::StorageClass::Workgroup;
+        break;
+      case StorageClass::Private:
+        sc = spirv::StorageClass::Function;
+        break;
+      case StorageClass::PushConstant:
+        sc = spirv::StorageClass::PushConstant;
+        break;
+      }
+      return spirv::PointerType::get(elemType, sc);
+    });
     RewritePatternSet patterns(context);
     ScfToSPIRVContext scfContext;
     arith::populateArithToSPIRVPatterns(converter, patterns);
@@ -286,6 +335,19 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       signalPassFailure();
       return;
     }
+    shader.walk([&](spirv::FuncOp funcOp) {
+      for (unsigned i = 0; i < funcOp.getNumArguments(); ++i) {
+        Type argType = funcOp.getArgument(i).getType();
+        if (auto ptrType = dyn_cast<spirv::PointerType>(argType)) {
+          if (ptrType.getStorageClass() ==
+              spirv::StorageClass::PhysicalStorageBuffer) {
+            funcOp.setArgAttr(
+                i, spirv::DecorationAttr::name,
+                spirv::DecorationAttr::get(context, spirv::Decoration::Aliased));
+          }
+        }
+      }
+    });
     auto converted = shader.lookupSymbol<spirv::FuncOp>(entryName);
     builder.setInsertionPointToEnd(shader.getBody());
     spirv::ExecutionModel model;
@@ -310,6 +372,10 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
 };
 
 struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
+  TargetProfile profile;
+  GfxToLLVMPass() = default;
+  explicit GfxToLLVMPass(const TargetProfile &profile) : profile(profile) {}
+
   void runOnOperation() override {
     auto module = getOperation();
     func::FuncOp function;
@@ -333,6 +399,33 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
       if (helper != function)
         helper.setPrivate();
     OpBuilder builder(module.getContext());
+
+    auto convertGfxPtr = [&](Type t) -> Type {
+      if (auto ptr = dyn_cast<gfx::PtrType>(t)) {
+        unsigned addrSpace = 0;
+        switch (ptr.getStorageClass()) {
+        case StorageClass::Private: addrSpace = 0; break;
+        case StorageClass::Global: addrSpace = 1; break;
+        case StorageClass::PushConstant: addrSpace = 2; break;
+        case StorageClass::Workgroup: addrSpace = 3; break;
+        }
+        return LLVM::LLVMPointerType::get(module.getContext(), addrSpace);
+      }
+      return t;
+    };
+    for (auto fn : reachable) {
+      SmallVector<Type> newArgTypes;
+      for (auto arg : fn.getArguments()) {
+        Type newType = convertGfxPtr(arg.getType());
+        if (newType != arg.getType())
+          arg.setType(newType);
+        newArgTypes.push_back(arg.getType());
+      }
+      SmallVector<Type> newResTypes;
+      for (Type resType : fn.getResultTypes())
+        newResTypes.push_back(convertGfxPtr(resType));
+      fn.setType(builder.getFunctionType(newArgTypes, newResTypes));
+    }
     auto parameters =
         module->getAttrOfType<ParameterBlockAttr>("gfx.parameters");
     SmallVector<ParameterOp> reads;
@@ -483,15 +576,15 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
 std::unique_ptr<Pass> createGfxVerifyPass() {
   return std::make_unique<GfxVerifyPass>();
 }
-std::unique_ptr<Pass> createGfxToSPIRVPass() {
-  return std::make_unique<GfxToSPIRVPass>();
+std::unique_ptr<Pass> createGfxToSPIRVPass(const TargetProfile &profile) {
+  return std::make_unique<GfxToSPIRVPass>(profile);
 }
-std::unique_ptr<Pass> createGfxToLLVMPass() {
-  return std::make_unique<GfxToLLVMPass>();
+std::unique_ptr<Pass> createGfxToLLVMPass(const TargetProfile &profile) {
+  return std::make_unique<GfxToLLVMPass>(profile);
 }
 
-void buildDirectXPipeline(OpPassManager &manager) {
-  manager.addPass(createGfxToLLVMPass());
+void buildDirectXPipeline(OpPassManager &manager, const TargetProfile &profile) {
+  manager.addPass(createGfxToLLVMPass(profile));
   // Legalize vector-valued helper boundaries without unrolling shader loops.
   manager.addPass(createInlinerPass());
   manager.addPass(createSymbolDCEPass());

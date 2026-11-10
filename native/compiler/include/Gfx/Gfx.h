@@ -84,10 +84,20 @@ struct TargetProfile {
   static std::string formatShaderModel(uint32_t model);
 };
 
-std::unique_ptr<Pass> createGfxToSPIRVPass();
-std::unique_ptr<Pass> createGfxToLLVMPass();
+/// Returns the natural alignment in bytes for a supported type according to std430 rules.
+/// Returns 0 for unsupported or non-concrete types.
+uint32_t getNaturalAlignment(Type type);
+
+/// Returns the size in bytes for a supported scalar or vector type.
+uint32_t getTypeSize(Type type);
+
+/// Returns true if the type is a legal pointee type for !gfx.ptr.
+bool isValidPointeeType(Type type);
+
+std::unique_ptr<Pass> createGfxToSPIRVPass(const TargetProfile &profile = TargetProfile());
+std::unique_ptr<Pass> createGfxToLLVMPass(const TargetProfile &profile = TargetProfile());
 std::unique_ptr<Pass> createGfxVerifyPass();
-void buildDirectXPipeline(OpPassManager &manager);
+void buildDirectXPipeline(OpPassManager &manager, const TargetProfile &profile = TargetProfile());
 void registerGfxPipelines();
 #define GEN_PASS_REGISTRATION
 #include "Gfx/GfxPasses.h.inc"

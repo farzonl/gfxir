@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVTypes.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
@@ -15,6 +16,7 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::gfx;
@@ -43,6 +45,120 @@ void GfxDialect::initialize() {
       >();
 }
 
+uint32_t mlir::gfx::getTypeSize(Type type) {
+  if (!type)
+    return 0;
+  if (type.isF32() || type.isInteger(32))
+    return 4;
+  if (type.isF16() || type.isInteger(16))
+    return 2;
+  if (type.isF64() || type.isInteger(64))
+    return 8;
+  if (type.isInteger(8) || type.isInteger(1))
+    return 1;
+  if (auto vector = dyn_cast<VectorType>(type)) {
+    if (vector.getRank() == 1)
+      return vector.getNumElements() * getTypeSize(vector.getElementType());
+  }
+  return 0;
+}
+
+uint32_t mlir::gfx::getNaturalAlignment(Type type) {
+  if (!type)
+    return 0;
+  if (type.isF32() || type.isInteger(32))
+    return 4;
+  if (type.isF16() || type.isInteger(16))
+    return 2;
+  if (type.isF64() || type.isInteger(64))
+    return 8;
+  if (type.isInteger(8) || type.isInteger(1))
+    return 1;
+  if (auto vector = dyn_cast<VectorType>(type)) {
+    if (vector.getRank() != 1)
+      return 0;
+    uint32_t elemAlign = getNaturalAlignment(vector.getElementType());
+    if (elemAlign == 0)
+      return 0;
+    uint32_t numElements = vector.getNumElements();
+    // std430 alignment rules: vec2 = 2 * scalar, vec3 and vec4 = 4 * scalar
+    uint32_t factor = (numElements == 3 || numElements == 4) ? 4 : numElements;
+    return factor * elemAlign;
+  }
+  if (auto spirvStruct = dyn_cast<spirv::StructType>(type)) {
+    uint32_t maxAlign = 1;
+    for (Type member : spirvStruct.getElementTypes())
+      maxAlign = std::max(maxAlign, getNaturalAlignment(member));
+    return maxAlign;
+  }
+  if (auto llvmStruct = dyn_cast<LLVM::LLVMStructType>(type)) {
+    uint32_t maxAlign = 1;
+    for (Type member : llvmStruct.getBody())
+      maxAlign = std::max(maxAlign, getNaturalAlignment(member));
+    return maxAlign;
+  }
+  if (auto tuple = dyn_cast<TupleType>(type)) {
+    uint32_t maxAlign = 1;
+    for (Type member : tuple.getTypes())
+      maxAlign = std::max(maxAlign, getNaturalAlignment(member));
+    return maxAlign;
+  }
+  return 0;
+}
+
+bool mlir::gfx::isValidPointeeType(Type type) {
+  if (!type)
+    return false;
+  // Disallow nested pointers
+  if (isa<PtrType>(type))
+    return false;
+  // Disallow opaque resource handles
+  if (isa<HandleType>(type))
+    return false;
+  if (auto vector = dyn_cast<VectorType>(type)) {
+    if (vector.getRank() != 1)
+      return false;
+    uint32_t numElements = vector.getNumElements();
+    if (numElements < 2 || numElements > 4)
+      return false;
+    Type elem = vector.getElementType();
+    return elem.isF32() || elem.isInteger(32) || elem.isF16() ||
+           elem.isInteger(16) || elem.isF64() || elem.isInteger(64) ||
+           elem.isInteger(8) || elem.isInteger(1);
+  }
+  if (type.isF32() || type.isInteger(32) || type.isF16() ||
+      type.isInteger(16) || type.isF64() || type.isInteger(64) ||
+      type.isInteger(8) || type.isInteger(1))
+    return true;
+  if (isa<spirv::StructType, LLVM::LLVMStructType, TupleType>(type))
+    return true;
+  return false;
+}
+
+uint32_t PtrType::getEffectiveAlignment() const {
+  uint32_t explicitAlign = getAlignment();
+  return explicitAlign != 0 ? explicitAlign : getNaturalAlignment(getElementType());
+}
+
+LogicalResult PtrType::verify(function_ref<InFlightDiagnostic()> emitError,
+                              Type elementType, StorageClass storageClass,
+                              uint32_t alignment) {
+  if (!isValidPointeeType(elementType))
+    return emitError() << "pointer element type must be a valid shader data type, got "
+                       << elementType;
+
+  if (alignment != 0) {
+    if (!llvm::isPowerOf2_32(alignment))
+      return emitError() << "pointer alignment must be a power of two, got " << alignment;
+    uint32_t natural = getNaturalAlignment(elementType);
+    if (natural > 0 && alignment < natural)
+      return emitError() << "pointer alignment (" << alignment
+                         << ") is smaller than the natural alignment of pointee type ("
+                         << natural << ")";
+  }
+  return success();
+}
+
 void mlir::gfx::registerGfxDialects(DialectRegistry &registry) {
   registry
       .insert<GfxDialect, arith::ArithDialect, func::FuncDialect,
@@ -64,13 +180,31 @@ LogicalResult GfxDialect::verifyOperationAttribute(Operation *op,
                                                    NamedAttribute attribute) {
   if (attribute.getName() == "gfx.stage") {
     auto function = dyn_cast<func::FuncOp>(op);
-    if (!function || !isa<StageAttr>(attribute.getValue()))
+    auto stageAttr = dyn_cast<StageAttr>(attribute.getValue());
+    if (!function || !stageAttr)
       return op->emitOpError(
           "gfx.stage requires a typed stage attribute on func.func");
-    if (!function.getFunctionType().getInputs().empty() ||
-        !function.getFunctionType().getResults().empty())
-      return op->emitOpError("entry points use gfx interface operations, not "
-                             "host function arguments/results");
+    if (stageAttr.getValue() == Stage::Compute) {
+      if (!function.getFunctionType().getResults().empty())
+        return op->emitOpError("compute entry points must not have return values");
+      for (Type input : function.getFunctionType().getInputs()) {
+        if (!isa<PtrType>(input))
+          return op->emitOpError(
+              "compute entry point arguments must be device pointers");
+      }
+    } else {
+      for (Type input : function.getFunctionType().getInputs()) {
+        if (auto ptr = dyn_cast<PtrType>(input)) {
+          if (ptr.getStorageClass() == StorageClass::Workgroup)
+            return op->emitOpError(
+                "workgroup pointers are only allowed in compute entry points");
+        }
+      }
+      if (!function.getFunctionType().getInputs().empty() ||
+          !function.getFunctionType().getResults().empty())
+        return op->emitOpError("entry points use gfx interface operations, not "
+                               "host function arguments/results");
+    }
     if (function.isExternal())
       return op->emitOpError("entry points must have a body");
   } else if (attribute.getName() == "gfx.workgroup_size") {
@@ -301,6 +435,38 @@ LogicalResult mlir::gfx::verifyShaderModule(ModuleOp module,
           return failure();
       }
     }
+    for (Type argType : function.getArgumentTypes()) {
+      if (auto ptr = dyn_cast<PtrType>(argType)) {
+        if (ptr.getStorageClass() == StorageClass::Workgroup &&
+            stage.getValue() != Stage::Compute) {
+          return function.emitOpError(
+              "workgroup pointers are only allowed in compute entry points");
+        }
+      }
+    }
+    WalkResult ptrCheck = function.walk([&](Operation *op) {
+      auto checkType = [&](Type t) -> LogicalResult {
+        if (auto ptr = dyn_cast<PtrType>(t)) {
+          if (ptr.getStorageClass() == StorageClass::Workgroup &&
+              stage.getValue() != Stage::Compute) {
+            return op->emitOpError(
+                "workgroup pointers are only allowed in compute entry points");
+          }
+        }
+        return success();
+      };
+      for (Type operandType : op->getOperandTypes()) {
+        if (failed(checkType(operandType)))
+          return WalkResult::interrupt();
+      }
+      for (Type resultType : op->getResultTypes()) {
+        if (failed(checkType(resultType)))
+          return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (ptrCheck.wasInterrupted())
+      return failure();
     llvm::SmallDenseMap<int32_t, InputOp> inputs;
     llvm::SmallSet<int32_t, 8> outputs;
     unsigned positions = 0;

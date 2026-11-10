@@ -33,6 +33,114 @@ class Type(Enum):
         raise ValueError(f"Unsupported shader interface type: {name!r}.")
 
 
+class StorageClass(Enum):
+    GLOBAL = "global"
+    WORKGROUP = "workgroup"
+    PRIVATE = "private"
+    PUSH_CONSTANT = "push_constant"
+
+    @classmethod
+    def from_str(cls, value: str) -> StorageClass:
+        for sc in cls:
+            if sc.value == value:
+                return sc
+        raise ValueError(f"Invalid storage class: {value!r}")
+
+
+def natural_alignment(type: Type | str) -> int:
+    """Return natural alignment in bytes according to std430 rules."""
+    if isinstance(type, Type):
+        val = type.value
+    elif isinstance(type, str):
+        val = type
+    else:
+        raise TypeError(f"Expected Type or str, got {type!r}")
+
+    if val in ("f32", "i32", "si32", "u32"):
+        return 4
+    if val in ("f16", "i16", "si16", "u16"):
+        return 2
+    if val in ("f64", "i64", "si64", "u64"):
+        return 8
+    if val in ("i8", "si8", "u8", "i1", "bool"):
+        return 1
+    if val == "vector<2xf32>":
+        return 8
+    if val in ("vector<3xf32>", "vector<4xf32>"):
+        return 16
+    if val.startswith("vector<") and val.endswith(">"):
+        inner = val[7:-1]
+        parts = inner.split("x", 1)
+        if len(parts) == 2:
+            try:
+                count = int(parts[0])
+                elem_align = natural_alignment(parts[1])
+                factor = 4 if count in (3, 4) else count
+                return factor * elem_align
+            except (ValueError, TypeError):
+                pass
+    raise ValueError(f"Unsupported type for natural alignment: {type!r}")
+
+
+@dataclass(frozen=True)
+class PointerType:
+    element_type: Type | str
+    storage_class: StorageClass
+    alignment: int = field(default=0)
+    _explicit: bool = field(default=False, compare=False, hash=False, repr=False)
+
+    def __init__(
+        self,
+        element_type: Type | str,
+        storage_class: StorageClass,
+        alignment: int | None = None,
+    ):
+        if element_type is None:
+            raise TypeError("element_type cannot be None")
+        if not isinstance(element_type, (Type, str)):
+            raise TypeError(f"element_type must be a Type or str, got {type(element_type).__name__}")
+        if isinstance(element_type, str) and (
+            element_type.startswith("!gfx.ptr") or element_type.startswith("!gfx.handle")
+        ):
+            raise ValueError(f"Invalid pointee type: {element_type}")
+
+        if not isinstance(storage_class, StorageClass):
+            raise TypeError(
+                f"storage_class must be a StorageClass enum instance, got {type(storage_class).__name__}"
+            )
+
+        nat = natural_alignment(element_type)
+        if alignment is None:
+            align = nat
+            explicit = False
+        else:
+            if not isinstance(alignment, int) or isinstance(alignment, bool):
+                raise TypeError(f"alignment must be an integer, got {type(alignment).__name__}")
+            if alignment <= 0 or (alignment & (alignment - 1)) != 0:
+                raise ValueError(f"pointer alignment must be a power of two, got {alignment}")
+            if nat > 0 and alignment < nat:
+                raise ValueError(
+                    f"pointer alignment ({alignment}) is smaller than the natural alignment of pointee type ({nat})"
+                )
+            align = alignment
+            explicit = True
+
+        object.__setattr__(self, "element_type", element_type)
+        object.__setattr__(self, "storage_class", storage_class)
+        object.__setattr__(self, "alignment", align)
+        object.__setattr__(self, "_explicit", explicit)
+
+    def __str__(self) -> str:
+        elem_str = (
+            self.element_type.value
+            if isinstance(self.element_type, Type)
+            else str(self.element_type)
+        )
+        if self._explicit:
+            return f"!gfx.ptr<{elem_str}, {self.storage_class.value}, {self.alignment}>"
+        return f"!gfx.ptr<{elem_str}, {self.storage_class.value}>"
+
+
 @dataclass(frozen=True)
 class Node:
     op: str

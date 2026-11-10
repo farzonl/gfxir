@@ -170,9 +170,9 @@ int main(int argc, char **argv) {
   auto reflection = gfx::reflectShader(*module);
   manager.clear();
   if (target == "vulkan")
-    manager.addPass(gfx::createGfxToSPIRVPass());
+    manager.addPass(gfx::createGfxToSPIRVPass(profile));
   else
-    gfx::buildDirectXPipeline(manager);
+    gfx::buildDirectXPipeline(manager, profile);
   if (failed(manager.run(*module)) || failed(verify(*module)))
     return 1;
   if (!loweredOutput.empty() &&

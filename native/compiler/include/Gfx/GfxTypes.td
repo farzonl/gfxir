@@ -7,8 +7,13 @@ def Gfx_PtrType : TypeDef<Gfx_Dialect, "Ptr"> {
   let mnemonic = "ptr";
   let summary = "Typed device pointer; representation is selected by target legalization";
   let parameters = (ins "::mlir::Type":$elementType,
-                         EnumParameter<Gfx_StorageClass>:$storageClass);
-  let assemblyFormat = "`<` $elementType `,` $storageClass `>`";
+                        EnumParameter<Gfx_StorageClass>:$storageClass,
+                        DefaultValuedParameter<"uint32_t", "0">:$alignment);
+  let assemblyFormat = "`<` $elementType `,` $storageClass ( `,` $alignment^ )? `>`";
+  let genVerifyDecl = 1;
+  let extraClassDeclaration = [{
+    uint32_t getEffectiveAlignment() const;
+  }];
 }
 
 def Gfx_HandleType : TypeDef<Gfx_Dialect, "Handle"> {
