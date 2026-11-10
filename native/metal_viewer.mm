@@ -113,6 +113,8 @@ static NSDictionary* frameLayout(const std::string& path) {
 @property(nonatomic) BOOL live;
 @property(nonatomic) BOOL hasFixedTime;
 @property(nonatomic) double fixedTime;
+@property(nonatomic, strong) NSDictionary<NSString*, id<MTLRenderPipelineState>>* pipelines;
+@property(nonatomic, copy) NSArray<NSDictionary*>* draws;
 - (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry;
 - (void)encode:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass;
@@ -150,7 +152,6 @@ static NSDictionary* frameLayout(const std::string& path) {
 - (void)encode:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass {
     id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
     if (!encoder) throw failure(@"Cannot create a Metal render encoder");
-    [encoder setRenderPipelineState:self.pipeline];
     [encoder setCullMode:MTLCullModeNone];
     [encoder setDepthClipMode:MTLDepthClipModeClip];
     id<MTLTexture> texture = pass.colorAttachments[0].texture;
@@ -173,8 +174,55 @@ static NSDictionary* frameLayout(const std::string& path) {
     }
     [encoder setViewport:(MTLViewport){0, 0, static_cast<double>(texture.width),
         static_cast<double>(texture.height), 0, 1}];
-    IRRuntimeDrawPrimitives(encoder, MTLPrimitiveTypeTriangle, uint64_t{0},
-                           static_cast<uint64_t>(self.vertexCount));
+
+    if (!self.draws || self.draws.count == 0) {
+        [encoder setRenderPipelineState:self.pipeline];
+        IRRuntimeDrawPrimitives(encoder, MTLPrimitiveTypeTriangle, uint64_t{0},
+                               static_cast<uint64_t>(self.vertexCount));
+    } else {
+        id<MTLRenderPipelineState> currentPipeline = nil;
+        for (NSDictionary* draw in self.draws) {
+            NSString* pipeId = draw[@"pipeline"];
+            id<MTLRenderPipelineState> nextPipeline = (self.pipelines && pipeId) ? self.pipelines[pipeId] : self.pipeline;
+            if (!nextPipeline) nextPipeline = self.pipeline;
+            if (nextPipeline != currentPipeline) {
+                [encoder setRenderPipelineState:nextPipeline];
+                currentPipeline = nextPipeline;
+            }
+            NSData* perDrawBytes = draw[@"parameters"];
+            if (perDrawBytes && [perDrawBytes isKindOfClass:[NSData class]] && perDrawBytes.length > 0) {
+                [encoder setVertexBytes:perDrawBytes.bytes length:perDrawBytes.length atIndex:3];
+            } else if ([draw[@"constant_size"] unsignedIntegerValue] > 0) {
+                NSUInteger sz = [draw[@"constant_size"] unsignedIntegerValue];
+                std::vector<uint8_t> zeros(sz, 0);
+                [encoder setVertexBytes:zeros.data() length:sz atIndex:3];
+            }
+            NSString* drawType = draw[@"type"] ?: @"standard";
+            if ([drawType isEqualToString:@"indexed"]) {
+                uint64_t indexCount = [draw[@"index_count"] unsignedLongLongValue];
+                uint64_t instanceCount = [draw[@"instance_count"] unsignedLongLongValue] ?: 1;
+                uint64_t firstIndex = [draw[@"first_index"] unsignedLongLongValue];
+                int64_t vertexOffset = [draw[@"vertex_offset"] longLongValue];
+                uint64_t firstInstance = [draw[@"first_instance"] unsignedLongLongValue];
+                id<MTLBuffer> indexBuffer = draw[@"index_buffer"];
+                if (indexBuffer) {
+                    IRRuntimeDrawIndexedPrimitives(encoder, MTLPrimitiveTypeTriangle, indexCount,
+                                                   MTLIndexTypeUInt16, indexBuffer, firstIndex * 2,
+                                                   instanceCount, vertexOffset, firstInstance);
+                } else {
+                    IRRuntimeDrawPrimitives(encoder, MTLPrimitiveTypeTriangle,
+                                           firstIndex, indexCount, instanceCount, firstInstance);
+                }
+            } else {
+                uint64_t vCount = [draw[@"vertex_count"] unsignedLongLongValue] ?: self.vertexCount;
+                uint64_t firstVertex = [draw[@"first_vertex"] unsignedLongLongValue];
+                uint64_t instanceCount = [draw[@"instance_count"] unsignedLongLongValue] ?: 1;
+                uint64_t firstInstance = [draw[@"first_instance"] unsignedLongLongValue];
+                IRRuntimeDrawPrimitives(encoder, MTLPrimitiveTypeTriangle,
+                                       firstVertex, vCount, instanceCount, firstInstance);
+            }
+        }
+    }
     [encoder endEncoding];
 }
 
