@@ -12,15 +12,23 @@ from .compiler import (
     compile_pipeline,
 )
 from .frontend import (
+    AccessMode,
+    Buffer,
+    BufferBinding,
+    BufferType,
     Draw,
     FragmentCoord,
     Pipeline,
     PointerType,
+    ReflectedBufferBinding,
     StorageClass,
     Type,
     Value,
     Vertex,
+    compute,
+    f32,
     fragment,
+    global_invocation_id,
     i32,
     maximum,
     minimum,
@@ -37,10 +45,12 @@ from .parameters import FrameParameters, ParameterBlock, pack_parameters
 from . import shader_math, sdf
 
 __all__ = [
-    "CompileError", "DIRECTX_SM60", "DIRECTX_SM66", "Draw", "FragmentCoord", "FrameParameters",
+    "AccessMode", "Buffer", "BufferBinding", "BufferType", "CompileError",
+    "DIRECTX_SM60", "DIRECTX_SM66", "Draw", "FragmentCoord", "FrameParameters",
     "HIGH_END_COMPUTE", "MLIRPipeline", "PRESETS", "ParameterBlock", "Pipeline", "PointerType",
-    "StorageClass", "Target", "TargetProfile", "Toolchain", "Type", "VULKAN_PORTABLE_1_0",
-    "Value", "Vertex", "compile_pipeline", "fragment", "i32", "maximum", "minimum",
+    "ReflectedBufferBinding", "StorageClass", "Target", "TargetProfile", "Toolchain", "Type",
+    "VULKAN_PORTABLE_1_0", "Value", "Vertex", "compile_pipeline", "compute", "f32",
+    "fragment", "global_invocation_id", "i32", "maximum", "minimum",
     "natural_alignment", "select", "u32", "fullscreen_vertex", "sdf", "shader_math", "vec2",
     "vec3", "vec4", "vertex",
 ]

@@ -100,6 +100,83 @@ struct GfxVerifyPass : impl::GfxVerifyBase<GfxVerifyPass> {
   }
 };
 
+struct PtrOffsetPattern : OpConversionPattern<gfx::PtrOffsetOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(gfx::PtrOffsetOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Type resType = getTypeConverter()->convertType(op.getType());
+    if (!resType)
+      return failure();
+    Value ptr = adaptor.getPtr();
+    auto ptrType = dyn_cast<spirv::PointerType>(ptr.getType());
+    if (ptrType && isa<spirv::StructType>(ptrType.getPointeeType())) {
+      auto zero = spirv::ConstantOp::create(
+          rewriter, op.getLoc(), rewriter.getI32Type(),
+          rewriter.getI32IntegerAttr(0));
+      rewriter.replaceOpWithNewOp<spirv::AccessChainOp>(
+          op, resType, ptr, ValueRange{zero, adaptor.getOffset()});
+      return success();
+    }
+    if (auto accessChain = ptr.getDefiningOp<spirv::AccessChainOp>()) {
+      auto indices = accessChain.getIndices();
+      if (indices.size() == 2) {
+        Value prevOffset = indices[1];
+        Value addOffset = adaptor.getOffset();
+        if (prevOffset.getType() != addOffset.getType()) {
+          addOffset = spirv::BitcastOp::create(
+              rewriter, op.getLoc(), prevOffset.getType(), addOffset);
+        }
+        auto combinedOffset = spirv::IAddOp::create(
+            rewriter, op.getLoc(), prevOffset.getType(), prevOffset, addOffset);
+        rewriter.replaceOpWithNewOp<spirv::AccessChainOp>(
+            op, resType, accessChain.getBasePtr(),
+            ValueRange{indices[0], combinedOffset});
+        return success();
+      }
+    }
+    rewriter.replaceOpWithNewOp<spirv::PtrAccessChainOp>(
+        op, resType, adaptor.getPtr(), adaptor.getOffset(), ValueRange{});
+    return success();
+  }
+};
+
+struct LoadPattern : OpConversionPattern<gfx::LoadOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(gfx::LoadOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Type resType = getTypeConverter()->convertType(op.getType());
+    if (!resType)
+      return failure();
+    spirv::MemoryAccessAttr memAccess;
+    IntegerAttr alignmentAttr;
+    if (op.getAlignment().has_value()) {
+      memAccess = spirv::MemoryAccessAttr::get(
+          rewriter.getContext(), spirv::MemoryAccess::Aligned);
+      alignmentAttr = rewriter.getI32IntegerAttr(*op.getAlignment());
+    }
+    rewriter.replaceOpWithNewOp<spirv::LoadOp>(
+        op, resType, adaptor.getPtr(), memAccess, alignmentAttr);
+    return success();
+  }
+};
+
+struct StorePattern : OpConversionPattern<gfx::StoreOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(gfx::StoreOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    spirv::MemoryAccessAttr memAccess;
+    IntegerAttr alignmentAttr;
+    if (op.getAlignment().has_value()) {
+      memAccess = spirv::MemoryAccessAttr::get(
+          rewriter.getContext(), spirv::MemoryAccess::Aligned);
+      alignmentAttr = rewriter.getI32IntegerAttr(*op.getAlignment());
+    }
+    rewriter.replaceOpWithNewOp<spirv::StoreOp>(
+        op, adaptor.getPtr(), adaptor.getValue(), memAccess, alignmentAttr);
+    return success();
+  }
+};
+
 struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
   TargetProfile profile;
   GfxToSPIRVPass() = default;
@@ -151,11 +228,51 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
         enableBDA ? spirv::AddressingModel::PhysicalStorageBuffer64
                   : spirv::AddressingModel::Logical;
 
+    bool usesStorageBuffer = false;
+    bool usesVariablePointers = false;
+    if (!enableBDA) {
+      auto checkPtrType = [&](Type type) {
+        if (auto ptrType = dyn_cast<PtrType>(type)) {
+          if (ptrType.getStorageClass() == StorageClass::Global)
+            usesStorageBuffer = true;
+        }
+      };
+      for (auto func : reachable) {
+        for (Type argType : func.getArgumentTypes())
+          checkPtrType(argType);
+        for (Type resType : func.getResultTypes())
+          checkPtrType(resType);
+        func.walk([&](Operation *op) {
+          for (Type opType : op->getOperandTypes())
+            checkPtrType(opType);
+          for (Type resType : op->getResultTypes())
+            checkPtrType(resType);
+          if (auto offsetOp = dyn_cast<PtrOffsetOp>(op)) {
+            Value root = offsetOp.getPtr();
+            while (auto parentOffset = root.getDefiningOp<PtrOffsetOp>())
+              root = parentOffset.getPtr();
+            if (!root.getDefiningOp<BufferBindingOp>())
+              usesVariablePointers = true;
+          }
+        });
+      }
+    }
+
     SmallVector<spirv::Capability, 4> capabilities = {spirv::Capability::Shader};
     SmallVector<spirv::Extension, 2> extensions;
     if (enableBDA) {
       capabilities.push_back(spirv::Capability::PhysicalStorageBufferAddresses);
       extensions.push_back(spirv::Extension::SPV_KHR_physical_storage_buffer);
+    } else {
+      if (usesVariablePointers) {
+        capabilities.push_back(spirv::Capability::VariablePointers);
+        capabilities.push_back(spirv::Capability::VariablePointersStorageBuffer);
+        extensions.push_back(spirv::Extension::SPV_KHR_variable_pointers);
+      }
+      if (usesStorageBuffer) {
+        extensions.push_back(
+            spirv::Extension::SPV_KHR_storage_buffer_storage_class);
+      }
     }
 
     auto version = spirv::VerCapExtAttr::get(
@@ -321,8 +438,40 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       }
       return spirv::PointerType::get(elemType, sc);
     });
+    SmallVector<BufferBindingOp> bufferBindings;
+    shader.walk([&](BufferBindingOp op) { bufferBindings.push_back(op); });
+    for (auto op : bufferBindings) {
+      auto ptrType = cast<PtrType>(op.getResult().getType());
+      Type elemType = converter.convertType(ptrType.getElementType());
+      if (!elemType)
+        elemType = ptrType.getElementType();
+      uint32_t byteSize = 4;
+      if (auto vecType = dyn_cast<VectorType>(elemType)) {
+        byteSize = vecType.getNumElements() * (vecType.getElementTypeBitWidth() / 8);
+      } else if (elemType.isIntOrFloat()) {
+        byteSize = elemType.getIntOrFloatBitWidth() / 8;
+      }
+      auto rtArray = spirv::RuntimeArrayType::get(elemType, byteSize);
+      auto structType = spirv::StructType::get(
+          {rtArray}, {0}, {},
+          {spirv::StructType::StructDecorationInfo(spirv::Decoration::Block,
+                                                   builder.getUnitAttr())});
+      auto varPtrType =
+          spirv::PointerType::get(structType, spirv::StorageClass::StorageBuffer);
+      builder.setInsertionPoint(function);
+      auto var = spirv::GlobalVariableOp::create(builder, op.getLoc(),
+                                                 varPtrType, op.getName());
+      var->setAttr("descriptor_set", builder.getI32IntegerAttr(op.getSet()));
+      var->setAttr("binding", builder.getI32IntegerAttr(op.getBinding()));
+      symbols.insert(var);
+      builder.setInsertionPoint(op);
+      auto addr = spirv::AddressOfOp::create(builder, op.getLoc(), var);
+      op.getResult().replaceAllUsesWith(addr);
+      op.erase();
+    }
     RewritePatternSet patterns(context);
     ScfToSPIRVContext scfContext;
+    patterns.add<PtrOffsetPattern, LoadPattern, StorePattern>(converter, context);
     arith::populateArithToSPIRVPatterns(converter, patterns);
     populateMathToSPIRVPatterns(converter, patterns);
     populateVectorToSPIRVPatterns(converter, patterns);
@@ -400,7 +549,7 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
         helper.setPrivate();
     OpBuilder builder(module.getContext());
 
-    auto convertGfxPtr = [&](Type t) -> Type {
+    std::function<Type(Type)> convertGfxPtr = [&](Type t) -> Type {
       if (auto ptr = dyn_cast<gfx::PtrType>(t)) {
         unsigned addrSpace = 0;
         switch (ptr.getStorageClass()) {
@@ -410,6 +559,15 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
         case StorageClass::Workgroup: addrSpace = 3; break;
         }
         return LLVM::LLVMPointerType::get(module.getContext(), addrSpace);
+      }
+      if (auto intType = dyn_cast<IntegerType>(t)) {
+        if (!intType.isSignless())
+          return builder.getIntegerType(intType.getWidth());
+      }
+      if (auto vecType = dyn_cast<VectorType>(t)) {
+        Type convertedElem = convertGfxPtr(vecType.getElementType());
+        if (convertedElem != vecType.getElementType())
+          return VectorType::get(vecType.getShape(), convertedElem);
       }
       return t;
     };
@@ -550,6 +708,125 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
       }
       op->erase();
     }
+    SmallVector<Operation *> bufferOps;
+    module.walk([&](Operation *op) {
+      if (isa<BufferBindingOp, PtrOffsetOp, LoadOp, StoreOp>(op))
+        bufferOps.push_back(op);
+    });
+    for (Operation *op : bufferOps) {
+      builder.setInsertionPoint(op);
+      if (auto binding = dyn_cast<BufferBindingOp>(op)) {
+        auto gfxPtrType = cast<gfx::PtrType>(binding.getResult().getType());
+        Type elemType = convertGfxPtr(gfxPtrType.getElementType());
+        int32_t isWriteable = (binding.getAccess() == AccessMode::ReadOnly) ? 0 : 1;
+        int32_t isROV = 0;
+        auto handleType = LLVM::LLVMTargetExtType::get(
+            module.getContext(), "dx.RawBuffer",
+            ArrayRef<Type>{elemType},
+            ArrayRef<unsigned int>{static_cast<unsigned int>(isWriteable),
+                                   static_cast<unsigned int>(isROV)});
+        auto integer = [&](uint32_t value) -> Value {
+          return LLVM::ConstantOp::create(builder, op->getLoc(),
+                                          builder.getI32Type(),
+                                          builder.getI32IntegerAttr(value));
+        };
+        auto pointerType = LLVM::LLVMPointerType::get(module.getContext());
+        auto nullVal = LLVM::ZeroOp::create(builder, op->getLoc(), pointerType);
+        auto handle = LLVM::CallIntrinsicOp::create(
+            builder, op->getLoc(), handleType,
+            builder.getStringAttr("llvm.dx.resource.handlefrombinding"),
+            ValueRange{integer(binding.getSet()),
+                       integer(binding.getBinding()),
+                       integer(1), integer(0), nullVal});
+        auto resPtrType = LLVM::LLVMPointerType::get(module.getContext(), 1);
+        auto pointer = LLVM::CallIntrinsicOp::create(
+            builder, op->getLoc(), resPtrType,
+            builder.getStringAttr("llvm.dx.resource.getpointer"),
+            ValueRange{handle.getResult(0), integer(0)});
+        op->getResult(0).replaceAllUsesWith(pointer.getResult(0));
+        op->erase();
+      } else if (isa<PtrOffsetOp>(op)) {
+        Value ptr = op->getOperand(0);
+        Value offsetVal = op->getOperand(1);
+        if (isa<IndexType>(offsetVal.getType())) {
+          offsetVal = arith::IndexCastOp::create(
+              builder, op->getLoc(), builder.getI32Type(), offsetVal);
+        } else if (auto intType = dyn_cast<IntegerType>(offsetVal.getType())) {
+          bool isUnsigned = intType.isUnsigned();
+          unsigned width = intType.getWidth();
+          if (!intType.isSignless()) {
+            Type signlessType = builder.getIntegerType(width);
+            offsetVal = UnrealizedConversionCastOp::create(
+                builder, op->getLoc(), TypeRange{signlessType},
+                ValueRange{offsetVal}).getResult(0);
+          }
+          if (width > 32) {
+            offsetVal = LLVM::TruncOp::create(
+                builder, op->getLoc(), builder.getI32Type(), offsetVal);
+          } else if (width < 32) {
+            if (isUnsigned) {
+              offsetVal = LLVM::ZExtOp::create(
+                  builder, op->getLoc(), builder.getI32Type(), offsetVal);
+            } else {
+              offsetVal = LLVM::SExtOp::create(
+                  builder, op->getLoc(), builder.getI32Type(), offsetVal);
+            }
+          }
+        }
+        auto gfxPtrType = cast<PtrType>(op->getResult(0).getType());
+        Type elemType = convertGfxPtr(gfxPtrType.getElementType());
+        Type resPtrType = convertGfxPtr(gfxPtrType);
+        if (ptr.getType() != resPtrType) {
+          ptr = UnrealizedConversionCastOp::create(
+              builder, op->getLoc(), TypeRange{resPtrType},
+              ValueRange{ptr}).getResult(0);
+        }
+        auto gep = LLVM::GEPOp::create(
+            builder, op->getLoc(), resPtrType, elemType,
+            ptr, ArrayRef<LLVM::GEPArg>{offsetVal});
+        op->getResult(0).replaceAllUsesWith(gep);
+        op->erase();
+      } else if (auto load = dyn_cast<LoadOp>(op)) {
+        Value ptr = op->getOperand(0);
+        Type expectedPtrType = convertGfxPtr(ptr.getType());
+        if (ptr.getType() != expectedPtrType) {
+          ptr = UnrealizedConversionCastOp::create(
+              builder, op->getLoc(), TypeRange{expectedPtrType},
+              ValueRange{ptr}).getResult(0);
+        }
+        Type elemType = convertGfxPtr(load.getResult().getType());
+        uint64_t align = load.getAlignment().value_or(0);
+        auto llvmLoad = LLVM::LoadOp::create(
+            builder, op->getLoc(), elemType, ptr, align);
+        Value resVal = llvmLoad.getResult();
+        if (resVal.getType() != load.getResult().getType()) {
+          resVal = UnrealizedConversionCastOp::create(
+              builder, op->getLoc(), TypeRange{load.getResult().getType()},
+              ValueRange{resVal}).getResult(0);
+        }
+        load.getResult().replaceAllUsesWith(resVal);
+        op->erase();
+      } else if (auto store = dyn_cast<StoreOp>(op)) {
+        Value val = op->getOperand(0);
+        Value ptr = op->getOperand(1);
+        uint64_t align = store.getAlignment().value_or(0);
+        Type expectedElem = convertGfxPtr(val.getType());
+        if (val.getType() != expectedElem) {
+          val = UnrealizedConversionCastOp::create(
+              builder, op->getLoc(), TypeRange{expectedElem},
+              ValueRange{val}).getResult(0);
+        }
+        Type expectedPtrType = convertGfxPtr(ptr.getType());
+        if (ptr.getType() != expectedPtrType) {
+          ptr = UnrealizedConversionCastOp::create(
+              builder, op->getLoc(), TypeRange{expectedPtrType},
+              ValueRange{ptr}).getResult(0);
+        }
+        LLVM::StoreOp::create(
+            builder, op->getLoc(), val, ptr, align);
+        op->erase();
+      }
+    }
     function->removeAttr("gfx.stage");
     function->removeAttr("gfx.workgroup_size");
     function->removeAttr("gfx.shared_memory_bytes");
@@ -603,6 +880,10 @@ void registerGfxPipelines() {
       "gfx-to-directx",
       "Lower gfx and standard operations to LLVM DirectX intrinsics",
       [](OpPassManager &manager) { buildDirectXPipeline(manager); });
+  PassPipelineRegistration<>(
+      "gfx-to-vulkan",
+      "Lower gfx and standard operations to SPIR-V Vulkan",
+      [](OpPassManager &manager) { manager.addPass(createGfxToSPIRVPass()); });
 }
 
 std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
@@ -617,18 +898,44 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
     return {};
   }
   const char *shaderKind = "pixel";
-  if (reflection.stage == Stage::Vertex)
+  if (reflection.stage == Stage::Vertex) {
     shaderKind = "vertex";
-  else if (reflection.stage == Stage::Compute)
+  } else if (reflection.stage == Stage::Compute) {
     shaderKind = "compute";
+    if (auto wgAttr = module->getAttrOfType<DenseI32ArrayAttr>("gfx.workgroup_size")) {
+      auto dims = wgAttr.asArrayRef();
+      std::string numthreads = llvm::formatv("{0},{1},{2}", dims[0], dims[1], dims[2]).str();
+      function->addFnAttr("hlsl.numthreads", numthreads);
+    } else if (auto numthreadsAttr = module->getAttrOfType<StringAttr>("hlsl.numthreads")) {
+      function->addFnAttr("hlsl.numthreads", numthreadsAttr.getValue());
+    } else {
+      function->addFnAttr("hlsl.numthreads", "1,1,1");
+    }
+  }
   function->addFnAttr("hlsl.shader", shaderKind);
   bool vertex = reflection.stage == Stage::Vertex;
+  SmallVector<llvm::hlsl::rootsig::RootElement> elements;
   if (reflection.parameters) {
     namespace rootsig = llvm::hlsl::rootsig;
     rootsig::RootConstants constants{
         parameterLayout(reflection.parameters).size / 4,
         {rootsig::RegisterType::BReg, 0}};
-    SmallVector<rootsig::RootElement> elements{constants};
+    elements.push_back(constants);
+  }
+  for (const auto &buf : reflection.buffers) {
+    namespace rootsig = llvm::hlsl::rootsig;
+    auto regType = (buf.access == AccessMode::ReadOnly) ? rootsig::RegisterType::TReg
+                                                        : rootsig::RegisterType::UReg;
+    rootsig::RootDescriptor desc;
+    desc.Type = (buf.access == AccessMode::ReadOnly) ? llvm::dxil::ResourceClass::SRV
+                                                     : llvm::dxil::ResourceClass::UAV;
+    desc.Reg = rootsig::Register{regType, static_cast<uint32_t>(buf.binding)};
+    desc.Space = static_cast<uint32_t>(buf.set);
+    desc.setDefaultFlags(llvm::dxbc::RootSignatureVersion::V1_1);
+    elements.push_back(desc);
+  }
+  if (!elements.empty()) {
+    namespace rootsig = llvm::hlsl::rootsig;
     auto signature =
         rootsig::MetadataBuilder(*translated, elements).BuildRootSignature();
     auto version = llvm::ConstantAsMetadata::get(
@@ -639,52 +946,54 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
                                         signature, version}));
   }
   SmallVector<llvm::Metadata *> inputs, outputs;
-  auto signatures = [&](ArrayRef<InterfaceElement> descriptions,
-                        SmallVectorImpl<llvm::Metadata *> &elements,
-                        bool input) {
-    unsigned id = 0;
-    for (const auto &io : descriptions) {
-      auto builtinKind = std::get_if<Builtin>(&io.binding);
-      bool position = std::holds_alternative<PositionBinding>(io.binding) ||
-                      (builtinKind && *builtinKind == Builtin::FragmentCoord);
-      bool builtin = position || std::holds_alternative<Builtin>(io.binding);
-      auto boundLocation = std::get_if<int32_t>(&io.binding);
-      uint32_t location = boundLocation ? *boundLocation : 0;
-      auto kind = builtin ? (position ? llvm::dxbc::PSV::SemanticKind::Position
-                                      : llvm::dxbc::PSV::SemanticKind::VertexID)
-                          : (!vertex && !input
-                                 ? llvm::dxbc::PSV::SemanticKind::Target
-                                 : llvm::dxbc::PSV::SemanticKind::Arbitrary);
-      StringRef semantic = builtin
-                               ? (position ? "SV_Position" : "SV_VertexID")
-                               : (!vertex && !input ? "SV_Target" : "TEXCOORD");
-      auto vector = dyn_cast<VectorType>(io.type);
-      auto scalar = vector ? vector.getElementType() : io.type;
-      auto component = scalar.isInteger(32) ? llvm::dxil::ElementType::U32
-                                            : llvm::dxil::ElementType::F32;
-      uint8_t columns = position ? 4 : vector ? vector.getNumElements() : 1;
-      llvm::hlsl::SemanticSignatureElement element(id++, semantic, component,
-                                                   kind, {location}, columns);
-      element.StartRow =
-          builtin ? 0 : (vertex || input ? location + 1 : location);
-      element.StartCol = 0;
-      auto mode = io.interpolation == Interpolation::Flat
-                      ? llvm::dxbc::PSV::InterpolationMode::Constant
-                  : io.interpolation == Interpolation::NoPerspective
-                      ? llvm::dxbc::PSV::InterpolationMode::LinearNoperspective
-                      : llvm::dxbc::PSV::InterpolationMode::Linear;
-      llvm::Triple::EnvironmentType stageEnv =
-          vertex ? llvm::Triple::Vertex
-                 : (reflection.stage == Stage::Compute ? llvm::Triple::Compute
-                                                       : llvm::Triple::Pixel);
-      element.InterpMode = llvm::hlsl::normalizeInterpolationMode(
-          mode, component, kind, stageEnv,
-          input ? llvm::hlsl::IOType::In : llvm::hlsl::IOType::Out);
-      elements.push_back(element.toMetadata(context));
-    }
-  };
-  signatures(reflection.inputs, inputs, true);
-  signatures(reflection.outputs, outputs, false);
+  if (reflection.stage != Stage::Compute) {
+    auto signatures = [&](ArrayRef<InterfaceElement> descriptions,
+                          SmallVectorImpl<llvm::Metadata *> &elements,
+                          bool input) {
+      unsigned id = 0;
+      for (const auto &io : descriptions) {
+        auto builtinKind = std::get_if<Builtin>(&io.binding);
+        bool position = std::holds_alternative<PositionBinding>(io.binding) ||
+                        (builtinKind && *builtinKind == Builtin::FragmentCoord);
+        bool builtin = position || std::holds_alternative<Builtin>(io.binding);
+        auto boundLocation = std::get_if<int32_t>(&io.binding);
+        uint32_t location = boundLocation ? *boundLocation : 0;
+        auto kind = builtin ? (position ? llvm::dxbc::PSV::SemanticKind::Position
+                                        : llvm::dxbc::PSV::SemanticKind::VertexID)
+                            : (!vertex && !input
+                                   ? llvm::dxbc::PSV::SemanticKind::Target
+                                   : llvm::dxbc::PSV::SemanticKind::Arbitrary);
+        StringRef semantic = builtin
+                                 ? (position ? "SV_Position" : "SV_VertexID")
+                                 : (!vertex && !input ? "SV_Target" : "TEXCOORD");
+        auto vector = dyn_cast<VectorType>(io.type);
+        auto scalar = vector ? vector.getElementType() : io.type;
+        auto component = scalar.isInteger(32) ? llvm::dxil::ElementType::U32
+                                              : llvm::dxil::ElementType::F32;
+        uint8_t columns = position ? 4 : vector ? vector.getNumElements() : 1;
+        llvm::hlsl::SemanticSignatureElement element(id++, semantic, component,
+                                                     kind, {location}, columns);
+        element.StartRow =
+            builtin ? 0 : (vertex || input ? location + 1 : location);
+        element.StartCol = 0;
+        auto mode = io.interpolation == Interpolation::Flat
+                        ? llvm::dxbc::PSV::InterpolationMode::Constant
+                    : io.interpolation == Interpolation::NoPerspective
+                        ? llvm::dxbc::PSV::InterpolationMode::LinearNoperspective
+                        : llvm::dxbc::PSV::InterpolationMode::Linear;
+        llvm::Triple::EnvironmentType stageEnv =
+            vertex ? llvm::Triple::Vertex
+                   : (reflection.stage == Stage::Compute ? llvm::Triple::Compute
+                                                         : llvm::Triple::Pixel);
+        element.InterpMode = llvm::hlsl::normalizeInterpolationMode(
+            mode, component, kind, stageEnv,
+            input ? llvm::hlsl::IOType::In : llvm::hlsl::IOType::Out);
+        elements.push_back(element.toMetadata(context));
+      }
+    };
+    signatures(reflection.inputs, inputs, true);
+    signatures(reflection.outputs, outputs, false);
+  }
   translated->getOrInsertNamedMetadata("dx.semantic.signatures")
       ->addOperand(
           llvm::MDNode::get(context, {llvm::ValueAsMetadata::get(function),

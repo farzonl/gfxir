@@ -5,7 +5,8 @@ include "mlir/IR/AttrTypeBase.td"
 
 def Gfx_PtrType : TypeDef<Gfx_Dialect, "Ptr"> {
   let mnemonic = "ptr";
-  let summary = "Typed device pointer; representation is selected by target legalization";
+  let summary = "!gfx.ptr";
+  let description = "Typed device pointer; representation is selected by target legalization";
   let parameters = (ins "::mlir::Type":$elementType,
                         EnumParameter<Gfx_StorageClass>:$storageClass,
                         DefaultValuedParameter<"uint32_t", "0">:$alignment);

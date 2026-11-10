@@ -298,6 +298,78 @@ class CompilerTests(unittest.TestCase):
                     self.assertTrue((manifest.parent / entry["binary"]).is_file())
                 self.assertFalse(any(path.suffix in {".metal", ".hlsl", ".glsl"} for path in manifest.parent.iterdir()))
 
+    def test_compute_pipeline_directx_executes_llc_and_dxv_for_both_dxil_and_ll(self):
+        from mlir_gpu import Buffer, compute
+        @compute(workgroup_size=(64, 1, 1))
+        def dummy_compute(buf: Buffer[Type.F32, "read_only"]):
+            pass
+
+        names = ["gfx-compile", "llc", "dxv"]
+        for suffix in (".dxil", ".ll"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as work:
+                calls = []
+                def tool(arguments):
+                    calls.append(arguments)
+                    if arguments[0] == "gfx-compile":
+                        idx = arguments.index("--output")
+                        Path(arguments[idx + 1]).write_text("compute ll text")
+                        idx_ref = arguments.index("--reflection")
+                        Path(arguments[idx_ref + 1]).write_text(json.dumps({"stage": "compute", "name": "dummy_compute", "buffers": []}))
+                    elif arguments[0] == "llc":
+                        idx = arguments.index("-o")
+                        Path(arguments[idx + 1]).write_bytes(b"DXBC" + b"\x00" * 28)
+                    elif arguments[0] == "dxv":
+                        idx = arguments.index("-o")
+                        Path(arguments[idx + 1]).write_bytes(b"DXBC" + b"\x00" * 28)
+                    return ""
+
+                with patch.object(Toolchain, "preflight", return_value={name: name for name in names}):
+                    with patch("mlir_gpu.compiler._run", side_effect=tool):
+                        out_file = Path(work) / f"comp{suffix}"
+                        manifest = compile_pipeline(dummy_compute, Target.DIRECTX, out_file)
+                self.assertTrue(out_file.is_file())
+                cmds = [args[0] for args in calls]
+                self.assertEqual(cmds.count("gfx-compile"), 1)
+                self.assertEqual(cmds.count("llc"), 1)
+                self.assertEqual(cmds.count("dxv"), 1)
+
+    def test_compute_pipeline_rejects_mismatched_output_suffixes(self):
+        from mlir_gpu import Buffer, compute
+        @compute(workgroup_size=(64, 1, 1))
+        def dummy_compute(buf: Buffer[Type.F32, "read_only"]):
+            pass
+
+        with patch.object(Toolchain, "preflight", return_value={"gfx-compile": "gfx-compile"}), tempfile.TemporaryDirectory() as work:
+            with self.assertRaisesRegex(CompileError, "Target.VULKAN compute output must have '.spv' extension"):
+                compile_pipeline(dummy_compute, Target.VULKAN, Path(work) / "test.dxil")
+            with self.assertRaisesRegex(CompileError, "Target.DIRECTX compute output must have '.dxil' or '.ll' extension"):
+                compile_pipeline(dummy_compute, Target.DIRECTX, Path(work) / "test.spv")
+            with self.assertRaisesRegex(CompileError, "Target.METAL compute output must have '.metallib' extension"):
+                compile_pipeline(dummy_compute, Target.METAL, Path(work) / "test.spv")
+
+    def test_compute_pipeline_llc_failure_not_masked_by_ll_output(self):
+        from mlir_gpu import Buffer, compute
+        @compute(workgroup_size=(64, 1, 1))
+        def dummy_compute(buf: Buffer[Type.F32, "read_only"]):
+            pass
+
+        names = ["gfx-compile", "llc", "dxv"]
+        with tempfile.TemporaryDirectory() as work:
+            def tool(arguments):
+                if arguments[0] == "gfx-compile":
+                    idx = arguments.index("--output")
+                    Path(arguments[idx + 1]).write_text("compute ll text")
+                    idx_ref = arguments.index("--reflection")
+                    Path(arguments[idx_ref + 1]).write_text(json.dumps({"stage": "compute", "name": "dummy_compute", "buffers": []}))
+                elif arguments[0] == "llc":
+                    raise CompileError("llc failed with Assertion failed: hasUseList()")
+                return ""
+
+            with patch.object(Toolchain, "preflight", return_value={name: name for name in names}):
+                with patch("mlir_gpu.compiler._run", side_effect=tool):
+                    with self.assertRaisesRegex(CompileError, "hasUseList"):
+                        compile_pipeline(dummy_compute, Target.DIRECTX, Path(work) / "comp.ll")
+
 
 
 

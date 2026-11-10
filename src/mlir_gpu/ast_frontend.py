@@ -81,12 +81,14 @@ class _Builder:
         if node.op in ("input", "ssa"):
             raise ValueError("A stage cannot capture another stage's device input or a region-local SSA value.")
         args = [self.emit(arg) for arg in node.args]
-        typ = node.type.schema_name
+        typ = node.type.schema_name if isinstance(node.type, Type) else str(node.type)
         attrs = None
         floating = node.args and node.args[0].type in (Type.F32, Type.VEC2, Type.VEC3, Type.VEC4)
         signed = node.args and node.args[0].type == Type.I32
         if node.op == "constant":
             op, attrs = "arith.constant", {"value": {"kind": "literal", "type": typ, "value": node.literal}}
+        elif node.op == "builtin":
+            op, attrs = "gfx.builtin", {"kind": {"kind": "builtin", "value": node.literal}}
         elif node.op in ("vec2", "vec3", "vec4"):
             op = "vector.from_elements"
         elif node.op == "extract":
@@ -120,8 +122,33 @@ class _Builder:
         return ref
 
 
+def _mlir_element_type(elem_type: Any) -> str:
+    if isinstance(elem_type, Type):
+        if elem_type in (Type.I32, Type.U32):
+            return "i32"
+        return elem_type.value
+    return str(getattr(elem_type, "schema_name", elem_type))
+
+
+@dataclass(frozen=True)
+class _BufferProxy:
+    name: str
+    ref: _Ref
+    ptr: Value
+    element_type: Any
+    access: Any
+    set: int = 0
+    binding: int = 0
+    shape: tuple[int, ...] | None = None
+    alignment: int | None = None
+
+    @property
+    def element_schema_name(self) -> str:
+        return _mlir_element_type(self.element_type)
+
+
 class ASTLowering:
-    def __init__(self, function, inputs, interfaces, parameters=None):
+    def __init__(self, function, inputs, interfaces, parameters=None, workgroup_size=None):
         self.serial = 0
         self.owned = set()
         self.nodes = {id(node): node for node in inputs}
@@ -131,6 +158,7 @@ class ASTLowering:
         self.file = function.__code__.co_filename
         self.line = function.__code__.co_firstlineno
         self.column = 1
+        self.workgroup_size = workgroup_size
         self.builder = _Builder(self)
         self.root = self.builder
         for node, interface in zip(inputs, interfaces):
@@ -149,9 +177,72 @@ class ASTLowering:
         if blocks and any(block != blocks[0] for block in blocks):
             self.fail("This parameter ABI supports one matching block per shader module.")
         self.parameters = blocks[0] if blocks else None
+
+        from .frontend import BufferBinding, BufferType, AccessMode, resolve_annotation
+        self.buffer_bindings = {}
+        binding_counter = 0
+        for parameter in inspect.signature(function).parameters.values():
+            annotation = resolve_annotation(function, parameter.annotation)
+            if isinstance(annotation, BufferType):
+                annotation = BufferBinding(
+                    element_type=annotation.element_type,
+                    access=annotation.access,
+                    storage_class=annotation.storage_class,
+                    set=annotation.set,
+                    binding=annotation.binding,
+                    shape=annotation.shape,
+                    alignment=annotation.alignment,
+                )
+            if isinstance(annotation, BufferBinding):
+                b_idx = annotation.binding if annotation.binding is not None else binding_counter
+                binding_counter = max(binding_counter + 1, b_idx + 1)
+                self.buffer_bindings[parameter.name] = BufferBinding(
+                    element_type=annotation.element_type,
+                    access=annotation.access,
+                    storage_class=annotation.storage_class,
+                    set=annotation.set,
+                    binding=b_idx,
+                    name=parameter.name,
+                    shape=annotation.shape,
+                    alignment=annotation.alignment,
+                )
+
         arguments = []
         raster = iter(inputs)
         for parameter in inspect.signature(function).parameters.values():
+            if parameter.name in self.buffer_bindings:
+                b_spec = self.buffer_bindings[parameter.name]
+                elem_val = _mlir_element_type(b_spec.element_type)
+                ptr_type = f"!gfx.ptr<{elem_val}, global>"
+                mode_str = b_spec.access.value if isinstance(b_spec.access, AccessMode) else str(b_spec.access)
+                ref, = self.root.raw(
+                    "gfx.buffer_binding",
+                    [],
+                    types=[ptr_type],
+                    attributes={
+                        "set": {"kind": "literal", "type": "i32", "value": b_spec.set},
+                        "binding": {"kind": "literal", "type": "i32", "value": b_spec.binding},
+                        "name": {"kind": "string", "value": parameter.name},
+                        "access": {"kind": "access_mode", "value": mode_str},
+                    },
+                )
+                ptr_val = self.root.bind(ref, b_spec.element_type)
+                self.root.cache[id(ptr_val.node)] = ref
+                arguments.append(
+                    _BufferProxy(
+                        name=parameter.name,
+                        ref=ref,
+                        ptr=ptr_val,
+                        element_type=b_spec.element_type,
+                        access=b_spec.access,
+                        set=b_spec.set,
+                        binding=b_spec.binding,
+                        shape=b_spec.shape,
+                        alignment=b_spec.alignment,
+                    )
+                )
+                self.structured = True
+                continue
             if parameter.name not in parameters:
                 arguments.append(Value(next(raster)))
                 continue
@@ -474,6 +565,12 @@ class ASTLowering:
             return tuple(values)
         if isinstance(node, ast.Subscript):
             owner = self.expression(node.value, env)
+            if isinstance(owner, _BufferProxy):
+                access_str = owner.access.value if hasattr(owner.access, "value") else str(owner.access)
+                if access_str == "write_only":
+                    self.fail(f"Cannot read from write-only buffer '{owner.name}'.")
+                index = self.expression(node.slice, env)
+                return self._buffer_load(owner, index)
             if type(owner) not in (Value, tuple, list, dict, str, range):
                 self.fail("Subscripts require device vectors or compile-time literal collections.")
             return owner[self.expression(node.slice, env)]
@@ -559,8 +656,72 @@ class ASTLowering:
         elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, tuple) and len(target.elts) == len(value):
             for child, item in zip(target.elts, value):
                 self.assign(child, item, env)
+        elif isinstance(target, ast.Subscript):
+            owner = self.expression(target.value, env)
+            if isinstance(owner, _BufferProxy):
+                access_str = owner.access.value if hasattr(owner.access, "value") else str(owner.access)
+                if access_str == "read_only":
+                    self.fail(f"Cannot write to read-only buffer '{owner.name}'.")
+                index = self.expression(target.slice, env)
+                self._buffer_store(owner, index, value)
+                return
+            self.fail("Device assignments require local names; attribute/subscript mutation is unsupported.")
         else:
             self.fail("Device assignments require local names; attribute/subscript mutation is unsupported.")
+
+    def _buffer_load(self, owner: _BufferProxy, index: Any) -> Value:
+        idx_val = self.lift(index, Type.I32) if not isinstance(index, Value) else index
+        if idx_val.type not in (Type.I32, Type.U32):
+            self.fail(f"Buffer subscript index must be an integer, got {idx_val.type}")
+        idx_ref = self.builder.emit(idx_val.node)
+        elem_schema = owner.element_schema_name
+        ptr_type = f"!gfx.ptr<{elem_schema}, global>"
+        off_ref, = self.builder.raw(
+            "gfx.ptr_offset",
+            [owner.ref, idx_ref],
+            types=[ptr_type],
+        )
+        load_attrs = {}
+        if owner.alignment:
+            load_attrs["alignment"] = {"kind": "literal", "type": "i32", "value": owner.alignment}
+        load_ref, = self.builder.raw(
+            "gfx.load",
+            [off_ref],
+            types=[elem_schema],
+            attributes=load_attrs if load_attrs else None,
+        )
+        return self.builder.bind(load_ref, owner.element_type)
+
+    def _buffer_store(self, owner: _BufferProxy, index: Any, value: Any) -> None:
+        idx_val = self.lift(index, Type.I32) if not isinstance(index, Value) else index
+        if idx_val.type not in (Type.I32, Type.U32):
+            self.fail(f"Buffer subscript index must be an integer, got {idx_val.type}")
+        idx_ref = self.builder.emit(idx_val.node)
+        val = self.lift(value, owner.element_type) if not isinstance(value, Value) else value
+
+        elem_type = owner.element_type
+        if isinstance(elem_type, Type) and val.type != elem_type:
+            val_val = val.type.value if isinstance(val.type, Type) else str(val.type)
+            elem_val = elem_type.value if isinstance(elem_type, Type) else str(elem_type)
+            self.fail(f"Type mismatch: cannot store {val_val} into Buffer[{elem_val}]")
+
+        val_ref = self.builder.emit(val.node)
+        elem_schema = owner.element_schema_name
+        ptr_type = f"!gfx.ptr<{elem_schema}, global>"
+        off_ref, = self.builder.raw(
+            "gfx.ptr_offset",
+            [owner.ref, idx_ref],
+            types=[ptr_type],
+        )
+        store_attrs = {}
+        if owner.alignment:
+            store_attrs["alignment"] = {"kind": "literal", "type": "i32", "value": owner.alignment}
+        self.builder.raw(
+            "gfx.store",
+            [val_ref, off_ref],
+            types=[],
+            attributes=store_attrs if store_attrs else None,
+        )
 
     def check_capture(self, name, env):
         if any(isinstance(value, (_Function, _Lambda)) and value.owner is self.scope
@@ -611,8 +772,8 @@ class ASTLowering:
             helper.env[node.name] = helper
             env[node.name] = helper
         elif isinstance(node, ast.AugAssign):
-            if not isinstance(node.target, ast.Name):
-                self.fail("Augmented assignment requires a local name.")
+            if not isinstance(node.target, (ast.Name, ast.Subscript)):
+                self.fail("Augmented assignment requires a local name or subscript target.")
             expression = ast.copy_location(ast.BinOp(node.target, node.op, node.value), node)
             self.assign(node.target, self.expression(expression, env), env)
         elif isinstance(node, ast.If):
@@ -756,7 +917,20 @@ class ASTLowering:
         result = rebuild_return([parent.bind(ref, typ) for ref, typ in zip(refs[mode_index + 1:], return_types)])
         return self.choose(mode == 2, lambda: returned(result, final_env), lambda: continuation(final_env))
 
-    def module(self, name, kind, outputs, interfaces):
+    def module(self, name, kind, outputs, interfaces, workgroup_size=None):
+        if kind == "compute":
+            self.root.raw("func.return")
+            wg_size = workgroup_size or self.workgroup_size
+            func_obj = {
+                "name": name, "stage": kind, "results": [],
+                "body": {"blocks": [self.root.block]}, **self.location(),
+            }
+            if wg_size:
+                func_obj["workgroup_size"] = list(wg_size)
+            result = {"schema_version": 2, **self.location(), "functions": [func_obj]}
+            if self.parameters:
+                result["parameters"] = self.parameters.to_dict()
+            return result
         for node, interface in zip(outputs, interfaces):
             ref = self.root.emit(node)
             if interface.builtin == "position":

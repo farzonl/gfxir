@@ -3,6 +3,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/AsmParser/AsmParser.h"
 #include "llvm/ADT/StringMap.h"
 #include <cmath>
 #include <limits>
@@ -25,7 +26,14 @@ private:
   Type type(StringRef name) {
     if (name == "index")
       return builder.getIndexType();
-    return parseShaderType(*builder.getContext(), name);
+    if (name.starts_with("!") || name.starts_with("vector<")) {
+      if (Type parsed = mlir::parseType(name, builder.getContext()))
+        return parsed;
+    }
+    Type shaderType = parseShaderType(*builder.getContext(), name);
+    if (shaderType)
+      return shaderType;
+    return mlir::parseType(name, builder.getContext());
   }
 
   LogicalResult error(Location location, StringRef message) {
@@ -133,6 +141,9 @@ private:
     }
     auto text = value->getAsString();
     if (text) {
+      if (*kind == "access_mode")
+        if (auto item = symbolizeAccessMode(*text))
+          return Attribute(AccessModeAttr::get(builder.getContext(), *item, Type{}));
       if (*kind == "builtin")
         if (auto item = symbolizeBuiltin(*text))
           return Attribute(BuiltinAttr::get(builder.getContext(), *item));

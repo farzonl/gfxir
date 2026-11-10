@@ -471,6 +471,7 @@ ShaderInterface mlir::gfx::reflectShader(ModuleOp module) {
       function->getAttrOfType<StageAttr>("gfx.stage").getValue(),
       {},
       {},
+      {},
       {}};
   SmallVector<func::FuncOp> pending{function};
   llvm::SmallPtrSet<Operation *, 8> visited;
@@ -515,6 +516,13 @@ ShaderInterface mlir::gfx::reflectShader(ModuleOp module) {
     } else if (auto position = dyn_cast<PositionOp>(op)) {
       result.outputs.push_back({"position", position.getValue().getType(),
                                 PositionBinding{}, Interpolation::Perspective});
+    } else if (auto binding = dyn_cast<BufferBindingOp>(op)) {
+      auto ptrType = cast<PtrType>(binding.getResult().getType());
+      result.buffers.push_back({binding.getName().str(),
+                                binding.getSet(),
+                                binding.getBinding(),
+                                binding.getAccess(),
+                                ptrType.getElementType()});
     }
   });
   return result;
@@ -545,6 +553,19 @@ mlir::gfx::serializeReflection(const ShaderInterface &reflection) {
   if (reflection.parameters)
     result["parameters"] =
         serializeParameters(reflection.parameters, reflection.stage);
+  if (!reflection.buffers.empty()) {
+    llvm::json::Array buffers;
+    for (const auto &buf : reflection.buffers) {
+      buffers.push_back(llvm::json::Object{
+          {"name", buf.name},
+          {"set", buf.set},
+          {"binding", buf.binding},
+          {"access", stringifyAccessMode(buf.access)},
+          {"element_type", typeName(buf.elementType)},
+      });
+    }
+    result["buffers"] = std::move(buffers);
+  }
   return result;
 }
 
