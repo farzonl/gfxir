@@ -1,6 +1,6 @@
-"""Adversarial stress-test suite for MiniGfx CPU math, camera, and orbit controller.
+"""Precision boundaries and stress-test suite for MiniGfx CPU math, camera, and orbit controller.
 
-Adversarial coverage:
+Precision coverage:
 1. Perspective projection depth precision:
    - Near/far ratios ranging from 1e-4 to 1e7 (n=0.0001 to 100, f=1 to 1e6).
    - Point on near plane maps to z_c / w_c == 0.0 +- 1e-5.

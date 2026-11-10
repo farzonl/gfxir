@@ -17,7 +17,25 @@ import struct
 import unittest
 
 from examples.minigfx.camera import Camera, CameraParams, OrbitController
-from examples.minigfx.math import Mat4, Quat, Vec2, Vec3, Vec4
+from examples.minigfx.math import (
+    Mat2,
+    Mat2x2,
+    Mat2x3,
+    Mat2x4,
+    Mat3,
+    Mat3x2,
+    Mat3x3,
+    Mat3x4,
+    Mat4,
+    Mat4x2,
+    Mat4x3,
+    Mat4x4,
+    Matrix,
+    Quat,
+    Vec2,
+    Vec3,
+    Vec4,
+)
 
 
 class TestVec2(unittest.TestCase):
@@ -643,6 +661,297 @@ class TestOrbitController(unittest.TestCase):
         self.assertAlmostEqual(cam.eye.x, 8.0, places=5)
         self.assertAlmostEqual(cam.eye.y, 2.0, places=5)
         self.assertAlmostEqual(cam.eye.z, 0.0, places=5)
+
+
+class TestCxRMatrices(unittest.TestCase):
+    """Comprehensive unit and property tests for the complete set of CxR matrix types."""
+
+    ALL_TYPES = [
+        (Mat2x2, 2, 2),
+        (Mat2x3, 2, 3),
+        (Mat2x4, 2, 4),
+        (Mat3x2, 3, 2),
+        (Mat3x3, 3, 3),
+        (Mat3x4, 3, 4),
+        (Mat4x2, 4, 2),
+        (Mat4x3, 4, 3),
+        (Mat4x4, 4, 4),
+    ]
+
+    def test_instantiation_all_9_types(self):
+        """Verify default identity instantiation, dimensions, len, and aliases for all 9 types."""
+        self.assertIs(Mat2, Mat2x2)
+        self.assertIs(Mat3, Mat3x3)
+        self.assertIs(Mat4, Mat4x4)
+
+        for cls, cols, rows in self.ALL_TYPES:
+            # Default instantiation -> identity
+            m = cls()
+            self.assertEqual(m.cols, cols)
+            self.assertEqual(m.rows, rows)
+            self.assertEqual(len(m), cols * rows)
+            self.assertEqual(len(m.elements), cols * rows)
+
+            # Check identity values: 1.0 where col == row, 0.0 elsewhere
+            for c in range(cols):
+                for r in range(rows):
+                    expected = 1.0 if c == r else 0.0
+                    self.assertEqual(m[r, c], expected, f"Failed at ({r}, {c}) for {cls.__name__}")
+
+            # Generic Matrix(cols, rows) constructor returns appropriate type
+            m_gen = Matrix(cols, rows)
+            self.assertIsInstance(m_gen, cls)
+            self.assertEqual(m_gen, m)
+
+            # Zero matrix constructor
+            z = cls.zero()
+            self.assertTrue(all(x == 0.0 for x in z))
+            self.assertEqual(len(z), cols * rows)
+
+            # Sequence constructor and flat arguments constructor
+            sample_data = [float(i + 1) for i in range(cols * rows)]
+            m_seq = cls(sample_data)
+            m_flat = cls(*sample_data)
+            self.assertEqual(m_seq, m_flat)
+            self.assertEqual(list(m_seq), sample_data)
+
+            # Invalid argument counts raise ValueError
+            with self.assertRaises(ValueError):
+                cls(sample_data[: cols * rows - 1])
+            with self.assertRaises(ValueError):
+                cls(*(sample_data + [99.0]))
+
+    def test_indexing_1d_and_2d_and_columns(self):
+        """Verify 1D, 2D (row, col), negative indexing, and column vector properties."""
+        for cls, cols, rows in self.ALL_TYPES:
+            sample_data = [float((c + 1) * 10 + (r + 1)) for c in range(cols) for r in range(rows)]
+            m = cls(sample_data)
+
+            # 1D indexing
+            for i in range(cols * rows):
+                self.assertEqual(m[i], sample_data[i])
+                self.assertEqual(m[i - cols * rows], sample_data[i])
+
+            # 2D indexing (r, c)
+            for c in range(cols):
+                for r in range(rows):
+                    flat_idx = c * rows + r
+                    self.assertEqual(m[r, c], sample_data[flat_idx])
+
+            # Negative 2D indexing
+            self.assertEqual(m[-1, -1], m[rows - 1, cols - 1])
+
+            # Index out of bounds
+            with self.assertRaises(IndexError):
+                _ = m[rows, 0]
+            with self.assertRaises(IndexError):
+                _ = m[0, cols]
+            with self.assertRaises(IndexError):
+                _ = m[cols * rows]
+            with self.assertRaises(IndexError):
+                _ = m[-cols * rows - 1]
+            with self.assertRaises(TypeError):
+                _ = m["invalid"]
+
+            # Columns property returning typed Vec2, Vec3, or Vec4
+            cols_vecs = m.columns
+            self.assertEqual(len(cols_vecs), cols)
+            vec_cls = {2: Vec2, 3: Vec3, 4: Vec4}[rows]
+            for c in range(cols):
+                self.assertIsInstance(cols_vecs[c], vec_cls)
+                for r in range(rows):
+                    self.assertEqual(cols_vecs[c][r], m[r, c])
+
+    def test_matmul_dimension_compatibility(self):
+        """Verify matmul between compatible dimensions and ValueError for incompatible dimensions."""
+        for cls_a, c_a, r_a in self.ALL_TYPES:
+            for cls_b, c_b, r_b in self.ALL_TYPES:
+                a_data = [(i + 1) * 0.5 for i in range(c_a * r_a)]
+                b_data = [(i + 2) * 0.25 for i in range(c_b * r_b)]
+                A = cls_a(a_data)
+                B = cls_b(b_data)
+
+                if c_a == r_b:
+                    # Compatible: A @ B should have shape (c_b, r_a)
+                    C1 = A @ B
+                    C2 = A * B
+                    self.assertEqual(C1, C2)
+                    self.assertEqual(C1.cols, c_b)
+                    self.assertEqual(C1.rows, r_a)
+
+                    # Verify values analytically
+                    for c in range(c_b):
+                        for r in range(r_a):
+                            expected = sum(A[r, k] * B[k, c] for k in range(c_a))
+                            self.assertAlmostEqual(
+                                C1[r, c], expected, places=5,
+                                msg=f"Matmul mismatch at ({r}, {c}) for {cls_a.__name__} @ {cls_b.__name__}",
+                            )
+                else:
+                    # Incompatible: must raise ValueError
+                    with self.assertRaises(ValueError):
+                        _ = A @ B
+                    with self.assertRaises(ValueError):
+                        _ = A * B
+
+    def test_matrix_vector_multiplication(self):
+        """Verify matrix-vector multiplication for compatible sizes and error handling for incompatible sizes."""
+        vec_map = {2: Vec2(1.5, -2.5), 3: Vec3(1.0, 2.0, 3.0), 4: Vec4(1.0, -1.0, 2.0, -2.0)}
+        vec_types = {2: Vec2, 3: Vec3, 4: Vec4}
+
+        for cls, cols, rows in self.ALL_TYPES:
+            m = cls([(i + 1) * 1.5 for i in range(cols * rows)])
+
+            # Compatible vector multiplication
+            v = vec_map[cols]
+            res = m * v
+            self.assertIsInstance(res, vec_types[rows])
+            self.assertEqual(len(res), rows)
+
+            for r in range(rows):
+                expected = sum(m[r, c] * v[c] for c in range(cols))
+                self.assertAlmostEqual(res[r], expected, places=5)
+
+            # Incompatible vector dimensions raise ValueError
+            for wrong_dim, wrong_vec in vec_map.items():
+                if wrong_dim != cols:
+                    with self.assertRaises(ValueError):
+                        _ = m * wrong_vec
+
+    def test_transposition_properties(self):
+        """Verify transposition properties (A.T).T == A and (A @ B).T == B.T @ A.T."""
+        for cls, cols, rows in self.ALL_TYPES:
+            sample_data = [(i + 1) * 0.7 for i in range(cols * rows)]
+            A = cls(sample_data)
+            AT = A.transpose()
+
+            self.assertEqual(AT.cols, rows)
+            self.assertEqual(AT.rows, cols)
+            self.assertEqual(A.T, AT)
+
+            # Property 1: (A.T).T == A
+            self.assertEqual(AT.transpose(), A)
+
+            # Element-wise check: AT[r, c] == A[c, r]
+            for r in range(AT.rows):
+                for c in range(AT.cols):
+                    self.assertAlmostEqual(AT[r, c], A[c, r], places=6)
+
+        # Property 2: (A @ B).T == B.T @ A.T for all compatible dimension pairs
+        for cls_a, c_a, r_a in self.ALL_TYPES:
+            for cls_b, c_b, r_b in self.ALL_TYPES:
+                if c_a == r_b:
+                    A = cls_a([(i + 1) * 0.3 for i in range(c_a * r_a)])
+                    B = cls_b([(i + 1) * 0.4 for i in range(c_b * r_b)])
+                    AB_T = (A @ B).T
+                    BT_AT = B.T @ A.T
+                    self.assertEqual(AB_T, BT_AT)
+
+    def test_std430_packing_roundtrip_and_strides(self):
+        """Verify std430 packing byte length, column strides, 4-byte padding for 3-row matrices, and roundtrip."""
+        for cls, cols, rows in self.ALL_TYPES:
+            m = cls([(i + 1) * 1.25 for i in range(cols * rows)])
+            raw = m.to_bytes()
+
+            stride = 8 if rows == 2 else 16
+            expected_total_bytes = cols * stride
+            self.assertEqual(
+                len(raw), expected_total_bytes,
+                f"Unexpected std430 byte size for {cls.__name__}: got {len(raw)}, expected {expected_total_bytes}",
+            )
+
+            # If rows == 3, verify the 4th float in each 16-byte column is 0x00 padding
+            if rows == 3:
+                for col_idx in range(cols):
+                    pad_bytes = raw[col_idx * 16 + 12 : col_idx * 16 + 16]
+                    self.assertEqual(
+                        pad_bytes, b"\x00\x00\x00\x00",
+                        f"Column {col_idx} missing 4-byte zero padding in {cls.__name__}",
+                    )
+
+            # Roundtrip deserialization
+            restored = cls.from_bytes(raw)
+            self.assertEqual(restored, m)
+
+            # Deserialization from larger buffer with offset 0
+            padded_buffer = raw + b"\xcd" * 64
+            restored_padded = cls.from_bytes(padded_buffer)
+            self.assertEqual(restored_padded, m)
+
+            # Deserialization with insufficient buffer raises ValueError
+            with self.assertRaises(ValueError):
+                cls.from_bytes(raw[: expected_total_bytes - 1])
+
+    def test_scalar_arithmetic_and_addition(self):
+        """Verify scalar multiplication, division, addition, subtraction, and negation."""
+        for cls, cols, rows in self.ALL_TYPES:
+            m = cls([(i + 1) * 2.0 for i in range(cols * rows)])
+
+            # Scalar multiplication
+            scaled1 = m * 3.0
+            scaled2 = 3.0 * m
+            self.assertEqual(scaled1, scaled2)
+            self.assertEqual(list(scaled1), [(i + 1) * 6.0 for i in range(cols * rows)])
+
+            # Scalar division
+            div = m / 2.0
+            self.assertEqual(list(div), [(i + 1) * 1.0 for i in range(cols * rows)])
+            with self.assertRaises(ZeroDivisionError):
+                _ = m / 0.0
+
+            # Addition and subtraction with matching shape
+            m2 = cls([1.0] * (cols * rows))
+            added = m + m2
+            subbed = m - m2
+            self.assertEqual(list(added), [(i + 1) * 2.0 + 1.0 for i in range(cols * rows)])
+            self.assertEqual(list(subbed), [(i + 1) * 2.0 - 1.0 for i in range(cols * rows)])
+
+            # Negation
+            neg = -m
+            self.assertEqual(m + neg, cls.zero())
+
+        # Incompatible shapes for addition raise ValueError
+        with self.assertRaises(ValueError):
+            _ = Mat2x3() + Mat3x2()
+
+    def test_analytic_inverse_square_matrices(self):
+        """Verify analytic matrix inverse for 2x2, 3x3, and 4x4, singular detection, and non-square rejection."""
+        # 2x2 inverse
+        m2 = Mat2x2(4.0, 7.0, 2.0, 6.0)
+        inv2 = m2.inverse()
+        self.assertEqual(m2 @ inv2, Mat2x2.identity())
+        self.assertEqual(inv2 @ m2, Mat2x2.identity())
+
+        # 3x3 inverse
+        m3 = Mat3x3(
+            1.0, 0.0, 5.0,
+            2.0, 1.0, 6.0,
+            3.0, 4.0, 0.0,
+        )
+        inv3 = m3.inverse()
+        self.assertEqual(m3 @ inv3, Mat3x3.identity())
+        self.assertEqual(inv3 @ m3, Mat3x3.identity())
+
+        # 4x4 inverse
+        m4 = Mat4x4.scaling(2.0, 3.0, 4.0)
+        inv4 = m4.inverse()
+        self.assertEqual(m4 @ inv4, Mat4x4.identity())
+
+        # Singular matrix raises ValueError
+        with self.assertRaises(ValueError):
+            Mat2x2.zero().inverse()
+        with self.assertRaises(ValueError):
+            Mat3x3.zero().inverse()
+        with self.assertRaises(ValueError):
+            Mat4x4.zero().inverse()
+
+        # Non-square matrices raise ValueError
+        with self.assertRaises(ValueError):
+            Mat2x3().inverse()
+        with self.assertRaises(ValueError):
+            Mat3x4().inverse()
+        with self.assertRaises(ValueError):
+            Mat4x2().inverse()
 
 
 if __name__ == "__main__":

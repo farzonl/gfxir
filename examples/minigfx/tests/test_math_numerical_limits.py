@@ -1,4 +1,4 @@
-"""Adversarial stress-testing suite for MiniGfx CPU math and camera controller.
+"""Numerical limits and edge-case testing suite for MiniGfx CPU math and camera controller.
 
 Covers:
 1. Mat4.inverse() numerical stability across 1,000 random non-singular matrices (T * R * S).
@@ -20,8 +20,8 @@ from examples.minigfx.camera import Camera, CameraParams, OrbitController
 from examples.minigfx.math import Mat4, Quat, Vec2, Vec3, Vec4
 
 
-class TestAdversarialMatrixInverse(unittest.TestCase):
-    """Adversarial testing of Mat4.inverse() precision and singular detection."""
+class MatrixInverseNumericalLimitsTests(unittest.TestCase):
+    """Numerical limits testing of Mat4.inverse() precision and singular detection."""
 
     def test_inverse_precision_1000_random_matrices(self):
         """Stress-test Mat4.inverse() over 1,000 random non-singular SRT matrices.
@@ -151,8 +151,8 @@ class TestAdversarialMatrixInverse(unittest.TestCase):
         self.assertIn("singular", str(ctx.exception).lower())
 
 
-class TestAdversarialQuaternion(unittest.TestCase):
-    """Adversarial testing of Quat vs Mat4 rotation equivalence and slerp boundaries."""
+class QuaternionNumericalLimitsTests(unittest.TestCase):
+    """Testing of Quat vs Mat4 rotation equivalence and slerp boundaries."""
 
     def test_quat_rotation_vs_matrix_rotation_100_random_axes(self):
         """Verify ||Q.to_mat4() * v - R_axis(theta) * v|| < 1e-5 for 100 random axis-angles."""
@@ -253,8 +253,8 @@ class TestAdversarialQuaternion(unittest.TestCase):
         self.assertAlmostEqual(s_near.w, expected_half.w, places=6)
 
 
-class TestAdversarialVectorOperations(unittest.TestCase):
-    """Adversarial testing of vector numerical stability and boundary conditions."""
+class VectorNumericalLimitsTests(unittest.TestCase):
+    """Testing of vector numerical stability and boundary conditions."""
 
     def test_zero_vector_normalization(self):
         """Zero vectors must normalize to zero vectors without NaN or ZeroDivisionError."""
@@ -319,8 +319,8 @@ class TestAdversarialVectorOperations(unittest.TestCase):
         self.assertAlmostEqual(unpacked[1], -3.4e38, delta=1e32)
 
 
-class TestAdversarialCameraAndController(unittest.TestCase):
-    """Adversarial testing of Camera, frustum extraction, and OrbitController."""
+class CameraAndControllerNumericalLimitsTests(unittest.TestCase):
+    """Testing of Camera, frustum extraction, and OrbitController boundary conditions."""
 
     def test_look_at_near_collinear_and_extreme_distance(self):
         """Test Camera look_at with distant coordinates and near-collinear up vector."""
@@ -353,7 +353,7 @@ class TestAdversarialCameraAndController(unittest.TestCase):
         far_pt = p_ratio * Vec4(0.0, 0.0, -100000.0, 1.0)
         self.assertAlmostEqual(far_pt.z / far_pt.w, 1.0, places=4)
 
-    def test_frustum_planes_normalized_under_adversarial_cams(self):
+    def test_frustum_planes_normalized_under_extreme_cams(self):
         """Frustum plane normals must always be unit length across varied configurations."""
         configs = [
             (Vec3(0, 0, 5), Vec3(0, 0, 0), Vec3(0, 1, 0), 45.0, 1.0, 0.1, 100.0),
@@ -380,12 +380,7 @@ class TestAdversarialCameraAndController(unittest.TestCase):
         self.assertAlmostEqual(cam.eye.z, 0.0, places=5)
 
     def test_orbit_controller_damping_dt_zero_preserves_position(self):
-        """When damping is active (damping > 0), dt=0.0 must not advance position (alpha must be 0.0).
-
-        Current implementation bug in camera.py line 225:
-          alpha = 1.0 if self.damping <= 0.0 or dt <= 0.0 else ...
-        evaluates alpha=1.0 when dt=0.0, causing instant snap instead of zero movement.
-        """
+        """When damping is active (damping > 0), dt=0.0 must not advance position (alpha must be 0.0)."""
         cam = Camera(eye=Vec3(0, 0, 5), target=Vec3(0, 0, 0))
         ctrl = OrbitController(target=Vec3(0, 0, 0), distance=5.0, damping=0.5)
         ctrl.rotate(1.0, 0.0)

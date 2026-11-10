@@ -2,10 +2,12 @@
 
 Storage and Coordinate Conventions:
 - Right-handed Cartesian coordinates (+X right, +Y up, +Z towards viewer; view along -Z).
-- Column-major matrix layout: m[col * 4 + row] stored as a flat tuple of 16 floats.
+- Column-major matrix layout: flat tuple of cols * rows floats, indexed as m[r, c] or m[i].
+- Complete set of CxR matrix types: Mat2x2 (Mat2), Mat2x3, Mat2x4, Mat3x2, Mat3x3 (Mat3),
+  Mat3x4, Mat4x2, Mat4x3, Mat4x4 (Mat4).
 - Column-vector transform convention: v' = M * v.
 - Clip-space Z range: [0.0, 1.0] (DirectX, Metal, Vulkan standard).
-- std430 binary packing via .to_bytes() using IEEE-754 little-endian encoding.
+- std430 binary packing via .to_bytes() using IEEE-754 little-endian encoding with column padding.
 """
 
 from __future__ import annotations
@@ -143,55 +145,448 @@ class Vec4(_Vec):
         return f"Vec4({self.x}, {self.y}, {self.z}, {self.w})"
 
 
-class Mat4:
-    """4x4 column-major transformation matrix."""
+class Matrix:
+    """Generic CxR column-major matrix obeying std430 packing and layout rules."""
 
-    __slots__ = ("_elements",)
+    __slots__ = ("_data", "_cols", "_rows")
+    cols: int = 4
+    rows: int = 4
+    _data: tuple[float, ...]
+    _cols: int
+    _rows: int
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> Matrix:
+        if cls is Matrix:
+            if len(args) < 2:
+                raise ValueError("Matrix requires at least cols and rows: Matrix(cols, rows, ...)")
+            cols, rows = int(args[0]), int(args[1])
+            target_cls = _MATRIX_CLASSES.get((cols, rows))
+            if target_cls is not None:
+                return target_cls(*args[2:])
+            inst = super().__new__(cls)
+            inst._cols = cols
+            inst._rows = rows
+            return inst
+        return super().__new__(cls)
 
     def __init__(self, *args: Any) -> None:
-        if len(args) == 0:
-            self._elements: tuple[float, ...] = (
-                1.0, 0.0, 0.0, 0.0,  0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,  0.0, 0.0, 0.0, 1.0,
-            )
-        elif len(args) == 1:
-            t = tuple(float(x) for x in args[0])
-            if len(t) != 16:
-                raise ValueError(f"Mat4 requires 16 elements, got {len(t)}")
-            self._elements = t
-        elif len(args) == 16:
-            self._elements = tuple(float(x) for x in args)
+        if self.__class__ is Matrix:
+            cols, rows = int(args[0]), int(args[1])
+            rem = args[2:]
+            self._cols = cols
+            self._rows = rows
         else:
-            raise ValueError(f"Mat4 requires 0, 1, or 16 arguments, got {len(args)}")
+            cols, rows = self.__class__.cols, self.__class__.rows
+            if len(args) >= 2 and args[0] == cols and args[1] == rows:
+                rem = args[2:]
+            else:
+                rem = args
+        total = cols * rows
+        name = "Mat4" if self.__class__.__name__ in ("Mat4", "Mat4x4") else self.__class__.__name__
+        if len(rem) == 0:
+            self._data = tuple(1.0 if c == r else 0.0 for c in range(cols) for r in range(rows))
+        elif len(rem) == 1:
+            t = tuple(float(x) for x in rem[0])
+            if len(t) != total:
+                raise ValueError(f"{name} requires {total} elements, got {len(t)}")
+            self._data = t
+        elif len(rem) == total:
+            self._data = tuple(float(x) for x in rem)
+        else:
+            raise ValueError(f"{name} requires 0, 1, or {total} arguments, got {len(rem)}")
+
+    @property
+    def cols(self) -> int:
+        return getattr(self, "_cols", self.__class__.cols)
+
+    @property
+    def rows(self) -> int:
+        return getattr(self, "_rows", self.__class__.rows)
 
     @property
     def elements(self) -> tuple[float, ...]:
-        return self._elements
+        return self._data
 
     @property
-    def columns(self) -> tuple[Vec4, Vec4, Vec4, Vec4]:
-        e = self._elements
-        return (
-            Vec4(e[0], e[1], e[2], e[3]), Vec4(e[4], e[5], e[6], e[7]),
-            Vec4(e[8], e[9], e[10], e[11]), Vec4(e[12], e[13], e[14], e[15]),
-        )
+    def _elements(self) -> tuple[float, ...]:
+        return self._data
+
+    @property
+    def columns(self) -> tuple[_Vec, ...]:
+        cols_list = []
+        for c in range(self.cols):
+            col_data = [self._data[c * self.rows + r] for r in range(self.rows)]
+            if self.rows == 2:
+                cols_list.append(Vec2(col_data[0], col_data[1]))
+            elif self.rows == 3:
+                cols_list.append(Vec3(col_data[0], col_data[1], col_data[2]))
+            elif self.rows == 4:
+                cols_list.append(Vec4(col_data[0], col_data[1], col_data[2], col_data[3]))
+            else:
+                cols_list.append(tuple(col_data))
+        return tuple(cols_list)
 
     def __getitem__(self, idx: Union[int, tuple[int, int]]) -> float:
-        return self._elements[idx[1] * 4 + idx[0]] if isinstance(idx, tuple) else self._elements[idx]
+        if isinstance(idx, tuple):
+            if len(idx) != 2:
+                raise IndexError(f"Matrix 2D index requires (row, col), got {idx}")
+            r, c = idx
+            r_norm = r + self.rows if r < 0 else r
+            c_norm = c + self.cols if c < 0 else c
+            if 0 <= r_norm < self.rows and 0 <= c_norm < self.cols:
+                return self._data[c_norm * self.rows + r_norm]
+            raise IndexError(f"Matrix index {idx} out of range for shape ({self.cols} cols, {self.rows} rows)")
+        if isinstance(idx, int):
+            total = self.cols * self.rows
+            norm_idx = idx + total if idx < 0 else idx
+            if not (0 <= norm_idx < total):
+                raise IndexError(f"Matrix 1D index {idx} out of range for size {total}")
+            return self._data[norm_idx]
+        raise TypeError(f"Matrix index must be int or tuple of 2 ints, got {type(idx).__name__}")
 
     def __iter__(self) -> Iterator[float]:
-        return iter(self._elements)
+        return iter(self._data)
 
     def __len__(self) -> int:
-        return 16
+        return self.cols * self.rows
 
     @classmethod
-    def identity(cls) -> Mat4:
-        return cls()
+    def identity(cls, cols: int | None = None, rows: int | None = None) -> Matrix:
+        if cls is Matrix:
+            c = cols if cols is not None else 4
+            r = rows if rows is not None else c
+            target_cls = _get_matrix_class(c, r)
+            return target_cls.identity()
+        data = tuple(1.0 if c == r else 0.0 for c in range(cls.cols) for r in range(cls.rows))
+        return cls(data)
 
     @classmethod
-    def zero(cls) -> Mat4:
-        return cls((0.0,) * 16)
+    def zero(cls, cols: int | None = None, rows: int | None = None) -> Matrix:
+        if cls is Matrix:
+            c = cols if cols is not None else 4
+            r = rows if rows is not None else c
+            target_cls = _get_matrix_class(c, r)
+            return target_cls.zero()
+        return cls((0.0,) * (cls.cols * cls.rows))
+
+    def transpose(self) -> Matrix:
+        new_cols = self.rows
+        new_rows = self.cols
+        transposed = [0.0] * (new_cols * new_rows)
+        for c in range(self.cols):
+            for r in range(self.rows):
+                val = self._data[c * self.rows + r]
+                transposed[r * new_rows + c] = val
+        target_cls = _get_matrix_class(new_cols, new_rows)
+        return target_cls(transposed)
+
+    @property
+    def T(self) -> Matrix:
+        return self.transpose()
+
+    def __mul__(self, o: Union[Matrix, _Vec, float, int]) -> Union[Matrix, _Vec]:
+        if isinstance(o, Matrix):
+            if self.cols != o.rows:
+                raise ValueError(
+                    f"Cannot multiply matrix with cols={self.cols} by matrix with rows={o.rows}"
+                )
+            res_cols = o.cols
+            res_rows = self.rows
+            res_data = [0.0] * (res_cols * res_rows)
+            for c in range(res_cols):
+                for r in range(res_rows):
+                    s = 0.0
+                    for k in range(self.cols):
+                        s += self._data[k * self.rows + r] * o._data[c * o.rows + k]
+                    res_data[c * res_rows + r] = s
+            target_cls = _get_matrix_class(res_cols, res_rows)
+            return target_cls(res_data)
+
+        if isinstance(o, _Vec):
+            if self.cols != len(o):
+                raise ValueError(
+                    f"Cannot multiply matrix with cols={self.cols} by vector of length {len(o)}"
+                )
+            v_elems = list(o)
+            res_elems = [0.0] * self.rows
+            for r in range(self.rows):
+                s = 0.0
+                for c in range(self.cols):
+                    s += self._data[c * self.rows + r] * v_elems[c]
+                res_elems[r] = s
+            if self.rows == 2:
+                return Vec2(res_elems[0], res_elems[1])
+            elif self.rows == 3:
+                return Vec3(res_elems[0], res_elems[1], res_elems[2])
+            elif self.rows == 4:
+                return Vec4(res_elems[0], res_elems[1], res_elems[2], res_elems[3])
+            raise NotImplementedError(f"Vector result unsupported for rows={self.rows}")
+
+        if isinstance(o, (int, float)):
+            s = float(o)
+            return type(self)([x * s for x in self._data])
+
+        return NotImplemented
+
+    def __rmul__(self, s: Any) -> Any:
+        if isinstance(s, (int, float)):
+            return self * s
+        return NotImplemented
+
+    def __matmul__(self, o: Any) -> Any:
+        return self.__mul__(o)
+
+    def __rmatmul__(self, o: Any) -> Any:
+        if isinstance(o, _Vec):
+            if len(o) != self.rows:
+                raise ValueError(
+                    f"Cannot multiply vector of length {len(o)} by matrix with rows={self.rows}"
+                )
+            v_elems = list(o)
+            res_elems = [0.0] * self.cols
+            for c in range(self.cols):
+                s = 0.0
+                for r in range(self.rows):
+                    s += v_elems[r] * self._data[c * self.rows + r]
+                res_elems[c] = s
+            if self.cols == 2:
+                return Vec2(res_elems[0], res_elems[1])
+            elif self.cols == 3:
+                return Vec3(res_elems[0], res_elems[1], res_elems[2])
+            elif self.cols == 4:
+                return Vec4(res_elems[0], res_elems[1], res_elems[2], res_elems[3])
+        return NotImplemented
+
+    def __truediv__(self, s: float) -> Matrix:
+        if isinstance(s, (int, float)):
+            if s == 0.0:
+                raise ZeroDivisionError("Matrix division by zero")
+            return self * (1.0 / s)
+        return NotImplemented
+
+    def __add__(self, o: Matrix) -> Matrix:
+        if isinstance(o, Matrix):
+            if self.cols != o.cols or self.rows != o.rows:
+                raise ValueError(
+                    f"Cannot add matrices with shapes ({self.cols}, {self.rows}) and ({o.cols}, {o.rows})"
+                )
+            return type(self)([a + b for a, b in zip(self._data, o._data)])
+        return NotImplemented
+
+    def __sub__(self, o: Matrix) -> Matrix:
+        if isinstance(o, Matrix):
+            if self.cols != o.cols or self.rows != o.rows:
+                raise ValueError(
+                    f"Cannot subtract matrices with shapes ({self.cols}, {self.rows}) and ({o.cols}, {o.rows})"
+                )
+            return type(self)([a - b for a, b in zip(self._data, o._data)])
+        return NotImplemented
+
+    def __neg__(self) -> Matrix:
+        return type(self)([-a for a in self._data])
+
+    def inverse(self) -> Matrix:
+        if self.cols != self.rows:
+            raise ValueError(f"Cannot invert non-square matrix of shape ({self.cols} cols, {self.rows} rows)")
+        if self.cols == 2:
+            m = self._data
+            det = m[0] * m[3] - m[2] * m[1]
+            if abs(det) < 1e-12:
+                raise ValueError("Matrix is singular and cannot be inverted.")
+            inv = 1.0 / det
+            return Mat2x2((m[3] * inv, -m[1] * inv, -m[2] * inv, m[0] * inv))
+        if self.cols == 3:
+            m = self._data
+            c00 = m[4] * m[8] - m[7] * m[5]
+            c10 = -(m[1] * m[8] - m[7] * m[2])
+            c20 = m[1] * m[5] - m[4] * m[2]
+            det = m[0] * c00 + m[3] * c10 + m[6] * c20
+            if abs(det) < 1e-12:
+                raise ValueError("Matrix is singular and cannot be inverted.")
+            inv = 1.0 / det
+            c01 = -(m[3] * m[8] - m[6] * m[5])
+            c11 = m[0] * m[8] - m[6] * m[2]
+            c21 = -(m[0] * m[5] - m[3] * m[2])
+            c02 = m[3] * m[7] - m[6] * m[4]
+            c12 = -(m[0] * m[7] - m[6] * m[1])
+            c22 = m[0] * m[4] - m[3] * m[1]
+            return Mat3x3((
+                c00 * inv, c10 * inv, c20 * inv,
+                c01 * inv, c11 * inv, c21 * inv,
+                c02 * inv, c12 * inv, c22 * inv,
+            ))
+        if self.cols == 4:
+            m = self._data
+            a00, a10, a20, a30 = m[0], m[1], m[2], m[3]
+            a01, a11, a21, a31 = m[4], m[5], m[6], m[7]
+            a02, a12, a22, a32 = m[8], m[9], m[10], m[11]
+            a03, a13, a23, a33 = m[12], m[13], m[14], m[15]
+
+            b00, b01 = a00 * a11 - a01 * a10, a00 * a12 - a02 * a10
+            b02, b03 = a00 * a13 - a03 * a10, a01 * a12 - a02 * a11
+            b04, b05 = a01 * a13 - a03 * a11, a02 * a13 - a03 * a12
+            b06, b07 = a20 * a31 - a21 * a30, a20 * a32 - a22 * a30
+            b08, b09 = a20 * a33 - a23 * a30, a21 * a32 - a22 * a31
+            b10, b11 = a21 * a33 - a23 * a31, a22 * a33 - a23 * a32
+
+            det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06
+            if abs(det) < 1e-12:
+                raise ValueError("Matrix is singular and cannot be inverted.")
+
+            inv = 1.0 / det
+            return Mat4x4((
+                (a11 * b11 - a12 * b10 + a13 * b09) * inv,
+                (-a10 * b11 + a12 * b08 - a13 * b07) * inv,
+                (a10 * b10 - a11 * b08 + a13 * b06) * inv,
+                (-a10 * b09 + a11 * b07 - a12 * b06) * inv,
+                (-a01 * b11 + a02 * b10 - a03 * b09) * inv,
+                (a00 * b11 - a02 * b08 + a03 * b07) * inv,
+                (-a00 * b10 + a01 * b08 - a03 * b06) * inv,
+                (a00 * b09 - a01 * b07 + a02 * b06) * inv,
+                (a31 * b05 - a32 * b04 + a33 * b03) * inv,
+                (-a30 * b05 + a32 * b02 - a33 * b01) * inv,
+                (a30 * b04 - a31 * b02 + a33 * b00) * inv,
+                (-a30 * b03 + a31 * b01 - a32 * b00) * inv,
+                (-a21 * b05 + a22 * b04 - a23 * b03) * inv,
+                (a20 * b05 - a22 * b02 + a23 * b01) * inv,
+                (-a20 * b04 + a21 * b02 - a23 * b00) * inv,
+                (a20 * b03 - a21 * b01 + a22 * b00) * inv,
+            ))
+        raise NotImplementedError(f"Inverse not implemented for matrix with cols={self.cols}")
+
+    def to_bytes(self) -> bytes:
+        out = bytearray()
+        for c in range(self.cols):
+            col_floats = [self._data[c * self.rows + r] for r in range(self.rows)]
+            if self.rows == 2:
+                out.extend(struct.pack("<2f", *col_floats))
+            elif self.rows == 3:
+                out.extend(struct.pack("<3ff", *col_floats, 0.0))
+            elif self.rows == 4:
+                out.extend(struct.pack("<4f", *col_floats))
+            else:
+                raise NotImplementedError(f"std430 packing unsupported for rows={self.rows}")
+        return bytes(out)
+
+    @classmethod
+    def from_bytes(
+        cls,
+        buffer: bytes | bytearray | memoryview,
+        cols: int | None = None,
+        rows: int | None = None,
+    ) -> Matrix:
+        if cls is Matrix:
+            c = cols if cols is not None else 4
+            r = rows if rows is not None else c
+            target_cls = _get_matrix_class(c, r)
+            return target_cls.from_bytes(buffer)
+        c = cls.cols
+        r = cls.rows
+        stride = 8 if r == 2 else 16
+        min_bytes = c * stride
+        name = "Mat4" if cls.__name__ in ("Mat4", "Mat4x4") else cls.__name__
+        if len(buffer) < min_bytes:
+            raise ValueError(f"Buffer size {len(buffer)} < {min_bytes} bytes for {name}")
+        flat: list[float] = []
+        for col_idx in range(c):
+            offset = col_idx * stride
+            if r == 2:
+                flat.extend(struct.unpack_from("<2f", buffer, offset))
+            elif r == 3:
+                flat.extend(struct.unpack_from("<3f", buffer, offset))
+            elif r == 4:
+                flat.extend(struct.unpack_from("<4f", buffer, offset))
+            else:
+                raise NotImplementedError(f"std430 unpacking unsupported for rows={r}")
+        return cls(flat)
+
+    def __eq__(self, o: object) -> bool:
+        if isinstance(o, Matrix):
+            if self.cols != o.cols or self.rows != o.rows:
+                return False
+            return all(
+                math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-7)
+                for a, b in zip(self._data, o._data)
+            )
+        if isinstance(o, (tuple, list)) and len(o) == self.cols * self.rows:
+            return all(
+                math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-7)
+                for a, b in zip(self._data, o)
+            )
+        return False
+
+    def __repr__(self) -> str:
+        name = "Mat4" if self.__class__.__name__ in ("Mat4", "Mat4x4") else self.__class__.__name__
+        return f"{name}({self._data})"
+
+
+class Mat2x2(Matrix):
+    """2x2 column-major transformation matrix."""
+
+    cols, rows = 2, 2
+    __slots__ = ()
+
+
+Mat2 = Mat2x2
+
+
+class Mat2x3(Matrix):
+    """2x3 column-major matrix (2 columns, 3 rows)."""
+
+    cols, rows = 2, 3
+    __slots__ = ()
+
+
+class Mat2x4(Matrix):
+    """2x4 column-major matrix (2 columns, 4 rows)."""
+
+    cols, rows = 2, 4
+    __slots__ = ()
+
+
+class Mat3x2(Matrix):
+    """3x2 column-major matrix (3 columns, 2 rows)."""
+
+    cols, rows = 3, 2
+    __slots__ = ()
+
+
+class Mat3x3(Matrix):
+    """3x3 column-major transformation matrix."""
+
+    cols, rows = 3, 3
+    __slots__ = ()
+
+
+Mat3 = Mat3x3
+
+
+class Mat3x4(Matrix):
+    """3x4 column-major matrix (3 columns, 4 rows)."""
+
+    cols, rows = 3, 4
+    __slots__ = ()
+
+
+class Mat4x2(Matrix):
+    """4x2 column-major matrix (4 columns, 2 rows)."""
+
+    cols, rows = 4, 2
+    __slots__ = ()
+
+
+class Mat4x3(Matrix):
+    """4x3 column-major matrix (4 columns, 3 rows)."""
+
+    cols, rows = 4, 3
+    __slots__ = ()
+
+
+class Mat4(Matrix):
+    """4x4 column-major transformation matrix."""
+
+    cols, rows = 4, 4
+    __slots__ = ()
 
     @classmethod
     def translation(cls, x: float | Sequence[float], y: float = 0.0, z: float = 0.0) -> Mat4:
@@ -267,70 +662,6 @@ class Mat4:
             0.0,               0.0,               0.0,               1.0,
         ))
 
-    def __mul__(self, o: Union[Mat4, Vec4]) -> Union[Mat4, Vec4]:
-        a = self._elements
-        if isinstance(o, Mat4):
-            b, res = o._elements, [0.0] * 16
-            for c in range(4):
-                b0, b1, b2, b3 = b[c * 4], b[c * 4 + 1], b[c * 4 + 2], b[c * 4 + 3]
-                for r in range(4):
-                    res[c * 4 + r] = a[r] * b0 + a[4 + r] * b1 + a[8 + r] * b2 + a[12 + r] * b3
-            return Mat4(res)
-        if isinstance(o, Vec4):
-            x, y, z, w = o.x, o.y, o.z, o.w
-            return Vec4(
-                a[0] * x + a[4] * y + a[8] * z + a[12] * w,
-                a[1] * x + a[5] * y + a[9] * z + a[13] * w,
-                a[2] * x + a[6] * y + a[10] * z + a[14] * w,
-                a[3] * x + a[7] * y + a[11] * z + a[15] * w,
-            )
-        return NotImplemented
-
-    def transpose(self) -> Mat4:
-        m = self._elements
-        return Mat4((
-            m[0], m[4], m[8],  m[12],  m[1], m[5], m[9],  m[13],
-            m[2], m[6], m[10], m[14],  m[3], m[7], m[11], m[15],
-        ))
-
-    def inverse(self) -> Mat4:
-        m = self._elements
-        a00, a10, a20, a30 = m[0], m[1], m[2], m[3]
-        a01, a11, a21, a31 = m[4], m[5], m[6], m[7]
-        a02, a12, a22, a32 = m[8], m[9], m[10], m[11]
-        a03, a13, a23, a33 = m[12], m[13], m[14], m[15]
-
-        b00, b01 = a00 * a11 - a01 * a10, a00 * a12 - a02 * a10
-        b02, b03 = a00 * a13 - a03 * a10, a01 * a12 - a02 * a11
-        b04, b05 = a01 * a13 - a03 * a11, a02 * a13 - a03 * a12
-        b06, b07 = a20 * a31 - a21 * a30, a20 * a32 - a22 * a30
-        b08, b09 = a20 * a33 - a23 * a30, a21 * a32 - a22 * a31
-        b10, b11 = a21 * a33 - a23 * a31, a22 * a33 - a23 * a32
-
-        det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06
-        if abs(det) < 1e-12:
-            raise ValueError("Matrix is singular and cannot be inverted.")
-
-        inv = 1.0 / det
-        return Mat4((
-            (a11 * b11 - a12 * b10 + a13 * b09) * inv,
-            (-a10 * b11 + a12 * b08 - a13 * b07) * inv,
-            (a10 * b10 - a11 * b08 + a13 * b06) * inv,
-            (-a10 * b09 + a11 * b07 - a12 * b06) * inv,
-            (-a01 * b11 + a02 * b10 - a03 * b09) * inv,
-            (a00 * b11 - a02 * b08 + a03 * b07) * inv,
-            (-a00 * b10 + a01 * b08 - a03 * b06) * inv,
-            (a00 * b09 - a01 * b07 + a02 * b06) * inv,
-            (a31 * b05 - a32 * b04 + a33 * b03) * inv,
-            (-a30 * b05 + a32 * b02 - a33 * b01) * inv,
-            (a30 * b04 - a31 * b02 + a33 * b00) * inv,
-            (-a30 * b03 + a31 * b01 - a32 * b00) * inv,
-            (-a21 * b05 + a22 * b04 - a23 * b03) * inv,
-            (a20 * b05 - a22 * b02 + a23 * b01) * inv,
-            (-a20 * b04 + a21 * b02 - a23 * b00) * inv,
-            (a20 * b03 - a21 * b01 + a22 * b00) * inv,
-        ))
-
     @classmethod
     def look_at(cls, eye: Sequence[float], target: Sequence[float], up: Sequence[float]) -> Mat4:
         ex, ey, ez = float(eye[0]), float(eye[1]), float(eye[2])
@@ -383,24 +714,24 @@ class Mat4:
             0.0,        0.0, near * far * nf, 0.0,
         ))
 
-    def to_bytes(self) -> bytes:
-        return struct.pack("<16f", *self._elements)
 
-    @classmethod
-    def from_bytes(cls, buffer: bytes | bytearray | memoryview) -> Mat4:
-        if len(buffer) < 64:
-            raise ValueError(f"Buffer size {len(buffer)} < 64 bytes for Mat4")
-        return cls(struct.unpack_from("<16f", buffer, 0))
+Mat4x4 = Mat4
 
-    def __eq__(self, o: object) -> bool:
-        if isinstance(o, Mat4):
-            return all(math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-7) for a, b in zip(self._elements, o._elements))
-        if isinstance(o, (tuple, list)) and len(o) == 16:
-            return all(math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-7) for a, b in zip(self._elements, o))
-        return False
+_MATRIX_CLASSES: dict[tuple[int, int], type[Matrix]] = {
+    (2, 2): Mat2x2,
+    (2, 3): Mat2x3,
+    (2, 4): Mat2x4,
+    (3, 2): Mat3x2,
+    (3, 3): Mat3x3,
+    (3, 4): Mat3x4,
+    (4, 2): Mat4x2,
+    (4, 3): Mat4x3,
+    (4, 4): Mat4x4,
+}
 
-    def __repr__(self) -> str:
-        return f"Mat4({self._elements})"
+
+def _get_matrix_class(cols: int, rows: int) -> type[Matrix]:
+    return _MATRIX_CLASSES.get((cols, rows), Matrix)
 
 
 class Quat:
@@ -489,3 +820,25 @@ class Quat:
 
     def __repr__(self) -> str:
         return f"Quat({self.x}, {self.y}, {self.z}, {self.w})"
+
+
+__all__ = [
+    "Vec2",
+    "Vec3",
+    "Vec4",
+    "Matrix",
+    "Mat2x2",
+    "Mat2",
+    "Mat2x3",
+    "Mat2x4",
+    "Mat3x2",
+    "Mat3x3",
+    "Mat3",
+    "Mat3x4",
+    "Mat4x2",
+    "Mat4x3",
+    "Mat4x4",
+    "Mat4",
+    "Quat",
+]
+
