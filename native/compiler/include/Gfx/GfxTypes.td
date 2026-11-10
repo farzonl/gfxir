@@ -28,4 +28,18 @@ def Gfx_HandleType : TypeDef<Gfx_Dialect, "Handle"> {
   let parameters = (ins EnumParameter<Gfx_ResourceKind>:$kind);
   let assemblyFormat = "`<` $kind `>`";
 }
+
+def Gfx_ArrayType : TypeDef<Gfx_Dialect, "Array"> {
+  let mnemonic = "array";
+  let summary = "Fixed-size array type with std430 stride and alignment";
+  let parameters = (ins "::mlir::Type":$elementType, "uint32_t":$count);
+  let assemblyFormat = "`<` $count `x` $elementType `>`";
+}
+
+def Gfx_StructType : TypeDef<Gfx_Dialect, "Struct"> {
+  let mnemonic = "struct";
+  let summary = "Aggregate struct type";
+  let parameters = (ins StringRefParameter<>:$name, "::mlir::ArrayAttr":$fields);
+  let assemblyFormat = "`<` $name `,` $fields `>`";
+}
 #endif

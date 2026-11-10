@@ -1,0 +1,190 @@
+// RUN: %split-file %s %t
+// RUN: %gfx-compile %t/scalars.json --target vulkan --output %t/scalars.spv --reflection %t/scalars.refl
+// RUN: %FileCheck %s --check-prefix=CHECK-SCALARS < %t/scalars.refl
+// RUN: %gfx-compile %t/vectors.json --target vulkan --output %t/vectors.spv --reflection %t/vectors.refl
+// RUN: %FileCheck %s --check-prefix=CHECK-VECTORS < %t/vectors.refl
+// RUN: %gfx-compile %t/arrays.json --target vulkan --output %t/arrays.spv --reflection %t/arrays.refl
+// RUN: %FileCheck %s --check-prefix=CHECK-ARRAYS < %t/arrays.refl
+// RUN: %gfx-compile %t/nested_struct.json --target vulkan --output %t/nested_struct.spv --reflection %t/nested_struct.refl
+// RUN: %FileCheck %s --check-prefix=CHECK-NESTED < %t/nested_struct.refl
+// RUN: %gfx-compile %t/std430_complex.json --target vulkan --output %t/std430_complex.spv --reflection %t/std430_complex.refl
+// RUN: %FileCheck %s --check-prefix=CHECK-COMPLEX < %t/std430_complex.refl
+
+// =============================================================================
+// FILECHECK DIRECTIVES
+// =============================================================================
+
+// CHECK-SCALARS-DAG: "schema_version":2
+// CHECK-SCALARS-DAG: "layout":"gfx-std430-v1"
+// CHECK-SCALARS-DAG: "name":"scalar_block"
+// CHECK-SCALARS-DAG: "size":32
+// CHECK-SCALARS-DAG: "alignment":8
+// CHECK-SCALARS-DAG: {"alignment":1,"name":"u8_val","offset":0,"size":1,"type":"u8"}
+// CHECK-SCALARS-DAG: {"alignment":1,"name":"i8_val","offset":1,"size":1,"type":"i8"}
+// CHECK-SCALARS-DAG: {"alignment":2,"name":"u16_val","offset":2,"size":2,"type":"u16"}
+// CHECK-SCALARS-DAG: {"alignment":4,"name":"f32_val","offset":4,"size":4,"type":"f32"}
+// CHECK-SCALARS-DAG: {"alignment":4,"name":"i32_val","offset":8,"size":4,"type":"i32"}
+// CHECK-SCALARS-DAG: {"alignment":8,"name":"f64_val","offset":16,"size":8,"type":"f64"}
+// CHECK-SCALARS-DAG: {"alignment":8,"name":"i64_val","offset":24,"size":8,"type":"i64"}
+
+// CHECK-VECTORS-DAG: "schema_version":2
+// CHECK-VECTORS-DAG: "layout":"gfx-std430-v1"
+// CHECK-VECTORS-DAG: "name":"vector_block"
+// CHECK-VECTORS-DAG: "size":48
+// CHECK-VECTORS-DAG: "alignment":16
+// CHECK-VECTORS-DAG: {"alignment":8,"name":"v2i","offset":0,"size":8,"type":"i32x2"}
+// CHECK-VECTORS-DAG: {"alignment":16,"name":"v3i","offset":16,"size":12,"type":"i32x3"}
+// CHECK-VECTORS-DAG: {"alignment":16,"name":"v4i","offset":32,"size":16,"type":"i32x4"}
+
+// CHECK-ARRAYS-DAG: "schema_version":2
+// CHECK-ARRAYS-DAG: "layout":"gfx-std430-v1"
+// CHECK-ARRAYS-DAG: "name":"array_block"
+// CHECK-ARRAYS-DAG: "size":64
+// CHECK-ARRAYS-DAG: "alignment":16
+// CHECK-ARRAYS-DAG: {"alignment":4,"count":4,"element_type":"f32","name":"scalars","offset":0,"size":16,"stride":4,"type":"array"}
+// CHECK-ARRAYS-DAG: {"alignment":16,"count":3,"element_type":"f32x3","name":"v3f_arr","offset":16,"size":48,"stride":16,"type":"array"}
+
+// CHECK-NESTED-DAG: "schema_version":2
+// CHECK-NESTED-DAG: "layout":"gfx-std430-v1"
+// CHECK-NESTED-DAG: "name":"nested_block"
+// CHECK-NESTED-DAG: "size":48
+// CHECK-NESTED-DAG: "alignment":16
+// CHECK-NESTED-DAG: {"alignment":4,"name":"id","offset":0,"size":4,"type":"i32"}
+// CHECK-NESTED-DAG: {"alignment":16,"fields":[{"alignment":4,"name":"val","offset":0,"size":4,"type":"f32"},{"alignment":16,"name":"pos","offset":16,"size":16,"type":"f32x4"}],"name":"sub","offset":16,"size":32,"type":"struct"}
+
+// CHECK-COMPLEX-DAG: "schema_version":2
+// CHECK-COMPLEX-DAG: "layout":"gfx-std430-v1"
+// CHECK-COMPLEX-DAG: "name":"complex_block"
+// CHECK-COMPLEX-DAG: "size":48
+// CHECK-COMPLEX-DAG: "alignment":16
+// CHECK-COMPLEX-DAG: {"alignment":4,"name":"a","offset":0,"size":4,"type":"f32"}
+// CHECK-COMPLEX-DAG: {"alignment":16,"name":"b","offset":16,"size":12,"type":"f32x3"}
+// CHECK-COMPLEX-DAG: {"alignment":4,"name":"c","offset":28,"size":4,"type":"f32"}
+// CHECK-COMPLEX-DAG: {"alignment":8,"name":"d","offset":32,"size":8,"type":"f32x2"}
+// CHECK-COMPLEX-DAG: {"alignment":4,"name":"e","offset":40,"size":4,"type":"i32"}
+
+//--- scalars.json
+{
+  "schema_version": 2,
+  "parameters": {
+    "name": "scalar_block",
+    "fields": [
+      {"name": "u8_val", "type": "u8"},
+      {"name": "i8_val", "type": "i8"},
+      {"name": "u16_val", "type": "u16"},
+      {"name": "f32_val", "type": "f32"},
+      {"name": "i32_val", "type": "i32"},
+      {"name": "f64_val", "type": "f64"},
+      {"name": "i64_val", "type": "i64"}
+    ]
+  },
+  "functions": [{
+    "name": "scalars_shader",
+    "stage": "fragment",
+    "results": [],
+    "body": {"blocks": [{"name": "entry", "arguments": [], "operations": [
+      {"op": "arith.constant", "results": [{"name": "color", "type": "f32x4"}], "attributes": {"value": {"kind": "dense", "type": "f32x4", "value": [1.0, 1.0, 1.0, 1.0]}}},
+      {"op": "gfx.output", "args": ["color"], "results": [], "attributes": {"location": {"kind": "literal", "type": "i32", "value": 0}, "name": {"kind": "string", "value": "target0"}, "interpolation": {"kind": "interpolation", "value": "perspective"}}},
+      {"op": "func.return"}
+    ]}]}
+  }]
+}
+
+//--- vectors.json
+{
+  "schema_version": 2,
+  "parameters": {
+    "name": "vector_block",
+    "fields": [
+      {"name": "v2i", "type": "i32x2"},
+      {"name": "v3i", "type": "i32x3"},
+      {"name": "v4i", "type": "i32x4"}
+    ]
+  },
+  "functions": [{
+    "name": "vector_shader",
+    "stage": "fragment",
+    "results": [],
+    "body": {"blocks": [{"name": "entry", "arguments": [], "operations": [
+      {"op": "arith.constant", "results": [{"name": "color", "type": "f32x4"}], "attributes": {"value": {"kind": "dense", "type": "f32x4", "value": [1.0, 1.0, 1.0, 1.0]}}},
+      {"op": "gfx.output", "args": ["color"], "results": [], "attributes": {"location": {"kind": "literal", "type": "i32", "value": 0}, "name": {"kind": "string", "value": "target0"}, "interpolation": {"kind": "interpolation", "value": "perspective"}}},
+      {"op": "func.return"}
+    ]}]}
+  }]
+}
+
+//--- arrays.json
+{
+  "schema_version": 2,
+  "parameters": {
+    "name": "array_block",
+    "fields": [
+      {"name": "scalars", "type": "array", "element_type": "f32", "count": 4},
+      {"name": "v3f_arr", "type": "array", "element_type": "f32x3", "count": 3}
+    ]
+  },
+  "functions": [{
+    "name": "array_shader",
+    "stage": "fragment",
+    "results": [],
+    "body": {"blocks": [{"name": "entry", "arguments": [], "operations": [
+      {"op": "arith.constant", "results": [{"name": "color", "type": "f32x4"}], "attributes": {"value": {"kind": "dense", "type": "f32x4", "value": [1.0, 1.0, 1.0, 1.0]}}},
+      {"op": "gfx.output", "args": ["color"], "results": [], "attributes": {"location": {"kind": "literal", "type": "i32", "value": 0}, "name": {"kind": "string", "value": "target0"}, "interpolation": {"kind": "interpolation", "value": "perspective"}}},
+      {"op": "func.return"}
+    ]}]}
+  }]
+}
+
+//--- nested_struct.json
+{
+  "schema_version": 2,
+  "parameters": {
+    "name": "nested_block",
+    "fields": [
+      {"name": "id", "type": "i32"},
+      {
+        "name": "sub",
+        "type": "struct",
+        "fields": [
+          {"name": "val", "type": "f32"},
+          {"name": "pos", "type": "f32x4"}
+        ]
+      }
+    ]
+  },
+  "functions": [{
+    "name": "nested_shader",
+    "stage": "fragment",
+    "results": [],
+    "body": {"blocks": [{"name": "entry", "arguments": [], "operations": [
+      {"op": "arith.constant", "results": [{"name": "color", "type": "f32x4"}], "attributes": {"value": {"kind": "dense", "type": "f32x4", "value": [1.0, 1.0, 1.0, 1.0]}}},
+      {"op": "gfx.output", "args": ["color"], "results": [], "attributes": {"location": {"kind": "literal", "type": "i32", "value": 0}, "name": {"kind": "string", "value": "target0"}, "interpolation": {"kind": "interpolation", "value": "perspective"}}},
+      {"op": "func.return"}
+    ]}]}
+  }]
+}
+
+//--- std430_complex.json
+{
+  "schema_version": 2,
+  "parameters": {
+    "name": "complex_block",
+    "fields": [
+      {"name": "a", "type": "f32"},
+      {"name": "b", "type": "f32x3"},
+      {"name": "c", "type": "f32"},
+      {"name": "d", "type": "f32x2"},
+      {"name": "e", "type": "i32"}
+    ]
+  },
+  "functions": [{
+    "name": "complex_shader",
+    "stage": "fragment",
+    "results": [],
+    "body": {"blocks": [{"name": "entry", "arguments": [], "operations": [
+      {"op": "arith.constant", "results": [{"name": "color", "type": "f32x4"}], "attributes": {"value": {"kind": "dense", "type": "f32x4", "value": [1.0, 1.0, 1.0, 1.0]}}},
+      {"op": "gfx.output", "args": ["color"], "results": [], "attributes": {"location": {"kind": "literal", "type": "i32", "value": 0}, "name": {"kind": "string", "value": "target0"}, "interpolation": {"kind": "interpolation", "value": "perspective"}}},
+      {"op": "func.return"}
+    ]}]}
+  }]
+}

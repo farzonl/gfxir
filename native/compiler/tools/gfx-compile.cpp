@@ -43,6 +43,9 @@ static llvm::cl::opt<uint32_t>
 static llvm::cl::opt<uint32_t>
     maxSharedMemoryBytes("max-shared-memory-bytes",
                          llvm::cl::desc("Override max shared memory bytes (default 32768)"));
+static llvm::cl::opt<std::string> cHeaderOutput(
+    "c-header",
+    llvm::cl::desc("Output C header file containing reflected aggregate struct definitions and compile-time static assertions"));
 
 static LogicalResult writeFile(StringRef path,
                                function_ref<void(llvm::raw_ostream &)> writer) {
@@ -203,6 +206,11 @@ int main(int argc, char **argv) {
   if (failed(writeFile(reflectionOutput, [&](auto &stream) {
         stream << llvm::json::Value(gfx::serializeReflection(reflection))
                << "\n";
+      })))
+    return 1;
+  if (!cHeaderOutput.empty() &&
+      failed(writeFile(cHeaderOutput, [&](auto &stream) {
+        (void)gfx::emitCHeader(reflection, stream);
       })))
     return 1;
   return 0;

@@ -23,7 +23,7 @@
 # FIELD: error: 'gfx.parameter' op unknown parameter field
 # TYPE: error: 'gfx.parameter' op parameter result type does not match its field
 # DUPLICATE: error: parameter fields must be typed and uniquely named
-# UNSUPPORTED-TYPE: error: parameter fields currently support f32 and f32x2/3/4
+# UNSUPPORTED-TYPE: error: parameter field requires only a name and supported type
 # SIZE: error: read-only parameter blocks currently fit within 128 bytes
 # OFFSET: error: parameter field requires only a name and supported type
 # BINDING: error: parameters requires a name and fields, not authored offsets or backend bindings

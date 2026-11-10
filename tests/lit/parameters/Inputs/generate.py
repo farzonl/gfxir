@@ -24,7 +24,7 @@ def generate(case):
     elif case == "duplicate":
         shader["parameters"]["fields"].append(shader["parameters"]["fields"][0])
     elif case == "unsupported":
-        shader["parameters"]["fields"][0]["type"] = "u32"
+        shader["parameters"]["fields"][0]["type"] = "unsupported"
     elif case == "oversized":
         shader["parameters"]["fields"] = [{"name": f"field{i}", "type": "f32x4"} for i in range(9)]
     elif case == "authored_offset":

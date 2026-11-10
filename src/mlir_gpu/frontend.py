@@ -13,6 +13,14 @@ class Type(Enum):
     F32 = "f32"
     U32 = "i32"
     I32 = "si32"
+    F16 = "f16"
+    U16 = "i16"
+    I16 = "si16"
+    F64 = "f64"
+    U64 = "i64"
+    I64 = "si64"
+    U8 = "i8"
+    I8 = "si8"
     BOOL = "i1"
     VEC2 = "vector<2xf32>"
     VEC3 = "vector<3xf32>"
@@ -21,7 +29,10 @@ class Type(Enum):
     @property
     def schema_name(self) -> str:
         return {
-            Type.F32: "f32", Type.U32: "u32", Type.I32: "i32", Type.BOOL: "bool",
+            Type.F32: "f32", Type.U32: "u32", Type.I32: "i32",
+            Type.F16: "f16", Type.U16: "u16", Type.I16: "i16",
+            Type.F64: "f64", Type.U64: "u64", Type.I64: "i64",
+            Type.U8: "u8", Type.I8: "i8", Type.BOOL: "bool",
             Type.VEC2: "f32x2", Type.VEC3: "f32x3", Type.VEC4: "f32x4",
         }[self]
 

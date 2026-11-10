@@ -12,6 +12,7 @@
 #include <array>
 #include <optional>
 #include <variant>
+#include <vector>
 
 #include "Gfx/GfxDialect.h.inc"
 #include "Gfx/GfxEnums.h.inc"
@@ -48,14 +49,29 @@ struct ShaderInterface {
 
 struct ParameterFieldLayout {
   ParameterFieldAttr field;
-  uint32_t offset, size, alignment;
+  std::string name;
+  Type type;
+  uint32_t offset = 0;
+  uint32_t size = 0;
+  uint32_t alignment = 1;
+  uint32_t paddingAfter = 0;
+  uint32_t count = 0;
+  uint32_t stride = 0;
+  std::vector<ParameterFieldLayout> nestedFields;
 };
 struct ParameterLayout {
   SmallVector<ParameterFieldLayout> fields;
-  uint32_t size;
+  uint32_t size = 0;
+  uint32_t alignment = 16;
 };
 ParameterLayout parameterLayout(ParameterBlockAttr block);
+std::vector<ParameterFieldLayout> layoutStructMembers(StructType type);
+LogicalResult getStd430Layout(Type type, uint32_t &size, uint32_t &alignment);
 llvm::json::Object serializeParameters(ParameterBlockAttr block, Stage stage);
+LogicalResult emitCHeader(const ParameterLayout &layout, llvm::raw_ostream &os,
+                          llvm::StringRef structName);
+LogicalResult emitCHeader(const ShaderInterface &reflection,
+                          llvm::raw_ostream &os);
 
 struct TargetProfile {
   uint32_t spirv_version = 0x10000; // 1.0 default (0xMMmm00)
