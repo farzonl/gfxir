@@ -18,7 +18,8 @@ using Blocks = llvm::StringMap<Block *>;
 class StructuredImporter {
 public:
   explicit StructuredImporter(MLIRContext &context) : builder(&context) {}
-  OwningOpRef<ModuleOp> import(const llvm::json::Object &source);
+  OwningOpRef<ModuleOp> import(const llvm::json::Object &source,
+                               const TargetProfile &profile);
 
 private:
   OpBuilder builder;
@@ -150,6 +151,12 @@ private:
       if (*kind == "interpolation")
         if (auto item = symbolizeInterpolation(*text))
           return Attribute(InterpolationAttr::get(builder.getContext(), *item));
+      if (*kind == "memory_scope")
+        if (auto item = symbolizeMemoryScope(*text))
+          return Attribute(MemoryScopeAttr::get(builder.getContext(), *item));
+      if (*kind == "atomic_op")
+        if (auto item = symbolizeAtomicOp(*text))
+          return Attribute(AtomicOpAttr::get(builder.getContext(), *item));
       if (*kind == "cmpi")
         if (auto item = arith::symbolizeCmpIPredicate(*text))
           return Attribute(
@@ -332,7 +339,8 @@ LogicalResult StructuredImporter::region(const llvm::json::Object &description,
 }
 
 OwningOpRef<ModuleOp>
-StructuredImporter::import(const llvm::json::Object &source) {
+StructuredImporter::import(const llvm::json::Object &source,
+                           const TargetProfile &profile) {
   auto loc = location(source, builder.getUnknownLoc());
   if (failed(loc))
     return {};
@@ -535,7 +543,7 @@ StructuredImporter::import(const llvm::json::Object &source) {
                       function.getLoc())))
       return {};
   }
-  if (failed(verifyShaderModule(*module)))
+  if (failed(verifyShaderModule(*module, profile)))
     return {};
   return module;
 }
@@ -543,6 +551,7 @@ StructuredImporter::import(const llvm::json::Object &source) {
 
 OwningOpRef<ModuleOp>
 mlir::gfx::importStructuredShader(MLIRContext &context,
-                                  const llvm::json::Object &source) {
-  return StructuredImporter(context).import(source);
+                                  const llvm::json::Object &source,
+                                  const TargetProfile &profile) {
+  return StructuredImporter(context).import(source, profile);
 }

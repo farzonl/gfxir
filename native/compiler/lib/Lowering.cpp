@@ -102,6 +102,31 @@ struct GfxVerifyPass : impl::GfxVerifyBase<GfxVerifyPass> {
   }
 };
 
+static Value ensureSpirvElementPtr(ConversionPatternRewriter &rewriter,
+                                   Location loc, Value ptr, Type elemType) {
+  auto spvPtrType = dyn_cast<spirv::PointerType>(ptr.getType());
+  if (!spvPtrType)
+    return ptr;
+  Type pointee = spvPtrType.getPointeeType();
+  if (isa<spirv::StructType>(pointee)) {
+    auto zero = spirv::ConstantOp::create(
+        rewriter, loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+    auto resPtrType =
+        spirv::PointerType::get(elemType, spvPtrType.getStorageClass());
+    return spirv::AccessChainOp::create(rewriter, loc, resPtrType, ptr,
+                                        ValueRange{zero, zero});
+  }
+  if (isa<spirv::ArrayType>(pointee)) {
+    auto zero = spirv::ConstantOp::create(
+        rewriter, loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+    auto resPtrType =
+        spirv::PointerType::get(elemType, spvPtrType.getStorageClass());
+    return spirv::AccessChainOp::create(rewriter, loc, resPtrType, ptr,
+                                        ValueRange{zero});
+  }
+  return ptr;
+}
+
 struct PtrOffsetPattern : OpConversionPattern<gfx::PtrOffsetOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult matchAndRewrite(gfx::PtrOffsetOp op, OpAdaptor adaptor,
@@ -117,6 +142,11 @@ struct PtrOffsetPattern : OpConversionPattern<gfx::PtrOffsetOp> {
           rewriter.getI32IntegerAttr(0));
       rewriter.replaceOpWithNewOp<spirv::AccessChainOp>(
           op, resType, ptr, ValueRange{zero, adaptor.getOffset()});
+      return success();
+    }
+    if (ptrType && isa<spirv::ArrayType>(ptrType.getPointeeType())) {
+      rewriter.replaceOpWithNewOp<spirv::AccessChainOp>(
+          op, resType, ptr, ValueRange{adaptor.getOffset()});
       return success();
     }
     if (auto accessChain = ptr.getDefiningOp<spirv::AccessChainOp>()) {
@@ -135,6 +165,29 @@ struct PtrOffsetPattern : OpConversionPattern<gfx::PtrOffsetOp> {
             ValueRange{indices[0], combinedOffset});
         return success();
       }
+      if (indices.size() == 1) {
+        Value prevOffset = indices[0];
+        Value addOffset = adaptor.getOffset();
+        if (prevOffset.getType() != addOffset.getType()) {
+          addOffset = spirv::BitcastOp::create(
+              rewriter, op.getLoc(), prevOffset.getType(), addOffset);
+        }
+        bool isZeroBase = false;
+        if (auto constOp = prevOffset.getDefiningOp<spirv::ConstantOp>()) {
+          if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue());
+              intAttr && intAttr.getInt() == 0) {
+            isZeroBase = true;
+          }
+        }
+        Value combinedOffset =
+            isZeroBase ? addOffset
+                       : Value(spirv::IAddOp::create(rewriter, op.getLoc(),
+                                                     prevOffset.getType(),
+                                                     prevOffset, addOffset));
+        rewriter.replaceOpWithNewOp<spirv::AccessChainOp>(
+            op, resType, accessChain.getBasePtr(), ValueRange{combinedOffset});
+        return success();
+      }
     }
     rewriter.replaceOpWithNewOp<spirv::PtrAccessChainOp>(
         op, resType, adaptor.getPtr(), adaptor.getOffset(), ValueRange{});
@@ -149,9 +202,10 @@ struct LoadPattern : OpConversionPattern<gfx::LoadOp> {
     Type resType = getTypeConverter()->convertType(op.getType());
     if (!resType)
       return failure();
+    Value ptr = ensureSpirvElementPtr(rewriter, op.getLoc(), adaptor.getPtr(), resType);
     spirv::MemoryAccessAttr memAccess;
     IntegerAttr alignmentAttr;
-    auto spvPtrType = dyn_cast<spirv::PointerType>(adaptor.getPtr().getType());
+    auto spvPtrType = dyn_cast<spirv::PointerType>(ptr.getType());
     bool isBDA = spvPtrType && spvPtrType.getStorageClass() ==
                                    spirv::StorageClass::PhysicalStorageBuffer;
     if (op.getAlignment().has_value()) {
@@ -166,7 +220,7 @@ struct LoadPattern : OpConversionPattern<gfx::LoadOp> {
       alignmentAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(align));
     }
     rewriter.replaceOpWithNewOp<spirv::LoadOp>(
-        op, resType, adaptor.getPtr(), memAccess, alignmentAttr);
+        op, resType, ptr, memAccess, alignmentAttr);
     return success();
   }
 };
@@ -175,9 +229,11 @@ struct StorePattern : OpConversionPattern<gfx::StoreOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult matchAndRewrite(gfx::StoreOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
+    Value ptr = ensureSpirvElementPtr(rewriter, op.getLoc(), adaptor.getPtr(),
+                                      adaptor.getValue().getType());
     spirv::MemoryAccessAttr memAccess;
     IntegerAttr alignmentAttr;
-    auto spvPtrType = dyn_cast<spirv::PointerType>(adaptor.getPtr().getType());
+    auto spvPtrType = dyn_cast<spirv::PointerType>(ptr.getType());
     bool isBDA = spvPtrType && spvPtrType.getStorageClass() ==
                                    spirv::StorageClass::PhysicalStorageBuffer;
     if (op.getAlignment().has_value()) {
@@ -192,13 +248,131 @@ struct StorePattern : OpConversionPattern<gfx::StoreOp> {
       alignmentAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(align));
     }
     rewriter.replaceOpWithNewOp<spirv::StoreOp>(
-        op, adaptor.getPtr(), adaptor.getValue(), memAccess, alignmentAttr);
+        op, ptr, adaptor.getValue(), memAccess, alignmentAttr);
+    return success();
+  }
+};
+
+struct BarrierPattern : OpConversionPattern<gfx::BarrierOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(gfx::BarrierOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
+    spirv::Scope memScope = spirv::Scope::Workgroup;
+    spirv::MemorySemantics semantics =
+        spirv::MemorySemantics::AcquireRelease |
+        spirv::MemorySemantics::WorkgroupMemory;
+    switch (op.getScope()) {
+    case MemoryScope::Workgroup:
+      memScope = spirv::Scope::Workgroup;
+      semantics = spirv::MemorySemantics::AcquireRelease |
+                  spirv::MemorySemantics::WorkgroupMemory;
+      break;
+    case MemoryScope::Device:
+      memScope = spirv::Scope::Device;
+      semantics = spirv::MemorySemantics::AcquireRelease |
+                  spirv::MemorySemantics::UniformMemory;
+      break;
+    case MemoryScope::All:
+      memScope = spirv::Scope::Device;
+      semantics = spirv::MemorySemantics::AcquireRelease |
+                  spirv::MemorySemantics::UniformMemory |
+                  spirv::MemorySemantics::WorkgroupMemory;
+      break;
+    }
+    rewriter.replaceOpWithNewOp<spirv::ControlBarrierOp>(
+        op, spirv::Scope::Workgroup, memScope, semantics);
+    return success();
+  }
+};
+
+struct AtomicRMWPattern : OpConversionPattern<gfx::AtomicRMWOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(gfx::AtomicRMWOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Type resType = getTypeConverter()->convertType(op.getType());
+    if (!resType)
+      return failure();
+    Value ptr =
+        ensureSpirvElementPtr(rewriter, op.getLoc(), adaptor.getPtr(), resType);
+    auto gfxPtrType = cast<gfx::PtrType>(op.getPtr().getType());
+    spirv::Scope memScope =
+        (gfxPtrType.getStorageClass() == StorageClass::Workgroup)
+            ? spirv::Scope::Workgroup
+            : spirv::Scope::Device;
+    spirv::MemorySemantics semantics = spirv::MemorySemantics::None;
+    Value val = adaptor.getValue();
+
+    switch (op.getKind()) {
+    case AtomicOp::Add:
+      rewriter.replaceOpWithNewOp<spirv::AtomicIAddOp>(op, resType, ptr,
+                                                       memScope, semantics, val);
+      return success();
+    case AtomicOp::Sub:
+      rewriter.replaceOpWithNewOp<spirv::AtomicISubOp>(op, resType, ptr,
+                                                       memScope, semantics, val);
+      return success();
+    case AtomicOp::Min:
+      rewriter.replaceOpWithNewOp<spirv::AtomicSMinOp>(op, resType, ptr,
+                                                       memScope, semantics, val);
+      return success();
+    case AtomicOp::Max:
+      rewriter.replaceOpWithNewOp<spirv::AtomicSMaxOp>(op, resType, ptr,
+                                                       memScope, semantics, val);
+      return success();
+    case AtomicOp::UMin:
+      rewriter.replaceOpWithNewOp<spirv::AtomicUMinOp>(op, resType, ptr,
+                                                       memScope, semantics, val);
+      return success();
+    case AtomicOp::UMax:
+      rewriter.replaceOpWithNewOp<spirv::AtomicUMaxOp>(op, resType, ptr,
+                                                       memScope, semantics, val);
+      return success();
+    case AtomicOp::And:
+      rewriter.replaceOpWithNewOp<spirv::AtomicAndOp>(op, resType, ptr,
+                                                      memScope, semantics, val);
+      return success();
+    case AtomicOp::Or:
+      rewriter.replaceOpWithNewOp<spirv::AtomicOrOp>(op, resType, ptr, memScope,
+                                                     semantics, val);
+      return success();
+    case AtomicOp::Xor:
+      rewriter.replaceOpWithNewOp<spirv::AtomicXorOp>(op, resType, ptr,
+                                                      memScope, semantics, val);
+      return success();
+    case AtomicOp::Xchg:
+      rewriter.replaceOpWithNewOp<spirv::AtomicExchangeOp>(
+          op, resType, ptr, memScope, semantics, val);
+      return success();
+    }
+    return failure();
+  }
+};
+
+struct AtomicCASPattern : OpConversionPattern<gfx::AtomicCASOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(gfx::AtomicCASOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Type resType = getTypeConverter()->convertType(op.getType());
+    if (!resType)
+      return failure();
+    Value ptr =
+        ensureSpirvElementPtr(rewriter, op.getLoc(), adaptor.getPtr(), resType);
+    auto gfxPtrType = cast<gfx::PtrType>(op.getPtr().getType());
+    spirv::Scope memScope =
+        (gfxPtrType.getStorageClass() == StorageClass::Workgroup)
+            ? spirv::Scope::Workgroup
+            : spirv::Scope::Device;
+    rewriter.replaceOpWithNewOp<spirv::AtomicCompareExchangeOp>(
+        op, resType, ptr, memScope, spirv::MemorySemantics::None,
+        spirv::MemorySemantics::None, adaptor.getValue(), adaptor.getCmp());
     return success();
   }
 };
 
 static bool isBoundEntryPointerRoot(Value root, func::FuncOp entryFunction) {
-  if (root.getDefiningOp<BufferBindingOp>())
+  if (root.getDefiningOp<BufferBindingOp>() ||
+      root.getDefiningOp<SharedAllocOp>())
     return true;
   if (auto blockArg = dyn_cast<BlockArgument>(root)) {
     if (blockArg.getOwner() == &entryFunction.getBody().front()) {
@@ -667,9 +841,48 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
         op.erase();
       }
     }
+
+    SmallVector<SharedAllocOp> sharedAllocs;
+    shader.walk([&](SharedAllocOp op) { sharedAllocs.push_back(op); });
+    for (size_t idx = 0; idx < sharedAllocs.size(); ++idx) {
+      auto op = sharedAllocs[idx];
+      auto ptrType = cast<PtrType>(op.getResult().getType());
+      Type elemType = converter.convertType(ptrType.getElementType());
+      if (!elemType) {
+        op.emitOpError("unsupported element type for SPIR-V workgroup memory");
+        signalPassFailure();
+        return;
+      }
+      auto arrayType = spirv::ArrayType::get(elemType, op.getCount());
+      auto varPtrType =
+          spirv::PointerType::get(arrayType, spirv::StorageClass::Workgroup);
+      std::string symName =
+          (op.getName().has_value() && !op.getName()->empty())
+              ? ("shared_" + op.getName()->str() + "_" + std::to_string(idx))
+              : ("shared_mem_" + std::to_string(idx));
+      builder.setInsertionPoint(function);
+      auto var =
+          spirv::GlobalVariableOp::create(builder, op.getLoc(), varPtrType, symName);
+      symbols.insert(var);
+      if (!op.getResult().use_empty()) {
+        builder.setInsertionPoint(op);
+        auto addr = spirv::AddressOfOp::create(builder, op.getLoc(), var);
+        auto zero = spirv::ConstantOp::create(
+            builder, op.getLoc(), builder.getI32Type(),
+            builder.getI32IntegerAttr(0));
+        auto elemPtrType =
+            spirv::PointerType::get(elemType, spirv::StorageClass::Workgroup);
+        auto elem0 = spirv::AccessChainOp::create(
+            builder, op.getLoc(), elemPtrType, addr, ValueRange{zero});
+        op.getResult().replaceAllUsesWith(elem0);
+      }
+      op.erase();
+    }
+
     RewritePatternSet patterns(context);
     ScfToSPIRVContext scfContext;
-    patterns.add<PtrOffsetPattern, LoadPattern, StorePattern>(converter, context);
+    patterns.add<PtrOffsetPattern, LoadPattern, StorePattern, BarrierPattern,
+                 AtomicRMWPattern, AtomicCASPattern>(converter, context);
     arith::populateArithToSPIRVPatterns(converter, patterns);
     populateMathToSPIRVPatterns(converter, patterns);
     populateVectorToSPIRVPatterns(converter, patterns);
@@ -1028,9 +1241,54 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
       }
       op->erase();
     }
+    SmallVector<SharedAllocOp> sharedAllocs;
+    module.walk([&](SharedAllocOp op) { sharedAllocs.push_back(op); });
+    for (size_t idx = 0; idx < sharedAllocs.size(); ++idx) {
+      auto allocOp = sharedAllocs[idx];
+      auto ptrType = cast<PtrType>(allocOp.getResult().getType());
+      Type elemType = convertGfxPtr(ptrType.getElementType());
+      auto arrayType =
+          LLVM::LLVMArrayType::get(elemType, static_cast<unsigned>(allocOp.getCount()));
+      uint32_t align =
+          std::max<uint32_t>(getNaturalAlignment(ptrType.getElementType()), 4u);
+      std::string symName =
+          (allocOp.getName().has_value() && !allocOp.getName()->empty())
+              ? ("shared_" + allocOp.getName()->str() + "_" +
+                 std::to_string(idx))
+              : ("shared_mem_" + std::to_string(idx));
+      builder.setInsertionPointToStart(module.getBody());
+      auto globalOp = LLVM::GlobalOp::create(
+          builder, allocOp.getLoc(), arrayType, /*isConstant=*/false,
+          LLVM::Linkage::Internal, symName, /*value=*/Attribute{},
+          /*alignment=*/align, /*addrSpace=*/3);
+      {
+        OpBuilder::InsertionGuard guard(builder);
+        Block *initBlock =
+            builder.createBlock(&globalOp.getInitializerRegion());
+        builder.setInsertionPointToStart(initBlock);
+        Value undefVal =
+            LLVM::UndefOp::create(builder, allocOp.getLoc(), arrayType);
+        LLVM::ReturnOp::create(builder, allocOp.getLoc(), ValueRange{undefVal});
+      }
+      if (!allocOp.getResult().use_empty()) {
+        builder.setInsertionPoint(allocOp);
+        auto addr =
+            LLVM::AddressOfOp::create(builder, allocOp.getLoc(), globalOp);
+        Value castPtr =
+            UnrealizedConversionCastOp::create(
+                builder, allocOp.getLoc(),
+                TypeRange{allocOp.getResult().getType()},
+                ValueRange{addr.getRes()})
+                .getResult(0);
+        allocOp.getResult().replaceAllUsesWith(castPtr);
+      }
+      allocOp.erase();
+    }
+
     SmallVector<Operation *> bufferOps;
     module.walk([&](Operation *op) {
-      if (isa<BufferBindingOp, PtrOffsetOp, LoadOp, StoreOp>(op))
+      if (isa<BufferBindingOp, PtrOffsetOp, LoadOp, StoreOp, BarrierOp,
+              AtomicRMWOp, AtomicCASOp>(op))
         bufferOps.push_back(op);
     });
     for (Operation *op : bufferOps) {
@@ -1041,6 +1299,132 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
         Value pointer =
             emitRawBufferBasePtr(op->getLoc(), binding.getAccess(), compactReg);
         op->getResult(0).replaceAllUsesWith(pointer);
+        op->erase();
+      } else if (auto barrier = dyn_cast<BarrierOp>(op)) {
+        StringRef intrinsicName = "llvm.dx.group.memory.barrier.with.group.sync";
+        switch (barrier.getScope()) {
+        case MemoryScope::Workgroup:
+          intrinsicName = "llvm.dx.group.memory.barrier.with.group.sync";
+          break;
+        case MemoryScope::Device:
+          intrinsicName = "llvm.dx.device.memory.barrier.with.group.sync";
+          break;
+        case MemoryScope::All:
+          intrinsicName = "llvm.dx.all.memory.barrier.with.group.sync";
+          break;
+        }
+        LLVM::CallIntrinsicOp::create(
+            builder, op->getLoc(), builder.getStringAttr(intrinsicName),
+            ValueRange{});
+        op->erase();
+      } else if (auto rmw = dyn_cast<AtomicRMWOp>(op)) {
+        Value ptr = op->getOperand(0);
+        Type expectedPtrType = convertGfxPtr(ptr.getType());
+        if (ptr.getType() != expectedPtrType) {
+          ptr = UnrealizedConversionCastOp::create(
+                    builder, op->getLoc(), TypeRange{expectedPtrType},
+                    ValueRange{ptr})
+                    .getResult(0);
+        }
+        Value val = op->getOperand(1);
+        Type expectedElem = convertGfxPtr(val.getType());
+        if (val.getType() != expectedElem) {
+          val = UnrealizedConversionCastOp::create(
+                    builder, op->getLoc(), TypeRange{expectedElem},
+                    ValueRange{val})
+                    .getResult(0);
+        }
+        LLVM::AtomicBinOp binOp = LLVM::AtomicBinOp::add;
+        switch (rmw.getKind()) {
+        case AtomicOp::Add:
+          binOp = LLVM::AtomicBinOp::add;
+          break;
+        case AtomicOp::Sub: {
+          // DXIL RawBuffer atomics lower InterlockedAdd with a negated operand
+          // instead of a separate subtract opcode.
+          Value zero = LLVM::ConstantOp::create(
+              builder, op->getLoc(), expectedElem,
+              builder.getIntegerAttr(expectedElem, 0));
+          val = LLVM::SubOp::create(builder, op->getLoc(), zero, val);
+          binOp = LLVM::AtomicBinOp::add;
+          break;
+        }
+        case AtomicOp::Min:
+          binOp = LLVM::AtomicBinOp::min;
+          break;
+        case AtomicOp::Max:
+          binOp = LLVM::AtomicBinOp::max;
+          break;
+        case AtomicOp::UMin:
+          binOp = LLVM::AtomicBinOp::umin;
+          break;
+        case AtomicOp::UMax:
+          binOp = LLVM::AtomicBinOp::umax;
+          break;
+        case AtomicOp::And:
+          binOp = LLVM::AtomicBinOp::_and;
+          break;
+        case AtomicOp::Or:
+          binOp = LLVM::AtomicBinOp::_or;
+          break;
+        case AtomicOp::Xor:
+          binOp = LLVM::AtomicBinOp::_xor;
+          break;
+        case AtomicOp::Xchg:
+          binOp = LLVM::AtomicBinOp::xchg;
+          break;
+        }
+        auto llvmRmw = LLVM::AtomicRMWOp::create(
+            builder, op->getLoc(), binOp, ptr, val,
+            LLVM::AtomicOrdering::seq_cst, StringRef(), /*alignment=*/4u);
+        Value resVal = llvmRmw.getRes();
+        if (resVal.getType() != rmw.getResult().getType()) {
+          resVal = UnrealizedConversionCastOp::create(
+                       builder, op->getLoc(),
+                       TypeRange{rmw.getResult().getType()}, ValueRange{resVal})
+                       .getResult(0);
+        }
+        rmw.getResult().replaceAllUsesWith(resVal);
+        op->erase();
+      } else if (auto cas = dyn_cast<AtomicCASOp>(op)) {
+        Value ptr = op->getOperand(0);
+        Type expectedPtrType = convertGfxPtr(ptr.getType());
+        if (ptr.getType() != expectedPtrType) {
+          ptr = UnrealizedConversionCastOp::create(
+                    builder, op->getLoc(), TypeRange{expectedPtrType},
+                    ValueRange{ptr})
+                    .getResult(0);
+        }
+        Value cmp = op->getOperand(1);
+        Value val = op->getOperand(2);
+        Type expectedElem = convertGfxPtr(cmp.getType());
+        if (cmp.getType() != expectedElem) {
+          cmp = UnrealizedConversionCastOp::create(
+                    builder, op->getLoc(), TypeRange{expectedElem},
+                    ValueRange{cmp})
+                    .getResult(0);
+        }
+        if (val.getType() != expectedElem) {
+          val = UnrealizedConversionCastOp::create(
+                    builder, op->getLoc(), TypeRange{expectedElem},
+                    ValueRange{val})
+                    .getResult(0);
+        }
+        auto cmpxchg = LLVM::AtomicCmpXchgOp::create(
+            builder, op->getLoc(), ptr, cmp, val,
+            LLVM::AtomicOrdering::seq_cst, LLVM::AtomicOrdering::seq_cst,
+            StringAttr{}, builder.getI64IntegerAttr(4), /*weak=*/false,
+            /*volatile_=*/false, ArrayAttr{}, ArrayAttr{}, ArrayAttr{},
+            ArrayAttr{});
+        Value resVal = LLVM::ExtractValueOp::create(
+            builder, op->getLoc(), cmpxchg.getRes(), ArrayRef<int64_t>{0});
+        if (resVal.getType() != cas.getResult().getType()) {
+          resVal = UnrealizedConversionCastOp::create(
+                       builder, op->getLoc(),
+                       TypeRange{cas.getResult().getType()}, ValueRange{resVal})
+                       .getResult(0);
+        }
+        cas.getResult().replaceAllUsesWith(resVal);
         op->erase();
       } else if (isa<PtrOffsetOp>(op)) {
         Value ptr = op->getOperand(0);

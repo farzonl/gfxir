@@ -1120,6 +1120,342 @@ LogicalResult StoreOp::verify() {
   return success();
 }
 
+LogicalResult SharedAllocOp::verify() {
+  if (!(*this)->getParentOfType<func::FuncOp>())
+    return emitOpError("requires an enclosing function");
+  if (auto stage = stageOf(*this)) {
+    if (stage.getValue() != Stage::Compute)
+      return emitOpError(
+          "shared memory allocations are only allowed in compute shaders");
+  }
+  int64_t count = getCountAttr().getInt();
+  if (count <= 0)
+    return emitOpError("shared memory element count must be positive, got ")
+           << count;
+  if (getName().has_value() && !isShaderSymbolName(*getName()))
+    return emitOpError("shared memory name must be a valid identifier");
+
+  auto ptrType = cast<PtrType>(getResult().getType());
+  if (ptrType.getStorageClass() != StorageClass::Workgroup)
+    return emitOpError(
+               "shared_alloc must produce a pointer with 'workgroup' storage class, got '")
+           << stringifyStorageClass(ptrType.getStorageClass()) << "'";
+
+  uint32_t elemSize = 0, elemAlign = 0;
+  if (failed(getStd430Layout(ptrType.getElementType(), elemSize, elemAlign)) ||
+      elemSize == 0)
+    return emitOpError("shared_alloc element type ")
+           << ptrType.getElementType() << " does not have a supported layout";
+
+  return success();
+}
+
+static LogicalResult verifyUniformBarrierPlacement(BarrierOp barrier,
+                                                   func::FuncOp func) {
+  llvm::DenseSet<Value> divergent;
+  auto markDivergent = [&](Value v) -> bool {
+    return v && divergent.insert(v).second;
+  };
+
+  func.walk([&](Operation *op) {
+    if (auto builtin = dyn_cast<BuiltinOp>(op)) {
+      if (builtin.getKind() == Builtin::LocalInvocationId ||
+          builtin.getKind() == Builtin::GlobalInvocationId) {
+        markDivergent(builtin.getValue());
+      }
+    } else if (auto rmw = dyn_cast<AtomicRMWOp>(op)) {
+      markDivergent(rmw.getResult());
+    } else if (auto cas = dyn_cast<AtomicCASOp>(op)) {
+      markDivergent(cas.getResult());
+    }
+  });
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    func.walk([&](Operation *op) {
+      if (isa<BuiltinOp, ParameterOp, SharedAllocOp, BufferBindingOp,
+              arith::ConstantOp>(op))
+        return;
+
+      if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+        bool condDiv = divergent.contains(ifOp.getCondition());
+        auto thenYield =
+            cast<scf::YieldOp>(ifOp.getThenRegion().front().getTerminator());
+        scf::YieldOp elseYield;
+        if (!ifOp.getElseRegion().empty()) {
+          elseYield =
+              cast<scf::YieldOp>(ifOp.getElseRegion().front().getTerminator());
+        }
+        for (unsigned i = 0; i < ifOp.getNumResults(); ++i) {
+          bool resDiv = condDiv || divergent.contains(thenYield.getOperand(i)) ||
+                        (elseYield && divergent.contains(elseYield.getOperand(i)));
+          if (resDiv)
+            changed |= markDivergent(ifOp.getResult(i));
+        }
+        return;
+      }
+
+      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        bool boundsDiv = divergent.contains(forOp.getLowerBound()) ||
+                         divergent.contains(forOp.getUpperBound()) ||
+                         divergent.contains(forOp.getStep());
+        if (boundsDiv)
+          changed |= markDivergent(forOp.getInductionVar());
+        auto yieldOp =
+            cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+        for (unsigned i = 0; i < forOp.getInitArgs().size(); ++i) {
+          bool iterDiv = boundsDiv ||
+                         divergent.contains(forOp.getInitArgs()[i]) ||
+                         divergent.contains(yieldOp.getOperand(i));
+          if (iterDiv) {
+            changed |= markDivergent(forOp.getRegionIterArgs()[i]);
+            changed |= markDivergent(forOp.getResult(i));
+          }
+        }
+        return;
+      }
+
+      if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+        auto condOp = cast<scf::ConditionOp>(
+            whileOp.getBefore().front().getTerminator());
+        auto yieldOp =
+            cast<scf::YieldOp>(whileOp.getAfter().front().getTerminator());
+        bool condDiv = divergent.contains(condOp.getCondition());
+        for (unsigned i = 0; i < whileOp.getInits().size(); ++i) {
+          bool argDiv =
+              condDiv || divergent.contains(whileOp.getInits()[i]) ||
+              (i < yieldOp.getNumOperands() &&
+               divergent.contains(yieldOp.getOperand(i)));
+          if (argDiv && i < whileOp.getBeforeArguments().size())
+            changed |= markDivergent(whileOp.getBeforeArguments()[i]);
+        }
+        for (unsigned i = 0; i < condOp.getArgs().size(); ++i) {
+          bool afterDiv = condDiv || divergent.contains(condOp.getArgs()[i]);
+          if (afterDiv) {
+            if (i < whileOp.getAfterArguments().size())
+              changed |= markDivergent(whileOp.getAfterArguments()[i]);
+            if (i < whileOp.getNumResults())
+              changed |= markDivergent(whileOp.getResult(i));
+          }
+        }
+        return;
+      }
+
+      bool anyOperandDiv = llvm::any_of(op->getOperands(), [&](Value operand) {
+        return divergent.contains(operand);
+      });
+      if (anyOperandDiv) {
+        for (Value res : op->getResults())
+          changed |= markDivergent(res);
+      }
+    });
+  }
+
+  for (Operation *parent = barrier->getParentOp();
+       parent && parent != func.getOperation();
+       parent = parent->getParentOp()) {
+    if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
+      if (divergent.contains(ifOp.getCondition()))
+        return barrier.emitOpError(
+            "barrier cannot be placed inside thread-divergent control flow");
+    } else if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
+      if (divergent.contains(forOp.getLowerBound()) ||
+          divergent.contains(forOp.getUpperBound()) ||
+          divergent.contains(forOp.getStep())) {
+        return barrier.emitOpError(
+            "barrier cannot be placed inside thread-divergent control flow");
+      }
+    } else if (auto whileOp = dyn_cast<scf::WhileOp>(parent)) {
+      auto condOp =
+          cast<scf::ConditionOp>(whileOp.getBefore().front().getTerminator());
+      if (divergent.contains(condOp.getCondition())) {
+        return barrier.emitOpError(
+            "barrier cannot be placed inside thread-divergent control flow");
+      }
+    }
+  }
+
+  Block *block = barrier->getBlock();
+  if (block && block != &func.getBody().front() &&
+      llvm::isa<func::FuncOp>(block->getParentOp())) {
+    for (Block *pred : block->getPredecessors()) {
+      if (auto condBr = dyn_cast<cf::CondBranchOp>(pred->getTerminator())) {
+        if (divergent.contains(condBr.getCondition())) {
+          return barrier.emitOpError(
+              "barrier cannot be placed inside thread-divergent control flow");
+        }
+      }
+    }
+  }
+
+  return success();
+}
+
+LogicalResult BarrierOp::verify() {
+  auto func = (*this)->getParentOfType<func::FuncOp>();
+  if (!func)
+    return emitOpError("requires an enclosing function");
+  if (auto stage = stageOf(*this)) {
+    if (stage.getValue() != Stage::Compute)
+      return emitOpError("barriers are only allowed in compute shaders");
+  }
+  return verifyUniformBarrierPlacement(*this, func);
+}
+
+ParseResult BarrierOp::parse(OpAsmParser &parser, OperationState &result) {
+  MemoryScope scopeVal = MemoryScope::Workgroup;
+  if (succeeded(parser.parseOptionalLess())) {
+    std::string keyword;
+    llvm::SMLoc kwLoc = parser.getCurrentLocation();
+    if (parser.parseKeywordOrString(&keyword) || parser.parseGreater())
+      return failure();
+    auto maybeScope = symbolizeMemoryScope(keyword);
+    if (!maybeScope) {
+      return parser.emitError(
+          kwLoc,
+          "expected ::mlir::gfx::MemoryScope to be one of: workgroup, device, all");
+    }
+    scopeVal = *maybeScope;
+  } else {
+    MemoryScopeAttr attr;
+    OptionalParseResult optRes =
+        parser.parseOptionalAttribute(attr, Type{});
+    if (optRes.has_value()) {
+      if (failed(*optRes))
+        return failure();
+      scopeVal = attr.getValue();
+    }
+  }
+  result.getOrAddProperties<BarrierOp::Properties>().scope =
+      MemoryScopeAttr::get(parser.getContext(), scopeVal);
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+  return success();
+}
+
+void BarrierOp::print(OpAsmPrinter &printer) {
+  if (getScope() != MemoryScope::Workgroup)
+    printer << " <" << stringifyMemoryScope(getScope()) << ">";
+  printer.printOptionalAttrDict(
+      (*this)->getDiscardableAttrDictionary().getValue());
+}
+
+static LogicalResult verifyAtomicPointerAndAccess(Operation *op, Value ptrVal) {
+  auto ptrType = cast<PtrType>(ptrVal.getType());
+  StorageClass sc = ptrType.getStorageClass();
+  if (sc != StorageClass::Global && sc != StorageClass::Workgroup) {
+    return op->emitOpError(
+               "atomic operations require 'global' or 'workgroup' storage class, got '")
+           << stringifyStorageClass(sc) << "'";
+  }
+  Type elemType = ptrType.getElementType();
+  if (!elemType.isInteger(32)) {
+    return op->emitOpError(
+               "atomic operations require a 32-bit integer pointee type, got ")
+           << elemType;
+  }
+  if (sc == StorageClass::Global) {
+    Value rootVal = getRootPointerValue(ptrVal);
+    if (auto binding = rootVal.getDefiningOp<BufferBindingOp>()) {
+      if (binding.getAccess() != AccessMode::ReadWrite)
+        return op->emitOpError(
+                   "atomic operations require read_write buffer binding '")
+               << binding.getName() << "', got '"
+               << stringifyAccessMode(binding.getAccess()) << "'";
+    } else {
+      std::string argLabel;
+      if (auto mode = getBlockArgumentAccessMode(rootVal, argLabel)) {
+        if (*mode != AccessMode::ReadWrite)
+          return op->emitOpError(
+                     "atomic operations require read_write buffer argument '")
+                 << argLabel << "', got '" << stringifyAccessMode(*mode) << "'";
+      }
+    }
+  }
+  return success();
+}
+
+LogicalResult AtomicRMWOp::verify() {
+  if (failed(verifyAtomicPointerAndAccess(*this, getPtr())))
+    return failure();
+  auto ptrType = cast<PtrType>(getPtr().getType());
+  Type elemType = ptrType.getElementType();
+  if (getValue().getType() != elemType) {
+    return emitOpError("atomic value operand type ")
+           << getValue().getType() << " does not match pointer element type "
+           << elemType;
+  }
+  if (getResult().getType() != elemType) {
+    return emitOpError("atomic result type ")
+           << getResult().getType() << " does not match pointer element type "
+           << elemType;
+  }
+  return success();
+}
+
+LogicalResult AtomicCASOp::verify() {
+  if (failed(verifyAtomicPointerAndAccess(*this, getPtr())))
+    return failure();
+  auto ptrType = cast<PtrType>(getPtr().getType());
+  Type elemType = ptrType.getElementType();
+  if (getCmp().getType() != elemType) {
+    return emitOpError("atomic compare operand type ")
+           << getCmp().getType() << " does not match pointer element type "
+           << elemType;
+  }
+  if (getValue().getType() != elemType) {
+    return emitOpError("atomic exchange operand type ")
+           << getValue().getType() << " does not match pointer element type "
+           << elemType;
+  }
+  if (getResult().getType() != elemType) {
+    return emitOpError("atomic result type ")
+           << getResult().getType() << " does not match pointer element type "
+           << elemType;
+  }
+  return success();
+}
+
+uint64_t mlir::gfx::computeSharedMemoryBytes(ModuleOp module,
+                                             func::FuncOp entry) {
+  if (!entry)
+    return 0;
+  uint64_t allocTotal = 0;
+  SmallVector<func::FuncOp, 8> pending{entry};
+  llvm::SmallPtrSet<Operation *, 8> visited;
+  while (!pending.empty()) {
+    func::FuncOp current = pending.pop_back_val();
+    if (!visited.insert(current.getOperation()).second)
+      continue;
+    current.walk([&](SharedAllocOp alloc) {
+      auto ptrType = cast<PtrType>(alloc.getResult().getType());
+      uint32_t elemSize = 0, elemAlign = 0;
+      if (succeeded(
+              getStd430Layout(ptrType.getElementType(), elemSize, elemAlign)) &&
+          elemSize > 0 && elemAlign > 0) {
+        uint64_t stride = llvm::alignTo(elemSize, elemAlign);
+        int64_t count = alloc.getCountAttr().getInt();
+        if (count > 0) {
+          allocTotal = llvm::alignTo(allocTotal, elemAlign);
+          allocTotal += static_cast<uint64_t>(count) * stride;
+        }
+      }
+    });
+    current.walk([&](func::CallOp call) {
+      if (auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee()))
+        pending.push_back(callee);
+    });
+  }
+  uint64_t attrBytes = 0;
+  if (auto sharedAttr =
+          entry->getAttrOfType<IntegerAttr>("gfx.shared_memory_bytes")) {
+    if (sharedAttr.getInt() > 0)
+      attrBytes = static_cast<uint64_t>(sharedAttr.getInt());
+  }
+  return std::max(allocTotal, attrBytes);
+}
+
 LogicalResult mlir::gfx::verifyShaderModule(ModuleOp module,
                                             const TargetProfile &profile) {
   if (failed(verify(module)))
@@ -1160,11 +1496,37 @@ LogicalResult mlir::gfx::verifyShaderModule(ModuleOp module,
       if (failed(profile.verifyWorkgroupSize(sizeAttr.asArrayRef(),
                                             function.getLoc())))
         return failure();
-      if (auto sharedAttr =
-              function->getAttrOfType<IntegerAttr>("gfx.shared_memory_bytes")) {
-        if (failed(profile.verifySharedMemory(sharedAttr.getInt(),
-                                              function.getLoc())))
+      uint64_t totalSharedBytes = computeSharedMemoryBytes(module, function);
+      if (totalSharedBytes > 0) {
+        if (failed(
+                profile.verifySharedMemory(totalSharedBytes, function.getLoc())))
           return failure();
+      }
+    } else {
+      SmallVector<func::FuncOp, 8> pending{function};
+      llvm::SmallPtrSet<Operation *, 8> visited;
+      while (!pending.empty()) {
+        func::FuncOp current = pending.pop_back_val();
+        if (!visited.insert(current.getOperation()).second)
+          continue;
+        WalkResult computeOnlyCheck = current.walk([&](Operation *op) {
+          if (isa<SharedAllocOp>(op)) {
+            op->emitOpError(
+                "shared memory allocations are only allowed in compute shaders");
+            return WalkResult::interrupt();
+          }
+          if (isa<BarrierOp>(op)) {
+            op->emitOpError("barriers are only allowed in compute shaders");
+            return WalkResult::interrupt();
+          }
+          return WalkResult::advance();
+        });
+        if (computeOnlyCheck.wasInterrupted())
+          return failure();
+        current.walk([&](func::CallOp call) {
+          if (auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee()))
+            pending.push_back(callee);
+        });
       }
     }
     for (Type argType : function.getArgumentTypes()) {
@@ -1285,7 +1647,7 @@ TargetProfile::verifyWorkgroupSize(llvm::ArrayRef<int32_t> dims,
 }
 
 llvm::LogicalResult
-TargetProfile::verifySharedMemory(uint32_t bytes, mlir::Location loc) const {
+TargetProfile::verifySharedMemory(uint64_t bytes, mlir::Location loc) const {
   if (bytes > max_shared_memory_bytes) {
     return mlir::emitError(loc)
            << "shared memory allocation (" << bytes

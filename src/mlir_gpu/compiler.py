@@ -676,6 +676,8 @@ def compile_pipeline(
             }
             if "parameters" in compute_refl:
                 manifest["parameters"] = compute_refl["parameters"]
+            if compute_refl.get("shared_memory_bytes", 0) > 0:
+                manifest["shared_memory_bytes"] = compute_refl["shared_memory_bytes"]
             (directory / "pipeline.json").write_text(json.dumps(manifest, indent=2) + "\n")
             directory.rename(output)
             return output / "pipeline.json"

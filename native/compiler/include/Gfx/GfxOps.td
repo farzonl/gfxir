@@ -113,4 +113,76 @@ def Gfx_StoreOp : Gfx_Op<"store", [MemoryEffects<[MemWrite]>]> {
   let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;
 }
+
+def Gfx_SharedAllocOp : Gfx_Op<"shared_alloc", [MemoryEffects<[MemAlloc, MemWrite]>]> {
+  let summary = "Allocate a static workgroup-shared array in compute shaders";
+  let description = [{
+    Declares a statically sized array of count elements in workgroup-local shared
+    memory and returns a typed pointer (!gfx.ptr<T, workgroup>) to element 0.
+  }];
+
+  let arguments = (ins
+    I32Attr:$count,
+    OptionalAttr<StrAttr>:$name
+  );
+  let results = (outs Gfx_PtrType:$result);
+  let assemblyFormat = [{
+    $count (`name` `=` $name^)? attr-dict `:` qualified(type($result))
+  }];
+  let hasVerifier = 1;
+}
+
+def Gfx_BarrierOp : Gfx_Op<"barrier", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Synchronize workgroup execution and memory accesses";
+  let description = [{
+    Synchronizes execution across all invocations in a compute workgroup and
+    orders memory accesses within the specified memory scope (workgroup, device,
+    or all). Must execute in workgroup-uniform control flow.
+  }];
+
+  let arguments = (ins
+    DefaultValuedAttr<Gfx_MemoryScopeAttr, "MemoryScope::Workgroup">:$scope
+  );
+  let results = (outs);
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+def Gfx_AtomicRMWOp : Gfx_Op<"atomic_rmw", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Perform a 32-bit integer atomic read-modify-write operation";
+  let description = [{
+    Atomically loads a 32-bit integer from ptr, combines it with value according
+    to kind, stores the result back to ptr, and returns the original loaded value.
+  }];
+
+  let arguments = (ins
+    Gfx_AtomicOpAttr:$kind,
+    Gfx_PtrType:$ptr,
+    AnyType:$value
+  );
+  let results = (outs AnyType:$result);
+  let assemblyFormat = [{
+    $kind $ptr `,` $value attr-dict `:` functional-type(operands, results)
+  }];
+  let hasVerifier = 1;
+}
+
+def Gfx_AtomicCASOp : Gfx_Op<"atomic_cas", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Perform a 32-bit integer atomic compare-and-exchange operation";
+  let description = [{
+    Atomically compares the 32-bit integer at ptr with cmp; if equal, replaces
+    it with value. Always returns the original 32-bit integer loaded from ptr.
+  }];
+
+  let arguments = (ins
+    Gfx_PtrType:$ptr,
+    AnyType:$cmp,
+    AnyType:$value
+  );
+  let results = (outs AnyType:$result);
+  let assemblyFormat = [{
+    $ptr `,` $cmp `,` $value attr-dict `:` functional-type(operands, results)
+  }];
+  let hasVerifier = 1;
+}
 #endif
