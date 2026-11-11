@@ -1197,12 +1197,14 @@ class _Vulkan:
         ), vk.VK_SUBPASS_CONTENTS_INLINE)
 
         if data is not None:
-            vk.vkCmdPushConstants(command, layout, self.parameter_stages(parameters),
+            vk.vkCmdPushConstants(command, layout,
+                                  vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT,
                                   parameters["bindings"]["vulkan"]["offset"], len(data), vk.ffi.from_buffer(data))
 
-        pipeline_map, default_draws = getattr(self, "pipeline_extras", {}).get(pipeline, ({"default": pipeline}, None))
+        extras_map, extras_draws = getattr(self, "pipeline_extras", {}).get(pipeline, (None, None))
+        pipeline_map = getattr(pipeline, "pipeline_map", extras_map or {"default": pipeline})
         if draws is None:
-            draws = default_draws
+            draws = getattr(pipeline, "draws", extras_draws)
 
         if not draws:
             vk.vkCmdBindPipeline(command, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline)
