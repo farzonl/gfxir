@@ -5,11 +5,11 @@ import sys
 from pathlib import Path
 
 from .compiler import CompileError, MLIRPipeline, Target, Toolchain, compile_pipeline
-from .frontend import Pipeline
+from .frontend import ComputePipeline, Pipeline
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Compile Python graphics entry points through MLIR.")
+    parser = argparse.ArgumentParser(description="Compile Python graphics or compute entry points through MLIR.")
     parser.add_argument("program", type=Path, help="Python file defining a 'pipeline' object")
     parser.add_argument("--target", choices=[target.value for target in Target], required=True)
     parser.add_argument("--output", type=Path, required=True, help="New artifact directory")
@@ -19,8 +19,8 @@ def main() -> int:
     try:
         namespace = runpy.run_path(str(args.program))
         pipeline = namespace.get("pipeline")
-        if not isinstance(pipeline, (Pipeline, MLIRPipeline)):
-            raise CompileError("The program must define a Pipeline or MLIRPipeline named 'pipeline'.")
+        if not isinstance(pipeline, (Pipeline, ComputePipeline, MLIRPipeline)):
+            raise CompileError("The program must define a Pipeline, ComputePipeline, or MLIRPipeline named 'pipeline'.")
         manifest = compile_pipeline(
             pipeline, Target(args.target), args.output, Toolchain(args.llvm_bin, args.tools_bin)
         )

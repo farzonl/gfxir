@@ -4,9 +4,18 @@ import struct
 import sys
 from pathlib import Path
 
-import yaml
-from PIL import Image
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+from mlir_gpu.imgdiff import ImageDiffError, read_png
+from mlir_gpu.viewer import RenderedImage, ViewerError, write_png
 from execution_targets import target_output_path, targets_from_environment
 
 
@@ -28,10 +37,35 @@ def _lab(rgb: tuple[int, int, int]) -> tuple[float, float, float]:
     return 116 * y - 16, 500 * (x - y), 200 * (y - z)
 
 
+def _parse_simple_yaml(text: str) -> dict[str, object]:
+    parsed: dict[str, object] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if ":" not in line:
+            raise ValueError(f"invalid rules line: {raw_line!r}")
+        key, val_str = (part.strip() for part in line.split(":", 1))
+        if val_str in ("true", "True"):
+            parsed[key] = True
+        elif val_str in ("false", "False"):
+            parsed[key] = False
+        else:
+            try:
+                parsed[key] = int(val_str)
+            except ValueError:
+                try:
+                    parsed[key] = float(val_str)
+                except ValueError:
+                    parsed[key] = val_str.strip("'\"")
+    return parsed
+
+
 def _rules(path: Path) -> tuple[str, float, float, int]:
     try:
-        rules = yaml.safe_load(path.read_text())
-    except (OSError, yaml.YAMLError) as error:
+        content = path.read_text()
+        rules = yaml.safe_load(content) if yaml is not None else _parse_simple_yaml(content)
+    except Exception as error:
         raise ValueError(f"cannot read image-diff rules {path}: {error}") from error
     if not isinstance(rules, dict) or set(rules) != {
         "Mode", "MaxDeltaE", "MaxPixelPercent", "MaxAlphaDelta",
@@ -67,15 +101,30 @@ def compare(
 ) -> int:
     mode, max_delta_e, max_pixel_percent, max_alpha_delta = _rules(rules_path)
     try:
-        with Image.open(expected_path) as expected_file, Image.open(actual_path) as actual_file:
-            expected = expected_file.convert("RGBA")
-            actual = actual_file.convert("RGBA")
-            if expected.size != actual.size:
-                raise ValueError(f"image sizes do not match: {expected.size} != {actual.size}")
-            expected_pixels = struct.iter_unpack("4B", expected.tobytes())
-            actual_pixels = struct.iter_unpack("4B", actual.tobytes())
-            pixel_count = expected.width * expected.height
-    except (OSError, ValueError) as error:
+        if Image is not None:
+            with Image.open(expected_path) as expected_file, Image.open(actual_path) as actual_file:
+                expected = expected_file.convert("RGBA")
+                actual = actual_file.convert("RGBA")
+                width, height = expected.width, expected.height
+                if expected.size != actual.size:
+                    raise ValueError(f"image sizes do not match: {expected.size} != {actual.size}")
+                expected_bytes = expected.tobytes()
+                actual_bytes = actual.tobytes()
+        else:
+            expected_img = read_png(expected_path)
+            actual_img = read_png(actual_path)
+            width, height = expected_img.width, expected_img.height
+            if (expected_img.width, expected_img.height) != (actual_img.width, actual_img.height):
+                raise ValueError(
+                    f"image sizes do not match: {(expected_img.width, expected_img.height)} != "
+                    f"{(actual_img.width, actual_img.height)}"
+                )
+            expected_bytes = expected_img.rgba
+            actual_bytes = actual_img.rgba
+        expected_pixels = struct.iter_unpack("4B", expected_bytes)
+        actual_pixels = struct.iter_unpack("4B", actual_bytes)
+        pixel_count = width * height
+    except (OSError, ValueError, ImageDiffError) as error:
         raise ValueError(f"cannot compare images: {error}") from error
 
     differing = 0
@@ -86,9 +135,12 @@ def compare(
             mismatch = left != right
             delta_e = 0.0
         else:
-            left_lab = _lab(left[:3])
-            right_lab = _lab(right[:3])
-            delta_e = math.sqrt(sum((a - b) ** 2 for a, b in zip(left_lab, right_lab)))
+            if left[:3] == right[:3]:
+                delta_e = 0.0
+            else:
+                left_lab = _lab(left[:3])
+                right_lab = _lab(right[:3])
+                delta_e = math.sqrt(sum((a - b) ** 2 for a, b in zip(left_lab, right_lab)))
             mismatch = delta_e > max_delta_e or abs(left[3] - right[3]) > max_alpha_delta
         largest_delta_e = max(largest_delta_e, delta_e)
         differing += mismatch
@@ -97,10 +149,15 @@ def compare(
     percent = 100 * differing / pixel_count
     if output_path is not None:
         try:
-            diff = Image.new("RGBA", expected.size)
-            diff.putdata(diff_pixels)
-            diff.save(output_path)
-        except OSError as error:
+            if Image is not None:
+                diff = Image.new("RGBA", (width, height))
+                diff.putdata(diff_pixels)
+                diff.save(output_path)
+            else:
+                output_path.unlink(missing_ok=True)
+                flat_diff = b"".join(struct.pack("4B", *px) for px in diff_pixels)
+                write_png(output_path, RenderedImage(width, height, flat_diff, "imgdiff"))
+        except (OSError, ViewerError) as error:
             raise ValueError(f"cannot write diff image {output_path}: {error}") from error
     print(
         f"imgdiff: {differing}/{pixel_count} pixels differ "

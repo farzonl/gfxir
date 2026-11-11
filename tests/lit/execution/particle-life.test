@@ -1,0 +1,3 @@
+# REQUIRES: compute_execution
+# RUN: %python %S/Inputs/render_compute.py particle_life %t.particle-life.png --target GFXIR_LIT_COMPUTE_TARGETS --width 128 --height 128 --steps 8
+# RUN: %python %S/Inputs/imgdiff.py %S/Inputs/goldens/common/particle-life.png %t.particle-life.png --target GFXIR_LIT_COMPUTE_TARGETS --rules %S/Inputs/golden-rules.yaml

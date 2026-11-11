@@ -1,0 +1,3 @@
+# REQUIRES: compute_execution
+# RUN: %python %S/Inputs/render_compute.py mandelbrot %t.mandelbrot.png --target GFXIR_LIT_COMPUTE_TARGETS --width 256 --height 256
+# RUN: %python %S/Inputs/imgdiff.py %S/Inputs/goldens/common/mandelbrot.png %t.mandelbrot.png --target GFXIR_LIT_COMPUTE_TARGETS --rules %S/Inputs/golden-rules.yaml
