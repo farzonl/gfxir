@@ -329,8 +329,8 @@ class TestFeature03PerDrawConstants(unittest.TestCase):
     def test_f03_t1_01_per_draw_constants_multi_block_reflection(self):
         self._require_feature()
         # Validates multi-block parameter support (e.g., frame and object)
-        b1 = mgpu_params.ParameterBlock("frame", [{"name": "time", "type": "f32", "offset": 0}])
-        b2 = mgpu_params.ParameterBlock("object", [{"name": "id", "type": "u32", "offset": 0}])
+        b1 = mgpu_params.ParameterBlock("frame", (("time", mgpu_params.Type.F32),))
+        b2 = mgpu_params.ParameterBlock("object", (("id", mgpu_params.Type.U32),))
         self.assertEqual(b1.name, "frame")
         self.assertEqual(b2.name, "object")
 

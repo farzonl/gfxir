@@ -267,12 +267,13 @@ for _c in range(ord("a"), ord("z") + 1):
 
 if vertex is not None and fragment is not None:
     @vertex
-    def _gpu_overlay_vs(vert: Vertex, params: OverlayParams) -> Vertex:
-        clip_pos = vec4(0.0, 0.0, 0.0, 1.0)
-        return Vertex(clip_pos, varyings={"uv": vec2(0.0, 0.0)})
+    def _gpu_overlay_vs(pos: Type.VEC2, uv: Type.VEC2, params: OverlayParams) -> Vertex:
+        ndc_x = (pos.x / params.viewport.x) * 2.0 - 1.0
+        ndc_y = 1.0 - (pos.y / params.viewport.y) * 2.0
+        return Vertex(vec4(ndc_x, ndc_y, 0.0, 1.0), varyings={"uv": uv})
 
     @fragment
-    def _gpu_overlay_ps(uv: Value, params: OverlayParams) -> Value:
+    def _gpu_overlay_ps(uv: Type.VEC2, params: OverlayParams) -> vec4:
         return params.text_color
 
     overlay_vertex_shader = ShaderFunction(_gpu_overlay_vs, "vertex", _cpu_overlay_vs)
@@ -421,7 +422,7 @@ def draw_to_image(
 class DebugOverlay:
     """Debug HUD tracking performance metrics and rendering text overlays."""
 
-    def __init__(self, backend_name: str = "") -> None:
+    def __init__(self, backend_name: str = "", params: Optional[OverlayParams] = None) -> None:
         self.backend_name = backend_name
         self.fps, self.frame_time_ms, self.draw_calls, self.visible_meshes = 0.0, 0.0, 0, 0
         self.params = params if params is not None else OverlayParams()

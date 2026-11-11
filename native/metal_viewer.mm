@@ -136,6 +136,8 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
 @property(nonatomic) BOOL hasFixedTime;
 @property(nonatomic) double fixedTime;
 @property(nonatomic, strong) NSDictionary<NSString*, id<MTLRenderPipelineState>>* pipelines;
+@property(nonatomic, strong) NSDictionary<NSString*, id<MTLDepthStencilState>>* pipelineDepthStates;
+@property(nonatomic, strong) NSDictionary<NSString*, id>* pipelineParameters;
 @property(nonatomic, copy) NSArray<NSDictionary*>* draws;
 @property(nonatomic, strong) id<MTLDepthStencilState> depthState;
 @property(nonatomic) BOOL hasDepth;
@@ -241,9 +243,9 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
             } else if ([format isEqualToString:@"i16"] || [format isEqualToString:@"R16_SINT"]) {
                 mtlFmt = MTLVertexFormatShort; attrSize = 2;
             }
-            vd.attributes[loc].format = mtlFmt;
-            vd.attributes[loc].offset = offset;
-            vd.attributes[loc].bufferIndex = binding;
+            vd.attributes[kIRStageInAttributeStartIndex + loc].format = mtlFmt;
+            vd.attributes[kIRStageInAttributeStartIndex + loc].offset = offset;
+            vd.attributes[kIRStageInAttributeStartIndex + loc].bufferIndex = kIRVertexBufferBindPoint + binding;
             if (offset + attrSize > maxEndOffset) {
                 maxEndOffset = offset + attrSize;
             }
@@ -253,14 +255,14 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
             for (NSDictionary* b in bindings) {
                 NSUInteger binding = [b[@"binding"] unsignedIntegerValue];
                 NSUInteger stride = [b[@"stride"] unsignedIntegerValue];
-                vd.layouts[binding].stride = stride;
-                vd.layouts[binding].stepFunction = MTLVertexStepFunctionPerVertex;
-                vd.layouts[binding].stepRate = 1;
+                vd.layouts[kIRVertexBufferBindPoint + binding].stride = stride;
+                vd.layouts[kIRVertexBufferBindPoint + binding].stepFunction = MTLVertexStepFunctionPerVertex;
+                vd.layouts[kIRVertexBufferBindPoint + binding].stepRate = 1;
             }
         } else if (attrs && attrs.count > 0) {
-            vd.layouts[0].stride = maxEndOffset;
-            vd.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
-            vd.layouts[0].stepRate = 1;
+            vd.layouts[kIRVertexBufferBindPoint].stride = maxEndOffset;
+            vd.layouts[kIRVertexBufferBindPoint].stepFunction = MTLVertexStepFunctionPerVertex;
+            vd.layouts[kIRVertexBufferBindPoint].stepRate = 1;
         }
         descriptor.vertexDescriptor = vd;
     }
@@ -311,24 +313,22 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
     [encoder setViewport:(MTLViewport){0, 0, static_cast<double>(texture.width),
         static_cast<double>(texture.height), 0, 1}];
     if (self.vertexBuffer) {
-        [encoder setVertexBuffer:self.vertexBuffer offset:0 atIndex:0];
+        [encoder setVertexBuffer:self.vertexBuffer offset:0 atIndex:kIRVertexBufferBindPoint];
     }
 
     if (!self.draws || self.draws.count == 0) {
         [encoder setRenderPipelineState:self.pipeline];
         if (self.isIndexed && self.indexBuffer) {
             MTLIndexType type = [self.indexType isEqualToString:@"uint16"] ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
-            [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                indexCount:self.indexCount
-                                 indexType:type
-                               indexBuffer:self.indexBuffer
-                         indexBufferOffset:0];
+            IRRuntimeDrawIndexedPrimitives(encoder, MTLPrimitiveTypeTriangle, self.indexCount,
+                                           type, self.indexBuffer, 0);
         } else {
             IRRuntimeDrawPrimitives(encoder, MTLPrimitiveTypeTriangle, uint64_t{0},
                                    static_cast<uint64_t>(self.vertexCount));
         }
     } else {
         id<MTLRenderPipelineState> currentPipeline = nil;
+        id<MTLDepthStencilState> currentDepthState = nil;
         for (NSDictionary* draw in self.draws) {
             NSString* pipeId = draw[@"pipeline"];
             id<MTLRenderPipelineState> nextPipeline = (self.pipelines && pipeId) ? self.pipelines[pipeId] : self.pipeline;
@@ -337,13 +337,72 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
                 [encoder setRenderPipelineState:nextPipeline];
                 currentPipeline = nextPipeline;
             }
-            NSData* perDrawBytes = draw[@"parameters"];
-            if (perDrawBytes && [perDrawBytes isKindOfClass:[NSData class]] && perDrawBytes.length > 0) {
-                [encoder setVertexBytes:perDrawBytes.bytes length:perDrawBytes.length atIndex:3];
+            id<MTLDepthStencilState> nextDepth = (self.pipelineDepthStates && pipeId) ? self.pipelineDepthStates[pipeId] : self.depthState;
+            if (!nextDepth) nextDepth = self.depthState;
+            if (nextDepth && nextDepth != currentDepthState) {
+                [encoder setDepthStencilState:nextDepth];
+                currentDepthState = nextDepth;
+            }
+
+            std::vector<uint8_t> rawBytes;
+            id rawParams = draw[@"parameters"];
+            if ([rawParams isKindOfClass:[NSData class]]) {
+                NSData* d = rawParams;
+                const auto* ptr = static_cast<const uint8_t*>(d.bytes);
+                rawBytes.assign(ptr, ptr + d.length);
+            } else if ([rawParams isKindOfClass:[NSDictionary class]] && [rawParams[@"data"] isKindOfClass:[NSArray class]]) {
+                NSArray* dataArr = rawParams[@"data"];
+                rawBytes.reserve(dataArr.count);
+                for (NSNumber* num in dataArr) {
+                    rawBytes.push_back(static_cast<uint8_t>([num unsignedIntValue] & 0xFF));
+                }
             } else if ([draw[@"constant_size"] unsignedIntegerValue] > 0) {
-                NSUInteger sz = [draw[@"constant_size"] unsignedIntegerValue];
-                std::vector<uint8_t> zeros(sz, 0);
-                [encoder setVertexBytes:zeros.data() length:sz atIndex:3];
+                rawBytes.assign([draw[@"constant_size"] unsignedIntegerValue], 0);
+            }
+
+            if (!rawBytes.empty()) {
+                NSUInteger cOff = [draw[@"constant_offset"] unsignedIntegerValue];
+                std::vector<uint8_t> fullConst(cOff + rawBytes.size(), 0);
+                std::memcpy(fullConst.data() + cOff, rawBytes.data(), rawBytes.size());
+
+                id pipeParams = (self.pipelineParameters && pipeId) ? self.pipelineParameters[pipeId] : nil;
+                if ([pipeParams isKindOfClass:[NSArray class]]) {
+                    std::vector<uint8_t> vsArg, fsArg;
+                    for (NSDictionary* block in (NSArray*)pipeParams) {
+                        NSUInteger bOff = [block[@"bindings"][@"vulkan"][@"offset"] unsignedIntegerValue];
+                        NSUInteger bSize = [block[@"size"] unsignedIntegerValue];
+                        NSArray* stages = block[@"stages"];
+                        auto appendSlice = [&](std::vector<uint8_t>& dst) {
+                            size_t prev = dst.size();
+                            dst.resize(prev + bSize, 0);
+                            if (bOff < fullConst.size()) {
+                                size_t avail = std::min<size_t>(bSize, fullConst.size() - bOff);
+                                std::memcpy(dst.data() + prev, fullConst.data() + bOff, avail);
+                            }
+                        };
+                        if ([stages containsObject:@"vertex"]) appendSlice(vsArg);
+                        if ([stages containsObject:@"fragment"]) appendSlice(fsArg);
+                    }
+                    if (!vsArg.empty()) [encoder setVertexBytes:vsArg.data() length:vsArg.size() atIndex:kIRArgumentBufferBindPoint];
+                    if (!fsArg.empty()) [encoder setFragmentBytes:fsArg.data() length:fsArg.size() atIndex:kIRArgumentBufferBindPoint];
+                } else if ([pipeParams isKindOfClass:[NSDictionary class]]) {
+                    NSDictionary* block = pipeParams;
+                    NSUInteger bOff = [block[@"bindings"][@"vulkan"][@"offset"] unsignedIntegerValue];
+                    NSUInteger bSize = [block[@"size"] unsignedIntegerValue] ?: rawBytes.size();
+                    std::vector<uint8_t> slice(bSize, 0);
+                    if (bOff < fullConst.size()) {
+                        size_t avail = std::min<size_t>(bSize, fullConst.size() - bOff);
+                        std::memcpy(slice.data(), fullConst.data() + bOff, avail);
+                    }
+                    NSArray* stages = block[@"stages"];
+                    if (!stages || [stages containsObject:@"vertex"])
+                        [encoder setVertexBytes:slice.data() length:slice.size() atIndex:kIRArgumentBufferBindPoint];
+                    if (!stages || [stages containsObject:@"fragment"])
+                        [encoder setFragmentBytes:slice.data() length:slice.size() atIndex:kIRArgumentBufferBindPoint];
+                } else {
+                    [encoder setVertexBytes:rawBytes.data() length:rawBytes.size() atIndex:kIRArgumentBufferBindPoint];
+                    [encoder setFragmentBytes:rawBytes.data() length:rawBytes.size() atIndex:kIRArgumentBufferBindPoint];
+                }
             }
             NSString* drawType = draw[@"type"] ?: @"standard";
             if ([drawType isEqualToString:@"indexed"]) {
@@ -773,7 +832,7 @@ int main(int argc, char** argv) {
                         pair.first != "--index-buffer" && pair.first != "--index-type" &&
                         pair.first != "--index-count" &&
                         pair.first != "--compute" && pair.first != "--compute-entry" &&
-                        pair.first != "--compute-spec" &&
+                        pair.first != "--compute-spec" && pair.first != "--multi-spec" &&
                         pair.first != "--depth-compare" && pair.first != "--depth-write" &&
                         pair.first != "--depth-format")
                         throw std::runtime_error("Unknown option: " + pair.first);
@@ -867,6 +926,48 @@ int main(int argc, char** argv) {
                 renderer.live = !arguments.count("--readback");
                 renderer.hasFixedTime = arguments.count("--time");
                 renderer.fixedTime = fixedTime;
+                if (arguments.count("--multi-spec")) {
+                    NSError* specErr = nil;
+                    NSData* specData = [NSData dataWithContentsOfFile:@(arguments.at("--multi-spec").c_str()) options:0 error:&specErr];
+                    if (!specData) throw failure(@"Cannot read Metal multi-spec file", specErr);
+                    NSDictionary* specDict = [NSJSONSerialization JSONObjectWithData:specData options:0 error:&specErr];
+                    if (![specDict isKindOfClass:[NSDictionary class]]) throw failure(@"Invalid Metal multi-spec JSON", specErr);
+                    NSDictionary* pipesSpec = specDict[@"pipelines"];
+                    NSMutableDictionary<NSString*, id<MTLRenderPipelineState>>* builtPipes = [NSMutableDictionary new];
+                    NSMutableDictionary<NSString*, id<MTLDepthStencilState>>* builtDepths = [NSMutableDictionary new];
+                    NSMutableDictionary<NSString*, id>* builtParams = [NSMutableDictionary new];
+                    if ([pipesSpec isKindOfClass:[NSDictionary class]]) {
+                        for (NSString* pId in pipesSpec) {
+                            NSDictionary* pCfg = pipesSpec[pId];
+                            NSDictionary* pLayout = ([pCfg[@"input_layout"] isKindOfClass:[NSDictionary class]]) ? pCfg[@"input_layout"] : inputLayoutDict;
+                            MetalDepthSettings pDepth = depthSettings;
+                            NSDictionary* dsCfg = pCfg[@"depth_stencil"];
+                            if ([dsCfg isKindOfClass:[NSDictionary class]]) {
+                                bool dsTest = dsCfg[@"depth_test_enable"] ? [dsCfg[@"depth_test_enable"] boolValue] : true;
+                                bool dsWrite = dsCfg[@"depth_write_enable"] ? [dsCfg[@"depth_write_enable"] boolValue] : true;
+                                std::string cmpStr = dsCfg[@"depth_compare_op"] ? [dsCfg[@"depth_compare_op"] UTF8String] : "less_equal";
+                                pDepth.compareFunction = dsTest ? parseMetalCompareFunction(cmpStr) : MTLCompareFunctionAlways;
+                                pDepth.writeEnabled = dsTest && dsWrite;
+                            }
+                            GraphicsRenderer* sub = [[GraphicsRenderer alloc]
+                                initWithVertex:pCfg[@"vertex"] vertexEntry:pCfg[@"vertex_entry"]
+                                      fragment:pCfg[@"fragment"] fragmentEntry:pCfg[@"fragment_entry"]
+                                   inputLayout:pLayout
+                                 depthSettings:pDepth];
+                            builtPipes[pId] = sub.pipeline;
+                            if (sub.depthState) builtDepths[pId] = sub.depthState;
+                            if (pCfg[@"parameters"] && pCfg[@"parameters"] != [NSNull null]) {
+                                builtParams[pId] = pCfg[@"parameters"];
+                            }
+                        }
+                    }
+                    renderer.pipelines = builtPipes;
+                    renderer.pipelineDepthStates = builtDepths;
+                    renderer.pipelineParameters = builtParams;
+                    if ([specDict[@"draws"] isKindOfClass:[NSArray class]]) {
+                        renderer.draws = specDict[@"draws"];
+                    }
+                }
                 if (arguments.count("--readback")) {
                     readback(renderer, width, height, arguments.at("--readback"));
                     return 0;
