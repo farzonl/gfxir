@@ -35,7 +35,7 @@ from .compiler import (
     convert_dxil_to_metallib,
 )
 from .frontend import Dispatch, Draw
-from .interfaces import reflect_pipeline_parameters, verify_graphics_interface
+from .interfaces import reflect_pipeline_parameters, verify_graphics_interface, verify_depth_stencil
 from .parameters import FrameParameters, pack_parameters, verify_parameters
 
 
@@ -66,6 +66,7 @@ class GraphicsProgram:
     parameters: dict | None = None
     pipelines: dict[str, Any] = None
     draws: list[Any] = None
+    depth_stencil: dict | None = None
 
     def __post_init__(self) -> None:
         if self.pipelines is None:
@@ -228,6 +229,13 @@ def load_program(manifest: Path) -> GraphicsProgram:
             first_v_count = 3
         draw_obj = Draw(vertex_count=first_v_count, topology="triangle-list")
 
+        multi_depth_stencil = data.get("depth_stencil")
+        if multi_depth_stencil is not None:
+            try:
+                verify_depth_stencil(multi_depth_stencil)
+            except ValueError as error:
+                raise ViewerError(f"Invalid depth_stencil configuration in manifest: {error}") from error
+
         return GraphicsProgram(
             vertex=first_pipe.vertex,
             fragment=first_pipe.fragment,
@@ -236,6 +244,7 @@ def load_program(manifest: Path) -> GraphicsProgram:
             parameters=data.get("parameters"),
             pipelines=pipelines,
             draws=draw_calls,
+            depth_stencil=multi_depth_stencil,
         )
 
     draw_data = data.get("draw")
@@ -273,6 +282,13 @@ def load_program(manifest: Path) -> GraphicsProgram:
             raise ViewerError(f"SPIR-V binary is not word-aligned: {filename}.")
         shaders[stage] = Shader(name, code)
 
+    depth_stencil = data.get("depth_stencil")
+    if depth_stencil is not None:
+        try:
+            verify_depth_stencil(depth_stencil)
+        except ValueError as error:
+            raise ViewerError(f"Invalid depth_stencil configuration in manifest: {error}") from error
+
     pipe_state = PipelineState(
         vertex=shaders["vertex"],
         fragment=shaders["fragment"],
@@ -296,6 +312,7 @@ def load_program(manifest: Path) -> GraphicsProgram:
         parameters=parameters,
         pipelines={"default": pipe_state},
         draws=[single_draw],
+        depth_stencil=depth_stencil,
     )
 
 
@@ -493,6 +510,14 @@ def _metal_libraries(program: GraphicsProgram, toolchain: Toolchain):
                 library.write_bytes(shader.code)
             libraries.extend([f"--{stage}", str(library), f"--{stage}-entry", shader.entry_point])
         arguments = [toolchain.find("mlir-gpu-metal-view"), *libraries, "--vertex-count", str(program.draw.vertex_count)]
+        if program.depth_stencil is not None:
+            arguments.append("--depth")
+            if "depth_compare_op" in program.depth_stencil:
+                arguments.extend(["--depth-compare", program.depth_stencil["depth_compare_op"]])
+            if "depth_write_enable" in program.depth_stencil:
+                arguments.extend(["--depth-write", "1" if program.depth_stencil["depth_write_enable"] else "0"])
+            if "format" in program.depth_stencil:
+                arguments.extend(["--depth-format", program.depth_stencil["format"]])
         if program.parameters is not None:
             layout = directory / "frame-layout.json"
             layout.write_text(json.dumps(program.parameters, allow_nan=False))
@@ -587,6 +612,14 @@ def _directx_shaders(program: GraphicsProgram, toolchain: Toolchain):
             path.write_bytes(shader.code)
             arguments.extend([f"--{stage}", str(path)])
         arguments.extend(["--vertex-count", str(program.draw.vertex_count)])
+        if program.depth_stencil is not None:
+            arguments.append("--depth")
+            if "depth_compare_op" in program.depth_stencil:
+                arguments.extend(["--depth-compare", program.depth_stencil["depth_compare_op"]])
+            if "depth_write_enable" in program.depth_stencil:
+                arguments.extend(["--depth-write", "1" if program.depth_stencil["depth_write_enable"] else "0"])
+            if "format" in program.depth_stencil:
+                arguments.extend(["--depth-format", program.depth_stencil["format"]])
         yield directory, arguments
 
 
@@ -727,6 +760,18 @@ def _api_errors():
         yield
     except (vk.VkError, vk.VkException, vk.ProcedureNotFoundError, vk.ExtensionNotSupportedError) as error:
         raise ViewerError(f"Vulkan operation failed: {type(error).__name__}. {error}") from error
+
+
+def _vulkan_depth_format(vk, format_name: str) -> int:
+    formats = {
+        "d32_sfloat": vk.VK_FORMAT_D32_SFLOAT,
+        "d16_unorm": vk.VK_FORMAT_D16_UNORM,
+        "d24_unorm_s8_uint": vk.VK_FORMAT_D24_UNORM_S8_UINT,
+        "d32_sfloat_s8_uint": vk.VK_FORMAT_D32_SFLOAT_S8_UINT,
+    }
+    if format_name not in formats:
+        raise ViewerError(f"Unsupported depth format: '{format_name}'.")
+    return formats[format_name]
 
 
 class _Vulkan:
@@ -888,12 +933,14 @@ class _Vulkan:
                 return index
         raise ViewerError(f"No Vulkan memory type supports required flags 0x{flags:x}.")
 
-    def view(self, resources, image, format):
+    def view(self, resources, image, format, aspect_mask=None):
         vk = self.vk
+        if aspect_mask is None:
+            aspect_mask = vk.VK_IMAGE_ASPECT_COLOR_BIT
         view = vk.vkCreateImageView(self.device, vk.VkImageViewCreateInfo(
             image=image, viewType=vk.VK_IMAGE_VIEW_TYPE_2D, format=format,
             subresourceRange=vk.VkImageSubresourceRange(
-                aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, levelCount=1, layerCount=1,
+                aspectMask=aspect_mask, levelCount=1, layerCount=1,
             ),
         ), None)
         resources.callback(vk.vkDestroyImageView, self.device, view, None)
@@ -927,6 +974,37 @@ class _Vulkan:
         ), None)
         vk.vkBindImageMemory(self.device, image, memory, 0)
         return image, self.view(resources, image, format)
+
+    def depth_image(self, resources, width, height, format=None):
+        vk = self.vk
+        if format is None:
+            format = vk.VK_FORMAT_D32_SFLOAT
+        properties = vk.vkGetPhysicalDeviceFormatProperties(self.physical, format)
+        if not properties.optimalTilingFeatures & vk.VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT:
+            raise ViewerError("The Vulkan device does not support the depth attachment format.")
+        image = vk.vkCreateImage(self.device, vk.VkImageCreateInfo(
+            imageType=vk.VK_IMAGE_TYPE_2D, format=format,
+            extent=vk.VkExtent3D(width=width, height=height, depth=1),
+            mipLevels=1, arrayLayers=1, samples=vk.VK_SAMPLE_COUNT_1_BIT,
+            tiling=vk.VK_IMAGE_TILING_OPTIMAL,
+            usage=vk.VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+            sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE, initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+        ), None)
+        memory = None
+
+        def destroy():
+            vk.vkDestroyImage(self.device, image, None)
+            if memory is not None:
+                vk.vkFreeMemory(self.device, memory, None)
+
+        resources.callback(destroy)
+        requirements = vk.vkGetImageMemoryRequirements(self.device, image)
+        memory = vk.vkAllocateMemory(self.device, vk.VkMemoryAllocateInfo(
+            allocationSize=requirements.size,
+            memoryTypeIndex=self.memory_type(requirements.memoryTypeBits, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+        ), None)
+        vk.vkBindImageMemory(self.device, image, memory, 0)
+        return image, self.view(resources, image, format, aspect_mask=vk.VK_IMAGE_ASPECT_DEPTH_BIT)
 
     def readback_buffer(self, resources, size):
         vk = self.vk
@@ -1062,29 +1140,84 @@ class _Vulkan:
         if width > self.max_width or height > self.max_height:
             raise ViewerError("The requested preview exceeds the device's framebuffer limits.")
         final_layout = vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR if present else vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+
+        depth_format = None
+        depth_stencil_state = None
+        depth_ref = None
+        if program.depth_stencil is not None:
+            depth_format_name = program.depth_stencil.get("format", "d32_sfloat")
+            depth_format = _vulkan_depth_format(vk, depth_format_name)
+            depth_test_enable = program.depth_stencil.get("depth_test_enable", True)
+            depth_write_enable = program.depth_stencil.get("depth_write_enable", True)
+            compare_op_str = program.depth_stencil.get("depth_compare_op", "less_equal")
+            compare_ops = {
+                "never": vk.VK_COMPARE_OP_NEVER,
+                "less": vk.VK_COMPARE_OP_LESS,
+                "equal": vk.VK_COMPARE_OP_EQUAL,
+                "less_equal": vk.VK_COMPARE_OP_LESS_OR_EQUAL,
+                "greater": vk.VK_COMPARE_OP_GREATER,
+                "not_equal": vk.VK_COMPARE_OP_NOT_EQUAL,
+                "greater_equal": vk.VK_COMPARE_OP_GREATER_OR_EQUAL,
+                "always": vk.VK_COMPARE_OP_ALWAYS,
+            }
+            if compare_op_str not in compare_ops:
+                raise ViewerError(f"Unsupported depth compare op: '{compare_op_str}'.")
+            depth_stencil_state = vk.VkPipelineDepthStencilStateCreateInfo(
+                depthTestEnable=vk.VK_TRUE if depth_test_enable else vk.VK_FALSE,
+                depthWriteEnable=vk.VK_TRUE if depth_write_enable else vk.VK_FALSE,
+                depthCompareOp=compare_ops[compare_op_str],
+                depthBoundsTestEnable=vk.VK_FALSE,
+                stencilTestEnable=vk.VK_FALSE,
+                minDepthBounds=0.0,
+                maxDepthBounds=1.0,
+            )
+            depth_ref = vk.VkAttachmentReference(
+                attachment=1, layout=vk.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            )
+
+        attachments = [vk.VkAttachmentDescription(
+            format=format, samples=vk.VK_SAMPLE_COUNT_1_BIT,
+            loadOp=vk.VK_ATTACHMENT_LOAD_OP_CLEAR, storeOp=vk.VK_ATTACHMENT_STORE_OP_STORE,
+            stencilLoadOp=vk.VK_ATTACHMENT_LOAD_OP_DONT_CARE, stencilStoreOp=vk.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED, finalLayout=final_layout,
+        )]
+        if depth_format is not None:
+            attachments.append(vk.VkAttachmentDescription(
+                format=depth_format, samples=vk.VK_SAMPLE_COUNT_1_BIT,
+                loadOp=vk.VK_ATTACHMENT_LOAD_OP_CLEAR, storeOp=vk.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                stencilLoadOp=vk.VK_ATTACHMENT_LOAD_OP_DONT_CARE, stencilStoreOp=vk.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+                finalLayout=vk.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            ))
+
         subpass = vk.VkSubpassDescription(
             pipelineBindPoint=vk.VK_PIPELINE_BIND_POINT_GRAPHICS,
             pColorAttachments=[vk.VkAttachmentReference(attachment=0, layout=vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)],
+            pDepthStencilAttachment=depth_ref,
         )
+
+        src_stages = vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+        dst_stages = vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+        src_access = vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+        dst_access = vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+        if depth_format is not None:
+            src_stages |= vk.VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+            dst_stages |= vk.VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+            src_access |= vk.VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+            dst_access |= vk.VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+
         render_pass = vk.vkCreateRenderPass(self.device, vk.VkRenderPassCreateInfo(
-            pAttachments=[vk.VkAttachmentDescription(
-                format=format, samples=vk.VK_SAMPLE_COUNT_1_BIT,
-                loadOp=vk.VK_ATTACHMENT_LOAD_OP_CLEAR, storeOp=vk.VK_ATTACHMENT_STORE_OP_STORE,
-                stencilLoadOp=vk.VK_ATTACHMENT_LOAD_OP_DONT_CARE, stencilStoreOp=vk.VK_ATTACHMENT_STORE_OP_DONT_CARE,
-                initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED, finalLayout=final_layout,
-            )],
+            pAttachments=attachments,
             pSubpasses=[subpass],
             pDependencies=[
                 vk.VkSubpassDependency(
                     srcSubpass=vk.VK_SUBPASS_EXTERNAL, dstSubpass=0,
-                    srcStageMask=vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                    dstStageMask=vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                    dstAccessMask=vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    srcStageMask=src_stages, dstStageMask=dst_stages,
+                    dstAccessMask=dst_access,
                 ),
                 vk.VkSubpassDependency(
                     srcSubpass=0, dstSubpass=vk.VK_SUBPASS_EXTERNAL,
-                    srcStageMask=vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                    srcAccessMask=vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    srcStageMask=src_stages, srcAccessMask=src_access,
                     dstStageMask=vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT if present else vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
                     dstAccessMask=0 if present else vk.VK_ACCESS_TRANSFER_READ_BIT,
                 ),
@@ -1142,6 +1275,7 @@ class _Vulkan:
                     frontFace=vk.VK_FRONT_FACE_COUNTER_CLOCKWISE, lineWidth=1.0,
                 ),
                 pMultisampleState=vk.VkPipelineMultisampleStateCreateInfo(rasterizationSamples=vk.VK_SAMPLE_COUNT_1_BIT),
+                pDepthStencilState=depth_stencil_state,
                 pColorBlendState=vk.VkPipelineColorBlendStateCreateInfo(pAttachments=[vk.VkPipelineColorBlendAttachmentState(
                     colorWriteMask=vk.VK_COLOR_COMPONENT_R_BIT | vk.VK_COLOR_COMPONENT_G_BIT | vk.VK_COLOR_COMPONENT_B_BIT | vk.VK_COLOR_COMPONENT_A_BIT,
                 )]),
@@ -1168,16 +1302,17 @@ class _Vulkan:
             }[stage]
         return flags
 
-    def framebuffer(self, resources, render_pass, view, width, height):
+    def framebuffer(self, resources, render_pass, view, width, height, depth_view=None):
         vk = self.vk
+        attachments = [view] if depth_view is None else [view, depth_view]
         framebuffer = vk.vkCreateFramebuffer(self.device, vk.VkFramebufferCreateInfo(
-            renderPass=render_pass, pAttachments=[view], width=width, height=height, layers=1,
+            renderPass=render_pass, pAttachments=attachments, width=width, height=height, layers=1,
         ), None)
         resources.callback(vk.vkDestroyFramebuffer, self.device, framebuffer, None)
         return framebuffer
 
     def command(self, resources, render_pass, pipeline, framebuffer, width, height, draw: Draw, copy=None,
-                *, layout=None, parameters=None, elapsed=0.0, command=None, draws=None):
+                *, layout=None, parameters=None, elapsed=0.0, command=None, draws=None, has_depth=False):
         vk = self.vk
         data = _frame_data(parameters, width, height, elapsed) if parameters is not None else None
         if data is not None and layout is None:
@@ -1190,10 +1325,17 @@ class _Vulkan:
         else:
             vk.vkResetCommandBuffer(command, 0)
         vk.vkBeginCommandBuffer(command, vk.VkCommandBufferBeginInfo())
+        clear_values = [
+            vk.VkClearValue(color=vk.VkClearColorValue(float32=[0.02, 0.02, 0.04, 1.0]))
+        ]
+        if has_depth:
+            clear_values.append(
+                vk.VkClearValue(depthStencil=vk.VkClearDepthStencilValue(depth=1.0, stencil=0))
+            )
         vk.vkCmdBeginRenderPass(command, vk.VkRenderPassBeginInfo(
             renderPass=render_pass, framebuffer=framebuffer,
             renderArea=vk.VkRect2D(extent=vk.VkExtent2D(width=width, height=height)),
-            pClearValues=[vk.VkClearValue(color=vk.VkClearColorValue(float32=[0.02, 0.02, 0.04, 1.0]))],
+            pClearValues=clear_values,
         ), vk.VK_SUBPASS_CONTENTS_INLINE)
 
         if data is not None:
@@ -1310,9 +1452,14 @@ def _offscreen_renderer(
         vk = gpu.vk
         format = vk.VK_FORMAT_R8G8B8A8_UNORM
         image, view = gpu.image(resources, width, height, format)
+        has_depth = program.depth_stencil is not None
+        depth_view = None
+        if has_depth:
+            depth_format = _vulkan_depth_format(vk, program.depth_stencil.get("format", "d32_sfloat"))
+            depth_image, depth_view = gpu.depth_image(resources, width, height, depth_format)
         buffer, memory = gpu.readback_buffer(resources, width * height * 4)
         render_pass, pipeline, layout = gpu.pipeline(resources, program, format, width, height, False)
-        framebuffer = gpu.framebuffer(resources, render_pass, view, width, height)
+        framebuffer = gpu.framebuffer(resources, render_pass, view, width, height, depth_view=depth_view)
         fence = vk.vkCreateFence(gpu.device, vk.VkFenceCreateInfo(), None)
         resources.callback(vk.vkDestroyFence, gpu.device, fence, None)
         command = None
@@ -1321,7 +1468,8 @@ def _offscreen_renderer(
             nonlocal command
             first = command is None
             command = gpu.command(resources, render_pass, pipeline, framebuffer, width, height, program.draw, (image, buffer),
-                                  layout=layout, parameters=program.parameters, elapsed=_time_value(elapsed), command=command)
+                                  layout=layout, parameters=program.parameters, elapsed=_time_value(elapsed), command=command,
+                                  has_depth=has_depth)
             if first:
                 resources.callback(vk.vkDeviceWaitIdle, gpu.device)
             vk.vkResetFences(gpu.device, 1, [fence])
@@ -2066,14 +2214,19 @@ def _swapchain(gpu, resources, program, width, height):
         presentMode=vk.VK_PRESENT_MODE_FIFO_KHR, clipped=vk.VK_TRUE,
     ), None)
     resources.callback(gpu.device_function("vkDestroySwapchainKHR"), gpu.device, swapchain, None)
+    has_depth = program.depth_stencil is not None
+    depth_view = None
+    if has_depth:
+        depth_format = _vulkan_depth_format(gpu.vk, program.depth_stencil.get("format", "d32_sfloat"))
+        depth_image, depth_view = gpu.depth_image(resources, width, height, depth_format)
     render_pass, pipeline, layout = gpu.pipeline(resources, program, format, width, height, True)
     commands, finished, framebuffers = [], [], []
     for image in gpu.device_function("vkGetSwapchainImagesKHR")(gpu.device, swapchain):
         view = gpu.view(resources, image, format)
-        framebuffer = gpu.framebuffer(resources, render_pass, view, width, height)
+        framebuffer = gpu.framebuffer(resources, render_pass, view, width, height, depth_view=depth_view)
         framebuffers.append(framebuffer)
         commands.append(gpu.command(resources, render_pass, pipeline, framebuffer, width, height, program.draw,
-                                    layout=layout, parameters=program.parameters))
+                                    layout=layout, parameters=program.parameters, has_depth=has_depth))
         semaphore = vk.vkCreateSemaphore(gpu.device, vk.VkSemaphoreCreateInfo(), None)
         resources.callback(vk.vkDestroySemaphore, gpu.device, semaphore, None)
         finished.append(semaphore)

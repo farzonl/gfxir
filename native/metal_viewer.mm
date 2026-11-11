@@ -103,6 +103,24 @@ static NSDictionary* frameLayout(const std::string& path) {
     return layout;
 }
 
+struct MetalDepthSettings {
+    bool enabled = false;
+    bool writeEnabled = true;
+    MTLCompareFunction compareFunction = MTLCompareFunctionLessEqual;
+};
+
+static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
+    if (op == "less_equal") return MTLCompareFunctionLessEqual;
+    if (op == "less") return MTLCompareFunctionLess;
+    if (op == "equal") return MTLCompareFunctionEqual;
+    if (op == "greater") return MTLCompareFunctionGreater;
+    if (op == "greater_equal") return MTLCompareFunctionGreaterEqual;
+    if (op == "not_equal") return MTLCompareFunctionNotEqual;
+    if (op == "always") return MTLCompareFunctionAlways;
+    if (op == "never") return MTLCompareFunctionNever;
+    throw std::runtime_error("Unsupported depth compare op: " + op);
+}
+
 @interface GraphicsRenderer : NSObject <MTKViewDelegate, NSWindowDelegate>
 {
     std::chrono::steady_clock::time_point _started;
@@ -119,14 +137,26 @@ static NSDictionary* frameLayout(const std::string& path) {
 @property(nonatomic) double fixedTime;
 @property(nonatomic, strong) NSDictionary<NSString*, id<MTLRenderPipelineState>>* pipelines;
 @property(nonatomic, copy) NSArray<NSDictionary*>* draws;
+@property(nonatomic, strong) id<MTLDepthStencilState> depthState;
+@property(nonatomic) BOOL hasDepth;
 - (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry;
+- (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
+                       fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
+                  depthSettings:(MetalDepthSettings)depthSettings;
 - (void)encode:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass;
 @end
 
 @implementation GraphicsRenderer
 - (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry {
+    return [self initWithVertex:vertex vertexEntry:vertexEntry fragment:fragment fragmentEntry:fragmentEntry
+                  depthSettings:{}];
+}
+
+- (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
+                       fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
+                  depthSettings:(MetalDepthSettings)depthSettings {
     self = [super init];
     if (!self) throw failure(@"Cannot allocate Metal renderer");
     _device = MTLCreateSystemDefaultDevice();
@@ -145,8 +175,21 @@ static NSDictionary* frameLayout(const std::string& path) {
         throw failure(@"The converted library does not contain the manifest's entry point");
     descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     descriptor.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+    if (depthSettings.enabled) {
+        descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    }
     _pipeline = [_device newRenderPipelineStateWithDescriptor:descriptor error:&error];
     if (!_pipeline) throw failure(@"Cannot create the converted DXIL render pipeline", error);
+
+    if (depthSettings.enabled) {
+        MTLDepthStencilDescriptor* depthDesc = [MTLDepthStencilDescriptor new];
+        depthDesc.depthCompareFunction = depthSettings.compareFunction;
+        depthDesc.depthWriteEnabled = depthSettings.writeEnabled ? YES : NO;
+        _depthState = [_device newDepthStencilStateWithDescriptor:depthDesc];
+        if (!_depthState) throw failure(@"Cannot create Metal depth-stencil state");
+        _hasDepth = YES;
+    }
+
     _queue = [_device newCommandQueue];
     if (!_queue) throw failure(@"Cannot create a Metal command queue");
     _started = std::chrono::steady_clock::now();
@@ -156,6 +199,9 @@ static NSDictionary* frameLayout(const std::string& path) {
 - (void)encode:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass {
     id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
     if (!encoder) throw failure(@"Cannot create a Metal render encoder");
+    if (self.depthState) {
+        [encoder setDepthStencilState:self.depthState];
+    }
     [encoder setCullMode:MTLCullModeNone];
     [encoder setDepthClipMode:MTLDepthClipModeClip];
     id<MTLTexture> texture = pass.colorAttachments[0].texture;
@@ -281,6 +327,21 @@ static void readback(GraphicsRenderer* renderer, NSUInteger width, NSUInteger he
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     pass.colorAttachments[0].clearColor = MTLClearColorMake(0.02, 0.02, 0.04, 1.0);
+
+    if (renderer.hasDepth) {
+        MTLTextureDescriptor* depthDesc = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:width height:height mipmapped:NO];
+        depthDesc.storageMode = MTLStorageModePrivate;
+        depthDesc.usage = MTLTextureUsageRenderTarget;
+        id<MTLTexture> depthTexture = [renderer.device newTextureWithDescriptor:depthDesc];
+        if (!depthTexture) throw failure(@"Cannot allocate offscreen depth texture");
+
+        pass.depthAttachment.texture = depthTexture;
+        pass.depthAttachment.loadAction = MTLLoadActionClear;
+        pass.depthAttachment.storeAction = MTLStoreActionDontCare;
+        pass.depthAttachment.clearDepth = 1.0;
+    }
+
     id<MTLCommandBuffer> command = [renderer.queue commandBuffer];
     if (!command) throw failure(@"Cannot allocate an offscreen command buffer");
     [renderer encode:command pass:pass];
@@ -583,10 +644,20 @@ int main(int argc, char** argv) {
         @try {
             try {
                 std::map<std::string, std::string> arguments;
-                for (int i = 1; i < argc; i += 2) {
+                MetalDepthSettings depthSettings;
+                for (int i = 1; i < argc; ++i) {
                     std::string option = argv[i];
                     if (option == "-frames") option = "--frames";
-                    if (i + 1 >= argc || !arguments.emplace(option, argv[i + 1]).second)
+                    if (option == "--depth") {
+                        depthSettings.enabled = true;
+                        if (i + 1 < argc && (std::string(argv[i + 1]) == "1" || std::string(argv[i + 1]) == "true")) {
+                            ++i;
+                        }
+                        continue;
+                    }
+                    if (i + 1 >= argc) throw std::runtime_error("Expected unique --option value pairs");
+                    std::string val = argv[++i];
+                    if (!arguments.emplace(option, val).second)
                         throw std::runtime_error("Expected unique --option value pairs");
                 }
                 for (const auto& pair : arguments) {
@@ -597,8 +668,21 @@ int main(int argc, char** argv) {
                         pair.first != "--vertex-count" && pair.first != "--frame-layout" &&
                         pair.first != "--time" &&
                         pair.first != "--compute" && pair.first != "--compute-entry" &&
-                        pair.first != "--compute-spec")
+                        pair.first != "--compute-spec" &&
+                        pair.first != "--depth-compare" && pair.first != "--depth-write" &&
+                        pair.first != "--depth-format")
                         throw std::runtime_error("Unknown option: " + pair.first);
+                }
+                if (arguments.count("--depth-compare")) {
+                    depthSettings.compareFunction = parseMetalCompareFunction(arguments.at("--depth-compare"));
+                }
+                if (arguments.count("--depth-write")) {
+                    std::string w = arguments.at("--depth-write");
+                    depthSettings.writeEnabled = (w == "1" || w == "true");
+                }
+                if (arguments.count("--depth-format")) {
+                    std::string fmt = arguments.at("--depth-format");
+                    if (fmt != "d32_sfloat") throw std::runtime_error("Unsupported depth format: " + fmt);
                 }
                 auto required = [&](const char* key) -> const std::string& {
                     auto found = arguments.find(key);
@@ -628,7 +712,8 @@ int main(int argc, char** argv) {
                 double fixedTime = arguments.count("--time") ? seconds(arguments.at("--time")) : 0;
                 GraphicsRenderer* renderer = [[GraphicsRenderer alloc]
                     initWithVertex:@(required("--vertex").c_str()) vertexEntry:@(required("--vertex-entry").c_str())
-                    fragment:@(required("--fragment").c_str()) fragmentEntry:@(required("--fragment-entry").c_str())];
+                    fragment:@(required("--fragment").c_str()) fragmentEntry:@(required("--fragment-entry").c_str())
+                    depthSettings:depthSettings];
                 renderer.vertexCount = number(required("--vertex-count"), UINT32_MAX);
                 if (renderer.vertexCount % 3) throw std::runtime_error("Triangle-list vertex count must be a multiple of three");
                 renderer.limit = arguments.count("--frames") ? number(arguments.at("--frames"), NSUIntegerMax) : 0;
@@ -651,6 +736,10 @@ int main(int argc, char** argv) {
                 PreviewView* view = [[PreviewView alloc] initWithFrame:NSMakeRect(0, 0, width, height) device:renderer.device];
                 view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
                 view.autoResizeDrawable = YES;
+                if (renderer.hasDepth) {
+                    view.depthStencilPixelFormat = MTLPixelFormatDepth32Float;
+                    view.clearDepth = 1.0;
+                }
                 CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
                 if (!colorSpace) throw failure(@"Cannot create the canonical presentation color space");
                 view.colorspace = colorSpace;

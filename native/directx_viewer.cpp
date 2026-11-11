@@ -701,6 +701,24 @@ struct DirectXDrawCall {
     std::vector<uint32_t> rootConstants;
 };
 
+static D3D12_COMPARISON_FUNC parseD3D12ComparisonFunc(const std::wstring& op) {
+    if (op == L"less_equal") return D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    if (op == L"less") return D3D12_COMPARISON_FUNC_LESS;
+    if (op == L"equal") return D3D12_COMPARISON_FUNC_EQUAL;
+    if (op == L"greater") return D3D12_COMPARISON_FUNC_GREATER;
+    if (op == L"greater_equal") return D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+    if (op == L"not_equal") return D3D12_COMPARISON_FUNC_NOT_EQUAL;
+    if (op == L"always") return D3D12_COMPARISON_FUNC_ALWAYS;
+    if (op == L"never") return D3D12_COMPARISON_FUNC_NEVER;
+    throw std::runtime_error("Unsupported depth compare op");
+}
+
+struct DepthSettings {
+    bool enabled = false;
+    bool write = true;
+    D3D12_COMPARISON_FUNC compare = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+};
+
 class Renderer {
     ComPtr<IDXGIFactory6> factory;
     ComPtr<ID3D12Device> device;
@@ -711,6 +729,11 @@ class Renderer {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pipeline;
     ComPtr<ID3D12DescriptorHeap> rtvHeap;
+    ComPtr<ID3D12DescriptorHeap> dsvHeap;
+    ComPtr<ID3D12Resource> depthBuffer;
+    UINT depthWidth = 0;
+    UINT depthHeight = 0;
+    DepthSettings depthSettings;
     ComPtr<ID3D12Fence> fence;
     Event completion;
     UINT64 fenceValue = 0;
@@ -767,6 +790,44 @@ class Renderer {
         commands->ResourceBarrier(1, &transition);
     }
 
+    void ensureDepthBuffer(UINT width, UINT height) {
+        if (!depthSettings.enabled) return;
+        if (depthBuffer && depthWidth == width && depthHeight == height) return;
+        depthWidth = width;
+        depthHeight = height;
+
+        D3D12_HEAP_PROPERTIES heapProps{};
+        heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC depthDesc{};
+        depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        depthDesc.Width = width;
+        depthDesc.Height = height;
+        depthDesc.DepthOrArraySize = 1;
+        depthDesc.MipLevels = 1;
+        depthDesc.Format = DXGI_FORMAT_D32_FLOAT;
+        depthDesc.SampleDesc.Count = 1;
+        depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+        D3D12_CLEAR_VALUE clearValue{};
+        clearValue.Format = DXGI_FORMAT_D32_FLOAT;
+        clearValue.DepthStencil.Depth = 1.0f;
+        clearValue.DepthStencil.Stencil = 0;
+
+        check(device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &depthDesc,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE, &clearValue,
+            IID_PPV_ARGS(&depthBuffer)), "Create depth buffer");
+
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
+        dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
+        dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        dsvDesc.Flags = D3D12_DSV_FLAG_NONE;
+
+        auto dsvHandle = dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        device->CreateDepthStencilView(depthBuffer.Get(), &dsvDesc, dsvHandle);
+    }
+
     void draw(ID3D12Resource* target, UINT width, UINT height, double elapsed) {
         auto handle = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         device->CreateRenderTargetView(target, nullptr, handle);
@@ -786,7 +847,17 @@ class Renderer {
         D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
         commands->RSSetViewports(1, &viewport);
         commands->RSSetScissorRects(1, &scissor);
-        commands->OMSetRenderTargets(1, &handle, FALSE, nullptr);
+
+        const D3D12_CPU_DESCRIPTOR_HANDLE* pDsv = nullptr;
+        D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle{};
+        if (depthSettings.enabled) {
+            ensureDepthBuffer(width, height);
+            dsvHandle = dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            commands->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            pDsv = &dsvHandle;
+        }
+
+        commands->OMSetRenderTargets(1, &handle, FALSE, pDsv);
         const float background[]{0.02f, 0.02f, 0.04f, 1.0f};
         commands->ClearRenderTargetView(handle, background, 0, nullptr);
         commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -836,8 +907,10 @@ public:
     }
 
     Renderer(const std::wstring& vertex, const std::wstring& fragment, UINT count, bool validation,
-             bool warp = false, bool hasTime = false, double time = 0.0)
+             bool warp = false, bool hasTime = false, double time = 0.0,
+             DepthSettings depthSettings = {})
         : vertexCount(count), hasFixedTime(hasTime), fixedTime(time),
+          depthSettings(depthSettings),
           started(std::chrono::steady_clock::now()) {
         auto dev = createDirectXDevice(warp, validation);
         factory = std::move(dev.factory);
@@ -900,7 +973,19 @@ public:
         description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         description.RasterizerState.DepthClipEnable = TRUE;
-        description.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        if (depthSettings.enabled) {
+            description.DepthStencilState.DepthEnable = TRUE;
+            description.DepthStencilState.DepthWriteMask = depthSettings.write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+            description.DepthStencilState.DepthFunc = depthSettings.compare;
+            description.DepthStencilState.StencilEnable = FALSE;
+            description.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        } else {
+            description.DepthStencilState.DepthEnable = FALSE;
+            description.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            description.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            description.DepthStencilState.StencilEnable = FALSE;
+            description.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        }
         description.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
         description.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
         auto& stencil = description.DepthStencilState.FrontFace;
@@ -918,6 +1003,13 @@ public:
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         heap.NumDescriptors = 1;
         check(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&rtvHeap)), "CreateDescriptorHeap");
+
+        if (depthSettings.enabled) {
+            D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc{};
+            dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+            dsvHeapDesc.NumDescriptors = 1;
+            check(device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&dsvHeap)), "Create DSV DescriptorHeap");
+        }
         check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), pipeline.Get(),
                                        IID_PPV_ARGS(&commands)), "CreateCommandList");
         check(commands->Close(), "Close initial command list");
@@ -1075,6 +1167,7 @@ int wmain(int argc, wchar_t** argv) {
         bool validation = false;
         bool warp = false;
         bool reportCapabilities = false;
+        DepthSettings depthSettings;
         for (int index = 1; index < argc; ++index) {
             std::wstring key = argv[index];
             if (key == L"--validation") {
@@ -1093,10 +1186,18 @@ int wmain(int argc, wchar_t** argv) {
                 continue;
             }
             if (key == L"-frames") key = L"--frames";
+            if (key == L"--depth") {
+                depthSettings.enabled = true;
+                if (index + 1 < argc && (std::wstring(argv[index + 1]) == L"1" || std::wstring(argv[index + 1]) == L"true")) {
+                    ++index;
+                }
+                continue;
+            }
             if (key != L"--vertex" && key != L"--fragment" && key != L"--width" &&
                 key != L"--height" && key != L"--frames" && key != L"--vertex-count" &&
                 key != L"--readback" && key != L"--time" &&
-                key != L"--compute" && key != L"--compute-spec")
+                key != L"--compute" && key != L"--compute-spec" &&
+                key != L"--depth-compare" && key != L"--depth-write" && key != L"--depth-format")
                 throw std::runtime_error("Unknown native DirectX viewer argument");
             if (++index == argc || !options.emplace(key, argv[index]).second)
                 throw std::runtime_error("Missing or duplicate native viewer argument");
@@ -1130,8 +1231,20 @@ int wmain(int argc, wchar_t** argv) {
         bool hasTime = options.count(L"--time") != 0;
         double fixedTime = hasTime ? seconds(options.at(L"--time")) : 0.0;
 
+        if (options.count(L"--depth-compare")) {
+            depthSettings.compare = parseD3D12ComparisonFunc(options.at(L"--depth-compare"));
+        }
+        if (options.count(L"--depth-write")) {
+            std::wstring w = options.at(L"--depth-write");
+            depthSettings.write = (w == L"1" || w == L"true");
+        }
+        if (options.count(L"--depth-format")) {
+            std::wstring fmt = options.at(L"--depth-format");
+            if (fmt != L"d32_sfloat") throw std::runtime_error("Unsupported depth format");
+        }
+
         Renderer renderer(options.at(L"--vertex"), options.at(L"--fragment"), count, validation,
-                          warp, hasTime, fixedTime);
+                          warp, hasTime, fixedTime, depthSettings);
         if (options.count(L"--readback")) {
             renderer.readback(width, height, options.at(L"--readback"));
         } else {

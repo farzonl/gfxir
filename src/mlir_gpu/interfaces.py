@@ -4,6 +4,39 @@ from .frontend import Type
 from .parameters import verify_parameters
 
 
+SUPPORTED_DEPTH_FORMATS = {"d32_sfloat"}
+COMPARE_OPS = {
+    "never", "less", "equal", "less_equal",
+    "greater", "not_equal", "greater_equal", "always",
+}
+
+
+def verify_depth_stencil(depth_stencil: object) -> None:
+    if not isinstance(depth_stencil, dict):
+        raise ValueError("depth_stencil configuration must be a dictionary.")
+
+    fmt = depth_stencil.get("format")
+    if not isinstance(fmt, str) or fmt not in SUPPORTED_DEPTH_FORMATS:
+        raise ValueError(f"Unsupported depth format: {fmt!r}. Supported formats: {sorted(SUPPORTED_DEPTH_FORMATS)}.")
+
+    test_enable = depth_stencil.get("depth_test_enable")
+    if type(test_enable) is not bool:
+        raise ValueError(f"depth_test_enable must be a boolean, got {type(test_enable).__name__}.")
+
+    write_enable = depth_stencil.get("depth_write_enable")
+    if type(write_enable) is not bool:
+        raise ValueError(f"depth_write_enable must be a boolean, got {type(write_enable).__name__}.")
+
+    op = depth_stencil.get("depth_compare_op")
+    if not isinstance(op, str) or op not in COMPARE_OPS:
+        raise ValueError(f"Unsupported depth_compare_op: {op!r}. Supported operators: {sorted(COMPARE_OPS)}.")
+
+    if "clear_depth" in depth_stencil:
+        clear = depth_stencil["clear_depth"]
+        if type(clear) not in (int, float) or isinstance(clear, bool) or not (0.0 <= clear <= 1.0):
+            raise ValueError(f"clear_depth must be a float in [0.0, 1.0], got {clear!r}.")
+
+
 def verify_graphics_interface(interface: object, *, preview: bool = False) -> None:
     if not isinstance(interface, dict) or set(interface) != {"vertex", "fragment"}:
         raise ValueError("Graphics reflection requires vertex and fragment interfaces.")

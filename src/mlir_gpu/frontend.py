@@ -796,6 +796,28 @@ class Draw:
 
 
 @dataclass(frozen=True)
+class DepthStencil:
+    format: str = "d32_sfloat"
+    depth_test_enable: bool = True
+    depth_write_enable: bool = True
+    depth_compare_op: str = "less_equal"
+    clear_depth: float = 1.0
+
+    def __post_init__(self):
+        from .interfaces import verify_depth_stencil
+        verify_depth_stencil(self.to_dict())
+
+    def to_dict(self) -> dict:
+        return {
+            "format": self.format,
+            "depth_test_enable": self.depth_test_enable,
+            "depth_write_enable": self.depth_write_enable,
+            "depth_compare_op": self.depth_compare_op,
+            "clear_depth": self.clear_depth,
+        }
+
+
+@dataclass(frozen=True)
 class ShaderIO:
     name: str
     type: Type
@@ -1155,6 +1177,14 @@ class Pipeline:
     vertex: Entry
     fragment: Entry
     draw: Draw = field(default_factory=Draw)
+    depth_stencil: DepthStencil | None = None
+
+    def __post_init__(self):
+        if self.depth_stencil is not None:
+            if isinstance(self.depth_stencil, dict):
+                object.__setattr__(self, "depth_stencil", DepthStencil(**self.depth_stencil))
+            elif not isinstance(self.depth_stencil, DepthStencil):
+                raise TypeError("depth_stencil must be a DepthStencil instance or dict.")
 
     def trace(self) -> tuple[Stage, Stage]:
         if self.vertex.kind != "vertex" or self.fragment.kind != "fragment":
