@@ -5,11 +5,15 @@
 #define IR_PRIVATE_IMPLEMENTATION
 #include <metal_irconverter_runtime/metal_irconverter_runtime.h>
 
-#include <fstream>
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -267,6 +271,265 @@ static void readback(GraphicsRenderer* renderer, NSUInteger width, NSUInteger he
     std::cout << "\n";
 }
 
+static std::array<NSUInteger, 3> parseDimTriple(id value, NSString* label) {
+    if (![value isKindOfClass:[NSArray class]] || [value count] != 3) {
+        throw failure([NSString stringWithFormat:@"%@ must be an array of 3 positive integers", label]);
+    }
+    NSArray* array = value;
+    std::array<NSUInteger, 3> dims{};
+    for (NSUInteger i = 0; i < 3; ++i) {
+        id item = array[i];
+        if (![item isKindOfClass:[NSNumber class]]) {
+            throw failure([NSString stringWithFormat:@"%@ dimensions must be integers", label]);
+        }
+        NSInteger signedVal = [item integerValue];
+        if (signedVal < 1) {
+            throw failure([NSString stringWithFormat:@"%@ dimensions must be positive", label]);
+        }
+        dims[i] = static_cast<NSUInteger>(signedVal);
+    }
+    return dims;
+}
+
+static void runComputeDispatch(const std::string& metallibPath, const std::string& entryPoint,
+                               const std::string& specPath) {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) throw failure(@"No Metal device is available");
+    if (device.argumentBuffersSupport != MTLArgumentBuffersTier2)
+        throw failure(@"Converted DXIL compute execution requires Argument Buffers Tier 2");
+
+    NSError* error = nil;
+    NSData* specData = [NSData dataWithContentsOfFile:@(specPath.c_str()) options:0 error:&error];
+    if (!specData) throw failure(@"Cannot read compute dispatch spec", error);
+    id rawSpec = [NSJSONSerialization JSONObjectWithData:specData options:0 error:&error];
+    if (![rawSpec isKindOfClass:[NSDictionary class]])
+        throw failure(@"Invalid compute dispatch spec JSON", error);
+    NSDictionary* spec = rawSpec;
+
+    std::array<NSUInteger, 3> workgroupSize = parseDimTriple(spec[@"workgroup_size"], @"workgroup_size");
+    std::array<NSUInteger, 3> grid = parseDimTriple(spec[@"grid"], @"grid");
+
+    id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:@(metallibPath.c_str())] error:&error];
+    if (!library) throw failure(@"Cannot load converted compute metallib", error);
+    id<MTLFunction> computeFunction = [library newFunctionWithName:@(entryPoint.c_str())];
+    if (!computeFunction)
+        throw failure(@"The converted compute library does not contain the requested entry point");
+
+    MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
+    descriptor.computeFunction = computeFunction;
+    MTLAutoreleasedComputePipelineReflection reflection = nil;
+    MTLPipelineOption options = MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo;
+    id<MTLComputePipelineState> pipeline =
+        [device newComputePipelineStateWithDescriptor:descriptor
+                                              options:options
+                                           reflection:&reflection
+                                                error:&error];
+    if (!pipeline) throw failure(@"Cannot create Metal compute pipeline state", error);
+
+    NSUInteger threadsPerGroup = workgroupSize[0] * workgroupSize[1] * workgroupSize[2];
+    if (threadsPerGroup > pipeline.maxTotalThreadsPerThreadgroup) {
+        throw failure(@"Compute workgroup_size exceeds Metal pipeline maxTotalThreadsPerThreadgroup");
+    }
+
+    std::vector<uint8_t> rootConstants;
+    id rootConstantsPathObj = spec[@"root_constants_path"];
+    if ([rootConstantsPathObj isKindOfClass:[NSString class]] && [rootConstantsPathObj length] > 0) {
+        NSString* rcPath = rootConstantsPathObj;
+        NSData* rcData = [NSData dataWithContentsOfFile:rcPath options:0 error:&error];
+        if (!rcData) throw failure(@"Cannot read compute root constants file", error);
+        const auto* rcPtr = static_cast<const uint8_t*>(rcData.bytes);
+        rootConstants.assign(rcPtr, rcPtr + rcData.length);
+    }
+
+    struct MetalComputeBuffer {
+        std::string name;
+        uint32_t set = 0;
+        uint32_t binding = 0;
+        std::string access;
+        size_t size = 0;
+        size_t alignedSize = 0;
+        bool isUAV = false;
+        std::string outputPath;
+        id<MTLBuffer> buffer = nil;
+    };
+
+    id rawBuffers = spec[@"buffers"];
+    if (![rawBuffers isKindOfClass:[NSArray class]])
+        throw failure(@"Compute dispatch spec 'buffers' must be an array");
+    NSArray* bufferSpecs = rawBuffers;
+
+    std::vector<MetalComputeBuffer> buffers;
+    buffers.reserve(bufferSpecs.count);
+
+    for (id item in bufferSpecs) {
+        if (![item isKindOfClass:[NSDictionary class]])
+            throw failure(@"Invalid buffer entry in compute dispatch spec");
+        NSDictionary* dict = item;
+        NSString* nameNs = dict[@"name"];
+        NSString* accessNs = dict[@"access"];
+        NSNumber* sizeNs = dict[@"size"];
+        if (![nameNs isKindOfClass:[NSString class]] || ![accessNs isKindOfClass:[NSString class]] ||
+            ![sizeNs isKindOfClass:[NSNumber class]])
+            throw failure(@"Compute buffer entry is missing required fields");
+
+        MetalComputeBuffer entry;
+        entry.name = nameNs.UTF8String;
+        entry.access = accessNs.UTF8String;
+        if (entry.access != "read_only" && entry.access != "write_only" && entry.access != "read_write")
+            throw std::runtime_error("Unsupported compute buffer access mode: " + entry.access);
+        long long rawSize = [sizeNs longLongValue];
+        if (rawSize <= 0)
+            throw std::runtime_error("Compute buffer byte size must be positive: " + entry.name);
+        entry.size = static_cast<size_t>(rawSize);
+        entry.alignedSize = std::max<size_t>(4, (entry.size + 3) & ~static_cast<size_t>(3));
+        entry.isUAV = (entry.access != "read_only");
+
+        if ([dict[@"set"] isKindOfClass:[NSNumber class]])
+            entry.set = static_cast<uint32_t>([dict[@"set"] unsignedIntValue]);
+        if ([dict[@"binding"] isKindOfClass:[NSNumber class]])
+            entry.binding = static_cast<uint32_t>([dict[@"binding"] unsignedIntValue]);
+        if ([dict[@"output_path"] isKindOfClass:[NSString class]])
+            entry.outputPath = [dict[@"output_path"] UTF8String];
+
+        entry.buffer = [device newBufferWithLength:entry.alignedSize options:MTLResourceStorageModeShared];
+        if (!entry.buffer)
+            throw failure(@"Cannot allocate Metal compute storage buffer");
+        std::memset(entry.buffer.contents, 0, entry.alignedSize);
+
+        id inputPathObj = dict[@"input_path"];
+        if ([inputPathObj isKindOfClass:[NSString class]] && [inputPathObj length] > 0) {
+            NSData* inData = [NSData dataWithContentsOfFile:inputPathObj options:0 error:&error];
+            if (!inData) throw failure(@"Cannot read compute input buffer file", error);
+            if (inData.length != entry.size)
+                throw std::runtime_error("Compute input buffer file size does not match spec size: " + entry.name);
+            std::memcpy(entry.buffer.contents, inData.bytes, entry.size);
+        }
+
+        buffers.push_back(std::move(entry));
+    }
+
+    std::stable_sort(buffers.begin(), buffers.end(),
+                     [](const MetalComputeBuffer& a, const MetalComputeBuffer& b) {
+                         if (a.set != b.set) return a.set < b.set;
+                         return a.binding < b.binding;
+                     });
+
+    std::vector<size_t> uavIndices;
+    std::vector<size_t> srvIndices;
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        if (buffers[i].isUAV) uavIndices.push_back(i);
+        else srvIndices.push_back(i);
+    }
+
+    size_t totalDescriptors = uavIndices.size() + srvIndices.size();
+    id<MTLBuffer> descriptorTable = nil;
+    if (totalDescriptors > 0) {
+        size_t tableByteSize = totalDescriptors * sizeof(IRDescriptorTableEntry);
+        descriptorTable = [device newBufferWithLength:tableByteSize options:MTLResourceStorageModeShared];
+        if (!descriptorTable)
+            throw failure(@"Cannot allocate Metal IRDescriptorTableEntry buffer");
+        auto* entries = static_cast<IRDescriptorTableEntry*>(descriptorTable.contents);
+        std::memset(entries, 0, tableByteSize);
+        size_t slot = 0;
+        for (size_t idx : uavIndices) {
+            IRDescriptorTableSetBuffer(&entries[slot++], buffers[idx].buffer.gpuAddress, 0);
+        }
+        for (size_t idx : srvIndices) {
+            IRDescriptorTableSetBuffer(&entries[slot++], buffers[idx].buffer.gpuAddress, 0);
+        }
+    }
+
+    bool needsTopLevelArgBuffer = !rootConstants.empty() || totalDescriptors > 0;
+    size_t reflectedSize = 0;
+    size_t descriptorTableOffset = (rootConstants.size() + 7) & ~static_cast<size_t>(7);
+    if (reflection != nil) {
+        for (id<MTLBinding> binding in reflection.bindings) {
+            if (binding.type == MTLBindingTypeBuffer && binding.index == kIRArgumentBufferBindPoint) {
+                id untyped = binding;
+                id<MTLBufferBinding> bufferBinding = untyped;
+                reflectedSize = bufferBinding.bufferDataSize;
+                MTLStructType* structType = bufferBinding.bufferStructType;
+                if (structType != nil) {
+                    for (MTLStructMember* member in structType.members) {
+                        if (member.dataType == MTLDataTypePointer) {
+                            descriptorTableOffset = member.offset;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    id<MTLBuffer> topLevelArgBuffer = nil;
+    if (needsTopLevelArgBuffer) {
+        size_t minSize = rootConstants.size();
+        if (totalDescriptors > 0) {
+            minSize = std::max<size_t>(minSize, descriptorTableOffset + sizeof(uint64_t));
+        }
+        size_t argBufSize = std::max<size_t>(std::max<size_t>(reflectedSize, minSize), 16);
+        topLevelArgBuffer = [device newBufferWithLength:argBufSize options:MTLResourceStorageModeShared];
+        if (!topLevelArgBuffer)
+            throw failure(@"Cannot allocate Metal top-level argument buffer");
+        auto* argBytes = static_cast<uint8_t*>(topLevelArgBuffer.contents);
+        std::memset(argBytes, 0, argBufSize);
+        if (!rootConstants.empty()) {
+            std::memcpy(argBytes, rootConstants.data(), rootConstants.size());
+        }
+        if (totalDescriptors > 0 && descriptorTable != nil) {
+            uint64_t tableAddress = descriptorTable.gpuAddress;
+            std::memcpy(argBytes + descriptorTableOffset, &tableAddress, sizeof(tableAddress));
+        }
+    }
+
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    if (!queue) throw failure(@"Cannot create a Metal command queue");
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    if (!command) throw failure(@"Cannot allocate a Metal compute command buffer");
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    if (!encoder) throw failure(@"Cannot create a Metal compute command encoder");
+
+    [encoder setComputePipelineState:pipeline];
+    if (topLevelArgBuffer != nil) {
+        [encoder setBuffer:topLevelArgBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
+    }
+    if (descriptorTable != nil) {
+        [encoder useResource:descriptorTable usage:MTLResourceUsageRead];
+    }
+    for (const auto& buf : buffers) {
+        MTLResourceUsage usage = buf.isUAV ? (MTLResourceUsageRead | MTLResourceUsageWrite)
+                                           : MTLResourceUsageRead;
+        [encoder useResource:buf.buffer usage:usage];
+    }
+
+    [encoder dispatchThreadgroups:MTLSizeMake(grid[0], grid[1], grid[2])
+            threadsPerThreadgroup:MTLSizeMake(workgroupSize[0], workgroupSize[1], workgroupSize[2])];
+    [encoder endEncoding];
+
+    [command commit];
+    [command waitUntilCompleted];
+    if (command.status == MTLCommandBufferStatusError)
+        throw failure(@"Metal compute dispatch failed", command.error);
+
+    for (const auto& buf : buffers) {
+        if (!buf.isUAV || buf.outputPath.empty()) continue;
+        const auto* source = static_cast<const char*>(buf.buffer.contents);
+        if (!source) throw failure(@"Metal compute buffer is not CPU accessible");
+        std::ofstream out(buf.outputPath, std::ios::binary | std::ios::trunc);
+        if (!out) throw std::runtime_error("Cannot open compute readback output: " + buf.name);
+        out.write(source, static_cast<std::streamsize>(buf.size));
+        out.close();
+        if (!out) throw std::runtime_error("Cannot write compute readback output: " + buf.name);
+    }
+
+    NSData* report = [NSJSONSerialization dataWithJSONObject:@{
+        @"device": device.name
+    } options:0 error:&error];
+    if (!report) throw failure(@"Cannot encode compute dispatch report", error);
+    std::cout.write(static_cast<const char*>(report.bytes), static_cast<std::streamsize>(report.length));
+    std::cout << "\n" << std::flush;
+}
+
 int main(int argc, char** argv) {
     @autoreleasepool {
         @try {
@@ -283,7 +546,10 @@ int main(int argc, char** argv) {
                         pair.first != "--vertex-entry" && pair.first != "--fragment-entry" &&
                         pair.first != "--width" && pair.first != "--height" &&
                         pair.first != "--frames" && pair.first != "--readback" &&
-                        pair.first != "--vertex-count" && pair.first != "--frame-layout" && pair.first != "--time")
+                        pair.first != "--vertex-count" && pair.first != "--frame-layout" &&
+                        pair.first != "--time" &&
+                        pair.first != "--compute" && pair.first != "--compute-entry" &&
+                        pair.first != "--compute-spec")
                         throw std::runtime_error("Unknown option: " + pair.first);
                 }
                 auto required = [&](const char* key) -> const std::string& {
@@ -292,6 +558,21 @@ int main(int argc, char** argv) {
                         throw std::runtime_error(std::string("Missing ") + key);
                     return found->second;
                 };
+                if (arguments.count("--compute") || arguments.count("--compute-entry") ||
+                    arguments.count("--compute-spec")) {
+                    if (arguments.count("--vertex") || arguments.count("--fragment") ||
+                        arguments.count("--vertex-entry") || arguments.count("--fragment-entry") ||
+                        arguments.count("--width") || arguments.count("--height") ||
+                        arguments.count("--frames") || arguments.count("--readback") ||
+                        arguments.count("--vertex-count") || arguments.count("--frame-layout") ||
+                        arguments.count("--time"))
+                        throw std::runtime_error("Compute dispatch options cannot be combined with graphics options");
+                    runComputeDispatch(
+                        required("--compute"),
+                        required("--compute-entry"),
+                        required("--compute-spec"));
+                    return 0;
+                }
                 NSUInteger width = number(required("--width"), 4096);
                 NSUInteger height = number(required("--height"), 4096);
                 if (!width || !height) throw std::runtime_error("Dimensions must be positive");

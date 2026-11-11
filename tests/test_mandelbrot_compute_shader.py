@@ -7,8 +7,10 @@ import os
 from pathlib import Path
 import runpy
 import struct
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from mlir_gpu import (
     Target,
@@ -147,6 +149,201 @@ class TestMandelbrotVulkanExecution(unittest.TestCase):
             )
             out_png = td_path / "mandelbrot_vulkan.png"
             diff_png = td_path / "mandelbrot_vulkan_diff.png"
+            write_png(out_png, rendered)
+            self.assertTrue(out_png.is_file())
+
+            diff = imgdiff(
+                out_png,
+                GOLDEN_MANDELBROT_PNG,
+                cie76_threshold=2.3,
+                max_outlier_fraction=0.002,
+                diff_output=diff_png,
+            )
+            self.assertTrue(diff.passed, diff.summary())
+            self.assertTrue(diff_png.is_file())
+
+
+@unittest.skipUnless(
+    sys.platform == "win32" and os.environ.get("MLIR_GPU_TEST_DIRECTX") == "1",
+    "Set MLIR_GPU_TEST_DIRECTX=1 on Windows to run live DirectX 12 Mandelbrot compute execution",
+)
+class TestMandelbrotDirectXExecution(unittest.TestCase):
+    """Live DirectX 12 / WARP compute dispatch, buffer readback, write_png, and imgdiff verification."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not (available("llc") and available("dxv") and available("mlir-gpu-directx-view")):
+            raise unittest.SkipTest("DirectX 12 compute execution tools are unavailable")
+        cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
+        cls.example = runpy.run_path(str(ROOT / "examples" / "mandelbrot_compute.py"))
+        cls.pipeline = cls.example["pipeline"]
+        cls.rgba_pipeline = cls.example["rgba_pipeline"]
+        cls.default_params = cls.example["DEFAULT_MANDELBROT_PARAMS"]
+        cls.cpu_pixel = staticmethod(cls.example["cpu_mandelbrot_pixel"])
+
+    def test_directx_mandelbrot_escape_counts_match_analytical_oracle(self):
+        width, height = 256, 256
+        params = {**self.default_params, "width": width, "height": height, "pitch": width}
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = compile_pipeline(self.pipeline, Target.DIRECTX, Path(td) / "dx_counts", TOOLS)
+            result = dispatch_compute(
+                manifest,
+                buffers={"output_buffer": width * height * 4},
+                parameters=params,
+                grid=(16, 16, 1),
+                validation=self.validation,
+                provider="warp",
+                toolchain=TOOLS,
+            )
+            self.assertIn("Basic Render Driver", result.device)
+            raw = result.buffers["output_buffer"]
+            self.assertEqual(len(raw), width * height * 4)
+            counts = struct.unpack(f"<{width * height}I", raw)
+
+            self.assertEqual(counts[128 * width + 128], 100)
+            self.assertEqual(counts[128 * width + 85], 100)
+            self.assertEqual(counts[0], 1)
+            self.assertEqual(counts[255], 2)
+
+            exact_matches = 0
+            for py in range(height):
+                row_offset = py * width
+                for px in range(width):
+                    if counts[row_offset + px] == self.cpu_pixel(px, py, width=width, height=height):
+                        exact_matches += 1
+            match_ratio = exact_matches / (width * height)
+            self.assertGreater(
+                match_ratio,
+                0.998,
+                f"Expected >99.8% exact pixel escape-count agreement on DirectX WARP, got {match_ratio:.5f}",
+            )
+
+    def test_directx_warp_mandelbrot_rgba_writes_png_and_passes_imgdiff(self):
+        width, height = 256, 256
+        params = {**self.default_params, "width": width, "height": height, "pitch": width}
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            manifest = compile_pipeline(self.rgba_pipeline, Target.DIRECTX, td_path / "dx_rgba", TOOLS)
+            rendered = render_compute_rgba(
+                manifest,
+                width,
+                height,
+                parameters=params,
+                validation=self.validation,
+                provider="warp",
+                toolchain=TOOLS,
+            )
+            self.assertIn("Basic Render Driver", rendered.device)
+            out_png = td_path / "mandelbrot_directx_warp.png"
+            diff_png = td_path / "mandelbrot_directx_warp_diff.png"
+            write_png(out_png, rendered)
+            self.assertTrue(out_png.is_file())
+
+            diff = imgdiff(
+                out_png,
+                GOLDEN_MANDELBROT_PNG,
+                cie76_threshold=2.3,
+                max_outlier_fraction=0.002,
+                diff_output=diff_png,
+            )
+            self.assertTrue(diff.passed, diff.summary())
+            self.assertTrue(diff_png.is_file())
+
+    def test_directx_compute_rejects_accidental_hardware_fallback_when_warp_requested(self):
+        width, height = 16, 16
+        params = {**self.default_params, "width": width, "height": height, "pitch": width}
+        with tempfile.TemporaryDirectory() as td:
+            manifest = compile_pipeline(self.pipeline, Target.DIRECTX, Path(td) / "dx_mock", TOOLS)
+            with patch(
+                "mlir_gpu.viewer._read_native_compute_outputs",
+                return_value=("Simulated Hardware Adapter", {"output_buffer": b"\x00" * (width * height * 4)}),
+            ), patch("mlir_gpu.viewer._directx_run", return_value='{"device":"Simulated Hardware Adapter"}'):
+                with self.assertRaisesRegex(ViewerError, "Accidental hardware/driver fallback rejected"):
+                    dispatch_compute(
+                        manifest,
+                        buffers={"output_buffer": width * height * 4},
+                        parameters=params,
+                        grid=(1, 1, 1),
+                        provider="warp",
+                        toolchain=TOOLS,
+                    )
+
+
+@unittest.skipUnless(
+    sys.platform == "darwin" and os.environ.get("MLIR_GPU_TEST_METAL") == "1",
+    "Set MLIR_GPU_TEST_METAL=1 on macOS to run live Metal Mandelbrot compute execution",
+)
+class TestMandelbrotMetalExecution(unittest.TestCase):
+    """Live Metal compute dispatch, buffer readback, write_png, and imgdiff verification."""
+
+    @classmethod
+    def setUpClass(cls):
+        required = ("llc", "dxv", "metal-shaderconverter", "mlir-gpu-metal-view")
+        if not all(available(tool) for tool in required):
+            raise unittest.SkipTest("Metal compute execution tools are unavailable")
+        cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
+        cls.example = runpy.run_path(str(ROOT / "examples" / "mandelbrot_compute.py"))
+        cls.pipeline = cls.example["pipeline"]
+        cls.rgba_pipeline = cls.example["rgba_pipeline"]
+        cls.default_params = cls.example["DEFAULT_MANDELBROT_PARAMS"]
+        cls.cpu_pixel = staticmethod(cls.example["cpu_mandelbrot_pixel"])
+
+    def test_metal_mandelbrot_escape_counts_match_analytical_oracle(self):
+        width, height = 256, 256
+        params = {**self.default_params, "width": width, "height": height, "pitch": width}
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = compile_pipeline(self.pipeline, Target.METAL, Path(td) / "mtl_counts", TOOLS)
+            result = dispatch_compute(
+                manifest,
+                buffers={"output_buffer": width * height * 4},
+                parameters=params,
+                grid=(16, 16, 1),
+                validation=self.validation,
+                toolchain=TOOLS,
+            )
+            self.assertTrue(result.device)
+            raw = result.buffers["output_buffer"]
+            self.assertEqual(len(raw), width * height * 4)
+            counts = struct.unpack(f"<{width * height}I", raw)
+
+            self.assertEqual(counts[128 * width + 128], 100)
+            self.assertEqual(counts[128 * width + 85], 100)
+            self.assertEqual(counts[0], 1)
+            self.assertEqual(counts[255], 2)
+
+            exact_matches = 0
+            for py in range(height):
+                row_offset = py * width
+                for px in range(width):
+                    if counts[row_offset + px] == self.cpu_pixel(px, py, width=width, height=height):
+                        exact_matches += 1
+            match_ratio = exact_matches / (width * height)
+            self.assertGreater(
+                match_ratio,
+                0.998,
+                f"Expected >99.8% exact pixel escape-count agreement on Metal, got {match_ratio:.5f}",
+            )
+
+    def test_metal_mandelbrot_rgba_writes_png_and_passes_imgdiff(self):
+        width, height = 256, 256
+        params = {**self.default_params, "width": width, "height": height, "pitch": width}
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            manifest = compile_pipeline(self.rgba_pipeline, Target.METAL, td_path / "mtl_rgba", TOOLS)
+            rendered = render_compute_rgba(
+                manifest,
+                width,
+                height,
+                parameters=params,
+                validation=self.validation,
+                toolchain=TOOLS,
+            )
+            out_png = td_path / "mandelbrot_metal.png"
+            diff_png = td_path / "mandelbrot_metal_diff.png"
             write_png(out_png, rendered)
             self.assertTrue(out_png.is_file())
 

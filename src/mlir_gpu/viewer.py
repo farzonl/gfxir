@@ -1365,6 +1365,216 @@ def _vulkan_compute_session(
         yield run
 
 
+def _write_native_compute_spec(
+    step_dir: Path,
+    program: ComputeProgram,
+    active_grid: tuple[int, int, int],
+    packed_params: bytes | None,
+    prepared: list[tuple[dict, int, bytes | None]],
+) -> tuple[Path, list[tuple[dict, int, Path]]]:
+    rc_path_str = ""
+    if packed_params is not None:
+        rc_path = step_dir / "root_constants.bin"
+        rc_path.write_bytes(packed_params)
+        rc_path_str = str(rc_path)
+
+    spec_buffers: list[dict] = []
+    expected_outputs: list[tuple[dict, int, Path]] = []
+    for idx, (buf_meta, byte_size, initial_data) in enumerate(prepared):
+        input_path_str = ""
+        if initial_data is not None:
+            in_path = step_dir / f"in_{idx}.bin"
+            in_path.write_bytes(initial_data)
+            input_path_str = str(in_path)
+
+        output_path_str = ""
+        if buf_meta["access"] in ("write_only", "read_write"):
+            out_path = step_dir / f"out_{idx}.bin"
+            output_path_str = str(out_path)
+            expected_outputs.append((buf_meta, byte_size, out_path))
+
+        spec_buffers.append({
+            "name": buf_meta["name"],
+            "set": buf_meta["set"],
+            "binding": buf_meta["binding"],
+            "access": buf_meta["access"],
+            "size": byte_size,
+            "input_path": input_path_str,
+            "output_path": output_path_str,
+        })
+
+    spec_path = step_dir / "compute_spec.json"
+    spec_path.write_text(json.dumps({
+        "workgroup_size": list(program.workgroup_size),
+        "grid": list(active_grid),
+        "root_constants_path": rc_path_str,
+        "buffers": spec_buffers,
+    }, allow_nan=False))
+    return spec_path, expected_outputs
+
+
+def _read_native_compute_outputs(
+    report_text: str,
+    expected_outputs: list[tuple[dict, int, Path]],
+    backend: str,
+) -> tuple[str, dict[str, bytes]]:
+    try:
+        report = json.loads(report_text)
+    except json.JSONDecodeError as error:
+        raise ViewerError(f"The native {backend} compute runner returned invalid JSON.") from error
+    device = report.get("device") if isinstance(report, dict) else None
+    if not isinstance(device, str) or not device:
+        raise ViewerError(f"The native {backend} compute runner returned an invalid device report.")
+    outputs: dict[str, bytes] = {}
+    for buf_meta, byte_size, out_path in expected_outputs:
+        if not out_path.is_file():
+            raise ViewerError(f"{backend} compute readback output file is missing for {buf_meta['name']!r}.")
+        raw = out_path.read_bytes()
+        if len(raw) != byte_size:
+            raise ViewerError(
+                f"{backend} compute readback size ({len(raw)}) does not match requested byte size ({byte_size}) "
+                f"for {buf_meta['name']!r}."
+            )
+        outputs[buf_meta["name"]] = raw
+    return device, outputs
+
+
+@contextmanager
+def _directx_compute_session(
+    program: ComputeProgram,
+    validation: bool = False,
+    provider: str | None = None,
+    toolchain: Toolchain | None = None,
+):
+    if sys.platform != "win32":
+        raise ViewerError("Native DirectX 12 compute execution requires Windows.")
+    if program.target != "directx":
+        raise ViewerError("DirectX 12 compute execution requires DirectX DXIL artifacts.")
+    explicit_warp = provider == "warp"
+    if provider is None and os.environ.get("MLIR_GPU_TEST_WARP") == "1":
+        provider = "warp"
+    _validate_provider(provider, "directx")
+
+    tools = toolchain or _preview_toolchain()
+    viewer_exe = tools.find("mlir-gpu-directx-view")
+    warp_args = ["--warp"] if provider == "warp" else []
+
+    with tempfile.TemporaryDirectory(prefix="mlir-gpu-directx-compute-") as work:
+        work_dir = Path(work)
+        shader_path = work_dir / "compute.dxil"
+        shader_path.write_bytes(program.compute.code)
+        step_counter = 0
+
+        def run(
+            *,
+            buffers: Mapping[str, bytes | bytearray | memoryview | int] | None = None,
+            parameters: Mapping[str, object] | bytes | bytearray | memoryview | None = None,
+            grid: tuple[int, int, int] | None = None,
+        ) -> ComputeDispatchResult:
+            nonlocal step_counter
+            active_grid, packed_params, prepared = _prepare_compute_inputs(program, buffers, parameters, grid)
+            if any(dim > 65535 for dim in active_grid):
+                raise ViewerError("Compute dispatch grid exceeds DirectX 12 per-dimension threadgroup limit (65535).")
+            step_dir = work_dir / f"step_{step_counter}"
+            step_counter += 1
+            step_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                spec_path, expected_outputs = _write_native_compute_spec(
+                    step_dir, program, active_grid, packed_params, prepared
+                )
+                text = _directx_run(
+                    [viewer_exe, *warp_args, "--compute", str(shader_path), "--compute-spec", str(spec_path)],
+                    validation,
+                    True,
+                )
+                device, outputs = _read_native_compute_outputs(text, expected_outputs, "DirectX 12")
+                if explicit_warp and "basic render driver" not in device.lower():
+                    raise ViewerError(
+                        "Requested provider 'warp' but returned device is not a software adapter. "
+                        "Accidental hardware/driver fallback rejected."
+                    )
+                if provider == "hardware" and "basic render driver" in device.lower():
+                    raise ViewerError(
+                        "Requested provider 'hardware' but returned device is a software adapter. "
+                        "Accidental hardware/driver fallback rejected."
+                    )
+                return ComputeDispatchResult(buffers=outputs, device=device)
+            finally:
+                shutil.rmtree(step_dir, ignore_errors=True)
+
+        yield run
+
+
+@contextmanager
+def _metal_compute_session(
+    program: ComputeProgram,
+    validation: bool = False,
+    toolchain: Toolchain | None = None,
+):
+    if sys.platform != "darwin":
+        raise ViewerError("Metal compute execution requires macOS.")
+    if program.target not in ("directx", "metal"):
+        raise ViewerError("Metal compute execution requires DirectX or Metal artifacts.")
+
+    tools = toolchain or _preview_toolchain()
+    viewer_exe = tools.find("mlir-gpu-metal-view")
+
+    with tempfile.TemporaryDirectory(prefix="mlir-gpu-metal-compute-") as work:
+        work_dir = Path(work)
+        metallib_path = work_dir / "compute.metallib"
+        if program.target == "directx":
+            source_dxil = work_dir / "compute.dxil"
+            validated_dxil = work_dir / "compute.validated.dxil"
+            source_dxil.write_bytes(program.compute.code)
+            _run([tools.find("dxv"), str(source_dxil), "-o", str(validated_dxil)])
+            _check_binary(validated_dxil, b"DXBC", 32)
+            convert_dxil_to_metallib(
+                validated_dxil,
+                metallib_path,
+                program.compute.entry_point,
+                tools.find("metal-shaderconverter"),
+            )
+        else:
+            metallib_path.write_bytes(program.compute.code)
+
+        step_counter = 0
+
+        def run(
+            *,
+            buffers: Mapping[str, bytes | bytearray | memoryview | int] | None = None,
+            parameters: Mapping[str, object] | bytes | bytearray | memoryview | None = None,
+            grid: tuple[int, int, int] | None = None,
+        ) -> ComputeDispatchResult:
+            nonlocal step_counter
+            active_grid, packed_params, prepared = _prepare_compute_inputs(program, buffers, parameters, grid)
+            step_dir = work_dir / f"step_{step_counter}"
+            step_counter += 1
+            step_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                spec_path, expected_outputs = _write_native_compute_spec(
+                    step_dir, program, active_grid, packed_params, prepared
+                )
+                text = _metal_run(
+                    [
+                        viewer_exe,
+                        "--compute",
+                        str(metallib_path),
+                        "--compute-entry",
+                        program.compute.entry_point,
+                        "--compute-spec",
+                        str(spec_path),
+                    ],
+                    validation,
+                    True,
+                )
+                device, outputs = _read_native_compute_outputs(text, expected_outputs, "Metal")
+                return ComputeDispatchResult(buffers=outputs, device=device)
+            finally:
+                shutil.rmtree(step_dir, ignore_errors=True)
+
+        yield run
+
+
 @contextmanager
 def compute_session(
     program: ComputeProgram | Path,
@@ -1380,7 +1590,18 @@ def compute_session(
         with _vulkan_compute_session(loaded, validation=validation, provider=provider) as run:
             yield run
         return
-    raise ViewerError(f"Compute dispatch is not yet supported for target {loaded.target!r}.")
+    if loaded.target == "directx" and sys.platform != "darwin":
+        with _directx_compute_session(
+            loaded, validation=validation, provider=provider, toolchain=toolchain
+        ) as run:
+            yield run
+        return
+    if loaded.target in ("metal", "directx"):
+        _validate_provider(provider, "metal")
+        with _metal_compute_session(loaded, validation=validation, toolchain=toolchain) as run:
+            yield run
+        return
+    raise ViewerError(f"Compute dispatch is not supported for target {loaded.target!r}.")
 
 
 def dispatch_compute(

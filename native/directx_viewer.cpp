@@ -5,6 +5,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -228,6 +229,424 @@ struct ReadbackReport {
     UINT width;
     UINT height;
 };
+
+struct ComputeBufferSpec {
+    std::string name;
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    std::string access;
+    uint64_t size = 0;
+    std::string input_path;
+    std::string output_path;
+};
+
+struct ComputeDispatchSpec {
+    std::array<uint32_t, 3> workgroup_size = {1, 1, 1};
+    std::array<uint32_t, 3> grid = {1, 1, 1};
+    std::string root_constants_path;
+    std::vector<ComputeBufferSpec> buffers;
+};
+
+struct ComputeReport {
+    std::string device;
+};
+
+static std::vector<char> binaryFile(const std::filesystem::path& path, const char* description) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error(std::string("Cannot open ") + description);
+    std::vector<char> bytes((std::istreambuf_iterator<char>(input)), {});
+    if (input.bad()) throw std::runtime_error(std::string("Cannot read ") + description);
+    return bytes;
+}
+
+static void checkValidationQueue(ID3D12InfoQueue* diagnostics) {
+    if (!diagnostics) return;
+    std::string errors;
+    UINT64 count = diagnostics->GetNumStoredMessagesAllowedByRetrievalFilter();
+    for (UINT64 index = 0; index < count; ++index) {
+        SIZE_T size = 0;
+        check(diagnostics->GetMessage(index, nullptr, &size), "GetMessage size");
+        std::vector<char> storage(size);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        check(diagnostics->GetMessage(index, message, &size), "GetMessage");
+        if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR)
+            errors += std::string(message->pDescription) + "\n";
+    }
+    diagnostics->ClearStoredMessages();
+    if (!errors.empty()) throw std::runtime_error("D3D12 validation failed:\n" + errors);
+}
+
+static void runComputeDispatch(const std::wstring& computePath, const std::wstring& specPath,
+                               bool warp, bool validation) {
+    auto specBytes = binaryFile(std::filesystem::path(specPath), "compute dispatch spec");
+    std::string specJson(specBytes.begin(), specBytes.end());
+    ComputeDispatchSpec spec{};
+    auto parseErr = glz::read<glz::opts{.error_on_unknown_keys = false}>(spec, specJson);
+    if (parseErr) {
+        throw std::runtime_error("Invalid compute dispatch spec JSON");
+    }
+    for (uint32_t dim : spec.grid) {
+        if (dim == 0 || dim > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION) {
+            throw std::runtime_error("Compute dispatch grid dimension is out of D3D12 bounds");
+        }
+    }
+
+    auto dev = createDirectXDevice(warp, validation);
+    ComPtr<ID3D12InfoQueue> diagnostics;
+    if (validation) {
+        check(dev.device.As(&diagnostics), "Get D3D12 validation queue");
+    }
+
+    D3D12_COMMAND_QUEUE_DESC queueDesc{};
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ComPtr<ID3D12CommandQueue> queue;
+    check(dev.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue)), "CreateCommandQueue");
+
+    ComPtr<ID3D12CommandAllocator> allocator;
+    check(dev.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
+          "CreateCommandAllocator");
+
+    auto cs = shader(computePath);
+
+    bool hasRootConstants = false;
+    UINT rootConstantsParamIndex = 0;
+    UINT rootConstantsNumWords = 0;
+    bool hasDescriptorTable = false;
+    UINT descriptorTableParamIndex = 0;
+
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12VersionedRootSignatureDeserializer> deserializer;
+    if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(
+            cs.data(), cs.size(), IID_PPV_ARGS(&deserializer)))) {
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc =
+            deserializer->GetUnconvertedRootSignatureDesc();
+        if (desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+            for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
+                const auto& param = desc->Desc_1_1.pParameters[i];
+                if (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+                    hasRootConstants = true;
+                    rootConstantsParamIndex = i;
+                    rootConstantsNumWords = param.Constants.Num32BitValues;
+                } else if (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+                    hasDescriptorTable = true;
+                    descriptorTableParamIndex = i;
+                }
+            }
+        } else {
+            for (UINT i = 0; i < desc->Desc_1_0.NumParameters; ++i) {
+                const auto& param = desc->Desc_1_0.pParameters[i];
+                if (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+                    hasRootConstants = true;
+                    rootConstantsParamIndex = i;
+                    rootConstantsNumWords = param.Constants.Num32BitValues;
+                } else if (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+                    hasDescriptorTable = true;
+                    descriptorTableParamIndex = i;
+                }
+            }
+        }
+        HRESULT rsStatus = dev.device->CreateRootSignature(
+            0, cs.data(), cs.size(), IID_PPV_ARGS(&root));
+        if (FAILED(rsStatus) && diagnostics) {
+            diagnostics->ClearStoredMessages();
+        }
+    }
+
+    if (!root) {
+        D3D12_ROOT_SIGNATURE_DESC emptyDesc{};
+        ComPtr<ID3DBlob> serialized, errors;
+        HRESULT serStatus = D3D12SerializeRootSignature(
+            &emptyDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
+        if (FAILED(serStatus) && errors) {
+            throw std::runtime_error(std::string(
+                static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize()));
+        }
+        check(serStatus, "D3D12SerializeRootSignature");
+        check(dev.device->CreateRootSignature(
+                  0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&root)),
+              "CreateRootSignature");
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+    psoDesc.pRootSignature = root.Get();
+    psoDesc.CS = {cs.data(), cs.size()};
+    ComPtr<ID3D12PipelineState> pipeline;
+    HRESULT psoStatus = dev.device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pipeline));
+    checkValidationQueue(diagnostics.Get());
+    check(psoStatus, "CreateComputePipelineState (compiled DXIL)");
+
+    std::vector<uint32_t> rootConstantWords;
+    if (hasRootConstants) {
+        rootConstantWords.assign(rootConstantsNumWords, 0);
+        if (!spec.root_constants_path.empty()) {
+            auto rcBytes = binaryFile(std::filesystem::path(spec.root_constants_path), "root constants");
+            size_t requiredBytes = static_cast<size_t>(rootConstantsNumWords) * sizeof(uint32_t);
+            if (rcBytes.size() < requiredBytes) {
+                throw std::runtime_error("Root constants file is smaller than the root signature parameter block");
+            }
+            std::memcpy(rootConstantWords.data(), rcBytes.data(), requiredBytes);
+        } else {
+            throw std::runtime_error("Compute root signature requires root constants, but none were provided");
+        }
+    }
+
+    std::stable_sort(spec.buffers.begin(), spec.buffers.end(),
+                     [](const ComputeBufferSpec& a, const ComputeBufferSpec& b) {
+                         if (a.set != b.set) return a.set < b.set;
+                         return a.binding < b.binding;
+                     });
+
+    struct AllocatedComputeBuffer {
+        ComputeBufferSpec spec;
+        bool isUAV = false;
+        uint64_t alignedSize = 0;
+        ComPtr<ID3D12Resource> defaultBuf;
+        ComPtr<ID3D12Resource> uploadBuf;
+        ComPtr<ID3D12Resource> readbackBuf;
+    };
+
+    std::vector<AllocatedComputeBuffer> buffers;
+    buffers.reserve(spec.buffers.size());
+    std::vector<size_t> uavIndices;
+    std::vector<size_t> srvIndices;
+
+    for (const auto& bufSpec : spec.buffers) {
+        if (bufSpec.access != "read_only" && bufSpec.access != "write_only" &&
+            bufSpec.access != "read_write") {
+            throw std::runtime_error("Unsupported compute buffer access mode: " + bufSpec.access);
+        }
+        if (bufSpec.size == 0) {
+            throw std::runtime_error("Compute buffer byte size must be positive: " + bufSpec.name);
+        }
+
+        AllocatedComputeBuffer entry;
+        entry.spec = bufSpec;
+        entry.isUAV = (bufSpec.access != "read_only");
+        entry.alignedSize = std::max<uint64_t>(4, (bufSpec.size + 3ULL) & ~3ULL);
+
+        D3D12_HEAP_PROPERTIES defaultHeap{};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC defaultDesc{};
+        defaultDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        defaultDesc.Width = entry.alignedSize;
+        defaultDesc.Height = 1;
+        defaultDesc.DepthOrArraySize = 1;
+        defaultDesc.MipLevels = 1;
+        defaultDesc.SampleDesc.Count = 1;
+        defaultDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        defaultDesc.Flags = entry.isUAV ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                                        : D3D12_RESOURCE_FLAG_NONE;
+        check(dev.device->CreateCommittedResource(
+                  &defaultHeap, D3D12_HEAP_FLAG_NONE, &defaultDesc,
+                  D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&entry.defaultBuf)),
+              "Create compute default buffer");
+
+        D3D12_HEAP_PROPERTIES uploadHeap{};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC stagingDesc = defaultDesc;
+        stagingDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        check(dev.device->CreateCommittedResource(
+                  &uploadHeap, D3D12_HEAP_FLAG_NONE, &stagingDesc,
+                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&entry.uploadBuf)),
+              "Create compute upload buffer");
+
+        void* uploadMapped = nullptr;
+        D3D12_RANGE emptyReadRange{0, 0};
+        check(entry.uploadBuf->Map(0, &emptyReadRange, &uploadMapped), "Map compute upload buffer");
+        std::memset(uploadMapped, 0, static_cast<size_t>(entry.alignedSize));
+        if (!bufSpec.input_path.empty()) {
+            auto inputBytes = binaryFile(std::filesystem::path(bufSpec.input_path), "compute input buffer");
+            if (inputBytes.size() != bufSpec.size) {
+                entry.uploadBuf->Unmap(0, nullptr);
+                throw std::runtime_error("Compute input buffer file size does not match spec size: " + bufSpec.name);
+            }
+            std::memcpy(uploadMapped, inputBytes.data(), inputBytes.size());
+        }
+        entry.uploadBuf->Unmap(0, nullptr);
+
+        if (entry.isUAV && !bufSpec.output_path.empty()) {
+            D3D12_HEAP_PROPERTIES readbackHeap{};
+            readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
+            check(dev.device->CreateCommittedResource(
+                      &readbackHeap, D3D12_HEAP_FLAG_NONE, &stagingDesc,
+                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&entry.readbackBuf)),
+                  "Create compute readback buffer");
+        }
+
+        size_t idx = buffers.size();
+        if (entry.isUAV) {
+            uavIndices.push_back(idx);
+        } else {
+            srvIndices.push_back(idx);
+        }
+        buffers.push_back(std::move(entry));
+    }
+
+    ComPtr<ID3D12DescriptorHeap> descriptorHeap;
+    size_t totalDescriptors = uavIndices.size() + srvIndices.size();
+    if (hasDescriptorTable || totalDescriptors > 0) {
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heapDesc.NumDescriptors = static_cast<UINT>(std::max<size_t>(1, totalDescriptors));
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        check(dev.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&descriptorHeap)),
+              "Create compute CBV_SRV_UAV descriptor heap");
+
+        UINT increment = dev.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE handle = descriptorHeap->GetCPUDescriptorHandleForHeapStart();
+
+        for (size_t idx : uavIndices) {
+            const auto& buf = buffers[idx];
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+            uavDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+            uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            uavDesc.Buffer.FirstElement = 0;
+            uavDesc.Buffer.NumElements = static_cast<UINT>(buf.alignedSize / 4);
+            uavDesc.Buffer.StructureByteStride = 0;
+            uavDesc.Buffer.CounterOffsetInBytes = 0;
+            uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            dev.device->CreateUnorderedAccessView(buf.defaultBuf.Get(), nullptr, &uavDesc, handle);
+            handle.ptr += increment;
+        }
+        for (size_t idx : srvIndices) {
+            const auto& buf = buffers[idx];
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+            srvDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvDesc.Buffer.FirstElement = 0;
+            srvDesc.Buffer.NumElements = static_cast<UINT>(buf.alignedSize / 4);
+            srvDesc.Buffer.StructureByteStride = 0;
+            srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            dev.device->CreateShaderResourceView(buf.defaultBuf.Get(), &srvDesc, handle);
+            handle.ptr += increment;
+        }
+    }
+
+    ComPtr<ID3D12GraphicsCommandList> commands;
+    check(dev.device->CreateCommandList(
+              0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), pipeline.Get(),
+              IID_PPV_ARGS(&commands)),
+          "Create compute command list");
+
+    if (!buffers.empty()) {
+        std::vector<D3D12_RESOURCE_BARRIER> toCopyDest;
+        toCopyDest.reserve(buffers.size());
+        for (const auto& buf : buffers) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = buf.defaultBuf.Get();
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            toCopyDest.push_back(b);
+        }
+        commands->ResourceBarrier(static_cast<UINT>(toCopyDest.size()), toCopyDest.data());
+
+        for (const auto& buf : buffers) {
+            commands->CopyBufferRegion(
+                buf.defaultBuf.Get(), 0, buf.uploadBuf.Get(), 0, buf.alignedSize);
+        }
+
+        std::vector<D3D12_RESOURCE_BARRIER> toShaderState;
+        toShaderState.reserve(buffers.size());
+        for (const auto& buf : buffers) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = buf.defaultBuf.Get();
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            b.Transition.StateAfter = buf.isUAV ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                                : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            toShaderState.push_back(b);
+        }
+        commands->ResourceBarrier(static_cast<UINT>(toShaderState.size()), toShaderState.data());
+    }
+
+    commands->SetComputeRootSignature(root.Get());
+    if (descriptorHeap) {
+        ID3D12DescriptorHeap* heaps[] = {descriptorHeap.Get()};
+        commands->SetDescriptorHeaps(1, heaps);
+    }
+    if (hasRootConstants) {
+        commands->SetComputeRoot32BitConstants(
+            rootConstantsParamIndex, rootConstantsNumWords, rootConstantWords.data(), 0);
+    }
+    if (hasDescriptorTable && descriptorHeap) {
+        commands->SetComputeRootDescriptorTable(
+            descriptorTableParamIndex, descriptorHeap->GetGPUDescriptorHandleForHeapStart());
+    }
+
+    commands->Dispatch(spec.grid[0], spec.grid[1], spec.grid[2]);
+
+    std::vector<D3D12_RESOURCE_BARRIER> postDispatchBarriers;
+    for (const auto& buf : buffers) {
+        if (buf.readbackBuf) {
+            D3D12_RESOURCE_BARRIER uavBarrier{};
+            uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            uavBarrier.UAV.pResource = buf.defaultBuf.Get();
+            postDispatchBarriers.push_back(uavBarrier);
+
+            D3D12_RESOURCE_BARRIER toCopySource{};
+            toCopySource.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toCopySource.Transition.pResource = buf.defaultBuf.Get();
+            toCopySource.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            toCopySource.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            toCopySource.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            postDispatchBarriers.push_back(toCopySource);
+        }
+    }
+    if (!postDispatchBarriers.empty()) {
+        commands->ResourceBarrier(
+            static_cast<UINT>(postDispatchBarriers.size()), postDispatchBarriers.data());
+    }
+    for (const auto& buf : buffers) {
+        if (buf.readbackBuf) {
+            commands->CopyBufferRegion(
+                buf.readbackBuf.Get(), 0, buf.defaultBuf.Get(), 0, buf.alignedSize);
+        }
+    }
+
+    check(commands->Close(), "Close compute command list");
+    ID3D12CommandList* lists[] = {commands.Get()};
+    queue->ExecuteCommandLists(1, lists);
+
+    ComPtr<ID3D12Fence> fence;
+    check(dev.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence");
+    Event completion;
+    check(queue->Signal(fence.Get(), 1), "Signal compute fence");
+    check(fence->SetEventOnCompletion(1, completion.handle), "SetEventOnCompletion");
+    DWORD waitStatus = WaitForSingleObject(completion.handle, 30000);
+    if (waitStatus != WAIT_OBJECT_0) {
+        check(dev.device->GetDeviceRemovedReason(), "GPU device removed");
+        throw std::runtime_error("Compute GPU completion wait failed or timed out");
+    }
+    check(dev.device->GetDeviceRemovedReason(), "GPU device removed");
+    checkValidationQueue(diagnostics.Get());
+
+    for (const auto& buf : buffers) {
+        if (!buf.readbackBuf) continue;
+        void* mapped = nullptr;
+        D3D12_RANGE readRange{0, static_cast<SIZE_T>(buf.spec.size)};
+        check(buf.readbackBuf->Map(0, &readRange, &mapped), "Map compute readback buffer");
+        std::ofstream output(std::filesystem::path(buf.spec.output_path),
+                             std::ios::binary | std::ios::trunc);
+        if (!output) {
+            D3D12_RANGE emptyWritten{0, 0};
+            buf.readbackBuf->Unmap(0, &emptyWritten);
+            throw std::runtime_error("Cannot open compute buffer readback output: " + buf.spec.name);
+        }
+        output.write(static_cast<const char*>(mapped), static_cast<std::streamsize>(buf.spec.size));
+        D3D12_RANGE emptyWritten{0, 0};
+        buf.readbackBuf->Unmap(0, &emptyWritten);
+        output.close();
+        if (!output) {
+            throw std::runtime_error("Cannot write compute buffer readback output: " + buf.spec.name);
+        }
+    }
+
+    std::cout << glz::write_json(ComputeReport{dev.name}).value_or("{}") << "\n" << std::flush;
+}
 
 static void reportDeviceCapabilities(bool warp, bool validation) {
     SelectedDevice dev = createDirectXDevice(warp, validation);
@@ -625,13 +1044,25 @@ int wmain(int argc, wchar_t** argv) {
             if (key == L"-frames") key = L"--frames";
             if (key != L"--vertex" && key != L"--fragment" && key != L"--width" &&
                 key != L"--height" && key != L"--frames" && key != L"--vertex-count" &&
-                key != L"--readback" && key != L"--time")
+                key != L"--readback" && key != L"--time" &&
+                key != L"--compute" && key != L"--compute-spec")
                 throw std::runtime_error("Unknown native DirectX viewer argument");
             if (++index == argc || !options.emplace(key, argv[index]).second)
                 throw std::runtime_error("Missing or duplicate native viewer argument");
         }
         if (reportCapabilities) {
             reportDeviceCapabilities(warp, validation);
+            return 0;
+        }
+        if (options.count(L"--compute") || options.count(L"--compute-spec")) {
+            if (!options.count(L"--compute") || !options.count(L"--compute-spec"))
+                throw std::runtime_error("Both --compute and --compute-spec are required for compute dispatch");
+            if (options.count(L"--vertex") || options.count(L"--fragment") ||
+                options.count(L"--width") || options.count(L"--height") ||
+                options.count(L"--frames") || options.count(L"--vertex-count") ||
+                options.count(L"--readback") || options.count(L"--time"))
+                throw std::runtime_error("Compute dispatch arguments cannot be combined with graphics arguments");
+            runComputeDispatch(options.at(L"--compute"), options.at(L"--compute-spec"), warp, validation);
             return 0;
         }
         if (!options.count(L"--vertex") || !options.count(L"--fragment"))

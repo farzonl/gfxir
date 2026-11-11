@@ -12,8 +12,8 @@ def targets_from_environment(name: str) -> list[str]:
 
 def parse_targets(value: str) -> list[str]:
     targets = value.split(",")
-    if not targets or any(target not in ("vulkan", "metal") for target in targets):
-        raise ValueError(f"targets must be a comma-separated list of vulkan and/or metal: {value!r}")
+    if not targets or any(target not in ("vulkan", "directx", "metal") for target in targets):
+        raise ValueError(f"targets must be a comma-separated list of vulkan, directx, and/or metal: {value!r}")
     if len(set(targets)) != len(targets):
         raise ValueError(f"targets must not contain duplicates: {value!r}")
     return targets
