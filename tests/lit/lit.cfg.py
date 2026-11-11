@@ -20,9 +20,10 @@ if site:
 
 llvm_bin = Path(os.environ.get("LLVM_BIN", getattr(config, "gfx_tools_dir", root / ".toolchains/llvm-build/bin")))
 tools_bin = Path(os.environ.get("GPU_TOOLS_BIN", root / ".tools/bin"))
+sdk_bin = root / ".sdk/bin"
 path = os.pathsep.join((
     str(llvm_bin), str(getattr(config, "llvm_tools_dir", llvm_bin)),
-    str(tools_bin), os.environ.get("PATH", ""),
+    str(tools_bin), str(sdk_bin), os.environ.get("PATH", ""),
 ))
 config.environment["PATH"] = path
 if "LLVM_BIN" in os.environ:

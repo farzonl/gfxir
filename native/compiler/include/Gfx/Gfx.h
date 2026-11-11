@@ -54,7 +54,11 @@ struct ShaderInterface {
   SmallVector<InterfaceElement> outputs;
   ParameterBlockAttr parameters;
   SmallVector<BufferInterfaceElement> buffers;
+  std::optional<std::array<int32_t, 3>> workgroupSize;
 };
+
+std::optional<BufferInterfaceElement>
+getArgumentBufferBinding(func::FuncOp function, unsigned argIndex);
 
 struct ParameterFieldLayout {
   ParameterFieldAttr field;

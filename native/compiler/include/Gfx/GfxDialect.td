@@ -9,6 +9,7 @@ def Gfx_Dialect : Dialect {
   let useDefaultAttributePrinterParser = 1;
   let useDefaultTypePrinterParser = 1;
   let hasOperationAttrVerify = 1;
+  let hasRegionArgAttrVerify = 1;
 }
 
 class Gfx_Op<string mnemonic, list<Trait> traits = []>
