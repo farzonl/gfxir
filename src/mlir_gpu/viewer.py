@@ -1152,8 +1152,10 @@ class _Vulkan:
             if default_pipeline is None:
                 default_pipeline = vk_pipe
 
-        setattr(default_pipeline, "pipeline_map", pipeline_map)
-        setattr(default_pipeline, "draws", getattr(program, "draws", []))
+        # cffi handles are opaque pointers and cannot carry attributes.
+        if not hasattr(self, "pipeline_extras"):
+            self.pipeline_extras = {}
+        self.pipeline_extras[default_pipeline] = (pipeline_map, getattr(program, "draws", []))
         return render_pass, default_pipeline, layout
 
     def parameter_stages(self, parameters):
@@ -1198,9 +1200,9 @@ class _Vulkan:
             vk.vkCmdPushConstants(command, layout, self.parameter_stages(parameters),
                                   parameters["bindings"]["vulkan"]["offset"], len(data), vk.ffi.from_buffer(data))
 
-        pipeline_map = getattr(pipeline, "pipeline_map", {"default": pipeline})
+        pipeline_map, default_draws = getattr(self, "pipeline_extras", {}).get(pipeline, ({"default": pipeline}, None))
         if draws is None:
-            draws = getattr(pipeline, "draws", None)
+            draws = default_draws
 
         if not draws:
             vk.vkCmdBindPipeline(command, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline)
