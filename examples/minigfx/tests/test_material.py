@@ -27,7 +27,7 @@ for _p in (_REPO_ROOT, _SRC_DIR):
     if _str_p not in sys.path:
         sys.path.insert(0, _str_p)
 
-from examples.minigfx.math import Mat4, Vec3, Vec4
+from examples.minigfx.math import Mat4x4, Vec3, Vec4
 from examples.minigfx.material import (
     CameraParams,
     LightParams,
@@ -209,7 +209,7 @@ class TestObjectAndCameraParametersLayout(unittest.TestCase):
     """Validation of ObjectParams and CameraParams std430 80B layouts."""
 
     def test_object_params_packing_and_roundtrip(self):
-        m = Mat4.translation(1.0, 2.0, 3.0)
+        m = Mat4x4.translation(1.0, 2.0, 3.0)
         c = Vec4(0.1, 0.2, 0.3, 1.0)
         obj = ObjectParams(model=m, color=c)
         raw = obj.to_bytes()
@@ -219,7 +219,7 @@ class TestObjectAndCameraParametersLayout(unittest.TestCase):
         self.assertEqual(obj, restored)
 
     def test_camera_params_packing_and_roundtrip(self):
-        vp = Mat4.look_at(Vec3(0, 0, 5), Vec3(0, 0, 0), Vec3(0, 1, 0))
+        vp = Mat4x4.look_at(Vec3(0, 0, 5), Vec3(0, 0, 0), Vec3(0, 1, 0))
         eye = Vec3(0, 0, 5)
         cam = CameraParams(view_proj=vp, eye_pos=eye, time=3.5)
         raw = cam.to_bytes()
@@ -230,7 +230,7 @@ class TestObjectAndCameraParametersLayout(unittest.TestCase):
 
     def test_camera_params_float32_time_roundtrip_precision(self):
         """Verify CameraParams roundtrip equality for non-dyadic float timestamps affected by float32 truncation."""
-        vp = Mat4.look_at(Vec3(1.0, 2.0, 3.0), Vec3(0.0, 0.0, 0.0), Vec3(0.0, 1.0, 0.0))
+        vp = Mat4x4.look_at(Vec3(1.0, 2.0, 3.0), Vec3(0.0, 0.0, 0.0), Vec3(0.0, 1.0, 0.0))
         eye = Vec3(1.0, 2.0, 3.0)
         for t in (0.1, 0.3, 0.7, 1.1):
             cam = CameraParams(view_proj=vp, eye_pos=eye, time=t)
@@ -413,8 +413,8 @@ class TestShaderTracingAndDualModeExecution(unittest.TestCase):
         self.assertTrue(callable(default_ps))
 
     def test_cpu_vertex_execution(self):
-        cam = CameraParams(view_proj=Mat4.identity())
-        obj = ObjectParams(model=Mat4.identity())
+        cam = CameraParams(view_proj=Mat4x4.identity())
+        obj = ObjectParams(model=Mat4x4.identity())
         clip_pos = material_vertex_shader(pos=(1.0, 2.0, 3.0, 1.0), cam=cam, obj=obj)
         self.assertIsInstance(clip_pos, Vec4)
         self.assertAlmostEqual(clip_pos.x, 1.0, places=5)

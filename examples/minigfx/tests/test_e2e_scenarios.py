@@ -136,7 +136,7 @@ class TestTier3MathCamera(unittest.TestCase):
         self._require_math()
         # Collinear eye and up vector raises ValueError
         with self.assertRaises(ValueError):
-            mgfx_math.Mat4.look_at(
+            mgfx_math.Mat4x4.look_at(
                 mgfx_math.Vec3(0, 0, 5),
                 mgfx_math.Vec3(0, 0, 0),
                 mgfx_math.Vec3(0, 0, 1),
