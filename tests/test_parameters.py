@@ -64,6 +64,65 @@ class ParameterAuthoringTests(unittest.TestCase):
         with self.assertRaisesRegex(AttributeError, r"test_parameters.py:\d+:\d+: Unknown parameter field"):
             Pipeline(fullscreen_vertex, missing).trace()
 
+    def test_integer_and_float_parameter_declarations_and_packing(self):
+        compute_params = ParameterBlock(
+            "sim_params",
+            (
+                ("count", Type.U32),
+                ("species_offset", Type.I32),
+                ("dt", Type.F32),
+                ("bounds", Type.VEC2),
+            ),
+        )
+        self.assertEqual(
+            compute_params.to_dict(),
+            {
+                "name": "sim_params",
+                "fields": [
+                    {"name": "count", "type": "u32"},
+                    {"name": "species_offset", "type": "i32"},
+                    {"name": "dt", "type": "f32"},
+                    {"name": "bounds", "type": "f32x2"},
+                ],
+            },
+        )
+        reflected = {
+            "schema_version": 2,
+            "name": "sim_params",
+            "layout": "gfx-std430-v1",
+            "size": 24,
+            "alignment": 8,
+            "stages": ["compute"],
+            "ownership": "host",
+            "access": "read-only",
+            "addressable": False,
+            "fields": [
+                {"name": "count", "type": "u32", "offset": 0, "size": 4, "alignment": 4},
+                {"name": "species_offset", "type": "i32", "offset": 4, "size": 4, "alignment": 4},
+                {"name": "dt", "type": "f32", "offset": 8, "size": 4, "alignment": 4},
+                {"name": "bounds", "type": "f32x2", "offset": 16, "size": 8, "alignment": 8},
+            ],
+            "bindings": {
+                "vulkan": {"storage": "push_constant", "offset": 0},
+                "directx": {
+                    "storage": "root_constants",
+                    "parameter_index": 0,
+                    "register": 0,
+                    "space": 0,
+                    "num32bit_constants": 6,
+                    "visibility": "all",
+                    "root_signature_version": "1.1",
+                },
+                "metal": {"storage": "converter_argument_buffer", "buffer_index": 2, "offset": 0, "size": 24},
+            },
+        }
+        verify_parameters(reflected)
+        packed = pack_parameters(
+            reflected,
+            {"count": 1024, "species_offset": -3, "dt": 0.016, "bounds": (100.0, 200.0)},
+        )
+        self.assertEqual(packed, py_struct.pack("<Iif4x2f", 1024, -3, 0.016, 100.0, 200.0))
+
 
 class ParameterPackingTests(unittest.TestCase):
     def test_host_packing_matches_static_valid_reflection(self):

@@ -9,9 +9,33 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mlir_gpu import CompileError, Pipeline, Target, Toolchain, Vertex, fragment, i32, maximum, minimum, select, shader_math as sm, u32, vec2, vec3, vec4, vertex
+from mlir_gpu import (
+    Buffer,
+    CompileError,
+    ComputePipeline,
+    Dispatch,
+    GlobalInvocationId,
+    ParameterBlock,
+    Pipeline,
+    Target,
+    TargetProfile,
+    Toolchain,
+    Vertex,
+    compute,
+    fragment,
+    i32,
+    maximum,
+    minimum,
+    select,
+    shader_math as sm,
+    u32,
+    vec2,
+    vec3,
+    vec4,
+    vertex,
+)
 from mlir_gpu.__main__ import main
-from mlir_gpu.compiler import PIPELINE_SCHEMA_VERSION, RASTER_CONVENTION, _check_binary, _run
+from mlir_gpu.compiler import COMPUTE_SCHEMA_VERSION, PIPELINE_SCHEMA_VERSION, RASTER_CONVENTION, _check_binary, _run
 from mlir_gpu.compiler import compile_pipeline
 from mlir_gpu.frontend import Type
 
@@ -369,6 +393,145 @@ class CompilerTests(unittest.TestCase):
                 with patch("mlir_gpu.compiler._run", side_effect=tool):
                     with self.assertRaisesRegex(CompileError, "hasUseList"):
                         compile_pipeline(dummy_compute, Target.DIRECTX, Path(work) / "comp.ll")
+
+    def test_compute_pipeline_manifest_and_adapter_commands_across_all_targets(self):
+        SimParams = ParameterBlock("sim_params", (("count", Type.U32), ("scale", Type.F32)))
+
+        @compute(workgroup_size=(64, 1, 1))
+        def scale_kernel(
+            gid: GlobalInvocationId,
+            src: Buffer[Type.F32, "read_only"],
+            dst: Buffer[Type.F32, "write_only"],
+            params: SimParams,
+        ):
+            idx = gid.x
+            if idx < params.count:
+                dst[idx] = src[idx] * params.scale
+
+        pipeline = ComputePipeline(scale_kernel, dispatch=Dispatch(grid=(16, 4, 1)))
+
+        for target in Target:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as work:
+                calls = []
+
+                def tool(arguments):
+                    calls.append(arguments)
+                    if arguments[0] == "gfx-compile":
+                        source = json.loads(Path(arguments[1]).read_text())
+                        fn_meta = source["functions"][0] if "functions" in source else source
+                        for flag in ("--ir-output", "--lowered-output"):
+                            Path(arguments[arguments.index(flag) + 1]).write_text("module {}\n")
+                        reflected = {
+                            "name": fn_meta["name"],
+                            "stage": fn_meta["stage"],
+                            "workgroup_size": fn_meta["workgroup_size"],
+                            "inputs": [],
+                            "outputs": [],
+                            "buffers": [
+                                {"name": "src", "set": 0, "binding": 0, "access": "read_only", "element_type": "f32"},
+                                {"name": "dst", "set": 0, "binding": 1, "access": "write_only", "element_type": "f32"},
+                            ],
+                            "parameters": {
+                                "schema_version": 2,
+                                "name": "sim_params",
+                                "layout": "gfx-std430-v1",
+                                "size": 8,
+                                "alignment": 4,
+                                "stages": ["compute"],
+                                "ownership": "host",
+                                "access": "read-only",
+                                "addressable": False,
+                                "fields": [
+                                    {"name": "count", "type": "u32", "offset": 0, "size": 4, "alignment": 4},
+                                    {"name": "scale", "type": "f32", "offset": 4, "size": 4, "alignment": 4},
+                                ],
+                                "bindings": {
+                                    "vulkan": {"storage": "push_constant", "offset": 0},
+                                    "directx": {
+                                        "storage": "root_constants",
+                                        "parameter_index": 0,
+                                        "register": 0,
+                                        "space": 0,
+                                        "num32bit_constants": 2,
+                                        "visibility": "all",
+                                        "root_signature_version": "1.1",
+                                    },
+                                    "metal": {"storage": "converter_argument_buffer", "buffer_index": 2, "offset": 0, "size": 8},
+                                },
+                            },
+                        }
+                        Path(arguments[arguments.index("--reflection") + 1]).write_text(json.dumps(reflected))
+                        output = Path(arguments[arguments.index("--output") + 1])
+                        output.write_bytes(b"\x03\x02\x23\x07" + bytes(16) if output.suffix == ".spv" else b"; LLVM IR\n")
+                    if "-o" in arguments:
+                        output = Path(arguments[arguments.index("-o") + 1])
+                        payload = {
+                            ".spv": b"\x03\x02\x23\x07" + bytes(16),
+                            ".dxil": b"DXBC" + bytes(28),
+                            ".metallib": b"MTLB" + bytes(12),
+                        }.get(output.suffix, b"; test IR\n")
+                        output.write_bytes(payload)
+                    return ""
+
+                names = ["gfx-compile", "llc", "dxv", "spirv-val", "metal-shaderconverter"]
+                with patch.object(Toolchain, "preflight", return_value={name: name for name in names}):
+                    with patch("mlir_gpu.compiler._run", side_effect=tool):
+                        manifest_path = compile_pipeline(pipeline, target, Path(work) / "out")
+
+                data = json.loads(manifest_path.read_text())
+                self.assertEqual(data["schema_version"], COMPUTE_SCHEMA_VERSION)
+                self.assertEqual(data["stage"], "compute")
+                self.assertEqual(data["target"], target.value)
+                self.assertEqual(data["workgroup_size"], [64, 1, 1])
+                self.assertEqual(data["dispatch"], {"grid": [16, 4, 1]})
+                self.assertEqual(len(data["entries"]), 1)
+                self.assertEqual(data["entries"][0]["entry_point"], "scale_kernel")
+                self.assertEqual(len(data["buffers"]), 2)
+                self.assertEqual(data["parameters"]["name"], "sim_params")
+                self.assertTrue((manifest_path.parent / data["entries"][0]["binary"]).is_file())
+
+                commands = [args[0] for args in calls]
+                if target == Target.VULKAN:
+                    self.assertEqual(commands.count("spirv-val"), 1)
+                    self.assertEqual(data["backend_status"], "validated-binary")
+                elif target == Target.DIRECTX:
+                    self.assertEqual(commands.count("llc"), 1)
+                    self.assertEqual(commands.count("dxv"), 1)
+                    self.assertEqual(data["backend_status"], "validated-binary")
+                elif target == Target.METAL:
+                    self.assertEqual(commands.count("llc"), 1)
+                    self.assertEqual(commands.count("dxv"), 1)
+                    self.assertEqual(commands.count("metal-shaderconverter"), 1)
+                    self.assertEqual(data["backend_status"], "converted-binary")
+
+    def test_vulkan_buffer_device_address_selects_vulkan_1_2_validator_target_env(self):
+        @compute(workgroup_size=(64, 1, 1))
+        def bda_kernel(buf: Buffer[Type.F32, "read_only"]):
+            pass
+
+        bda_profile = TargetProfile(
+            spirv_version="1.5",
+            required_capabilities=("buffer_device_address",),
+        )
+        calls = []
+
+        def tool(arguments):
+            calls.append(arguments)
+            if arguments[0] == "gfx-compile":
+                Path(arguments[arguments.index("--output") + 1]).write_bytes(b"\x03\x02\x23\x07" + bytes(16))
+                Path(arguments[arguments.index("--reflection") + 1]).write_text(
+                    json.dumps({"stage": "compute", "name": "bda_kernel", "buffers": []})
+                )
+            return ""
+
+        with tempfile.TemporaryDirectory() as work:
+            with patch.object(Toolchain, "preflight", return_value={"gfx-compile": "gfx-compile", "spirv-val": "spirv-val"}):
+                with patch("mlir_gpu.compiler._run", side_effect=tool):
+                    compile_pipeline(bda_kernel, Target.VULKAN, Path(work) / "bda.spv", target_profile=bda_profile)
+
+        spirv_val_calls = [args for args in calls if args[0] == "spirv-val"]
+        self.assertEqual(len(spirv_val_calls), 1)
+        self.assertIn("vulkan1.2", spirv_val_calls[0])
 
 
 
