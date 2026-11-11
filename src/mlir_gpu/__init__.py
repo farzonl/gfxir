@@ -10,6 +10,10 @@ from .compiler import (
     TargetProfile,
     Toolchain,
     compile_pipeline,
+    MULTI_DRAW_SCHEMA_VERSION,
+    DrawCall,
+    MultiDrawManifest,
+    verify_multi_draw_manifest,
 )
 from .frontend import (
     AccessMode,
@@ -75,17 +79,18 @@ mat3x2, mat3x3, mat3x4 = Type.MAT3X2, Type.MAT3X3, Type.MAT3X4
 mat4x2, mat4x3, mat4x4 = Type.MAT4X2, Type.MAT4X3, Type.MAT4X4
 
 __all__ = [
-    "AccessMode", "Buffer", "BufferBinding", "BufferType", "CompileError",
-    "ComputeDispatchResult", "ComputePipeline", "ComputeProgram", "DIRECTX_SM60", "DIRECTX_SM66",
-    "Dispatch", "Draw", "FragmentCoord", "FrameParameters", "GlobalInvocationId",
-    "HIGH_END_COMPUTE", "ImageDiffError", "ImageDiffResult", "LocalInvocationId", "MLIRPipeline",
-    "PRESETS", "ParameterBlock", "Pipeline", "PointerType", "ReflectedBufferBinding",
-    "RenderedImage", "StorageClass", "StructField", "Target", "TargetProfile", "Toolchain", "Type",
-    "VULKAN_PORTABLE_1_0", "Value", "Vertex", "ViewerError", "WorkgroupId", "compile_pipeline",
-    "compute", "compute_session", "dispatch_compute", "f32", "fragment", "fullscreen_vertex",
-    "global_invocation_id", "i32", "imgdiff", "is_struct", "load_compute_program",
-    "local_invocation_id", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4",
-    "mat4x2", "mat4x3", "mat4x4", "maximum", "minimum", "natural_alignment", "pack_parameters",
-    "read_png", "render_compute_rgba", "sdf", "select", "shader_math", "struct", "u32", "vec2",
-    "vec3", "vec4", "vertex", "workgroup_id", "write_png",
+    "AccessMode", "Buffer", "BufferBinding", "BufferType", "CompileError", "ComputeDispatchResult",
+    "ComputePipeline", "ComputeProgram", "DIRECTX_SM60", "DIRECTX_SM66", "Dispatch", "Draw",
+    "DrawCall", "FragmentCoord", "FrameParameters", "GlobalInvocationId", "HIGH_END_COMPUTE",
+    "ImageDiffError", "ImageDiffResult", "LocalInvocationId", "MLIRPipeline",
+    "MULTI_DRAW_SCHEMA_VERSION", "MultiDrawManifest", "PRESETS", "ParameterBlock", "Pipeline",
+    "PointerType", "ReflectedBufferBinding", "RenderedImage", "StorageClass", "StructField",
+    "Target", "TargetProfile", "Toolchain", "Type", "VULKAN_PORTABLE_1_0", "Value", "Vertex",
+    "ViewerError", "WorkgroupId", "compile_pipeline", "compute", "compute_session",
+    "dispatch_compute", "f32", "fragment", "fullscreen_vertex", "global_invocation_id", "i32",
+    "imgdiff", "is_struct", "load_compute_program", "local_invocation_id", "mat2x2", "mat2x3",
+    "mat2x4", "mat3x2", "mat3x3", "mat3x4", "mat4x2", "mat4x3", "mat4x4", "maximum", "minimum",
+    "natural_alignment", "pack_parameters", "read_png", "render_compute_rgba", "sdf", "select",
+    "shader_math", "struct", "u32", "vec2", "vec3", "vec4", "verify_multi_draw_manifest", "vertex",
+    "workgroup_id", "write_png",
 ]

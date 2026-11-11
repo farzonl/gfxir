@@ -246,6 +246,165 @@ class MLIRPipeline:
 PIPELINE_SCHEMA_VERSION = 3
 PARAMETER_SCHEMA_VERSION = 4
 COMPUTE_SCHEMA_VERSION = 5
+MULTI_DRAW_SCHEMA_VERSION = 6
+
+
+@dataclass(frozen=True)
+class DrawCall:
+    """Represents a single draw command within a multi-draw sequence."""
+
+    pipeline: str
+    type: str = "standard"  # "standard" | "indexed"
+    topology: str = "triangle-list"
+    vertex_count: int = 0
+    index_count: int = 0
+    instance_count: int = 1
+    first_vertex: int = 0
+    first_index: int = 0
+    vertex_offset: int = 0
+    first_instance: int = 0
+    index_type: str = "uint16"  # "uint16" | "uint32"
+    constant_offset: int = 0
+    constant_size: int = 0
+    parameters: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.type not in ("standard", "indexed"):
+            raise ValueError(f"Invalid draw type: {self.type!r}. Must be 'standard' or 'indexed'.")
+        if self.topology != "triangle-list":
+            raise ValueError(f"Unsupported topology: {self.topology!r}. Only 'triangle-list' is supported.")
+        if self.vertex_count < 0 or self.index_count < 0:
+            raise ValueError("vertex_count and index_count must be nonnegative.")
+        if self.instance_count < 1:
+            raise ValueError("instance_count must be at least 1.")
+        if self.first_vertex < 0 or self.first_index < 0:
+            raise ValueError("first_vertex and first_index must be nonnegative.")
+        if self.constant_offset < 0 or self.constant_size < 0:
+            raise ValueError("constant_offset and constant_size must be nonnegative.")
+        if self.type == "standard" and self.vertex_count % 3 != 0:
+            raise ValueError("Standard triangle-list vertex_count must be a multiple of 3.")
+        if self.type == "indexed" and self.index_count % 3 != 0:
+            raise ValueError("Indexed triangle-list index_count must be a multiple of 3.")
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "pipeline": self.pipeline,
+            "type": self.type,
+            "topology": self.topology,
+        }
+        if self.type == "indexed":
+            result["index_count"] = self.index_count
+            result["first_index"] = self.first_index
+            if self.vertex_offset != 0:
+                result["vertex_offset"] = self.vertex_offset
+            result["index_type"] = self.index_type
+        else:
+            result["vertex_count"] = self.vertex_count
+            result["first_vertex"] = self.first_vertex
+
+        if self.instance_count != 1:
+            result["instance_count"] = self.instance_count
+        if self.first_instance != 0:
+            result["first_instance"] = self.first_instance
+        if self.constant_offset != 0 or self.constant_size != 0:
+            result["constant_offset"] = self.constant_offset
+            result["constant_size"] = self.constant_size
+        if self.parameters is not None:
+            result["parameters"] = self.parameters
+        return result
+
+
+@dataclass(frozen=True)
+class MultiDrawManifest:
+    """Top-level pipeline manifest v5 expressing multiple pipelines and draws."""
+
+    pipelines: Mapping[str, Any]
+    draws: Sequence[DrawCall | Mapping[str, Any]]
+    target: str = "vulkan"
+    target_profile: TargetProfile | Mapping[str, Any] | None = None
+    raster_convention: Mapping[str, Any] = field(default_factory=lambda: dict(RASTER_CONVENTION))
+    parameters: list[dict[str, Any]] | dict[str, Any] | None = None
+    schema_version: int = MULTI_DRAW_SCHEMA_VERSION
+    runtime_verified: bool = False
+    backend_status: str = "validated-binary"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != MULTI_DRAW_SCHEMA_VERSION:
+            raise ValueError(f"MultiDrawManifest requires schema_version == {MULTI_DRAW_SCHEMA_VERSION}")
+        if not isinstance(self.pipelines, Mapping):
+            raise TypeError("pipelines must be a mapping of pipeline IDs to pipeline configurations.")
+
+        for draw in self.draws:
+            draw_dict = draw.to_dict() if hasattr(draw, "to_dict") else draw
+            if not isinstance(draw_dict, Mapping):
+                raise TypeError("Each draw item must be a mapping or DrawCall instance.")
+            pipe_ref = draw_dict.get("pipeline")
+            if pipe_ref not in self.pipelines:
+                raise ValueError(f"Draw references nonexistent pipeline: {pipe_ref!r}")
+            for count_key in ("vertex_count", "index_count", "first_vertex", "first_index", "constant_offset", "constant_size"):
+                val = draw_dict.get(count_key)
+                if val is not None and (type(val) is not int or val < 0):
+                    raise ValueError(f"Draw parameter {count_key} must be a nonnegative integer, got {val}")
+            inst_cnt = draw_dict.get("instance_count")
+            if inst_cnt is not None and (type(inst_cnt) is not int or inst_cnt < 1):
+                raise ValueError(f"Draw parameter instance_count must be >= 1, got {inst_cnt}")
+
+    def to_dict(self) -> dict[str, Any]:
+        profile_dict = (
+            self.target_profile.to_dict()
+            if hasattr(self.target_profile, "to_dict")
+            else (dict(self.target_profile) if isinstance(self.target_profile, Mapping)
+                  else TargetProfile.default_for_target(self.target).to_dict())
+        )
+        result: dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "target": self.target,
+            "target_profile": profile_dict,
+            "raster_convention": dict(self.raster_convention),
+            "runtime_verified": self.runtime_verified,
+            "backend_status": self.backend_status,
+            "pipelines": {k: (v.to_dict() if hasattr(v, "to_dict") else dict(v) if isinstance(v, Mapping) else v) for k, v in self.pipelines.items()},
+            "draws": [(dict(d) if isinstance(d, Mapping) else d.to_dict()) for d in self.draws],
+        }
+        if self.parameters is not None:
+            result["parameters"] = self.parameters
+        return result
+
+
+def verify_multi_draw_manifest(manifest: Mapping[str, Any] | MultiDrawManifest) -> None:
+    """Strictly validate a Schema v5 multi-draw manifest dictionary."""
+    data = manifest.to_dict() if hasattr(manifest, "to_dict") else manifest
+    if not isinstance(data, Mapping):
+        raise TypeError(f"Manifest must be a mapping, got {type(data).__name__}")
+
+    version = data.get("schema_version")
+    if version != MULTI_DRAW_SCHEMA_VERSION:
+        raise ValueError(f"verify_multi_draw_manifest requires schema_version == {MULTI_DRAW_SCHEMA_VERSION}, got {version}")
+
+    pipelines = data.get("pipelines")
+    if not isinstance(pipelines, Mapping):
+        raise ValueError("Manifest 'pipelines' must be a mapping.")
+
+    draws = data.get("draws")
+    if not isinstance(draws, (list, tuple)):
+        raise ValueError("Manifest 'draws' must be a list or tuple.")
+
+    for idx, draw in enumerate(draws):
+        if hasattr(draw, "to_dict"):
+            draw = draw.to_dict()
+        if not isinstance(draw, Mapping):
+            raise ValueError(f"Draw {idx} must be a dictionary.")
+        pipe_ref = draw.get("pipeline")
+        if not pipe_ref or pipe_ref not in pipelines:
+            raise ValueError(f"Draw {idx} references nonexistent pipeline {pipe_ref!r}.")
+        for k in ("vertex_count", "index_count", "first_vertex", "first_index", "constant_offset", "constant_size"):
+            v = draw.get(k)
+            if v is not None and (type(v) is not int or v < 0):
+                raise ValueError(f"Draw {idx} field {k} must be nonnegative integer, got {v}")
+        inst = draw.get("instance_count")
+        if inst is not None and (type(inst) is not int or inst < 1):
+            raise ValueError(f"Draw {idx} instance_count must be >= 1, got {inst}")
+
 RASTER_CONVENTION = {
     "clip_x": "right",
     "clip_y": "up",

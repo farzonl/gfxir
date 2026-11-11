@@ -686,6 +686,21 @@ static void reportDeviceCapabilities(bool warp, bool validation) {
     std::cout << glz::write_json(report).value_or("{}") << "\n" << std::flush;
 }
 
+struct DirectXDrawCall {
+    std::string pipelineId;
+    std::string type = "standard"; // "standard" or "indexed"
+    UINT vertexCount = 0;
+    UINT indexCount = 0;
+    UINT instanceCount = 1;
+    UINT firstVertex = 0;
+    UINT firstIndex = 0;
+    INT vertexOffset = 0;
+    UINT firstInstance = 0;
+    UINT constantOffset = 0;
+    UINT constantSize = 0;
+    std::vector<uint32_t> rootConstants;
+};
+
 class Renderer {
     ComPtr<IDXGIFactory6> factory;
     ComPtr<ID3D12Device> device;
@@ -701,6 +716,8 @@ class Renderer {
     UINT64 fenceValue = 0;
     UINT vertexCount;
     std::string name;
+    std::unordered_map<std::string, ComPtr<ID3D12PipelineState>> pipelines;
+    std::vector<DirectXDrawCall> draws;
     bool hasFrameConstants = false;
     bool hasFixedTime = false;
     double fixedTime = 0.0;
@@ -773,7 +790,34 @@ class Renderer {
         const float background[]{0.02f, 0.02f, 0.04f, 1.0f};
         commands->ClearRenderTargetView(handle, background, 0, nullptr);
         commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        commands->DrawInstanced(vertexCount, 1, 0, 0);
+        if (draws.empty()) {
+            commands->DrawInstanced(vertexCount, 1, 0, 0);
+        } else {
+            ID3D12PipelineState* currentPso = nullptr;
+            for (const auto& d : draws) {
+                ID3D12PipelineState* nextPso = pipeline.Get();
+                auto it = pipelines.find(d.pipelineId);
+                if (it != pipelines.end() && it->second) {
+                    nextPso = it->second.Get();
+                }
+                if (nextPso != currentPso) {
+                    commands->SetPipelineState(nextPso);
+                    currentPso = nextPso;
+                }
+                if (!d.rootConstants.empty()) {
+                    commands->SetGraphicsRoot32BitConstants(
+                        1, static_cast<UINT>(d.rootConstants.size()), d.rootConstants.data(), 0);
+                }
+                if (d.type == "indexed") {
+                    commands->DrawIndexedInstanced(
+                        d.indexCount, d.instanceCount, d.firstIndex, d.vertexOffset, d.firstInstance);
+                } else {
+                    commands->DrawInstanced(
+                        d.vertexCount ? d.vertexCount : vertexCount,
+                        d.instanceCount, d.firstVertex, d.firstInstance);
+                }
+            }
+        }
     }
 
     void submit() {
@@ -784,6 +828,13 @@ class Renderer {
     }
 
 public:
+    void setDraws(std::vector<DirectXDrawCall> drawList) {
+        draws = std::move(drawList);
+    }
+    void addPipeline(const std::string& id, ComPtr<ID3D12PipelineState> pso) {
+        pipelines[id] = std::move(pso);
+    }
+
     Renderer(const std::wstring& vertex, const std::wstring& fragment, UINT count, bool validation,
              bool warp = false, bool hasTime = false, double time = 0.0)
         : vertexCount(count), hasFixedTime(hasTime), fixedTime(time),

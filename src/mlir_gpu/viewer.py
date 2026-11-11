@@ -23,9 +23,13 @@ from .compiler import (
     COMPUTE_SCHEMA_VERSION,
     CompileError,
     PIPELINE_SCHEMA_VERSION,
+    MULTI_DRAW_SCHEMA_VERSION,
     RASTER_CONVENTION,
     TargetProfile,
     Toolchain,
+    DrawCall,
+    MultiDrawManifest,
+    verify_multi_draw_manifest,
     _check_binary,
     _run,
     convert_dxil_to_metallib,
@@ -46,12 +50,28 @@ class Shader:
 
 
 @dataclass(frozen=True)
+class PipelineState:
+    vertex: Shader
+    fragment: Shader
+    parameters: dict | None = None
+    interface: dict | None = None
+
+
+@dataclass(frozen=True)
 class GraphicsProgram:
     vertex: Shader
     fragment: Shader
     target: str = "vulkan"
     draw: Draw = Draw()
     parameters: dict | None = None
+    pipelines: dict[str, Any] = None
+    draws: list[Any] = None
+
+    def __post_init__(self) -> None:
+        if self.pipelines is None:
+            object.__setattr__(self, "pipelines", {})
+        if self.draws is None:
+            object.__setattr__(self, "draws", [])
 
 
 @dataclass(frozen=True)
@@ -88,9 +108,11 @@ def load_program(manifest: Path) -> GraphicsProgram:
         )
     if (
         not isinstance(data, dict) or type(data.get("schema_version")) is not int
-        or data.get("schema_version") not in (2, 3, 4) or data.get("target") not in ("vulkan", "directx", "metal")
+        or data.get("schema_version") not in (2, 3, 4, 6) or data.get("target") not in ("vulkan", "directx", "metal")
     ):
         raise ViewerError(f"The viewer requires a schema-version {PIPELINE_SCHEMA_VERSION} Vulkan, DirectX, or Metal pipeline manifest.")
+    if data.get("raster_convention") != RASTER_CONVENTION:
+        raise ViewerError("The pipeline does not declare the compiler's canonical raster convention; recompile it.")
     parameters = None
     if data["schema_version"] == 4:
         try:
@@ -106,7 +128,7 @@ def load_program(manifest: Path) -> GraphicsProgram:
     has_parameters = isinstance(reflected, dict) and any(
         isinstance(stage, dict) and "parameters" in stage for stage in reflected.values()
     )
-    if data["schema_version"] != 4 and ("parameters" in data or has_parameters):
+    if data["schema_version"] not in (4, 6) and ("parameters" in data or has_parameters):
         raise ViewerError("Parameter resources require schema version 4; recompile this stale manifest.")
     if data["schema_version"] == 2:
         legacy_interface = {
@@ -117,11 +139,105 @@ def load_program(manifest: Path) -> GraphicsProgram:
         }
         if data.get("interface") != legacy_interface or data.get("draw") != Draw().to_dict():
             raise ViewerError("Unsupported legacy version-2 interface; recompile with the native gfx compiler.")
-    else:
+    elif data["schema_version"] in (3, 4):
         try:
             verify_graphics_interface(data.get("interface"), preview=True)
         except ValueError as error:
             raise ViewerError(f"Unsupported graphics interface: {error}") from error
+
+    if data["schema_version"] == MULTI_DRAW_SCHEMA_VERSION:
+        try:
+            verify_multi_draw_manifest(data)
+        except (ValueError, TypeError) as error:
+            raise ViewerError(f"Invalid multi-draw manifest: {error}") from error
+
+        pipeline_defs = data.get("pipelines", {})
+        if not pipeline_defs:
+            raise ViewerError("Manifest must contain at least one pipeline.")
+        draws_list = data.get("draws", [])
+
+        pipelines: dict[str, PipelineState] = {}
+        magic, minimum = {
+            "vulkan": (b"#", 20), "directx": (b"DXBC", 32), "metal": (b"MTLB", 16),
+        }[data["target"]]
+
+        for pipe_id, p_def in pipeline_defs.items():
+            if not isinstance(p_def, dict):
+                raise ViewerError(f"Pipeline {pipe_id!r} configuration must be a dictionary.")
+            p_entries = p_def.get("entries")
+            if not isinstance(p_entries, list) or len(p_entries) != 2:
+                raise ViewerError(f"Pipeline {pipe_id!r} must contain exactly one vertex and one fragment entry.")
+            p_shaders: dict[str, Shader] = {}
+            for entry in p_entries:
+                if not isinstance(entry, dict):
+                    raise ViewerError(f"Invalid shader entry in pipeline {pipe_id!r}.")
+                stage, name, filename = entry.get("stage"), entry.get("entry_point"), entry.get("binary")
+                if stage not in ("vertex", "fragment") or stage in p_shaders:
+                    raise ViewerError(f"Pipeline {pipe_id!r} must contain unique vertex and fragment stages.")
+                if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                    raise ViewerError("Invalid shader entry-point name.")
+                if not isinstance(filename, str) or not filename:
+                    raise ViewerError("A shader binary path is required.")
+                binary = (manifest.parent / filename).resolve()
+                if Path(filename).is_absolute() or not binary.is_relative_to(manifest.parent):
+                    raise ViewerError("Shader binaries must be inside the pipeline directory.")
+                _check_binary(binary, magic, minimum)
+                code = binary.read_bytes()
+                if data["target"] == "vulkan" and len(code) % 4:
+                    raise ViewerError(f"SPIR-V binary is not word-aligned: {filename}.")
+                p_shaders[stage] = Shader(name, code)
+
+            pipelines[pipe_id] = PipelineState(
+                vertex=p_shaders["vertex"],
+                fragment=p_shaders["fragment"],
+                parameters=p_def.get("parameters"),
+                interface=p_def.get("interface"),
+            )
+
+        draw_calls: list[DrawCall] = []
+        for d in draws_list:
+            if isinstance(d, DrawCall):
+                draw_calls.append(d)
+            elif isinstance(d, dict):
+                try:
+                    draw_calls.append(DrawCall(
+                        pipeline=d["pipeline"],
+                        type=d.get("type", "standard"),
+                        topology=d.get("topology", "triangle-list"),
+                        vertex_count=d.get("vertex_count", 0),
+                        index_count=d.get("index_count", 0),
+                        instance_count=d.get("instance_count", 1),
+                        first_vertex=d.get("first_vertex", 0),
+                        first_index=d.get("first_index", 0),
+                        vertex_offset=d.get("vertex_offset", 0),
+                        first_instance=d.get("first_instance", 0),
+                        index_type=d.get("index_type", "uint16"),
+                        constant_offset=d.get("constant_offset", 0),
+                        constant_size=d.get("constant_size", 0),
+                        parameters=d.get("parameters"),
+                    ))
+                except ValueError as err:
+                    raise ViewerError(f"Invalid draw descriptor: {err}") from err
+            else:
+                raise ViewerError("Draw elements must be mappings or DrawCall instances.")
+
+        first_pipe = next(iter(pipelines.values()))
+        first_draw = draw_calls[0] if draw_calls else None
+        first_v_count = first_draw.vertex_count if (first_draw and first_draw.type == "standard" and first_draw.vertex_count > 0) else (first_draw.index_count if first_draw else 3)
+        if first_v_count == 0:
+            first_v_count = 3
+        draw_obj = Draw(vertex_count=first_v_count, topology="triangle-list")
+
+        return GraphicsProgram(
+            vertex=first_pipe.vertex,
+            fragment=first_pipe.fragment,
+            target=data["target"],
+            draw=draw_obj,
+            parameters=data.get("parameters"),
+            pipelines=pipelines,
+            draws=draw_calls,
+        )
+
     draw_data = data.get("draw")
     if not isinstance(draw_data, dict) or set(draw_data) != {"topology", "vertex_count"}:
         raise ViewerError("A separate topology/vertex_count draw description is required.")
@@ -129,8 +245,6 @@ def load_program(manifest: Path) -> GraphicsProgram:
         draw = Draw(vertex_count=draw_data["vertex_count"], topology=draw_data["topology"])
     except ValueError as error:
         raise ViewerError(f"Invalid draw description: {error}") from error
-    if data.get("raster_convention") != RASTER_CONVENTION:
-        raise ViewerError("The pipeline does not declare the compiler's canonical raster convention; recompile it.")
     entries = data.get("entries")
     if not isinstance(entries, list) or len(entries) != 2:
         raise ViewerError("The manifest must contain exactly one vertex and one fragment entry.")
@@ -151,14 +265,38 @@ def load_program(manifest: Path) -> GraphicsProgram:
         if Path(filename).is_absolute() or not binary.is_relative_to(manifest.parent):
             raise ViewerError("Shader binaries must be inside the pipeline directory.")
         magic, minimum = {
-            "vulkan": (b"\x03\x02\x23\x07", 20), "directx": (b"DXBC", 32), "metal": (b"MTLB", 16),
+            "vulkan": (b"#", 20), "directx": (b"DXBC", 32), "metal": (b"MTLB", 16),
         }[data["target"]]
         _check_binary(binary, magic, minimum)
         code = binary.read_bytes()
         if data["target"] == "vulkan" and len(code) % 4:
             raise ViewerError(f"SPIR-V binary is not word-aligned: {filename}.")
         shaders[stage] = Shader(name, code)
-    return GraphicsProgram(shaders["vertex"], shaders["fragment"], data["target"], draw, parameters)
+
+    pipe_state = PipelineState(
+        vertex=shaders["vertex"],
+        fragment=shaders["fragment"],
+        parameters=parameters,
+        interface=data.get("interface"),
+    )
+    single_draw = DrawCall(
+        pipeline="default",
+        type="standard",
+        topology=draw.topology,
+        vertex_count=draw.vertex_count,
+        first_vertex=0,
+        instance_count=1,
+        first_instance=0,
+    )
+    return GraphicsProgram(
+        vertex=shaders["vertex"],
+        fragment=shaders["fragment"],
+        target=data["target"],
+        draw=draw,
+        parameters=parameters,
+        pipelines={"default": pipe_state},
+        draws=[single_draw],
+    )
 
 
 def load_compute_program(manifest: Path) -> ComputeProgram:
@@ -924,7 +1062,6 @@ class _Vulkan:
         if width > self.max_width or height > self.max_height:
             raise ViewerError("The requested preview exceeds the device's framebuffer limits.")
         final_layout = vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR if present else vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-        # Keep pointer-bearing array elements alive through the binding's struct copies.
         subpass = vk.VkSubpassDescription(
             pipelineBindPoint=vk.VK_PIPELINE_BIND_POINT_GRAPHICS,
             pColorAttachments=[vk.VkAttachmentReference(attachment=0, layout=vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)],
@@ -954,42 +1091,72 @@ class _Vulkan:
             ],
         ), None)
         resources.callback(vk.vkDestroyRenderPass, self.device, render_pass, None)
+
         ranges = []
+        max_size = 0
         if program.parameters is not None:
-            if program.parameters["size"] > self.max_push_constants:
+            max_size = max(max_size, program.parameters["bindings"]["vulkan"]["offset"] + program.parameters["size"])
+        for d in getattr(program, "draws", []):
+            c_off = getattr(d, "constant_offset", 0)
+            c_sz = getattr(d, "constant_size", 0)
+            if c_sz > 0:
+                max_size = max(max_size, c_off + c_sz)
+            elif getattr(d, "parameters", None) is not None:
+                max_size = max(max_size, (c_off if c_off > 0 else 80) + 80)
+        for p in getattr(program, "pipelines", {}).values():
+            p_params = getattr(p, "parameters", None)
+            if p_params is not None and isinstance(p_params, dict) and "bindings" in p_params and "vulkan" in p_params["bindings"]:
+                max_size = max(max_size, p_params["bindings"]["vulkan"]["offset"] + p_params["size"])
+
+        if max_size > 0:
+            if max_size > self.max_push_constants:
                 raise ViewerError("The reflected frame block exceeds the device's push-constant limit.")
             ranges.append(vk.VkPushConstantRange(
-                stageFlags=self.parameter_stages(program.parameters),
-                offset=program.parameters["bindings"]["vulkan"]["offset"],
-                size=program.parameters["size"],
+                stageFlags=vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                offset=0,
+                size=max_size,
             ))
         layout = vk.vkCreatePipelineLayout(self.device, vk.VkPipelineLayoutCreateInfo(pPushConstantRanges=ranges), None)
         resources.callback(vk.vkDestroyPipelineLayout, self.device, layout, None)
-        stages = []
-        for shader, stage in ((program.vertex, vk.VK_SHADER_STAGE_VERTEX_BIT), (program.fragment, vk.VK_SHADER_STAGE_FRAGMENT_BIT)):
-            module = vk.vkCreateShaderModule(self.device, vk.VkShaderModuleCreateInfo(codeSize=len(shader.code), pCode=shader.code), None)
-            resources.callback(vk.vkDestroyShaderModule, self.device, module, None)
-            stages.append(vk.VkPipelineShaderStageCreateInfo(stage=stage, module=module, pName=shader.entry_point))
-        pipeline = vk.vkCreateGraphicsPipelines(self.device, vk.VK_NULL_HANDLE, 1, [vk.VkGraphicsPipelineCreateInfo(
-            pStages=stages,
-            pVertexInputState=vk.VkPipelineVertexInputStateCreateInfo(),
-            pInputAssemblyState=vk.VkPipelineInputAssemblyStateCreateInfo(topology=vk.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST),
-            pViewportState=vk.VkPipelineViewportStateCreateInfo(
-                pViewports=[vk.VkViewport(width=float(width), height=float(height), minDepth=0.0, maxDepth=1.0)],
-                pScissors=[vk.VkRect2D(extent=vk.VkExtent2D(width=width, height=height))],
-            ),
-            pRasterizationState=vk.VkPipelineRasterizationStateCreateInfo(
-                polygonMode=vk.VK_POLYGON_MODE_FILL, cullMode=vk.VK_CULL_MODE_NONE,
-                frontFace=vk.VK_FRONT_FACE_COUNTER_CLOCKWISE, lineWidth=1.0,
-            ),
-            pMultisampleState=vk.VkPipelineMultisampleStateCreateInfo(rasterizationSamples=vk.VK_SAMPLE_COUNT_1_BIT),
-            pColorBlendState=vk.VkPipelineColorBlendStateCreateInfo(pAttachments=[vk.VkPipelineColorBlendAttachmentState(
-                colorWriteMask=vk.VK_COLOR_COMPONENT_R_BIT | vk.VK_COLOR_COMPONENT_G_BIT | vk.VK_COLOR_COMPONENT_B_BIT | vk.VK_COLOR_COMPONENT_A_BIT,
-            )]),
-            layout=layout, renderPass=render_pass, subpass=0,
-        )], None)[0]
-        resources.callback(vk.vkDestroyPipeline, self.device, pipeline, None)
-        return render_pass, pipeline, layout
+
+        pipeline_map = {}
+        default_pipeline = None
+
+        pipeline_items = list(program.pipelines.items()) if getattr(program, "pipelines", None) else [("default", program)]
+        for pipe_id, p_state in pipeline_items:
+            stages = []
+            for shader, stage in ((p_state.vertex, vk.VK_SHADER_STAGE_VERTEX_BIT), (p_state.fragment, vk.VK_SHADER_STAGE_FRAGMENT_BIT)):
+                module = vk.vkCreateShaderModule(self.device, vk.VkShaderModuleCreateInfo(codeSize=len(shader.code), pCode=shader.code), None)
+                resources.callback(vk.vkDestroyShaderModule, self.device, module, None)
+                stages.append(vk.VkPipelineShaderStageCreateInfo(stage=stage, module=module, pName=shader.entry_point))
+            vk_pipe = vk.vkCreateGraphicsPipelines(self.device, vk.VK_NULL_HANDLE, 1, [vk.VkGraphicsPipelineCreateInfo(
+                pStages=stages,
+                pVertexInputState=vk.VkPipelineVertexInputStateCreateInfo(),
+                pInputAssemblyState=vk.VkPipelineInputAssemblyStateCreateInfo(topology=vk.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST),
+                pViewportState=vk.VkPipelineViewportStateCreateInfo(
+                    pViewports=[vk.VkViewport(width=float(width), height=float(height), minDepth=0.0, maxDepth=1.0)],
+                    pScissors=[vk.VkRect2D(extent=vk.VkExtent2D(width=width, height=height))],
+                ),
+                pRasterizationState=vk.VkPipelineRasterizationStateCreateInfo(
+                    polygonMode=vk.VK_POLYGON_MODE_FILL, cullMode=vk.VK_CULL_MODE_NONE,
+                    frontFace=vk.VK_FRONT_FACE_COUNTER_CLOCKWISE, lineWidth=1.0,
+                ),
+                pMultisampleState=vk.VkPipelineMultisampleStateCreateInfo(rasterizationSamples=vk.VK_SAMPLE_COUNT_1_BIT),
+                pColorBlendState=vk.VkPipelineColorBlendStateCreateInfo(pAttachments=[vk.VkPipelineColorBlendAttachmentState(
+                    colorWriteMask=vk.VK_COLOR_COMPONENT_R_BIT | vk.VK_COLOR_COMPONENT_G_BIT | vk.VK_COLOR_COMPONENT_B_BIT | vk.VK_COLOR_COMPONENT_A_BIT,
+                )]),
+                layout=layout, renderPass=render_pass, subpass=0,
+            )], None)[0]
+            resources.callback(vk.vkDestroyPipeline, self.device, vk_pipe, None)
+            pipeline_map[pipe_id] = vk_pipe
+            if default_pipeline is None:
+                default_pipeline = vk_pipe
+
+        # cffi handles are opaque pointers and cannot carry attributes.
+        if not hasattr(self, "pipeline_extras"):
+            self.pipeline_extras = {}
+        self.pipeline_extras[default_pipeline] = (pipeline_map, getattr(program, "draws", []))
+        return render_pass, default_pipeline, layout
 
     def parameter_stages(self, parameters):
         flags = 0
@@ -1010,7 +1177,7 @@ class _Vulkan:
         return framebuffer
 
     def command(self, resources, render_pass, pipeline, framebuffer, width, height, draw: Draw, copy=None,
-                *, layout=None, parameters=None, elapsed=0.0, command=None):
+                *, layout=None, parameters=None, elapsed=0.0, command=None, draws=None):
         vk = self.vk
         data = _frame_data(parameters, width, height, elapsed) if parameters is not None else None
         if data is not None and layout is None:
@@ -1028,11 +1195,68 @@ class _Vulkan:
             renderArea=vk.VkRect2D(extent=vk.VkExtent2D(width=width, height=height)),
             pClearValues=[vk.VkClearValue(color=vk.VkClearColorValue(float32=[0.02, 0.02, 0.04, 1.0]))],
         ), vk.VK_SUBPASS_CONTENTS_INLINE)
-        vk.vkCmdBindPipeline(command, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline)
+
         if data is not None:
-            vk.vkCmdPushConstants(command, layout, self.parameter_stages(parameters),
+            vk.vkCmdPushConstants(command, layout,
+                                  vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT,
                                   parameters["bindings"]["vulkan"]["offset"], len(data), vk.ffi.from_buffer(data))
-        vk.vkCmdDraw(command, draw.vertex_count, 1, 0, 0)
+
+        extras_map, extras_draws = getattr(self, "pipeline_extras", {}).get(pipeline, (None, None))
+        pipeline_map = getattr(pipeline, "pipeline_map", extras_map or {"default": pipeline})
+        if draws is None:
+            draws = getattr(pipeline, "draws", extras_draws)
+
+        if not draws:
+            vk.vkCmdBindPipeline(command, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline)
+            vk.vkCmdDraw(command, draw.vertex_count, 1, 0, 0)
+        else:
+            current_pipeline = None
+            for d in draws:
+                p_id = getattr(d, "pipeline", "default") if hasattr(d, "pipeline") else d.get("pipeline", "default")
+                p_handle = pipeline_map.get(p_id, pipeline)
+                if p_handle != current_pipeline:
+                    vk.vkCmdBindPipeline(command, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, p_handle)
+                    current_pipeline = p_handle
+
+                c_off = getattr(d, "constant_offset", 0) if hasattr(d, "constant_offset") else d.get("constant_offset", 0)
+                c_sz = getattr(d, "constant_size", 0) if hasattr(d, "constant_size") else d.get("constant_size", 0)
+                d_params = getattr(d, "parameters", None) if hasattr(d, "parameters") else d.get("parameters")
+
+                if d_params is not None:
+                    if isinstance(d_params, (bytes, bytearray, memoryview)):
+                        p_bytes = bytes(d_params)
+                    elif isinstance(d_params, dict) and "data" in d_params:
+                        p_bytes = bytes(d_params["data"])
+                    elif isinstance(d_params, dict):
+                        float_vals = [float(v) for v in d_params.values() if isinstance(v, (int, float))]
+                        p_bytes = struct.pack(f"<{len(float_vals)}f", *float_vals) if float_vals else bytes(c_sz or 16)
+                    else:
+                        p_bytes = bytes(c_sz or 16)
+                    actual_off = c_off if c_off > 0 else 80
+                    vk.vkCmdPushConstants(command, layout,
+                                          vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                                          actual_off, len(p_bytes), vk.ffi.from_buffer(p_bytes))
+                elif c_sz > 0:
+                    dummy_bytes = bytes(c_sz)
+                    vk.vkCmdPushConstants(command, layout,
+                                          vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                                          c_off, c_sz, vk.ffi.from_buffer(dummy_bytes))
+
+                d_type = getattr(d, "type", "standard") if hasattr(d, "type") else d.get("type", "standard")
+                if d_type == "indexed":
+                    idx_cnt = getattr(d, "index_count", 0) if hasattr(d, "index_count") else d.get("index_count", 0)
+                    inst_cnt = getattr(d, "instance_count", 1) if hasattr(d, "instance_count") else d.get("instance_count", 1)
+                    first_idx = getattr(d, "first_index", 0) if hasattr(d, "first_index") else d.get("first_index", 0)
+                    v_off = getattr(d, "vertex_offset", 0) if hasattr(d, "vertex_offset") else d.get("vertex_offset", 0)
+                    first_inst = getattr(d, "first_instance", 0) if hasattr(d, "first_instance") else d.get("first_instance", 0)
+                    vk.vkCmdDrawIndexed(command, idx_cnt, inst_cnt, first_idx, v_off, first_inst)
+                else:
+                    v_cnt = getattr(d, "vertex_count", draw.vertex_count) if hasattr(d, "vertex_count") else d.get("vertex_count", draw.vertex_count)
+                    inst_cnt = getattr(d, "instance_count", 1) if hasattr(d, "instance_count") else d.get("instance_count", 1)
+                    first_v = getattr(d, "first_vertex", 0) if hasattr(d, "first_vertex") else d.get("first_vertex", 0)
+                    first_inst = getattr(d, "first_instance", 0) if hasattr(d, "first_instance") else d.get("first_instance", 0)
+                    vk.vkCmdDraw(command, v_cnt, inst_cnt, first_v, first_inst)
+
         vk.vkCmdEndRenderPass(command)
         if copy is not None:
             image, buffer = copy
