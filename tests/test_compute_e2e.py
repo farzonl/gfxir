@@ -148,8 +148,10 @@ class TestComputeE2EIntegration(unittest.TestCase):
             dx_content = dx_out.read_text(encoding="utf-8")
             self.assertIn('"hlsl.shader"="compute"', dx_content)
             self.assertIn('"hlsl.numthreads"', dx_content)
-            self.assertIn("RootSRV", dx_content)
-            self.assertIn("RootUAV", dx_content)
+            self.assertIn("DescriptorTable", dx_content)
+            self.assertIn('!"SRV"', dx_content)
+            self.assertIn('!"UAV"', dx_content)
+            self.assertNotIn("!dx.semantic.signatures", dx_content)
 
     def test_buffer_copy_vector4_compiles_to_vulkan_and_directx(self):
         @compute(workgroup_size=(64, 1, 1))

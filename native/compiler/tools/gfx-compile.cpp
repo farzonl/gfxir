@@ -18,9 +18,15 @@ static llvm::cl::opt<std::string>
           llvm::cl::desc("Shader JSON or MLIR input"));
 static llvm::cl::opt<std::string> format("input-format",
                                          llvm::cl::init("json"));
-static llvm::cl::opt<std::string> target("target", llvm::cl::Required,
+static llvm::cl::opt<std::string> target("target", llvm::cl::init(""),
                                          llvm::cl::desc("vulkan or directx"));
-static llvm::cl::opt<std::string> output("output", llvm::cl::Required);
+static llvm::cl::opt<std::string> output("output", llvm::cl::init(""));
+static llvm::cl::opt<bool>
+    emitLLVM("emit-llvm", llvm::cl::init(false),
+             llvm::cl::desc("Emit DirectX LLVM IR text"));
+static llvm::cl::opt<bool>
+    emitTextAssembly("S", llvm::cl::init(false),
+                     llvm::cl::desc("Write text output (defaults to stdout when --output is omitted)"));
 static llvm::cl::opt<std::string> irOutput("ir-output");
 static llvm::cl::opt<std::string> loweredOutput("lowered-output");
 static llvm::cl::opt<std::string> reflectionOutput("reflection");
@@ -48,6 +54,11 @@ static llvm::cl::opt<std::string> cHeaderOutput(
 
 static LogicalResult writeFile(StringRef path,
                                function_ref<void(llvm::raw_ostream &)> writer) {
+  if (path == "-") {
+    writer(llvm::outs());
+    llvm::outs().flush();
+    return success();
+  }
   std::error_code error;
   llvm::raw_fd_ostream stream(path, error, llvm::sys::fs::OF_None);
   if (error) {
@@ -66,10 +77,16 @@ static LogicalResult writeFile(StringRef path,
 
 int main(int argc, char **argv) {
   llvm::cl::ParseCommandLineOptions(argc, argv, "Typed gfx shader compiler\n");
-  if ((target != "vulkan" && target != "directx") ||
-      (format != "json" && format != "mlir")) {
-    llvm::errs() << "gfx-compile: target must be vulkan/directx and "
-                    "input-format must be json/mlir\n";
+  std::string resolvedTarget = target;
+  if (resolvedTarget.empty() && emitLLVM)
+    resolvedTarget = "directx";
+  std::string resolvedOutput = output;
+  if (resolvedOutput.empty() && (emitLLVM || emitTextAssembly))
+    resolvedOutput = "-";
+  if ((resolvedTarget != "vulkan" && resolvedTarget != "directx") ||
+      (format != "json" && format != "mlir") || resolvedOutput.empty()) {
+    llvm::errs() << "gfx-compile: target must be vulkan/directx, "
+                    "input-format must be json/mlir, and output is required\n";
     return 1;
   }
   DialectRegistry registry;
@@ -179,7 +196,7 @@ int main(int argc, char **argv) {
     }
   }
   manager.clear();
-  if (target == "vulkan")
+  if (resolvedTarget == "vulkan")
     manager.addPass(gfx::createGfxToSPIRVPass(profile));
   else
     gfx::buildDirectXPipeline(manager, profile);
@@ -191,12 +208,12 @@ int main(int argc, char **argv) {
         stream << "\n";
       })))
     return 1;
-  if (target == "vulkan") {
+  if (resolvedTarget == "vulkan") {
     auto shader = *module->getOps<spirv::ModuleOp>().begin();
     SmallVector<uint32_t> binary;
     if (failed(spirv::serialize(shader, binary)))
       return 1;
-    if (failed(writeFile(output, [&](auto &stream) {
+    if (failed(writeFile(resolvedOutput, [&](auto &stream) {
           for (uint32_t word : binary)
             for (unsigned byte = 0; byte < 4; ++byte)
               stream << static_cast<char>(word >> (8 * byte));
@@ -205,7 +222,7 @@ int main(int argc, char **argv) {
   } else {
     llvm::LLVMContext llvmContext;
     auto translated = gfx::exportDirectX(*module, llvmContext, reflection);
-    if (!translated || failed(writeFile(output, [&](auto &stream) {
+    if (!translated || failed(writeFile(resolvedOutput, [&](auto &stream) {
           translated->print(stream, nullptr);
         })))
       return 1;
