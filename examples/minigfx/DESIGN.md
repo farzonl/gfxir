@@ -434,7 +434,7 @@ MiniGfx serves as the motivating client for the GfxIR compiler. Rendering a 3D s
 - **Current Limitation**: GfxIR only supports a flat tuple of primitive float fields in `ParameterBlock("frame", ...)`. Structs cannot be declared declaratively, nested, or used with user-defined types.
 - **Requirements**:
   - Declarative Python struct definitions via `@struct` decorator or class base.
-  - Supported field types: `f32`, `u32`, `i32`, `vec2`, `vec3`, `vec4`, and `mat4`.
+  - Supported field types: `f32`, `u32`, `i32`, `vec2`, `vec3`, `vec4`, and `matCxR` matrices (`mat2x2` through `mat4x4`).
   - CPU-side std430 serialization via `.to_bytes()`.
   - GPU-side lowering to `gfx.parameter` and MLIR SSA field access.
   - Manifest reflection schema: Emits struct metadata (field names, types, byte offsets, sizes, alignments, and target API bindings).
@@ -443,7 +443,7 @@ MiniGfx serves as the motivating client for the GfxIR compiler. Rendering a 3D s
 
 - **Current Limitation**: Parameter block size is hard-limited to 128 bytes of scalar/vector floats (`parameters.py:88`). Only one global "frame" parameter block is supported.
 - **Requirements**:
-  - Support parameter blocks up to 256 bytes containing `mat4` (64 bytes), `vec4` (16 bytes), and integer draw IDs (`u32`).
+  - Support parameter blocks up to 256 bytes containing `mat4x4` (64 bytes), `vec4` (16 bytes), and integer draw IDs (`u32`).
   - Support multiple parameter blocks: a global `frame` block (camera, time, lights) and a per-draw `object` block (model matrix, material parameters, draw index).
   - Target bindings:
     - **Vulkan**: `VkPushConstantRange` (guaranteed min 128B, partitioned for frame and object on hardware supporting >= 160B, or uniform buffer fallback).
@@ -602,7 +602,7 @@ examples/minigfx/
 | `vec2` | 8 | 8 | 2 consecutive 32-bit floats |
 | `vec3` | 12 | 16 | 3 consecutive 32-bit floats (aligned to 16B) |
 | `vec4` | 16 | 16 | 4 consecutive 32-bit floats |
-| `mat4` | 64 | 16 | 4 column vectors of `vec4`, each 16B aligned |
+| `matCxR` (`mat2x2` … `mat4x4`) | C × stride | 8 if R = 2, else 16 | C column vectors of `vecR`; each column padded to its stride (8B for R = 2, 16B for R = 3 or 4). E.g. `mat4x4` = 64, `mat3x3` = 48, `mat2x2` = 16, `mat4x2` = 32 |
 | `struct` | $\sum \text{fields} + \text{pad}$ | 16 | Struct size rounded up to multiple of 16B |
 
 ### 9.2 Core Shared Struct Memory Layouts
@@ -610,7 +610,7 @@ examples/minigfx/
 #### `CameraParams` (Total Size: 80 Bytes, Alignment: 16 Bytes)
 ```
 Offset   Field       Type    Size  Alignment
-0        view_proj   mat4    64    16
+0        view_proj   mat4x4    64    16
 64       eye_pos     vec3    12    16
 76       time        f32     4     4
 ```
@@ -618,7 +618,7 @@ Offset   Field       Type    Size  Alignment
 #### `ObjectParams` (Total Size: 80 Bytes, Alignment: 16 Bytes)
 ```
 Offset   Field       Type    Size  Alignment
-0        model       mat4    64    16
+0        model       mat4x4    64    16
 64       color       vec4    16    16
 ```
 

@@ -235,13 +235,13 @@ class TestTier3StructsPerDrawConstants(unittest.TestCase):
         self._require_structs()
         @mgpu_params.struct
         class TestCameraParams:
-            view_proj: mat4
+            view_proj: mat4x4
             eye_pos: vec3
             time: f32
 
         @mgpu_params.struct
         class TestObjectParams:
-            model: mat4
+            model: mat4x4
             color: vec4
 
         cam_refl = TestCameraParams.reflection()

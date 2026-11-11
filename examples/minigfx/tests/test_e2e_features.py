@@ -224,7 +224,7 @@ class TestFeature02SharedStructs(unittest.TestCase):
         self._require_feature()
         @mgpu_params.struct
         class TestCameraParams:
-            view_proj: mat4
+            view_proj: mat4x4
             eye_pos: vec3
             time: f32
 
@@ -237,7 +237,7 @@ class TestFeature02SharedStructs(unittest.TestCase):
         self._require_feature()
         @mgpu_params.struct
         class TestCameraParams:
-            view_proj: mat4
+            view_proj: mat4x4
             eye_pos: vec3
             time: f32
 
@@ -250,7 +250,7 @@ class TestFeature02SharedStructs(unittest.TestCase):
         self._require_feature()
         @mgpu_params.struct
         class TestCameraParams:
-            view_proj: mat4
+            view_proj: mat4x4
             eye_pos: vec3
             time: f32
 
@@ -261,7 +261,7 @@ class TestFeature02SharedStructs(unittest.TestCase):
         self._require_feature()
         @mgpu_params.struct
         class TestCameraParams:
-            view_proj: mat4
+            view_proj: mat4x4
             eye_pos: vec3
             time: f32
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-import struct
+import struct as _struct_module
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Union
@@ -27,8 +27,8 @@ class ParameterBlock:
             name, typ = field
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name) or name in names:
                 raise ValueError("Parameter field names must be valid, public, and unique.")
-            if typ not in (Type.F32, Type.VEC2, Type.VEC3, Type.VEC4):
-                raise TypeError("Parameter fields currently support f32 and f32x2/3/4.")
+            if typ not in (Type.F32, Type.U32, Type.I32, Type.VEC2, Type.VEC3, Type.VEC4) and not (isinstance(typ, Type) and typ.is_matrix):
+                raise TypeError("Parameter fields support f32, u32, i32, vec2, vec3, vec4, and matCxR matrices (mat2x2..mat4x4).")
             names.add(name)
 
     def to_dict(self):
@@ -42,7 +42,7 @@ FrameParameters = ParameterBlock("frame", (("time", Type.F32), ("resolution", Ty
 
 @dataclass(frozen=True)
 class _ParameterValues:
-    _values: dict[str, Value]
+    _values: dict[str, Any]
 
     def __getattr__(self, name):
         if name not in self._values:
@@ -202,6 +202,9 @@ def _type_size_align(t: Any) -> tuple[int, int]:
         }
         if t in mapping:
             return mapping[t]
+        if t.is_matrix:
+            size, align, _ = t.matrix_layout
+            return (size, align)
         raise ValueError(f"Unsupported Type: {t}")
     if isinstance(t, ArrayType):
         elem_size, elem_align = _type_size_align(t.element_type)
@@ -216,6 +219,8 @@ def _type_size_align(t: Any) -> tuple[int, int]:
             cursor = offset + sz
         size = (cursor + max_align - 1) // max_align * max_align
         return (size, max_align)
+    if isinstance(t, type) and is_struct(t):
+        return (getattr(t, "__struct_size__"), getattr(t, "__struct_alignment__", 16))
     if isinstance(t, str):
         str_map = {
             "f32": (4, 4), "i32": (4, 4), "u32": (4, 4),
@@ -228,6 +233,9 @@ def _type_size_align(t: Any) -> tuple[int, int]:
         }
         if t in str_map:
             return str_map[t]
+        matrix_type = _matrix_type_from_name(t)
+        if matrix_type is not None:
+            return matrix_type.matrix_layout[:2]
     raise ValueError(f"Unknown type for std430 layout: {t!r}")
 
 
@@ -393,6 +401,8 @@ def generate_c_header(layout: StructLayout | dict, struct_name: str | None = Non
                 base = scalar_map[t_schema]
                 dim = int(t_schema.split("x")[-1])
                 return f"{base} {name}[{count}][{dim}]"
+            elif _matrix_type_from_name(t_schema) is not None:
+                return f"float {name}[{count}][{_matrix_type_from_name(t_schema).matrix_layout[0] // 4}]"
             else:
                 return f"{t_schema} {name}[{count}]"
         else:
@@ -402,6 +412,8 @@ def generate_c_header(layout: StructLayout | dict, struct_name: str | None = Non
                 base = scalar_map[t_schema]
                 dim = int(t_schema.split("x")[-1])
                 return f"{base} {name}[{dim}]"
+            elif _matrix_type_from_name(t_schema) is not None:
+                return f"float {name}[{_matrix_type_from_name(t_schema).matrix_layout[0] // 4}]"
             return f"{t_schema} {name}"
 
     def _emit_struct_body(fields: tuple[FieldLayout, ...], total_size: int, pad_start: int = 0) -> tuple[list[str], int]:
@@ -503,6 +515,374 @@ def generate_c_header(layout: StructLayout | dict, struct_name: str | None = Non
 emit_c_header = generate_c_header
 
 
+# =============================================================================
+# Shared Host/Device Struct Types & std430 Layout Engine
+# =============================================================================
+
+_MISSING = object()
+
+TYPE_LAYOUT: dict[Type, tuple[int, int]] = {
+    Type.F32: (4, 4),
+    Type.U32: (4, 4),
+    Type.I32: (4, 4),
+    Type.VEC2: (8, 8),
+    Type.VEC3: (12, 16),
+    Type.VEC4: (16, 16),
+    **{typ: typ.matrix_layout[:2] for typ in Type if typ.is_matrix},
+}
+
+
+def _matrix_type_from_name(name: object) -> Type | None:
+    """Resolve 'mat4x4', 'mat3x2', ... to a matrix Type, else None."""
+    if not isinstance(name, str):
+        return None
+    match = re.fullmatch(r"mat(\d)x(\d)", name)
+    if not match:
+        return None
+    columns = int(match.group(1))
+    rows = int(match.group(2))
+    if not (2 <= columns <= 4 and 2 <= rows <= 4):
+        return None
+    return Type(f"mat{columns}x{rows}")
+
+
+@dataclass(frozen=True)
+class StructField:
+    name: str
+    type: Type | type
+    offset: int
+    size: int
+    alignment: int
+    default: object = _MISSING
+
+
+def is_struct(obj: object) -> bool:
+    """Return True if obj is a @struct class or an instance of a @struct class."""
+    if isinstance(obj, type):
+        return getattr(obj, "_is_gfx_struct", False)
+    return getattr(type(obj), "_is_gfx_struct", False)
+
+
+def _resolve_field_type(annotation: Any) -> Type | type:
+    if isinstance(annotation, Type):
+        if annotation in (Type.F32, Type.U32, Type.I32, Type.VEC2, Type.VEC3, Type.VEC4) or annotation.is_matrix:
+            return annotation
+        raise TypeError(f"Unsupported struct field type: {annotation!r}.")
+    if isinstance(annotation, str):
+        type_str_map = {
+            "f32": Type.F32, "u32": Type.U32, "i32": Type.I32,
+            "vec2": Type.VEC2, "f32x2": Type.VEC2,
+            "vec3": Type.VEC3, "f32x3": Type.VEC3,
+            "vec4": Type.VEC4, "f32x4": Type.VEC4,
+        }
+        if annotation in type_str_map:
+            return type_str_map[annotation]
+        matrix_type = _matrix_type_from_name(annotation)
+        if matrix_type is not None:
+            return matrix_type
+        raise TypeError(f"Unsupported struct field type string: {annotation!r}.")
+    if annotation is float:
+        return Type.F32
+    if annotation is int:
+        return Type.I32
+    if isinstance(annotation, type) and is_struct(annotation):
+        return annotation
+
+    # Check function/class by name (e.g. vec2/vec3/vec4 functions, Vec3 classes, and matCxR)
+    name = getattr(annotation, "__name__", "")
+    type_name_map = {
+        "f32": Type.F32, "u32": Type.U32, "i32": Type.I32,
+        "vec2": Type.VEC2, "f32x2": Type.VEC2,
+        "vec3": Type.VEC3, "f32x3": Type.VEC3,
+        "vec4": Type.VEC4, "f32x4": Type.VEC4,
+    }
+    if name.lower() in type_name_map:
+        return type_name_map[name.lower()]
+    matrix_type = _matrix_type_from_name(name.lower())
+    if matrix_type is not None:
+        return matrix_type
+
+    raise TypeError(f"Unsupported struct field type: {annotation!r}.")
+
+
+def _extract_components(val: Any, expected_count: int) -> tuple[float, ...]:
+    if expected_count in (2, 3, 4):
+        chars = "xyzw"[:expected_count]
+        if all(hasattr(val, c) for c in chars):
+            return tuple(float(getattr(val, c)) for c in chars)
+    if isinstance(val, (tuple, list)):
+        return tuple(float(x) for x in val)
+    if hasattr(val, "__iter__") and not isinstance(val, (str, bytes, bytearray)):
+        return tuple(float(x) for x in val)
+    raise ValueError(f"Expected {expected_count} components, got {val!r}.")
+
+
+def _extract_matrix(val: Any, columns: int, rows: int) -> tuple[float, ...]:
+    """Flatten a matrix value to ``columns * rows`` floats in column-major order."""
+    total = columns * rows
+    name = f"mat{columns}x{rows}"
+    if hasattr(val, "to_bytes") and callable(val.to_bytes):
+        raw = val.to_bytes()
+        if len(raw) != total * 4:
+            raise ValueError(f"{name} to_bytes returned {len(raw)} bytes, expected {total * 4}.")
+        return _struct_module.unpack(f"<{total}f", raw)
+    if hasattr(val, "columns") and len(val.columns) == columns:
+        comps = []
+        for col in val.columns:
+            comps.extend(_extract_components(col, rows))
+        if len(comps) == total:
+            return tuple(comps)
+    if hasattr(val, "elements"):
+        flat = tuple(val.elements)
+        if len(flat) == total:
+            return tuple(float(x) for x in flat)
+    if isinstance(val, (tuple, list)):
+        if len(val) == total:
+            return tuple(float(x) for x in val)
+        # A sequence of `columns` column sequences, each with `rows` components.
+        if len(val) == columns and all(isinstance(col, (tuple, list)) and len(col) == rows for col in val):
+            return tuple(float(x) for col in val for x in col)
+    if hasattr(val, "__iter__") and not isinstance(val, (str, bytes, bytearray)):
+        flat = tuple(float(x) for x in val)
+        if len(flat) == total:
+            return flat
+    raise ValueError(f"Expected {total} components for {name}, got {val!r}.")
+
+
+def _pack_matrix(data: bytearray, offset: int, typ: Type, comps: tuple[float, ...], field_name: str) -> None:
+    """Write column-major components into `data`, padding each column to its std430 stride."""
+    columns, rows = typ.matrix_shape
+    stride = typ.matrix_layout[2]
+    for comp in comps:
+        if not math.isfinite(comp):
+            raise ValueError("Floating-point parameters must be finite f32 values.")
+        if abs(comp) > 3.4028234663852886e38:
+            raise ValueError(f"Field {field_name!r} {typ.schema_name} component overflowed f32: {comp}.")
+    for c in range(columns):
+        _struct_module.pack_into(f"<{rows}f", data, offset + c * stride, *comps[c * rows:(c + 1) * rows])
+
+
+def _unpack_matrix(buffer: Any, offset: int, typ: Type) -> tuple[float, ...]:
+    columns, rows = typ.matrix_shape
+    stride = typ.matrix_layout[2]
+    comps: list[float] = []
+    for c in range(columns):
+        comps.extend(_struct_module.unpack_from(f"<{rows}f", buffer, offset + c * stride))
+    return tuple(comps)
+
+
+def _make_struct(cls: type) -> type:
+    raw_annotations = getattr(cls, "__annotations__", {})
+    if not raw_annotations:
+        raise ValueError("Struct must declare at least one field.")
+    if len(raw_annotations) > 32:
+        raise ValueError("Parameter blocks support at most 32 fields.")
+
+    fields: list[StructField] = []
+    cursor = 0
+    names = set()
+    has_default = False
+
+    for name, annotation in raw_annotations.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name) or name in names:
+            raise ValueError("Parameter field names must be valid, public, and unique.")
+        names.add(name)
+
+        typ = _resolve_field_type(annotation)
+        default = getattr(cls, name, _MISSING)
+        if default is not _MISSING:
+            has_default = True
+        elif has_default:
+            raise TypeError(f"Non-default field {name!r} follows default field.")
+
+        if isinstance(typ, type) and is_struct(typ):
+            size = getattr(typ, "__struct_size__")
+            align = getattr(typ, "__struct_alignment__", 16)
+        else:
+            size, align = TYPE_LAYOUT[typ]
+
+        offset = (cursor + align - 1) // align * align
+        fields.append(StructField(name=name, type=typ, offset=offset, size=size, alignment=align, default=default))
+        cursor = offset + size
+
+    struct_size = (cursor + 15) // 16 * 16
+    struct_alignment = 16
+
+    def __init__(self, *args, **kwargs):
+        if len(args) > len(fields):
+            raise TypeError(f"{cls.__name__} takes at most {len(fields)} positional arguments, got {len(args)}.")
+        assigned = {}
+        for index, arg in enumerate(args):
+            assigned[fields[index].name] = arg
+        for k, v in kwargs.items():
+            if k in assigned:
+                raise TypeError(f"Multiple values provided for argument {k!r}.")
+            if not any(f.name == k for f in fields):
+                raise TypeError(f"Unexpected keyword argument {k!r}.")
+            assigned[k] = v
+        for f in fields:
+            if f.name in assigned:
+                val = assigned[f.name]
+            elif f.default is not _MISSING:
+                val = f.default
+            else:
+                raise TypeError(f"Missing required argument {f.name!r}.")
+            setattr(self, f.name, val)
+
+    def to_bytes(self) -> bytes:
+        data = bytearray(struct_size)
+        for f in fields:
+            val = getattr(self, f.name)
+            if isinstance(f.type, type) and is_struct(f.type):
+                if not is_struct(val):
+                    raise ValueError(f"Field {f.name!r} requires struct instance of {f.type.__name__}.")
+                nested_bytes = val.to_bytes()
+                data[f.offset: f.offset + f.size] = nested_bytes
+            elif f.type == Type.F32:
+                if type(val) not in (int, float) or isinstance(val, bool) or not math.isfinite(val):
+                    raise ValueError("Floating-point parameters must be finite f32 values.")
+                if abs(val) > 3.4028234663852886e38:
+                    raise ValueError(f"Field {f.name!r} overflowed f32: {val}.")
+                _struct_module.pack_into("<f", data, f.offset, float(val))
+            elif f.type == Type.U32:
+                if not isinstance(val, int) or isinstance(val, bool) or not 0 <= val <= 0xFFFFFFFF:
+                    raise ValueError(f"Field {f.name!r} requires unsigned 32-bit integer.")
+                _struct_module.pack_into("<I", data, f.offset, val)
+            elif f.type == Type.I32:
+                if not isinstance(val, int) or isinstance(val, bool) or not -2**31 <= val <= 2**31 - 1:
+                    raise ValueError(f"Field {f.name!r} requires signed 32-bit integer.")
+                _struct_module.pack_into("<i", data, f.offset, val)
+            elif f.type in (Type.VEC2, Type.VEC3, Type.VEC4):
+                count = 2 if f.type == Type.VEC2 else (3 if f.type == Type.VEC3 else 4)
+                comps = _extract_components(val, count)
+                if len(comps) != count:
+                    raise ValueError(f"Expected {count} components for {f.type.schema_name}.")
+                for i, comp in enumerate(comps):
+                    if not math.isfinite(comp):
+                        raise ValueError("Floating-point parameters must be finite f32 values.")
+                    if abs(comp) > 3.4028234663852886e38:
+                        raise ValueError(f"Field {f.name!r} component overflowed f32: {comp}.")
+                    _struct_module.pack_into("<f", data, f.offset + i * 4, comp)
+            elif f.type.is_matrix:
+                columns, rows = f.type.matrix_shape
+                comps = _extract_matrix(val, columns, rows)
+                _pack_matrix(data, f.offset, f.type, comps, f.name)
+        return bytes(data)
+
+    @classmethod
+    def from_bytes(cls_ref, buffer: bytes | bytearray | memoryview) -> Any:
+        if len(buffer) < struct_size:
+            raise ValueError(f"Buffer size ({len(buffer)}) is less than struct size ({struct_size}).")
+        kwargs = {}
+        for f in fields:
+            if isinstance(f.type, type) and is_struct(f.type):
+                kwargs[f.name] = f.type.from_bytes(buffer[f.offset: f.offset + f.size])
+            elif f.type == Type.F32:
+                kwargs[f.name] = _struct_module.unpack_from("<f", buffer, f.offset)[0]
+            elif f.type == Type.U32:
+                kwargs[f.name] = _struct_module.unpack_from("<I", buffer, f.offset)[0]
+            elif f.type == Type.I32:
+                kwargs[f.name] = _struct_module.unpack_from("<i", buffer, f.offset)[0]
+            elif f.type == Type.VEC2:
+                kwargs[f.name] = _struct_module.unpack_from("<2f", buffer, f.offset)
+            elif f.type == Type.VEC3:
+                kwargs[f.name] = _struct_module.unpack_from("<3f", buffer, f.offset)
+            elif f.type == Type.VEC4:
+                kwargs[f.name] = _struct_module.unpack_from("<4f", buffer, f.offset)
+            elif f.type.is_matrix:
+                kwargs[f.name] = _unpack_matrix(buffer, f.offset, f.type)
+        return cls_ref(**kwargs)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {f.name: getattr(self, f.name) for f in fields}
+
+    @classmethod
+    def as_parameter_block(cls_ref, name: str | None = None) -> ParameterBlock:
+        block_name = name or cls_ref.__name__.lower()
+        block_fields = tuple((f.name, f.type) for f in fields)
+        return ParameterBlock(block_name, block_fields)
+
+    @classmethod
+    def reflection(cls_ref, stages=("vertex", "fragment"), name: str | None = None,
+                   binding_offset: int = 0) -> dict:
+        block_name = name or cls_ref.__name__.lower()
+        return {
+            "schema_version": 1,
+            "name": block_name,
+            "layout": "gfx-std430-v1",
+            "size": struct_size,
+            "alignment": 16,
+            "stages": list(stages),
+            "ownership": "host",
+            "access": "read-only",
+            "addressable": False,
+            "fields": [
+                {
+                    "name": f.name,
+                    "type": f.type.schema_name,
+                    "offset": f.offset,
+                    "size": f.size,
+                    "alignment": f.alignment,
+                }
+                for f in fields
+            ],
+            "bindings": {
+                "vulkan": {"storage": "push_constant", "offset": binding_offset},
+                "directx": {
+                    "storage": "root_constants",
+                    "parameter_index": 0,
+                    "register": 0,
+                    "space": 0,
+                    "num32bit_constants": struct_size // 4,
+                    "visibility": "all",
+                    "root_signature_version": "1.1",
+                },
+                "metal": {
+                    "storage": "converter_argument_buffer",
+                    "buffer_index": 2,
+                    "offset": binding_offset,
+                    "size": struct_size,
+                },
+            },
+        }
+
+    def __repr__(self) -> str:
+        field_strs = [f"{f.name}={getattr(self, f.name)!r}" for f in fields]
+        return f"{cls.__name__}({', '.join(field_strs)})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, cls):
+            return False
+        return all(getattr(self, f.name) == getattr(other, f.name) for f in fields)
+
+    cls._is_gfx_struct = True
+    cls.__struct_fields__ = tuple(fields)
+    cls.__struct_size__ = struct_size
+    cls.__struct_alignment__ = struct_alignment
+    cls.__init__ = __init__
+    cls.to_bytes = to_bytes
+    cls.from_bytes = from_bytes
+    cls.to_dict = to_dict
+    cls.as_parameter_block = as_parameter_block
+    cls.reflection = reflection
+    cls.__repr__ = __repr__
+    cls.__eq__ = __eq__
+    return cls
+
+
+def struct(cls: type | None = None, **kwargs):
+    """Decorator to declare a shared host/device struct."""
+    def decorator(target: type) -> type:
+        return _make_struct(target)
+    if cls is not None:
+        return decorator(cls)
+    return decorator
+
+
+# =============================================================================
+# Verification & Reflection Validation
+# =============================================================================
+
 def verify_parameters(block: object) -> None:
     if not isinstance(block, dict):
         raise ValueError("Parameter reflection requires a dictionary.")
@@ -513,7 +893,7 @@ def verify_parameters(block: object) -> None:
                 "ownership", "access", "addressable", "bindings"}
         if set(block) != keys:
             raise ValueError("Parameter reflection requires the complete layout and target bindings.")
-        if (block["layout"] != "gfx-root-f32-v1" or block["ownership"] != "host"
+        if (block["layout"] not in ("gfx-root-f32-v1", "gfx-std430-v1") or block["ownership"] != "host"
                 or block["access"] != "read-only" or block["addressable"] is not False):
             raise ValueError("Unsupported parameter schema, layout, ownership, or access.")
         if not isinstance(block["name"], str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", block["name"]):
@@ -525,27 +905,43 @@ def verify_parameters(block: object) -> None:
                 or len(set(stages)) != len(stages)):
             raise ValueError("Parameters require typed fields and unique supported stage visibility.")
         cursor, names = 0, set()
+        is_f32_layout = block["layout"] == "gfx-root-f32-v1"
         for field in fields:
             if not isinstance(field, dict) or set(field) != {"name", "type", "offset", "size", "alignment"}:
                 raise ValueError("Invalid reflected parameter field.")
             name, typ = field["name"], field["type"]
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or name in names:
                 raise ValueError("Invalid or duplicate parameter field name.")
-            components = {"f32": 1, "f32x2": 2, "f32x3": 3, "f32x4": 4}.get(typ) if isinstance(typ, str) else None
-            if components is None:
-                raise ValueError("Unsupported parameter field type.")
-            alignment = 16 if components == 3 else components * 4
+            if is_f32_layout:
+                components = {"f32": 1, "f32x2": 2, "f32x3": 3, "f32x4": 4}.get(typ) if isinstance(typ, str) else None
+                if components is None:
+                    raise ValueError("Unsupported parameter field type.")
+                alignment = 16 if components == 3 else components * 4
+                size = components * 4
+            else:
+                layout_info = {
+                    "f32": (4, 4), "u32": (4, 4), "i32": (4, 4),
+                    "f32x2": (8, 8), "vec2": (8, 8),
+                    "f32x3": (12, 16), "vec3": (12, 16),
+                    "f32x4": (16, 16), "vec4": (16, 16),
+                }.get(typ) if isinstance(typ, str) else None
+                if layout_info is None and _matrix_type_from_name(typ) is not None:
+                    layout_info = _matrix_type_from_name(typ).matrix_layout[:2]
+                if layout_info is None:
+                    raise ValueError("Unsupported parameter field type.")
+                size, alignment = layout_info
             offset = (cursor + alignment - 1) // alignment * alignment
             if any(type(field[key]) is not int for key in ("offset", "size", "alignment")) or (
                 field["offset"], field["size"], field["alignment"]
-            ) != (offset, components * 4, alignment):
+            ) != (offset, size, alignment):
                 raise ValueError(f"Parameter field {name!r} has a mismatched offset, size, or alignment.")
             names.add(name)
-            cursor = offset + components * 4
+            cursor = offset + size
         size = (cursor + 15) // 16 * 16
-        if (size > 128 or type(block["size"]) is not int or block["size"] != size
+        max_size = 128 if is_f32_layout else 256
+        if (size > max_size or type(block["size"]) is not int or block["size"] != size
                 or type(block["alignment"]) is not int or block["alignment"] != 16):
-            raise ValueError("Parameter block has a mismatched size/alignment or exceeds 128 bytes.")
+            raise ValueError(f"Parameter block has a mismatched size/alignment or exceeds {max_size} bytes.")
         bindings = {
             "vulkan": {"storage": "push_constant", "offset": 0},
             "directx": {"storage": "root_constants", "parameter_index": 0, "register": 0, "space": 0,
@@ -592,14 +988,16 @@ def verify_parameters(block: object) -> None:
     raise ValueError("Unsupported parameter schema, layout, ownership, or access.")
 
 
-def pack_parameters(block: dict, values: Mapping[str, object]) -> bytes:
+def pack_parameters(block: dict, values: Mapping[str, object] | Any) -> bytes:
     verify_parameters(block)
+    if is_struct(values):
+        values = values.to_dict()
     if not isinstance(values, Mapping) or set(values) != {field["name"] for field in block["fields"]}:
         raise ValueError("Supply exactly the reflected parameter fields.")
     data = bytearray(block["size"])
 
     def _pack_value(fmt: str, offset: int, val: Any):
-        struct.pack_into(fmt, data, offset, val)
+        _struct_module.pack_into(fmt, data, offset, val)
 
     def _pack_field(f: dict, val: Any, base_offset: int = 0):
         typ = f.get("type")
@@ -617,11 +1015,11 @@ def pack_parameters(block: dict, values: Mapping[str, object]) -> bytes:
                 raise ValueError("f16 requires finite float number.")
             _pack_value("<e", offset, float(val))
         elif typ in ("i32", "si32"):
-            if type(val) is not int or type(val) is bool:
+            if type(val) is not int or type(val) is bool or not -2**31 <= val <= 2**31 - 1:
                 raise ValueError("i32 requires int.")
             _pack_value("<i", offset, int(val))
         elif typ in ("u32", "ui32"):
-            if type(val) is not int or type(val) is bool:
+            if type(val) is not int or type(val) is bool or not 0 <= val <= 0xFFFFFFFF:
                 raise ValueError("u32 requires int.")
             _pack_value("<I", offset, int(val))
         elif typ in ("i16", "si16"):
@@ -642,24 +1040,41 @@ def pack_parameters(block: dict, values: Mapping[str, object]) -> bytes:
             _pack_value("<B", offset, int(val))
         elif typ in ("bool", "i1"):
             _pack_value("<?", offset, bool(val))
-        elif typ in ("f32x2", "f32x3", "f32x4"):
-            count = int(typ[-1])
-            if not isinstance(val, (tuple, list)) or len(val) != count:
+        elif typ in ("f32x2", "vec2", "f32x3", "vec3", "f32x4", "vec4"):
+            count = 2 if typ in ("f32x2", "vec2") else (3 if typ in ("f32x3", "vec3") else 4)
+            components = (val,) if isinstance(val, (int, float)) and not isinstance(val, bool) else val
+            if not isinstance(components, (tuple, list)) or len(components) != count:
+                try:
+                    components = _extract_components(val, count)
+                except Exception:
+                    raise ValueError(f"{typ} requires sequence of {count} numbers.")
+            if len(components) != count:
                 raise ValueError(f"{typ} requires sequence of {count} numbers.")
-            for c in val:
-                if type(c) not in (int, float) or type(c) is bool or not math.isfinite(c):
+            for c in components:
+                if type(c) not in (int, float) or type(c) is bool or abs(c) > 3.4028234663852886e38 or not math.isfinite(c):
                     raise ValueError(f"{typ} requires finite numbers.")
-            struct.pack_into(f"<{count}f", data, offset, *val)
+            _struct_module.pack_into(f"<{count}f", data, offset, *components)
         elif typ in ("i32x2", "i32x3", "i32x4"):
             count = int(typ[-1])
             if not isinstance(val, (tuple, list)) or len(val) != count:
                 raise ValueError(f"{typ} requires sequence of {count} integers.")
-            struct.pack_into(f"<{count}i", data, offset, *val)
+            _struct_module.pack_into(f"<{count}i", data, offset, *val)
         elif typ in ("u32x2", "u32x3", "u32x4"):
             count = int(typ[-1])
             if not isinstance(val, (tuple, list)) or len(val) != count:
                 raise ValueError(f"{typ} requires sequence of {count} integers.")
-            struct.pack_into(f"<{count}I", data, offset, *val)
+            _struct_module.pack_into(f"<{count}I", data, offset, *val)
+        elif _matrix_type_from_name(typ) is not None:
+            matrix_type = _matrix_type_from_name(typ)
+            columns, rows = matrix_type.matrix_shape
+            try:
+                comps = _extract_matrix(val, columns, rows)
+            except ValueError:
+                raise ValueError(f"Parameter {f['name']!r} requires {columns * rows} components for {typ}.")
+            for comp in comps:
+                if not math.isfinite(comp) or abs(comp) > 3.4028234663852886e38:
+                    raise ValueError(f"Parameter {f['name']!r} requires finite f32 numbers.")
+            _pack_matrix(data, offset, matrix_type, comps, f["name"])
         elif typ == "array":
             count = f.get("count", len(val) if isinstance(val, (tuple, list)) else 0)
             if not isinstance(val, (tuple, list)) or len(val) != count:
@@ -685,6 +1100,10 @@ def pack_parameters(block: dict, values: Mapping[str, object]) -> bytes:
             elif isinstance(val, (tuple, list)):
                 for idx, sub in enumerate(f.get("fields", [])):
                     _pack_field(sub, val[idx], offset)
+            elif is_struct(val):
+                nested_dict = val.to_dict()
+                for sub in f.get("fields", []):
+                    _pack_field(sub, nested_dict[sub["name"]], offset)
             else:
                 raise ValueError("struct requires mapping or sequence.")
         else:
