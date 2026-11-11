@@ -61,14 +61,17 @@ from examples.minigfx.scene import (
     create_sphere,
 )
 
-# Ensure compiler toolchain directories are accessible in PATH
+# Ensure local repository compiler toolchain directories are accessible in PATH
 for _extra_bin in [
-    Path("/Users/farzon/Projects/gfxir/build/compiler/bin"),
-    Path("/Users/farzon/Projects/gfxir/.tools/bin"),
-    Path("/Users/farzon/Projects/gfxir/.toolchains/llvm-build/bin"),
+    _repo_root / "build" / "compiler" / "bin",
+    _repo_root / ".tools" / "bin",
+    _repo_root / ".toolchains" / "llvm-build" / "bin",
+    _repo_root / ".sdk" / "bin",
 ]:
-    if _extra_bin.is_dir() and str(_extra_bin) not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = f"{_extra_bin}:{os.environ.get('PATH', '')}"
+    if _extra_bin.is_dir() and str(_extra_bin) not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = (
+            f"{_extra_bin}{os.pathsep}{os.environ['PATH']}" if os.environ.get("PATH") else str(_extra_bin)
+        )
 
 try:
     from mlir_gpu.compiler import Target, Toolchain, compile_pipeline
@@ -444,6 +447,7 @@ class ModelViewerApp(App):
         self.debug_overlay = DebugOverlay(backend_name=self.target)
         self.compiled_manifest: Optional[Any] = None
         self.last_rendered_image: Optional[Any] = None
+        self._window: Optional[Any] = None
 
     @classmethod
     def build_parser(cls) -> argparse.ArgumentParser:
@@ -548,10 +552,21 @@ class ModelViewerApp(App):
         """Lifecycle hook invoked once before entering the frame loop."""
         super().startup()
         self.compile_embedded_pipeline()
+        if not self.offscreen and not self.output_path and (self.frames is None or self.frames > 0):
+            from examples.minigfx.window import InteractiveWindow
+
+            self._window = InteractiveWindow(
+                target=self.target,
+                width=self.width,
+                height=self.height,
+            )
+            self._window.bind_app(self)
 
     def update(self, dt: float) -> None:
         """Advance simulation time, orbit light vector, and update camera controller."""
         super().update(dt)
+        if self._window is not None and not self._window.poll_and_sync(self):
+            return
 
         if self.animate_light:
             self.light_angle = (self.light_angle + float(dt) * 0.8) % (2.0 * math.pi)
@@ -753,19 +768,53 @@ class ModelViewerApp(App):
             self.last_rendered_image = img
             if self.output_path:
                 self.save_png(self.output_path, img)
+        elif self._window is not None and self.is_running:
+            self._window.present_frame(self, commands)
 
         return commands
 
     def cleanup(self) -> None:
         """Release allocated renderer and engine resources."""
-        if self.output_path and self.last_rendered_image is not None:
-            self.save_png(self.output_path, self.last_rendered_image)
-        super().cleanup()
+        try:
+            if self._window is not None:
+                self._window.close()
+                self._window = None
+            if self.output_path and self.last_rendered_image is not None:
+                self.save_png(self.output_path, self.last_rendered_image)
+        finally:
+            super().cleanup()
 
 
 def main(args: Optional[Sequence[str]] = None) -> int:
     """Entry point for executing ModelViewerApp from CLI."""
     parsed = ModelViewerApp.parse_args(args)
+    if (
+        args is None
+        and sys.platform == "darwin"
+        and not parsed.offscreen
+        and not getattr(parsed, "output", None)
+        and parsed.target == "vulkan"
+        and os.environ.get("_MINIGFX_VULKAN_REEXEC") != "1"
+    ):
+        vk_lib_dirs: List[Path] = [_repo_root / ".sdk" / "lib"]
+        vk_sdk = os.environ.get("VULKAN_SDK")
+        if vk_sdk:
+            vk_lib_dirs.append(Path(vk_sdk) / "lib")
+        vk_lib_dirs.extend([Path("/usr/local/lib"), Path("/opt/homebrew/lib")])
+        for lib_dir in vk_lib_dirs:
+            if (lib_dir / "libvulkan.dylib").is_file():
+                dyld = os.environ.get("DYLD_LIBRARY_PATH", "")
+                lib_str = str(lib_dir)
+                if lib_str not in dyld.split(":"):
+                    env = os.environ.copy()
+                    env["DYLD_LIBRARY_PATH"] = f"{lib_str}:{dyld}" if dyld else lib_str
+                    env["_MINIGFX_VULKAN_REEXEC"] = "1"
+                    os.execve(
+                        sys.executable,
+                        [sys.executable, "-m", "examples.minigfx.samples.model_viewer", *sys.argv[1:]],
+                        env,
+                    )
+                break
     app = ModelViewerApp(parsed)
     return app.run()
 

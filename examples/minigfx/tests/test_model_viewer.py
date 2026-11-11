@@ -311,6 +311,42 @@ f 2 4 3
         self.assertEqual(SampleMat4x4, mgfx_math.Mat4x4)
         self.assertFalse(hasattr(mgfx_math, "Mat4"), "Legacy Mat4 alias must remain removed")
 
+    def test_window_mesh_and_hud_vertex_packing(self) -> None:
+        """Verifies triangle storage buffer packing for scene meshes and HUD glyph quads."""
+        from examples.minigfx.window import build_hud_overlay_vertices, pack_mesh_triangles
+
+        args = ModelViewerApp.parse_args(["--offscreen", "--frames", "0"])
+        app = ModelViewerApp(args)
+
+        mesh_bytes, mesh_vert_count = pack_mesh_triangles(app.model_node.mesh)
+        self.assertGreater(mesh_vert_count, 0)
+        self.assertEqual(mesh_vert_count % 3, 0)
+        self.assertEqual(len(mesh_bytes), mesh_vert_count * 32)
+
+        hud_bytes, hud_vert_count = build_hud_overlay_vertices(
+            [("FPS: 60.0 | Backend: metal", (1.0, 1.0, 1.0, 1.0))],
+            1280,
+            720,
+        )
+        self.assertGreater(hud_vert_count, 0)
+        self.assertEqual(hud_vert_count % 6, 0)
+        self.assertEqual(len(hud_bytes), hud_vert_count * 32)
+
+    def test_window_embedded_shader_compilation(self) -> None:
+        """Verifies embedded window shaders compile to SPIR-V when GfxIR toolchain is available."""
+        import shutil
+        from examples.minigfx.window import _ensure_toolchain_paths, compile_minigfx_shaders
+
+        _ensure_toolchain_paths()
+        if shutil.which("gfx-compile") is None or shutil.which("spirv-val") is None:
+            self.skipTest("gfx-compile or spirv-val not available in PATH")
+
+        shaders = compile_minigfx_shaders("vulkan")
+        for stage_key in ("mesh_vs", "pbr_fs", "normal_fs", "overlay_vs", "overlay_fs"):
+            self.assertIn(stage_key, shaders)
+            self.assertTrue(shaders[stage_key].is_file())
+            self.assertGreater(shaders[stage_key].stat().st_size, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
