@@ -68,6 +68,9 @@ if (
     config.available_features.add("metal_execution")
 if {"vulkan_execution", "metal_execution"} & config.available_features:
     config.available_features.add("image_execution")
+if "vulkan_execution" in config.available_features:
+    config.available_features.add("compute_execution")
+    config.environment["GFXIR_LIT_COMPUTE_TARGETS"] = "vulkan"
 execution_targets = [
     target for target, feature in (
         ("vulkan", "vulkan_execution"),

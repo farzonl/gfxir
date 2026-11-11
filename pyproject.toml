@@ -16,6 +16,7 @@ test = ["lit>=18", "Pillow>=10", "PyYAML>=6"]
 [project.scripts]
 mlir-gpu = "mlir_gpu.__main__:main"
 mlir-gpu-view = "mlir_gpu.viewer:main"
+mlir-gpu-imgdiff = "mlir_gpu.imgdiff:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

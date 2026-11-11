@@ -13,12 +13,14 @@ import sys
 import tempfile
 import time as clock
 import zlib
+from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
 from .compiler import (
+    COMPUTE_SCHEMA_VERSION,
     CompileError,
     PIPELINE_SCHEMA_VERSION,
     RASTER_CONVENTION,
@@ -28,7 +30,7 @@ from .compiler import (
     _run,
     convert_dxil_to_metallib,
 )
-from .frontend import Draw
+from .frontend import Dispatch, Draw
 from .interfaces import reflect_pipeline_parameters, verify_graphics_interface
 from .parameters import FrameParameters, pack_parameters, verify_parameters
 
@@ -50,6 +52,22 @@ class GraphicsProgram:
     target: str = "vulkan"
     draw: Draw = Draw()
     parameters: dict | None = None
+
+
+@dataclass(frozen=True)
+class ComputeProgram:
+    compute: Shader
+    target: str = "vulkan"
+    workgroup_size: tuple[int, int, int] = (1, 1, 1)
+    buffers: tuple[dict, ...] = ()
+    dispatch: Dispatch = Dispatch()
+    parameters: dict | None = None
+
+
+@dataclass(frozen=True)
+class ComputeDispatchResult:
+    buffers: dict[str, bytes]
+    device: str
 
 
 @dataclass(frozen=True)
@@ -141,6 +159,128 @@ def load_program(manifest: Path) -> GraphicsProgram:
             raise ViewerError(f"SPIR-V binary is not word-aligned: {filename}.")
         shaders[stage] = Shader(name, code)
     return GraphicsProgram(shaders["vertex"], shaders["fragment"], data["target"], draw, parameters)
+
+
+def load_compute_program(manifest: Path) -> ComputeProgram:
+    manifest = Path(manifest).resolve()
+    data = json.loads(manifest.read_text())
+    if (
+        not isinstance(data, dict)
+        or type(data.get("schema_version")) is not int
+        or data.get("schema_version") != COMPUTE_SCHEMA_VERSION
+        or data.get("target") not in ("vulkan", "directx", "metal")
+        or data.get("stage") != "compute"
+    ):
+        raise ViewerError(
+            f"Compute execution requires a schema-version {COMPUTE_SCHEMA_VERSION} "
+            "Vulkan, DirectX, or Metal compute pipeline manifest."
+        )
+
+    wg = data.get("workgroup_size")
+    if (
+        not isinstance(wg, list)
+        or len(wg) != 3
+        or any(type(dim) is not int or dim < 1 for dim in wg)
+    ):
+        raise ViewerError("Compute manifest must declare a valid 3D positive workgroup_size.")
+    workgroup_size = (wg[0], wg[1], wg[2])
+
+    dispatch_data = data.get("dispatch")
+    if not isinstance(dispatch_data, dict) or set(dispatch_data) != {"grid"}:
+        raise ViewerError("Compute manifest must declare a dispatch grid.")
+    grid_data = dispatch_data.get("grid")
+    if (
+        not isinstance(grid_data, list)
+        or len(grid_data) != 3
+        or any(type(dim) is not int or dim < 1 for dim in grid_data)
+    ):
+        raise ViewerError("Compute dispatch grid dimensions must be 3 positive integers.")
+    dispatch = Dispatch(grid=(grid_data[0], grid_data[1], grid_data[2]))
+
+    interface = data.get("interface")
+    if not isinstance(interface, dict) or not isinstance(interface.get("compute"), dict):
+        raise ViewerError("Compute manifest must include compute stage reflection.")
+    compute_refl = interface["compute"]
+
+    raw_buffers = data.get("buffers")
+    if not isinstance(raw_buffers, list):
+        raise ViewerError("Compute manifest buffers field must be a list.")
+    seen_names: set[str] = set()
+    seen_slots: set[tuple[int, int]] = set()
+    validated_buffers: list[dict] = []
+    for buf in raw_buffers:
+        if not isinstance(buf, dict):
+            raise ViewerError("Invalid buffer binding entry in compute manifest.")
+        name = buf.get("name")
+        set_idx = buf.get("set")
+        binding_idx = buf.get("binding")
+        access = buf.get("access")
+        elem_type = buf.get("element_type")
+        if not isinstance(name, str) or not name or name in seen_names:
+            raise ViewerError(f"Invalid or duplicate buffer name in compute manifest: {name!r}.")
+        if type(set_idx) is not int or set_idx < 0 or type(binding_idx) is not int or binding_idx < 0:
+            raise ViewerError(f"Buffer {name!r} has invalid set/binding indices.")
+        if (set_idx, binding_idx) in seen_slots:
+            raise ViewerError(f"Duplicate buffer slot ({set_idx}, {binding_idx}) in compute manifest.")
+        if access not in ("read_only", "write_only", "read_write"):
+            raise ViewerError(f"Buffer {name!r} has unsupported access mode {access!r}.")
+        if not isinstance(elem_type, str) or not elem_type:
+            raise ViewerError(f"Buffer {name!r} is missing element_type.")
+        seen_names.add(name)
+        seen_slots.add((set_idx, binding_idx))
+        validated_buffers.append({
+            "name": name,
+            "set": set_idx,
+            "binding": binding_idx,
+            "access": access,
+            "element_type": elem_type,
+        })
+    validated_buffers.sort(key=lambda item: (item["set"], item["binding"]))
+
+    parameters = None
+    if "parameters" in data or "parameters" in compute_refl:
+        parameters = data.get("parameters")
+        try:
+            verify_parameters(parameters)
+            if compute_refl.get("parameters") != parameters:
+                raise ValueError("Manifest parameters must match compute stage reflection.")
+        except ValueError as error:
+            raise ViewerError(f"Invalid compute parameter resource manifest: {error}") from error
+
+    entries = data.get("entries")
+    if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
+        raise ViewerError("Compute manifest must contain exactly one compute entry.")
+    entry = entries[0]
+    stage, entry_name, filename = entry.get("stage"), entry.get("entry_point"), entry.get("binary")
+    if stage != "compute":
+        raise ViewerError("Compute manifest entry must have stage 'compute'.")
+    if not isinstance(entry_name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", entry_name):
+        raise ViewerError("Invalid compute shader entry-point name.")
+    if compute_refl.get("name") != entry_name:
+        raise ViewerError("Compute entry-point name must match compiler reflection.")
+    if not isinstance(filename, str) or not filename:
+        raise ViewerError("A compute shader binary path is required.")
+    binary = (manifest.parent / filename).resolve()
+    if Path(filename).is_absolute() or not binary.is_relative_to(manifest.parent):
+        raise ViewerError("Shader binaries must be inside the pipeline directory.")
+    magic, minimum = {
+        "vulkan": (b"\x03\x02\x23\x07", 20),
+        "directx": (b"DXBC", 32),
+        "metal": (b"MTLB", 16),
+    }[data["target"]]
+    _check_binary(binary, magic, minimum)
+    code = binary.read_bytes()
+    if data["target"] == "vulkan" and len(code) % 4:
+        raise ViewerError(f"SPIR-V binary is not word-aligned: {filename}.")
+
+    return ComputeProgram(
+        compute=Shader(entry_name, code),
+        target=data["target"],
+        workgroup_size=workgroup_size,
+        buffers=tuple(validated_buffers),
+        dispatch=dispatch,
+        parameters=parameters,
+    )
 
 
 def _frame_parameters(parameters: dict | None) -> None:
@@ -452,7 +592,15 @@ def _api_errors():
 
 
 class _Vulkan:
-    def __init__(self, resources: ExitStack, window=None, glfw=None, validation: bool = False, provider: str | None = None):
+    def __init__(
+        self,
+        resources: ExitStack,
+        window=None,
+        glfw=None,
+        validation: bool = False,
+        provider: str | None = None,
+        compute_only: bool = False,
+    ):
         if provider is None and os.environ.get("MLIR_GPU_TEST_SWIFTSHADER") == "1":
             provider = "swiftshader"
         _validate_provider(provider, "vulkan")
@@ -521,11 +669,12 @@ class _Vulkan:
             self.surface = surface[0]
             resources.callback(self.instance_function("vkDestroySurfaceKHR"), self.instance, self.surface, None)
 
+        required_queue = vk.VK_QUEUE_COMPUTE_BIT if compute_only else vk.VK_QUEUE_GRAPHICS_BIT
         candidates = []
         for physical in vk.vkEnumeratePhysicalDevices(self.instance):
             properties = vk.vkGetPhysicalDeviceProperties(physical)
             for index, queue in enumerate(vk.vkGetPhysicalDeviceQueueFamilyProperties(physical)):
-                if not queue.queueCount or not queue.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT:
+                if not queue.queueCount or not queue.queueFlags & required_queue:
                     continue
                 device_extensions = {item.extensionName for item in vk.vkEnumerateDeviceExtensionProperties(physical, None)}
                 if self.surface is not None:
@@ -544,7 +693,8 @@ class _Vulkan:
                     f"Requested provider '{provider}' was not found among available Vulkan physical devices. "
                     "Accidental hardware/driver fallback rejected."
                 )
-            raise ViewerError("No Vulkan device has a suitable graphics/presentation queue.")
+            queue_kind = "compute" if compute_only else "graphics/presentation"
+            raise ViewerError(f"No Vulkan device has a suitable {queue_kind} queue.")
 
         if provider is not None:
             matching = [c for c in candidates if _match_vulkan_device(c[4], provider)]
@@ -563,9 +713,14 @@ class _Vulkan:
         self.max_width = properties.limits.maxFramebufferWidth
         self.max_height = properties.limits.maxFramebufferHeight
         self.max_push_constants = properties.limits.maxPushConstantsSize
+        self.max_compute_workgroup_count = tuple(int(v) for v in properties.limits.maxComputeWorkGroupCount)
+        self.max_compute_workgroup_size = tuple(int(v) for v in properties.limits.maxComputeWorkGroupSize)
+        self.max_compute_workgroup_invocations = int(properties.limits.maxComputeWorkGroupInvocations)
         enabled = ["VK_KHR_swapchain"] if self.surface is not None else []
         if "VK_KHR_portability_subset" in device_extensions:
             enabled.append("VK_KHR_portability_subset")
+        if "VK_KHR_storage_buffer_storage_class" in device_extensions:
+            enabled.append("VK_KHR_storage_buffer_storage_class")
         queue_info = vk.VkDeviceQueueCreateInfo(queueFamilyIndex=self.family, pQueuePriorities=[1.0])
         self.device = vk.vkCreateDevice(self.physical, vk.VkDeviceCreateInfo(
             pQueueCreateInfos=[queue_info],
@@ -659,6 +814,110 @@ class _Vulkan:
         vk.vkBindBufferMemory(self.device, buffer, memory, 0)
         return buffer, memory
 
+    def storage_buffer(self, resources, size: int, initial_data: bytes | None = None):
+        vk = self.vk
+        alloc_size = max(4, (size + 3) & ~3)
+        buffer = vk.vkCreateBuffer(self.device, vk.VkBufferCreateInfo(
+            size=alloc_size,
+            usage=vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+        ), None)
+        memory = None
+
+        def destroy():
+            vk.vkDestroyBuffer(self.device, buffer, None)
+            if memory is not None:
+                vk.vkFreeMemory(self.device, memory, None)
+
+        resources.callback(destroy)
+        requirements = vk.vkGetBufferMemoryRequirements(self.device, buffer)
+        memory = vk.vkAllocateMemory(self.device, vk.VkMemoryAllocateInfo(
+            allocationSize=requirements.size,
+            memoryTypeIndex=self.memory_type(
+                requirements.memoryTypeBits,
+                vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            ),
+        ), None)
+        vk.vkBindBufferMemory(self.device, buffer, memory, 0)
+        mapped = vk.vkMapMemory(self.device, memory, 0, alloc_size, 0)
+        try:
+            if initial_data:
+                data_len = len(initial_data)
+                mapped[0:data_len] = initial_data
+                if data_len < alloc_size:
+                    mapped[data_len:alloc_size] = b"\x00" * (alloc_size - data_len)
+            else:
+                mapped[0:alloc_size] = b"\x00" * alloc_size
+        finally:
+            vk.vkUnmapMemory(self.device, memory)
+        return buffer, memory, alloc_size
+
+    def compute_pipeline(self, resources, program: ComputeProgram):
+        vk = self.vk
+        wgx, wgy, wgz = program.workgroup_size
+        if (
+            wgx > self.max_compute_workgroup_size[0]
+            or wgy > self.max_compute_workgroup_size[1]
+            or wgz > self.max_compute_workgroup_size[2]
+            or wgx * wgy * wgz > self.max_compute_workgroup_invocations
+        ):
+            raise ViewerError("The compute kernel's workgroup_size exceeds the Vulkan device limits.")
+
+        set_layouts = []
+        if program.buffers:
+            max_set = max(buf["set"] for buf in program.buffers)
+            for set_idx in range(max_set + 1):
+                bindings = [
+                    vk.VkDescriptorSetLayoutBinding(
+                        binding=buf["binding"],
+                        descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                        descriptorCount=1,
+                        stageFlags=vk.VK_SHADER_STAGE_COMPUTE_BIT,
+                    )
+                    for buf in program.buffers
+                    if buf["set"] == set_idx
+                ]
+                set_layout = vk.vkCreateDescriptorSetLayout(
+                    self.device,
+                    vk.VkDescriptorSetLayoutCreateInfo(pBindings=bindings),
+                    None,
+                )
+                resources.callback(vk.vkDestroyDescriptorSetLayout, self.device, set_layout, None)
+                set_layouts.append(set_layout)
+
+        ranges = []
+        if program.parameters is not None:
+            if program.parameters["size"] > self.max_push_constants:
+                raise ViewerError("The reflected compute parameter block exceeds the device's push-constant limit.")
+            ranges.append(vk.VkPushConstantRange(
+                stageFlags=self.parameter_stages(program.parameters),
+                offset=program.parameters["bindings"]["vulkan"]["offset"],
+                size=program.parameters["size"],
+            ))
+
+        layout = vk.vkCreatePipelineLayout(
+            self.device,
+            vk.VkPipelineLayoutCreateInfo(pSetLayouts=set_layouts, pPushConstantRanges=ranges),
+            None,
+        )
+        resources.callback(vk.vkDestroyPipelineLayout, self.device, layout, None)
+
+        module = vk.vkCreateShaderModule(
+            self.device,
+            vk.VkShaderModuleCreateInfo(codeSize=len(program.compute.code), pCode=program.compute.code),
+            None,
+        )
+        resources.callback(vk.vkDestroyShaderModule, self.device, module, None)
+        stage_info = vk.VkPipelineShaderStageCreateInfo(
+            stage=vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            module=module,
+            pName=program.compute.entry_point,
+        )
+        create_info = vk.VkComputePipelineCreateInfo(stage=stage_info, layout=layout)
+        pipeline = vk.vkCreateComputePipelines(self.device, vk.VK_NULL_HANDLE, 1, [create_info], None)[0]
+        resources.callback(vk.vkDestroyPipeline, self.device, pipeline, None)
+        return pipeline, layout, set_layouts
+
     def pipeline(self, resources, program, format, width, height, present):
         vk = self.vk
         _frame_parameters(program.parameters)
@@ -735,8 +994,11 @@ class _Vulkan:
     def parameter_stages(self, parameters):
         flags = 0
         for stage in parameters["stages"]:
-            flags |= {"vertex": self.vk.VK_SHADER_STAGE_VERTEX_BIT,
-                      "fragment": self.vk.VK_SHADER_STAGE_FRAGMENT_BIT}[stage]
+            flags |= {
+                "vertex": self.vk.VK_SHADER_STAGE_VERTEX_BIT,
+                "fragment": self.vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                "compute": self.vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            }[stage]
         return flags
 
     def framebuffer(self, resources, render_pass, view, width, height):
@@ -870,6 +1132,311 @@ def _vulkan_offscreen_renderer(
         raise ViewerError("Vulkan rendering requires Vulkan artifacts; use the Metal preview for DXIL.")
     with _offscreen_renderer(program, width, height, validation, provider=provider) as render:
         yield render
+
+
+def _prepare_compute_inputs(
+    program: ComputeProgram,
+    buffers: Mapping[str, bytes | bytearray | memoryview | int] | None,
+    parameters: Mapping[str, object] | bytes | bytearray | memoryview | None,
+    grid: tuple[int, int, int] | None,
+) -> tuple[tuple[int, int, int], bytes | None, list[tuple[dict, int, bytes | None]]]:
+    active_grid = program.dispatch.grid if grid is None else tuple(grid)
+    if (
+        len(active_grid) != 3
+        or any(type(dim) is not int or dim < 1 for dim in active_grid)
+    ):
+        raise ViewerError("Compute dispatch grid must contain 3 positive integers.")
+
+    packed_params: bytes | None = None
+    if program.parameters is None:
+        if parameters is not None:
+            raise ViewerError("The compute pipeline declares no parameter block, so parameters must be None.")
+    else:
+        if parameters is None:
+            raise ViewerError(f"Compute parameter block {program.parameters['name']!r} requires host values.")
+        if isinstance(parameters, (bytes, bytearray, memoryview)):
+            packed_params = bytes(parameters)
+            if len(packed_params) != program.parameters["size"]:
+                raise ViewerError(
+                    f"Packed parameter bytes length ({len(packed_params)}) does not match "
+                    f"reflected size ({program.parameters['size']})."
+                )
+        elif isinstance(parameters, Mapping):
+            try:
+                packed_params = pack_parameters(program.parameters, dict(parameters))
+            except (TypeError, ValueError) as error:
+                raise ViewerError(f"Invalid compute parameter values: {error}") from error
+        else:
+            raise ViewerError("Compute parameters must be a field mapping or packed byte buffer.")
+
+    provided = dict(buffers or {})
+    reflected_names = {buf["name"] for buf in program.buffers}
+    extra = sorted(set(provided) - reflected_names)
+    if extra:
+        raise ViewerError(f"Unknown compute buffer name(s): {', '.join(extra)}.")
+    missing = sorted(reflected_names - set(provided))
+    if missing:
+        raise ViewerError(f"Missing required compute buffer binding(s): {', '.join(missing)}.")
+
+    prepared: list[tuple[dict, int, bytes | None]] = []
+    for buf in program.buffers:
+        name = buf["name"]
+        access = buf["access"]
+        spec = provided[name]
+        if type(spec) is int:
+            if spec <= 0:
+                raise ViewerError(f"Compute buffer {name!r} byte size must be positive.")
+            prepared.append((buf, spec, None))
+        elif isinstance(spec, (bytes, bytearray, memoryview)):
+            raw = bytes(spec)
+            if len(raw) == 0:
+                raise ViewerError(f"Compute buffer {name!r} byte buffer must be non-empty.")
+            initial = None if access == "write_only" else raw
+            prepared.append((buf, len(raw), initial))
+        else:
+            raise ViewerError(
+                f"Compute buffer {name!r} must be a byte buffer (bytes/bytearray/memoryview) or positive int byte size."
+            )
+
+    return (active_grid[0], active_grid[1], active_grid[2]), packed_params, prepared
+
+
+@contextmanager
+def _vulkan_compute_session(
+    program: ComputeProgram,
+    validation: bool = False,
+    provider: str | None = None,
+):
+    _validate_provider(provider, "vulkan")
+    if program.target != "vulkan":
+        raise ViewerError("Vulkan compute execution requires Vulkan SPIR-V artifacts.")
+    vulkan_kwargs = {"provider": provider} if provider is not None else {}
+    with _api_errors(), ExitStack() as resources:
+        gpu = _Vulkan(resources, validation=validation, compute_only=True, **vulkan_kwargs)
+        vk = gpu.vk
+        resources.callback(vk.vkDeviceWaitIdle, gpu.device)
+        pipeline, layout, set_layouts = gpu.compute_pipeline(resources, program)
+        fence = vk.vkCreateFence(gpu.device, vk.VkFenceCreateInfo(), None)
+        resources.callback(vk.vkDestroyFence, gpu.device, fence, None)
+
+        def run(
+            *,
+            buffers: Mapping[str, bytes | bytearray | memoryview | int] | None = None,
+            parameters: Mapping[str, object] | bytes | bytearray | memoryview | None = None,
+            grid: tuple[int, int, int] | None = None,
+        ) -> ComputeDispatchResult:
+            active_grid, packed_params, prepared = _prepare_compute_inputs(program, buffers, parameters, grid)
+            gx, gy, gz = active_grid
+            if (
+                gx > gpu.max_compute_workgroup_count[0]
+                or gy > gpu.max_compute_workgroup_count[1]
+                or gz > gpu.max_compute_workgroup_count[2]
+            ):
+                raise ViewerError("Compute dispatch grid exceeds the Vulkan device maxComputeWorkGroupCount limits.")
+
+            with ExitStack() as step_resources:
+                step_resources.callback(vk.vkDeviceWaitIdle, gpu.device)
+                allocated: list[tuple[dict, int, object, object, int]] = []
+                for buf_meta, byte_size, initial_data in prepared:
+                    vk_buf, vk_mem, alloc_size = gpu.storage_buffer(step_resources, byte_size, initial_data)
+                    allocated.append((buf_meta, byte_size, vk_buf, vk_mem, alloc_size))
+
+                descriptor_sets = []
+                if set_layouts:
+                    pool_sizes = [
+                        vk.VkDescriptorPoolSize(
+                            type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            descriptorCount=len(allocated),
+                        )
+                    ]
+                    desc_pool = vk.vkCreateDescriptorPool(
+                        gpu.device,
+                        vk.VkDescriptorPoolCreateInfo(
+                            maxSets=len(set_layouts),
+                            pPoolSizes=pool_sizes,
+                        ),
+                        None,
+                    )
+                    step_resources.callback(vk.vkDestroyDescriptorPool, gpu.device, desc_pool, None)
+                    alloc_info = vk.VkDescriptorSetAllocateInfo(
+                        descriptorPool=desc_pool,
+                        descriptorSetCount=len(set_layouts),
+                        pSetLayouts=set_layouts,
+                    )
+                    descriptor_sets = list(vk.vkAllocateDescriptorSets(gpu.device, alloc_info))
+
+                    buf_infos = []
+                    writes = []
+                    for buf_meta, _, vk_buf, _, alloc_size in allocated:
+                        info = vk.VkDescriptorBufferInfo(buffer=vk_buf, offset=0, range=alloc_size)
+                        buf_infos.append(info)
+                        writes.append(vk.VkWriteDescriptorSet(
+                            dstSet=descriptor_sets[buf_meta["set"]],
+                            dstBinding=buf_meta["binding"],
+                            dstArrayElement=0,
+                            descriptorCount=1,
+                            descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            pBufferInfo=[info],
+                        ))
+                    vk.vkUpdateDescriptorSets(gpu.device, len(writes), writes, 0, None)
+
+                command = vk.vkAllocateCommandBuffers(gpu.device, vk.VkCommandBufferAllocateInfo(
+                    commandPool=gpu.pool,
+                    level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                    commandBufferCount=1,
+                ))[0]
+                step_resources.callback(vk.vkFreeCommandBuffers, gpu.device, gpu.pool, 1, [command])
+
+                vk.vkBeginCommandBuffer(command, vk.VkCommandBufferBeginInfo())
+                if allocated:
+                    host_barrier = vk.VkMemoryBarrier(
+                        srcAccessMask=vk.VK_ACCESS_HOST_WRITE_BIT,
+                        dstAccessMask=vk.VK_ACCESS_SHADER_READ_BIT | vk.VK_ACCESS_SHADER_WRITE_BIT,
+                    )
+                    vk.vkCmdPipelineBarrier(
+                        command,
+                        vk.VK_PIPELINE_STAGE_HOST_BIT,
+                        vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0,
+                        1,
+                        [host_barrier],
+                        0,
+                        None,
+                        0,
+                        None,
+                    )
+                vk.vkCmdBindPipeline(command, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
+                if descriptor_sets:
+                    vk.vkCmdBindDescriptorSets(
+                        command,
+                        vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+                        layout,
+                        0,
+                        len(descriptor_sets),
+                        descriptor_sets,
+                        0,
+                        None,
+                    )
+                if packed_params is not None and program.parameters is not None:
+                    vk.vkCmdPushConstants(
+                        command,
+                        layout,
+                        gpu.parameter_stages(program.parameters),
+                        program.parameters["bindings"]["vulkan"]["offset"],
+                        len(packed_params),
+                        vk.ffi.from_buffer(packed_params),
+                    )
+                vk.vkCmdDispatch(command, gx, gy, gz)
+                if allocated:
+                    readback_barrier = vk.VkMemoryBarrier(
+                        srcAccessMask=vk.VK_ACCESS_SHADER_WRITE_BIT,
+                        dstAccessMask=vk.VK_ACCESS_HOST_READ_BIT,
+                    )
+                    vk.vkCmdPipelineBarrier(
+                        command,
+                        vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        vk.VK_PIPELINE_STAGE_HOST_BIT,
+                        0,
+                        1,
+                        [readback_barrier],
+                        0,
+                        None,
+                        0,
+                        None,
+                    )
+                vk.vkEndCommandBuffer(command)
+
+                vk.vkResetFences(gpu.device, 1, [fence])
+                submit_info = vk.VkSubmitInfo(pCommandBuffers=[command])
+                vk.vkQueueSubmit(gpu.queue, 1, [submit_info], fence)
+                vk.vkWaitForFences(gpu.device, 1, [fence], vk.VK_TRUE, 30_000_000_000)
+
+                outputs: dict[str, bytes] = {}
+                for buf_meta, byte_size, _, vk_mem, alloc_size in allocated:
+                    if buf_meta["access"] in ("write_only", "read_write"):
+                        mapped = vk.vkMapMemory(gpu.device, vk_mem, 0, alloc_size, 0)
+                        try:
+                            outputs[buf_meta["name"]] = bytes(mapped[:byte_size])
+                        finally:
+                            vk.vkUnmapMemory(gpu.device, vk_mem)
+                gpu.check_validation()
+                return ComputeDispatchResult(buffers=outputs, device=gpu.name)
+
+        yield run
+
+
+@contextmanager
+def compute_session(
+    program: ComputeProgram | Path,
+    *,
+    validation: bool = False,
+    provider: str | None = None,
+    toolchain: Toolchain | None = None,
+):
+    loaded = load_compute_program(program) if isinstance(program, (Path, str)) else program
+    if not isinstance(loaded, ComputeProgram):
+        raise TypeError("compute_session requires a ComputeProgram or manifest Path.")
+    if loaded.target == "vulkan":
+        with _vulkan_compute_session(loaded, validation=validation, provider=provider) as run:
+            yield run
+        return
+    raise ViewerError(f"Compute dispatch is not yet supported for target {loaded.target!r}.")
+
+
+def dispatch_compute(
+    program: ComputeProgram | Path,
+    *,
+    buffers: Mapping[str, bytes | bytearray | memoryview | int] | None = None,
+    parameters: Mapping[str, object] | bytes | bytearray | memoryview | None = None,
+    grid: tuple[int, int, int] | None = None,
+    validation: bool = False,
+    provider: str | None = None,
+    toolchain: Toolchain | None = None,
+) -> ComputeDispatchResult:
+    with compute_session(program, validation=validation, provider=provider, toolchain=toolchain) as run:
+        return run(buffers=buffers, parameters=parameters, grid=grid)
+
+
+def render_compute_rgba(
+    program: ComputeProgram | Path,
+    width: int,
+    height: int,
+    *,
+    output_buffer: str = "output_buffer",
+    buffers: Mapping[str, bytes | bytearray | memoryview | int] | None = None,
+    parameters: Mapping[str, object] | bytes | bytearray | memoryview | None = None,
+    grid: tuple[int, int, int] | None = None,
+    validation: bool = False,
+    provider: str | None = None,
+    toolchain: Toolchain | None = None,
+) -> RenderedImage:
+    _dimensions(width, height)
+    loaded = load_compute_program(program) if isinstance(program, (Path, str)) else program
+    if not isinstance(loaded, ComputeProgram):
+        raise TypeError("render_compute_rgba requires a ComputeProgram or manifest Path.")
+    expected_bytes = width * height * 4
+    merged_buffers = dict(buffers or {})
+    merged_buffers[output_buffer] = expected_bytes
+    if grid is None:
+        wgx, wgy, _ = loaded.workgroup_size
+        active_grid = ((width + wgx - 1) // wgx, (height + wgy - 1) // wgy, 1)
+    else:
+        active_grid = grid
+    result = dispatch_compute(
+        loaded,
+        buffers=merged_buffers,
+        parameters=parameters,
+        grid=active_grid,
+        validation=validation,
+        provider=provider,
+        toolchain=toolchain,
+    )
+    if output_buffer not in result.buffers:
+        raise ViewerError(f"Output buffer {output_buffer!r} is not a writable compute buffer.")
+    rgba = result.buffers[output_buffer]
+    if len(rgba) != expected_bytes:
+        raise ViewerError("Compute RGBA output buffer size does not match requested image dimensions.")
+    return RenderedImage(width=width, height=height, rgba=rgba, device=result.device)
 
 
 def _video_encoder() -> str:
