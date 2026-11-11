@@ -781,6 +781,52 @@ def compile_pipeline(
         for stage in stages:
             if interface[stage.kind]["name"] != stage.name or interface[stage.kind]["stage"] != stage.kind:
                 raise CompileError(f"Reflected entry does not match the declared {stage.kind} stage {stage.name!r}.")
+        input_layout = None
+        if getattr(pipeline, "input_layout", None) is not None:
+            input_layout = pipeline.input_layout.to_dict() if hasattr(pipeline.input_layout, "to_dict") else pipeline.input_layout
+        else:
+            for s in stages:
+                if s.kind == "vertex" and getattr(s, "input_layout", None) is not None:
+                    input_layout = s.input_layout
+                    break
+            if input_layout is None and "vertex" in interface:
+                v_inputs = [inp for inp in interface["vertex"].get("inputs", []) if "location" in inp]
+                if v_inputs:
+                    attrs = []
+                    offset = 0
+                    def _sem(name, loc):
+                        nl = name.lower()
+                        if nl in ("position", "pos"): return ("POSITION", 0)
+                        if nl in ("normal", "norm"): return ("NORMAL", 0)
+                        if nl in ("uv", "texcoord") or nl.startswith("texcoord"): return ("TEXCOORD", 0)
+                        return (name.upper(), 0)
+                    format_sizes = {
+                        "f32": 4, "f32x2": 8, "f32x3": 12, "f32x4": 16,
+                        "vec2": 8, "vec3": 12, "vec4": 16,
+                        "u32": 4, "i32": 4, "u16": 2, "i16": 2,
+                    }
+                    for inp in v_inputs:
+                        loc = inp["location"]
+                        fmt = inp["type"]
+                        sz = format_sizes.get(fmt, 16)
+                        sname, sidx = _sem(inp["name"], loc)
+                        attrs.append({
+                            "name": inp["name"],
+                            "location": loc,
+                            "binding": 0,
+                            "format": fmt,
+                            "offset": offset,
+                            "size": sz,
+                            "semantic_name": sname,
+                            "semantic_index": sidx,
+                        })
+                        offset += sz
+                    stride = (offset + 3) // 4 * 4
+                    input_layout = {
+                        "bindings": [{"binding": 0, "stride": stride, "input_rate": "per_vertex"}],
+                        "attributes": attrs,
+                    }
+
         manifest = {
             "schema_version": PARAMETER_SCHEMA_VERSION if parameters else PIPELINE_SCHEMA_VERSION,
             "target": target.value,
@@ -792,6 +838,8 @@ def compile_pipeline(
             "runtime_verified": False,
             "backend_status": "converted-binary" if target == Target.METAL else "validated-binary",
         }
+        if input_layout:
+            manifest["input_layout"] = input_layout
         if parameters:
             manifest["parameters"] = parameters
         if getattr(pipeline, "depth_stencil", None) is not None:

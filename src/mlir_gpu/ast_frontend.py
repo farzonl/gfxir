@@ -254,6 +254,25 @@ def _mlir_element_type(elem_type: Any) -> str:
     return str(getattr(elem_type, "schema_name", elem_type))
 
 
+class _VertexProxy:
+    def __init__(self, struct_cls: type, values: dict[str, Value]):
+        self._struct_cls = struct_cls
+        self._values = values
+
+    def __getattr__(self, name: str) -> Value:
+        if name in self._values:
+            return self._values[name]
+        raise AttributeError(f"{self._struct_cls.__name__} has no attribute {name!r}.")
+
+    def __getitem__(self, key: str) -> Value:
+        if key in self._values:
+            return self._values[key]
+        raise KeyError(key)
+
+    def __repr__(self) -> str:
+        return f"<{self._struct_cls.__name__}Proxy {list(self._values.keys())}>"
+
+
 @dataclass(frozen=True)
 class _BufferProxy:
     name: str
@@ -382,7 +401,16 @@ class ASTLowering:
             LocalInvocationId: "local_invocation_id",
             WorkgroupId: "workgroup_id",
         }
+        from .parameters import is_struct
         for parameter in inspect.signature(function).parameters.values():
+            annotation = resolve_annotation(function, parameter.annotation)
+            if is_struct(annotation) and (getattr(annotation, "_is_vertex_struct", False) or getattr(annotation, "__struct_layout__", "") == "vertex"):
+                proxy_values = {
+                    f.name: Value(next(raster)) for f in annotation.__struct_fields__
+                }
+                arguments.append(_VertexProxy(annotation, proxy_values))
+                self.structured = True
+                continue
             if parameter.name in self.buffer_bindings:
                 b_spec = self.buffer_bindings[parameter.name]
                 elem_val = _mlir_element_type(b_spec.element_type)
@@ -738,7 +766,7 @@ class ASTLowering:
             if node.attr.startswith("_"):
                 self.fail("Private attributes and Python introspection are unsupported in device source.")
             owner = self.expression(node.value, env)
-            if not isinstance(owner, (Value, Node, ModuleType, Type, Vertex, Entry, Pipeline, ComputePipeline, _ParameterValues, MatrixValue)) and owner is not Type:
+            if not isinstance(owner, (Value, Node, ModuleType, Type, Vertex, Entry, Pipeline, ComputePipeline, _ParameterValues, MatrixValue, _VertexProxy)) and owner is not Type:
                 self.fail("Dynamic attributes on arbitrary Python objects are unsupported.")
             return getattr(owner, node.attr)
         if isinstance(node, (ast.Tuple, ast.List)):
@@ -1172,7 +1200,7 @@ class ASTLowering:
                     )
                 finally:
                     self.builder = parent
-                unmergeable = (_Function, _Lambda, _BufferProxy, _SharedArrayProxy)
+                unmergeable = (_Function, _Lambda, _BufferProxy, _SharedArrayProxy, _VertexProxy)
                 common_keys = [k for k in then_env if k in else_env]
                 changed_keys = [
                     k for k in common_keys

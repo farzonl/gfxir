@@ -719,6 +719,103 @@ struct DepthSettings {
     D3D12_COMPARISON_FUNC compare = D3D12_COMPARISON_FUNC_LESS_EQUAL;
 };
 
+static DXGI_FORMAT formatToDXGI(const std::string& fmt) {
+    if (fmt == "f32x3" || fmt == "vec3" || fmt == "R32G32B32_FLOAT") return DXGI_FORMAT_R32G32B32_FLOAT;
+    if (fmt == "f32x2" || fmt == "vec2" || fmt == "R32G32_FLOAT") return DXGI_FORMAT_R32G32_FLOAT;
+    if (fmt == "f32x4" || fmt == "vec4" || fmt == "R32G32B32A32_FLOAT") return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    if (fmt == "f32" || fmt == "R32_FLOAT") return DXGI_FORMAT_R32_FLOAT;
+    if (fmt == "u32" || fmt == "R32_UINT") return DXGI_FORMAT_R32_UINT;
+    if (fmt == "i32" || fmt == "R32_SINT") return DXGI_FORMAT_R32_SINT;
+    if (fmt == "u16" || fmt == "R16_UINT") return DXGI_FORMAT_R16_UINT;
+    if (fmt == "i16" || fmt == "R16_SINT") return DXGI_FORMAT_R16_SINT;
+    return DXGI_FORMAT_R32G32B32A32_FLOAT;
+}
+
+
+struct InputAttributeDesc {
+    std::string name{};
+    uint32_t location = 0;
+    uint32_t binding = 0;
+    std::string format{};
+    uint32_t offset = 0;
+    uint32_t size = 0;
+    std::string semantic_name{};
+    uint32_t semantic_index = 0;
+};
+
+struct InputBindingDesc {
+    uint32_t binding = 0;
+    uint32_t stride = 0;
+    std::string input_rate{};
+};
+
+struct InputLayoutData {
+    std::vector<InputBindingDesc> bindings{};
+    std::vector<InputAttributeDesc> attributes{};
+};
+
+struct ManifestOrLayoutDesc {
+    std::vector<InputBindingDesc> bindings{};
+    std::vector<InputAttributeDesc> attributes{};
+    std::optional<InputLayoutData> input_layout{};
+};
+
+static std::pair<std::string, UINT> inferSemantic(const std::string& name, UINT location) {
+    std::string lower;
+    lower.reserve(name.size());
+    for (char c : name) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    if (lower == "position" || lower == "pos") return {"POSITION", 0};
+    if (lower == "normal" || lower == "norm") return {"NORMAL", 0};
+    if (lower == "uv" || lower.rfind("texcoord", 0) == 0) return {"TEXCOORD", 0};
+    std::string upper;
+    upper.reserve(name.size());
+    for (char c : name) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    return {upper, 0};
+}
+
+static InputLayoutData loadInputLayout(const std::wstring& path) {
+    std::filesystem::path layoutPath{path};
+    std::ifstream file{layoutPath};
+    if (!file) throw std::runtime_error("Cannot open input layout JSON: " + layoutPath.string());
+    std::string text{std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+    ManifestOrLayoutDesc parsed{};
+    auto error = glz::read_json(parsed, text);
+    if (!error && parsed.input_layout.has_value()) {
+        return std::move(*parsed.input_layout);
+    }
+    if (!error && (!parsed.attributes.empty() || !parsed.bindings.empty())) {
+        return InputLayoutData{std::move(parsed.bindings), std::move(parsed.attributes)};
+    }
+    InputLayoutData direct{};
+    auto errorDirect = glz::read_json(direct, text);
+    if (!errorDirect) {
+        return direct;
+    }
+    throw std::runtime_error("Failed to parse input layout JSON");
+}
+
+static ComPtr<ID3D12Resource> createBuffer(ID3D12Device* dev, const void* data, size_t size) {
+    if (!data || size == 0) return nullptr;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> buffer;
+    check(dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&buffer)),
+        "Create buffer resource");
+    void* mapped = nullptr;
+    D3D12_RANGE readRange{0, 0};
+    check(buffer->Map(0, &readRange, &mapped), "Map buffer");
+    std::memcpy(mapped, data, size);
+    D3D12_RANGE writeRange{0, size};
+    buffer->Unmap(0, &writeRange);
+    return buffer;
+}
 class Renderer {
     ComPtr<IDXGIFactory6> factory;
     ComPtr<ID3D12Device> device;
@@ -744,6 +841,16 @@ class Renderer {
     bool hasFrameConstants = false;
     bool hasFixedTime = false;
     double fixedTime = 0.0;
+    bool isIndexed = false;
+    UINT indexCount = 0;
+    std::wstring indexType = L"uint16";
+    ComPtr<ID3D12Resource> vertexBuffer;
+    ComPtr<ID3D12Resource> indexBuffer;
+    D3D12_VERTEX_BUFFER_VIEW vertexBufferView{};
+    D3D12_INDEX_BUFFER_VIEW indexBufferView{};
+    UINT vertexStride = 0;
+    std::vector<std::string> semanticStorage;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements;
     std::chrono::steady_clock::time_point started;
 
     void validationErrors() {
@@ -861,8 +968,18 @@ class Renderer {
         const float background[]{0.02f, 0.02f, 0.04f, 1.0f};
         commands->ClearRenderTargetView(handle, background, 0, nullptr);
         commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        if (vertexBuffer) {
+            commands->IASetVertexBuffers(0, 1, &vertexBufferView);
+        }
+        if (indexBuffer) {
+            commands->IASetIndexBuffer(&indexBufferView);
+        }
         if (draws.empty()) {
-            commands->DrawInstanced(vertexCount, 1, 0, 0);
+            if (isIndexed) {
+                commands->DrawIndexedInstanced(indexCount, 1, 0, 0, 0);
+            } else {
+                commands->DrawInstanced(vertexCount, 1, 0, 0);
+            }
         } else {
             ID3D12PipelineState* currentPso = nullptr;
             for (const auto& d : draws) {
@@ -908,9 +1025,15 @@ public:
 
     Renderer(const std::wstring& vertex, const std::wstring& fragment, UINT count, bool validation,
              bool warp = false, bool hasTime = false, double time = 0.0,
-             DepthSettings depthSettings = {})
+             DepthSettings depthSettings = {},
+             const std::wstring& inputLayoutPath = L"",
+             const std::wstring& vertexBufferPath = L"",
+             const std::wstring& indexBufferPath = L"",
+             bool indexed = false, UINT idxCount = 0,
+             const std::wstring& idxType = L"uint16")
         : vertexCount(count), hasFixedTime(hasTime), fixedTime(time),
           depthSettings(depthSettings),
+          isIndexed(indexed), indexCount(idxCount), indexType(idxType),
           started(std::chrono::steady_clock::now()) {
         auto dev = createDirectXDevice(warp, validation);
         factory = std::move(dev.factory);
@@ -959,6 +1082,43 @@ public:
                                               IID_PPV_ARGS(&root)), "CreateRootSignature");
         }
 
+        if (!inputLayoutPath.empty()) {
+            auto layout = loadInputLayout(inputLayoutPath);
+            for (const auto& binding : layout.bindings) {
+                if (binding.binding == 0 && binding.stride > 0) {
+                    vertexStride = binding.stride;
+                    break;
+                }
+            }
+            semanticStorage.reserve(layout.attributes.size());
+            for (const auto& attr : layout.attributes) {
+                std::string semName = attr.semantic_name;
+                UINT semIdx = attr.semantic_index;
+                if (semName.empty()) {
+                    auto inferred = inferSemantic(attr.name, attr.location);
+                    semName = inferred.first;
+                    semIdx = inferred.second;
+                }
+                semanticStorage.push_back(std::move(semName));
+                D3D12_INPUT_ELEMENT_DESC elem{};
+                elem.SemanticIndex = semIdx;
+                elem.Format = formatToDXGI(attr.format);
+                elem.InputSlot = attr.binding;
+                elem.AlignedByteOffset = attr.offset;
+                elem.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+                elem.InstanceDataStepRate = 0;
+                inputElements.push_back(elem);
+            }
+            for (size_t i = 0; i < inputElements.size(); ++i) {
+                inputElements[i].SemanticName = semanticStorage[i].c_str();
+            }
+            if (vertexStride == 0 && !layout.attributes.empty()) {
+                for (const auto& attr : layout.attributes) {
+                    vertexStride = (std::max)(vertexStride, static_cast<UINT>(attr.offset + attr.size));
+                }
+            }
+        }
+
         D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
         description.pRootSignature = root.Get();
         description.VS = {vs.data(), vs.size()};
@@ -996,6 +1156,9 @@ public:
         description.NumRenderTargets = 1;
         description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         description.SampleDesc.Count = 1;
+        if (!inputElements.empty()) {
+            description.InputLayout = { inputElements.data(), static_cast<UINT>(inputElements.size()) };
+        }
         HRESULT status = device->CreateGraphicsPipelineState(&description, IID_PPV_ARGS(&pipeline));
         validationErrors();
         check(status, "CreateGraphicsPipelineState (compiled DXIL)");
@@ -1015,6 +1178,36 @@ public:
         check(commands->Close(), "Close initial command list");
         check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence");
         validationErrors();
+
+        if (!vertexBufferPath.empty()) {
+            std::filesystem::path vbPath{vertexBufferPath};
+            std::ifstream file{vbPath, std::ios::binary};
+            if (!file) throw std::runtime_error("Cannot open vertex buffer: " + vbPath.string());
+            std::vector<uint8_t> data{std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+            if (!data.empty()) {
+                vertexBuffer = createBuffer(device.Get(), data.data(), data.size());
+                if (vertexStride == 0 && vertexCount > 0) {
+                    vertexStride = static_cast<UINT>(data.size() / vertexCount);
+                }
+                vertexBufferView.BufferLocation = vertexBuffer->GetGPUVirtualAddress();
+                vertexBufferView.SizeInBytes = static_cast<UINT>(data.size());
+                vertexBufferView.StrideInBytes = vertexStride;
+            }
+        }
+
+        if (!indexBufferPath.empty()) {
+            std::filesystem::path ibPath{indexBufferPath};
+            std::ifstream file{ibPath, std::ios::binary};
+            if (!file) throw std::runtime_error("Cannot open index buffer: " + ibPath.string());
+            std::vector<uint8_t> data{std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+            if (!data.empty()) {
+                indexBuffer = createBuffer(device.Get(), data.data(), data.size());
+                DXGI_FORMAT fmt = (indexType == L"uint32") ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+                indexBufferView.BufferLocation = indexBuffer->GetGPUVirtualAddress();
+                indexBufferView.SizeInBytes = static_cast<UINT>(data.size());
+                indexBufferView.Format = fmt;
+            }
+        }
     }
 
     void readback(UINT width, UINT height, const std::wstring& path) {
@@ -1195,8 +1388,9 @@ int wmain(int argc, wchar_t** argv) {
             }
             if (key != L"--vertex" && key != L"--fragment" && key != L"--width" &&
                 key != L"--height" && key != L"--frames" && key != L"--vertex-count" &&
-                key != L"--readback" && key != L"--time" &&
-                key != L"--compute" && key != L"--compute-spec" &&
+                key != L"--readback" && key != L"--time" && key != L"--input-layout" &&
+                key != L"--vertex-buffer" && key != L"--index-buffer" && key != L"--index-type" &&
+                key != L"--index-count" && key != L"--compute" && key != L"--compute-spec" &&
                 key != L"--depth-compare" && key != L"--depth-write" && key != L"--depth-format")
                 throw std::runtime_error("Unknown native DirectX viewer argument");
             if (++index == argc || !options.emplace(key, argv[index]).second)
@@ -1212,7 +1406,10 @@ int wmain(int argc, wchar_t** argv) {
             if (options.count(L"--vertex") || options.count(L"--fragment") ||
                 options.count(L"--width") || options.count(L"--height") ||
                 options.count(L"--frames") || options.count(L"--vertex-count") ||
-                options.count(L"--readback") || options.count(L"--time"))
+                options.count(L"--readback") || options.count(L"--time") ||
+                options.count(L"--input-layout") || options.count(L"--vertex-buffer") ||
+                options.count(L"--index-buffer") || options.count(L"--index-type") ||
+                options.count(L"--index-count"))
                 throw std::runtime_error("Compute dispatch arguments cannot be combined with graphics arguments");
             runComputeDispatch(options.at(L"--compute"), options.at(L"--compute-spec"), warp, validation);
             return 0;
@@ -1230,6 +1427,12 @@ int wmain(int argc, wchar_t** argv) {
 
         bool hasTime = options.count(L"--time") != 0;
         double fixedTime = hasTime ? seconds(options.at(L"--time")) : 0.0;
+        std::wstring inputLayout = options.count(L"--input-layout") ? options.at(L"--input-layout") : L"";
+        std::wstring vertexBuffer = options.count(L"--vertex-buffer") ? options.at(L"--vertex-buffer") : L"";
+        std::wstring indexBuffer = options.count(L"--index-buffer") ? options.at(L"--index-buffer") : L"";
+        bool isIndexed = options.count(L"--index-count") != 0;
+        UINT indexCount = isIndexed ? number(options.at(L"--index-count"), UINT_MAX) : 0;
+        std::wstring indexType = options.count(L"--index-type") ? options.at(L"--index-type") : L"uint16";
 
         if (options.count(L"--depth-compare")) {
             depthSettings.compare = parseD3D12ComparisonFunc(options.at(L"--depth-compare"));
@@ -1244,7 +1447,9 @@ int wmain(int argc, wchar_t** argv) {
         }
 
         Renderer renderer(options.at(L"--vertex"), options.at(L"--fragment"), count, validation,
-                          warp, hasTime, fixedTime, depthSettings);
+                          warp, hasTime, fixedTime, depthSettings,
+                          inputLayout, vertexBuffer, indexBuffer,
+                          isIndexed, indexCount, indexType);
         if (options.count(L"--readback")) {
             renderer.readback(width, height, options.at(L"--readback"));
         } else {

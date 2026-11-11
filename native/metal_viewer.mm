@@ -139,6 +139,19 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
 @property(nonatomic, copy) NSArray<NSDictionary*>* draws;
 @property(nonatomic, strong) id<MTLDepthStencilState> depthState;
 @property(nonatomic) BOOL hasDepth;
+@property(nonatomic) BOOL isIndexed;
+@property(nonatomic) NSUInteger indexCount;
+@property(nonatomic, copy) NSString* indexType;
+@property(nonatomic, strong) NSDictionary* inputLayout;
+@property(nonatomic, strong) id<MTLBuffer> vertexBuffer;
+@property(nonatomic, strong) id<MTLBuffer> indexBuffer;
+- (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
+                       fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
+                    inputLayout:(NSDictionary*)inputLayout
+                  depthSettings:(MetalDepthSettings)depthSettings;
+- (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
+                       fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
+                    inputLayout:(NSDictionary*)inputLayout;
 - (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry;
 - (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
@@ -150,15 +163,37 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
 @implementation GraphicsRenderer
 - (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry {
-    return [self initWithVertex:vertex vertexEntry:vertexEntry fragment:fragment fragmentEntry:fragmentEntry
-                  depthSettings:{}];
+    return [self initWithVertex:vertex vertexEntry:vertexEntry
+                        fragment:fragment fragmentEntry:fragmentEntry
+                     inputLayout:nil
+                   depthSettings:{}];
+}
+
+- (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
+                       fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
+                    inputLayout:(NSDictionary*)inputLayout {
+    return [self initWithVertex:vertex vertexEntry:vertexEntry
+                        fragment:fragment fragmentEntry:fragmentEntry
+                     inputLayout:inputLayout
+                   depthSettings:{}];
 }
 
 - (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
                   depthSettings:(MetalDepthSettings)depthSettings {
+    return [self initWithVertex:vertex vertexEntry:vertexEntry
+                        fragment:fragment fragmentEntry:fragmentEntry
+                     inputLayout:nil
+                   depthSettings:depthSettings];
+}
+
+- (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
+                       fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
+                    inputLayout:(NSDictionary*)inputLayout
+                  depthSettings:(MetalDepthSettings)depthSettings {
     self = [super init];
     if (!self) throw failure(@"Cannot allocate Metal renderer");
+    _inputLayout = inputLayout;
     _device = MTLCreateSystemDefaultDevice();
     if (!_device) throw failure(@"No Metal device is available");
     if (_device.argumentBuffersSupport != MTLArgumentBuffersTier2)
@@ -177,6 +212,57 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
     descriptor.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
     if (depthSettings.enabled) {
         descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    }
+    if (inputLayout) {
+        MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
+        NSArray* attrs = inputLayout[@"attributes"];
+        NSUInteger maxEndOffset = 0;
+        for (NSDictionary* attr in attrs) {
+            NSUInteger loc = [attr[@"location"] unsignedIntegerValue];
+            NSUInteger offset = [attr[@"offset"] unsignedIntegerValue];
+            NSUInteger binding = [attr[@"binding"] unsignedIntegerValue];
+            NSString* format = attr[@"format"];
+            MTLVertexFormat mtlFmt = MTLVertexFormatFloat3;
+            NSUInteger attrSize = 12;
+            if ([format isEqualToString:@"f32x3"] || [format isEqualToString:@"vec3"] || [format isEqualToString:@"R32G32B32_FLOAT"]) {
+                mtlFmt = MTLVertexFormatFloat3; attrSize = 12;
+            } else if ([format isEqualToString:@"f32x2"] || [format isEqualToString:@"vec2"] || [format isEqualToString:@"R32G32_FLOAT"]) {
+                mtlFmt = MTLVertexFormatFloat2; attrSize = 8;
+            } else if ([format isEqualToString:@"f32x4"] || [format isEqualToString:@"vec4"] || [format isEqualToString:@"R32G32B32A32_FLOAT"]) {
+                mtlFmt = MTLVertexFormatFloat4; attrSize = 16;
+            } else if ([format isEqualToString:@"f32"] || [format isEqualToString:@"R32_FLOAT"]) {
+                mtlFmt = MTLVertexFormatFloat; attrSize = 4;
+            } else if ([format isEqualToString:@"u32"] || [format isEqualToString:@"R32_UINT"]) {
+                mtlFmt = MTLVertexFormatUInt; attrSize = 4;
+            } else if ([format isEqualToString:@"i32"] || [format isEqualToString:@"R32_SINT"]) {
+                mtlFmt = MTLVertexFormatInt; attrSize = 4;
+            } else if ([format isEqualToString:@"u16"] || [format isEqualToString:@"R16_UINT"]) {
+                mtlFmt = MTLVertexFormatUShort; attrSize = 2;
+            } else if ([format isEqualToString:@"i16"] || [format isEqualToString:@"R16_SINT"]) {
+                mtlFmt = MTLVertexFormatShort; attrSize = 2;
+            }
+            vd.attributes[loc].format = mtlFmt;
+            vd.attributes[loc].offset = offset;
+            vd.attributes[loc].bufferIndex = binding;
+            if (offset + attrSize > maxEndOffset) {
+                maxEndOffset = offset + attrSize;
+            }
+        }
+        NSArray* bindings = inputLayout[@"bindings"];
+        if (bindings && bindings.count > 0) {
+            for (NSDictionary* b in bindings) {
+                NSUInteger binding = [b[@"binding"] unsignedIntegerValue];
+                NSUInteger stride = [b[@"stride"] unsignedIntegerValue];
+                vd.layouts[binding].stride = stride;
+                vd.layouts[binding].stepFunction = MTLVertexStepFunctionPerVertex;
+                vd.layouts[binding].stepRate = 1;
+            }
+        } else if (attrs && attrs.count > 0) {
+            vd.layouts[0].stride = maxEndOffset;
+            vd.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+            vd.layouts[0].stepRate = 1;
+        }
+        descriptor.vertexDescriptor = vd;
     }
     _pipeline = [_device newRenderPipelineStateWithDescriptor:descriptor error:&error];
     if (!_pipeline) throw failure(@"Cannot create the converted DXIL render pipeline", error);
@@ -224,11 +310,23 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
     }
     [encoder setViewport:(MTLViewport){0, 0, static_cast<double>(texture.width),
         static_cast<double>(texture.height), 0, 1}];
+    if (self.vertexBuffer) {
+        [encoder setVertexBuffer:self.vertexBuffer offset:0 atIndex:0];
+    }
 
     if (!self.draws || self.draws.count == 0) {
         [encoder setRenderPipelineState:self.pipeline];
-        IRRuntimeDrawPrimitives(encoder, MTLPrimitiveTypeTriangle, uint64_t{0},
-                               static_cast<uint64_t>(self.vertexCount));
+        if (self.isIndexed && self.indexBuffer) {
+            MTLIndexType type = [self.indexType isEqualToString:@"uint16"] ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+            [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:self.indexCount
+                                 indexType:type
+                               indexBuffer:self.indexBuffer
+                         indexBufferOffset:0];
+        } else {
+            IRRuntimeDrawPrimitives(encoder, MTLPrimitiveTypeTriangle, uint64_t{0},
+                                   static_cast<uint64_t>(self.vertexCount));
+        }
     } else {
         id<MTLRenderPipelineState> currentPipeline = nil;
         for (NSDictionary* draw in self.draws) {
@@ -254,10 +352,14 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
                 uint64_t firstIndex = [draw[@"first_index"] unsignedLongLongValue];
                 int64_t vertexOffset = [draw[@"vertex_offset"] longLongValue];
                 uint64_t firstInstance = [draw[@"first_instance"] unsignedLongLongValue];
-                id<MTLBuffer> indexBuffer = draw[@"index_buffer"];
+                id<MTLBuffer> indexBuffer = draw[@"index_buffer"] ?: self.indexBuffer;
                 if (indexBuffer) {
+                    NSString* idxTypeStr = draw[@"index_type"] ?: self.indexType ?: @"uint16";
+                    bool isU16 = [idxTypeStr isEqualToString:@"uint16"] || [idxTypeStr isEqualToString:@"u16"];
+                    MTLIndexType idxType = isU16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+                    NSUInteger elemBytes = isU16 ? 2 : 4;
                     IRRuntimeDrawIndexedPrimitives(encoder, MTLPrimitiveTypeTriangle, indexCount,
-                                                   MTLIndexTypeUInt16, indexBuffer, firstIndex * 2,
+                                                   idxType, indexBuffer, firstIndex * elemBytes,
                                                    instanceCount, vertexOffset, firstInstance);
                 } else {
                     IRRuntimeDrawPrimitives(encoder, MTLPrimitiveTypeTriangle,
@@ -667,6 +769,9 @@ int main(int argc, char** argv) {
                         pair.first != "--frames" && pair.first != "--readback" &&
                         pair.first != "--vertex-count" && pair.first != "--frame-layout" &&
                         pair.first != "--time" &&
+                        pair.first != "--input-layout" && pair.first != "--vertex-buffer" &&
+                        pair.first != "--index-buffer" && pair.first != "--index-type" &&
+                        pair.first != "--index-count" &&
                         pair.first != "--compute" && pair.first != "--compute-entry" &&
                         pair.first != "--compute-spec" &&
                         pair.first != "--depth-compare" && pair.first != "--depth-write" &&
@@ -697,7 +802,9 @@ int main(int argc, char** argv) {
                         arguments.count("--width") || arguments.count("--height") ||
                         arguments.count("--frames") || arguments.count("--readback") ||
                         arguments.count("--vertex-count") || arguments.count("--frame-layout") ||
-                        arguments.count("--time"))
+                        arguments.count("--time") || arguments.count("--input-layout") ||
+                        arguments.count("--vertex-buffer") || arguments.count("--index-buffer") ||
+                        arguments.count("--index-type") || arguments.count("--index-count"))
                         throw std::runtime_error("Compute dispatch options cannot be combined with graphics options");
                     runComputeDispatch(
                         required("--compute"),
@@ -710,12 +817,51 @@ int main(int argc, char** argv) {
                 if (!width || !height) throw std::runtime_error("Dimensions must be positive");
                 NSDictionary* layout = arguments.count("--frame-layout") ? frameLayout(arguments.at("--frame-layout")) : nil;
                 double fixedTime = arguments.count("--time") ? seconds(arguments.at("--time")) : 0;
+                NSDictionary* inputLayoutDict = nil;
+                if (arguments.count("--input-layout")) {
+                    NSData* data = [NSData dataWithContentsOfFile:@(arguments.at("--input-layout").c_str())];
+                    if (data) {
+                        id parsedJson = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                        if ([parsedJson isKindOfClass:[NSDictionary class]]) {
+                            NSDictionary* dict = parsedJson;
+                            if (dict[@"input_layout"] && [dict[@"input_layout"] isKindOfClass:[NSDictionary class]]) {
+                                inputLayoutDict = dict[@"input_layout"];
+                            } else {
+                                inputLayoutDict = dict;
+                            }
+                        }
+                    }
+                }
                 GraphicsRenderer* renderer = [[GraphicsRenderer alloc]
                     initWithVertex:@(required("--vertex").c_str()) vertexEntry:@(required("--vertex-entry").c_str())
                     fragment:@(required("--fragment").c_str()) fragmentEntry:@(required("--fragment-entry").c_str())
-                    depthSettings:depthSettings];
-                renderer.vertexCount = number(required("--vertex-count"), UINT32_MAX);
-                if (renderer.vertexCount % 3) throw std::runtime_error("Triangle-list vertex count must be a multiple of three");
+                    inputLayout:inputLayoutDict
+                  depthSettings:depthSettings];
+                if (arguments.count("--index-count")) {
+                    renderer.isIndexed = YES;
+                    renderer.indexCount = number(arguments.at("--index-count"), UINT32_MAX);
+                    renderer.indexType = arguments.count("--index-type") ? @(arguments.at("--index-type").c_str()) : @"uint16";
+                    renderer.vertexCount = renderer.indexCount;
+                } else {
+                    renderer.vertexCount = number(required("--vertex-count"), UINT32_MAX);
+                    if (renderer.vertexCount % 3) throw std::runtime_error("Triangle-list vertex count must be a multiple of three");
+                }
+                if (arguments.count("--vertex-buffer")) {
+                    NSData* vbData = [NSData dataWithContentsOfFile:@(arguments.at("--vertex-buffer").c_str())];
+                    if (vbData && vbData.length > 0) {
+                        renderer.vertexBuffer = [renderer.device newBufferWithBytes:vbData.bytes
+                                                                             length:vbData.length
+                                                                            options:MTLResourceStorageModeShared];
+                    }
+                }
+                if (arguments.count("--index-buffer")) {
+                    NSData* ibData = [NSData dataWithContentsOfFile:@(arguments.at("--index-buffer").c_str())];
+                    if (ibData && ibData.length > 0) {
+                        renderer.indexBuffer = [renderer.device newBufferWithBytes:ibData.bytes
+                                                                            length:ibData.length
+                                                                           options:MTLResourceStorageModeShared];
+                    }
+                }
                 renderer.limit = arguments.count("--frames") ? number(arguments.at("--frames"), NSUIntegerMax) : 0;
                 renderer.frameLayout = layout;
                 renderer.live = !arguments.count("--readback");

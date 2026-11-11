@@ -64,6 +64,9 @@ class GraphicsProgram:
     target: str = "vulkan"
     draw: Draw = Draw()
     parameters: dict | None = None
+    input_layout: dict | None = None
+    vertex_buffer: Path | bytes | None = None
+    index_buffer: Path | bytes | None = None
     pipelines: dict[str, Any] = None
     draws: list[Any] = None
     depth_stencil: dict | None = None
@@ -99,7 +102,7 @@ class RenderedImage:
     device: str
 
 
-def load_program(manifest: Path) -> GraphicsProgram:
+def load_program(manifest: Path, *, vertex_buffer: Path | bytes | None = None, index_buffer: Path | bytes | None = None) -> GraphicsProgram:
     manifest = Path(manifest).resolve()
     data = json.loads(manifest.read_text())
     if isinstance(data, dict) and type(data.get("schema_version")) is int and data.get("schema_version") == 1:
@@ -235,6 +238,12 @@ def load_program(manifest: Path) -> GraphicsProgram:
                 verify_depth_stencil(multi_depth_stencil)
             except ValueError as error:
                 raise ViewerError(f"Invalid depth_stencil configuration in manifest: {error}") from error
+        if vertex_buffer is None and "vertex_buffer" in data:
+            vb_val = data["vertex_buffer"]
+            vertex_buffer = manifest.parent / vb_val if isinstance(vb_val, str) else vb_val
+        if index_buffer is None and "index_buffer" in data:
+            ib_val = data["index_buffer"]
+            index_buffer = manifest.parent / ib_val if isinstance(ib_val, str) else ib_val
 
         return GraphicsProgram(
             vertex=first_pipe.vertex,
@@ -242,18 +251,53 @@ def load_program(manifest: Path) -> GraphicsProgram:
             target=data["target"],
             draw=draw_obj,
             parameters=data.get("parameters"),
+            input_layout=data.get("input_layout"),
+            vertex_buffer=vertex_buffer,
+            index_buffer=index_buffer,
             pipelines=pipelines,
             draws=draw_calls,
             depth_stencil=multi_depth_stencil,
         )
 
     draw_data = data.get("draw")
-    if not isinstance(draw_data, dict) or set(draw_data) != {"topology", "vertex_count"}:
+    if not isinstance(draw_data, dict):
         raise ViewerError("A separate topology/vertex_count draw description is required.")
-    try:
-        draw = Draw(vertex_count=draw_data["vertex_count"], topology=draw_data["topology"])
-    except ValueError as error:
-        raise ViewerError(f"Invalid draw description: {error}") from error
+    is_indexed = draw_data.get("indexed", False)
+    if is_indexed:
+        required_keys = {"topology", "indexed", "index_count", "index_type"}
+        if not required_keys.issubset(set(draw_data)):
+            raise ViewerError("Indexed draw requires topology, indexed, index_count, and index_type.")
+        try:
+            draw = Draw(
+                topology=draw_data["topology"],
+                indexed=True,
+                index_count=draw_data["index_count"],
+                index_type=draw_data["index_type"],
+                first_index=draw_data.get("first_index", 0),
+                vertex_offset=draw_data.get("vertex_offset", 0),
+                instance_count=draw_data.get("instance_count", 1),
+                first_instance=draw_data.get("first_instance", 0),
+            )
+        except ValueError as error:
+            raise ViewerError(f"Invalid draw description: {error}") from error
+    else:
+        allowed_keys = {"topology", "vertex_count", "first_vertex", "instance_count", "first_instance"}
+        if (
+            "vertex_count" not in draw_data
+            or "topology" not in draw_data
+            or not set(draw_data).issubset(allowed_keys)
+        ):
+            raise ViewerError("A separate topology/vertex_count draw description is required.")
+        try:
+            draw = Draw(
+                topology=draw_data["topology"],
+                vertex_count=draw_data["vertex_count"],
+                first_vertex=draw_data.get("first_vertex", 0),
+                instance_count=draw_data.get("instance_count", 1),
+                first_instance=draw_data.get("first_instance", 0),
+            )
+        except ValueError as error:
+            raise ViewerError(f"Invalid draw description: {error}") from error
     entries = data.get("entries")
     if not isinstance(entries, list) or len(entries) != 2:
         raise ViewerError("The manifest must contain exactly one vertex and one fragment entry.")
@@ -281,7 +325,6 @@ def load_program(manifest: Path) -> GraphicsProgram:
         if data["target"] == "vulkan" and len(code) % 4:
             raise ViewerError(f"SPIR-V binary is not word-aligned: {filename}.")
         shaders[stage] = Shader(name, code)
-
     depth_stencil = data.get("depth_stencil")
     if depth_stencil is not None:
         try:
@@ -289,27 +332,50 @@ def load_program(manifest: Path) -> GraphicsProgram:
         except ValueError as error:
             raise ViewerError(f"Invalid depth_stencil configuration in manifest: {error}") from error
 
+    input_layout = data.get("input_layout")
+    if vertex_buffer is None and "vertex_buffer" in data:
+        vb_val = data["vertex_buffer"]
+        vertex_buffer = manifest.parent / vb_val if isinstance(vb_val, str) else vb_val
+    if index_buffer is None and "index_buffer" in data:
+        ib_val = data["index_buffer"]
+        index_buffer = manifest.parent / ib_val if isinstance(ib_val, str) else ib_val
     pipe_state = PipelineState(
         vertex=shaders["vertex"],
         fragment=shaders["fragment"],
         parameters=parameters,
         interface=data.get("interface"),
     )
-    single_draw = DrawCall(
-        pipeline="default",
-        type="standard",
-        topology=draw.topology,
-        vertex_count=draw.vertex_count,
-        first_vertex=0,
-        instance_count=1,
-        first_instance=0,
-    )
+    if getattr(draw, "indexed", False):
+        single_draw = DrawCall(
+            pipeline="default",
+            type="indexed",
+            topology=draw.topology,
+            index_count=draw.index_count,
+            index_type=draw.index_type,
+            first_index=draw.first_index,
+            vertex_offset=draw.vertex_offset,
+            instance_count=draw.instance_count,
+            first_instance=draw.first_instance,
+        )
+    else:
+        single_draw = DrawCall(
+            pipeline="default",
+            type="standard",
+            topology=draw.topology,
+            vertex_count=draw.vertex_count,
+            first_vertex=draw.first_vertex,
+            instance_count=draw.instance_count,
+            first_instance=draw.first_instance,
+        )
     return GraphicsProgram(
         vertex=shaders["vertex"],
         fragment=shaders["fragment"],
         target=data["target"],
         draw=draw,
         parameters=parameters,
+        input_layout=input_layout,
+        vertex_buffer=vertex_buffer,
+        index_buffer=index_buffer,
         pipelines={"default": pipe_state},
         draws=[single_draw],
         depth_stencil=depth_stencil,
@@ -509,7 +575,10 @@ def _metal_libraries(program: GraphicsProgram, toolchain: Toolchain):
             else:
                 library.write_bytes(shader.code)
             libraries.extend([f"--{stage}", str(library), f"--{stage}-entry", shader.entry_point])
-        arguments = [toolchain.find("mlir-gpu-metal-view"), *libraries, "--vertex-count", str(program.draw.vertex_count)]
+        draw_args = ["--index-count", str(program.draw.index_count)] if getattr(program.draw, "indexed", False) else ["--vertex-count", str(program.draw.vertex_count)]
+        arguments = [toolchain.find("mlir-gpu-metal-view"), *libraries, *draw_args]
+        if getattr(program.draw, "indexed", False) and program.draw.index_type:
+            arguments.extend(["--index-type", str(program.draw.index_type)])
         if program.depth_stencil is not None:
             arguments.append("--depth")
             if "depth_compare_op" in program.depth_stencil:
@@ -518,6 +587,24 @@ def _metal_libraries(program: GraphicsProgram, toolchain: Toolchain):
                 arguments.extend(["--depth-write", "1" if program.depth_stencil["depth_write_enable"] else "0"])
             if "format" in program.depth_stencil:
                 arguments.extend(["--depth-format", program.depth_stencil["format"]])
+        if getattr(program, "input_layout", None):
+            layout = directory / "input-layout.json"
+            layout.write_text(json.dumps(program.input_layout, allow_nan=False))
+            arguments.extend(["--input-layout", str(layout)])
+        if getattr(program, "vertex_buffer", None) is not None:
+            if isinstance(program.vertex_buffer, (bytes, bytearray, memoryview)):
+                vb_path = directory / "vertex.bin"
+                vb_path.write_bytes(bytes(program.vertex_buffer))
+            else:
+                vb_path = Path(program.vertex_buffer).resolve()
+            arguments.extend(["--vertex-buffer", str(vb_path)])
+        if getattr(program, "index_buffer", None) is not None:
+            if isinstance(program.index_buffer, (bytes, bytearray, memoryview)):
+                ib_path = directory / "index.bin"
+                ib_path.write_bytes(bytes(program.index_buffer))
+            else:
+                ib_path = Path(program.index_buffer).resolve()
+            arguments.extend(["--index-buffer", str(ib_path)])
         if program.parameters is not None:
             layout = directory / "frame-layout.json"
             layout.write_text(json.dumps(program.parameters, allow_nan=False))
@@ -611,7 +698,12 @@ def _directx_shaders(program: GraphicsProgram, toolchain: Toolchain):
             path = directory / f"{stage}.dxil"
             path.write_bytes(shader.code)
             arguments.extend([f"--{stage}", str(path)])
-        arguments.extend(["--vertex-count", str(program.draw.vertex_count)])
+        if getattr(program.draw, "indexed", False):
+            arguments.extend(["--index-count", str(program.draw.index_count)])
+            if program.draw.index_type:
+                arguments.extend(["--index-type", str(program.draw.index_type)])
+        else:
+            arguments.extend(["--vertex-count", str(program.draw.vertex_count)])
         if program.depth_stencil is not None:
             arguments.append("--depth")
             if "depth_compare_op" in program.depth_stencil:
@@ -620,6 +712,24 @@ def _directx_shaders(program: GraphicsProgram, toolchain: Toolchain):
                 arguments.extend(["--depth-write", "1" if program.depth_stencil["depth_write_enable"] else "0"])
             if "format" in program.depth_stencil:
                 arguments.extend(["--depth-format", program.depth_stencil["format"]])
+        if getattr(program, "input_layout", None):
+            layout_path = directory / "input_layout.json"
+            layout_path.write_text(json.dumps(program.input_layout) + "\n")
+            arguments.extend(["--input-layout", str(layout_path)])
+        if getattr(program, "vertex_buffer", None) is not None:
+            if isinstance(program.vertex_buffer, (bytes, bytearray, memoryview)):
+                vb_path = directory / "vertex.bin"
+                vb_path.write_bytes(bytes(program.vertex_buffer))
+            else:
+                vb_path = Path(program.vertex_buffer).resolve()
+            arguments.extend(["--vertex-buffer", str(vb_path)])
+        if getattr(program, "index_buffer", None) is not None:
+            if isinstance(program.index_buffer, (bytes, bytearray, memoryview)):
+                ib_path = directory / "index.bin"
+                ib_path.write_bytes(bytes(program.index_buffer))
+            else:
+                ib_path = Path(program.index_buffer).resolve()
+            arguments.extend(["--index-buffer", str(ib_path)])
         yield directory, arguments
 
 
@@ -772,6 +882,35 @@ def _vulkan_depth_format(vk, format_name: str) -> int:
     if format_name not in formats:
         raise ViewerError(f"Unsupported depth format: '{format_name}'.")
     return formats[format_name]
+
+
+_VK_FORMAT_NAMES = {
+    "f32": ("VK_FORMAT_R32_SFLOAT", 100),
+    "f32x2": ("VK_FORMAT_R32G32_SFLOAT", 103),
+    "f32x3": ("VK_FORMAT_R32G32B32_SFLOAT", 106),
+    "f32x4": ("VK_FORMAT_R32G32B32A32_SFLOAT", 109),
+    "vec2": ("VK_FORMAT_R32G32_SFLOAT", 103),
+    "vec3": ("VK_FORMAT_R32G32B32_SFLOAT", 106),
+    "vec4": ("VK_FORMAT_R32G32B32A32_SFLOAT", 109),
+    "float": ("VK_FORMAT_R32_SFLOAT", 100),
+    "float2": ("VK_FORMAT_R32G32_SFLOAT", 103),
+    "float3": ("VK_FORMAT_R32G32B32_SFLOAT", 106),
+    "float4": ("VK_FORMAT_R32G32B32A32_SFLOAT", 109),
+    "u32": ("VK_FORMAT_R32_UINT", 98),
+    "u32x2": ("VK_FORMAT_R32G32_UINT", 101),
+    "u32x3": ("VK_FORMAT_R32G32B32_UINT", 104),
+    "u32x4": ("VK_FORMAT_R32G32B32A32_UINT", 107),
+    "i32": ("VK_FORMAT_R32_SINT", 99),
+    "i32x2": ("VK_FORMAT_R32G32_SINT", 102),
+    "i32x3": ("VK_FORMAT_R32G32B32_SINT", 105),
+    "i32x4": ("VK_FORMAT_R32G32B32A32_SINT", 108),
+    "u16": ("VK_FORMAT_R16_UINT", 74),
+    "u16x2": ("VK_FORMAT_R16G16_UINT", 77),
+    "u16x4": ("VK_FORMAT_R16G16B16A16_UINT", 83),
+    "i16": ("VK_FORMAT_R16_SINT", 75),
+    "i16x2": ("VK_FORMAT_R16G16_SINT", 78),
+    "i16x4": ("VK_FORMAT_R16G16B16A16_SINT", 84),
+}
 
 
 class _Vulkan:
@@ -1068,6 +1207,43 @@ class _Vulkan:
             vk.vkUnmapMemory(self.device, memory)
         return buffer, memory, alloc_size
 
+    def create_buffer(self, resources, data_or_path, usage):
+        vk = self.vk
+        if isinstance(data_or_path, (str, Path)):
+            data = Path(data_or_path).read_bytes()
+        elif isinstance(data_or_path, (bytes, bytearray, memoryview)):
+            data = bytes(data_or_path)
+        else:
+            return data_or_path
+        size = max(len(data), 1)
+        buffer = vk.vkCreateBuffer(self.device, vk.VkBufferCreateInfo(
+            size=size, usage=usage, sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+        ), None)
+        memory = None
+
+        def destroy():
+            vk.vkDestroyBuffer(self.device, buffer, None)
+            if memory is not None:
+                vk.vkFreeMemory(self.device, memory, None)
+
+        resources.callback(destroy)
+        requirements = vk.vkGetBufferMemoryRequirements(self.device, buffer)
+        memory = vk.vkAllocateMemory(self.device, vk.VkMemoryAllocateInfo(
+            allocationSize=requirements.size,
+            memoryTypeIndex=self.memory_type(
+                requirements.memoryTypeBits,
+                vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            ),
+        ), None)
+        vk.vkBindBufferMemory(self.device, buffer, memory, 0)
+        if len(data) > 0:
+            mapped = vk.vkMapMemory(self.device, memory, 0, len(data), 0)
+            try:
+                vk.ffi.memmove(mapped, data, len(data))
+            finally:
+                vk.vkUnmapMemory(self.device, memory)
+        return buffer
+
     def compute_pipeline(self, resources, program: ComputeProgram):
         vk = self.vk
         wgx, wgy, wgz = program.workgroup_size
@@ -1251,7 +1427,6 @@ class _Vulkan:
             ))
         layout = vk.vkCreatePipelineLayout(self.device, vk.VkPipelineLayoutCreateInfo(pPushConstantRanges=ranges), None)
         resources.callback(vk.vkDestroyPipelineLayout, self.device, layout, None)
-
         pipeline_map = {}
         default_pipeline = None
 
@@ -1262,9 +1437,36 @@ class _Vulkan:
                 module = vk.vkCreateShaderModule(self.device, vk.VkShaderModuleCreateInfo(codeSize=len(shader.code), pCode=shader.code), None)
                 resources.callback(vk.vkDestroyShaderModule, self.device, module, None)
                 stages.append(vk.VkPipelineShaderStageCreateInfo(stage=stage, module=module, pName=shader.entry_point))
+            binding_descs = []
+            attrib_descs = []
+            input_layout = getattr(p_state, "input_layout", None) or getattr(program, "input_layout", None)
+            if input_layout:
+                for b in input_layout.get("bindings", []):
+                    rate = vk.VK_VERTEX_INPUT_RATE_INSTANCE if b.get("input_rate") == "per_instance" else vk.VK_VERTEX_INPUT_RATE_VERTEX
+                    binding_descs.append(vk.VkVertexInputBindingDescription(
+                        binding=b["binding"],
+                        stride=b["stride"],
+                        inputRate=rate,
+                    ))
+                for a in input_layout.get("attributes", []):
+                    fmt = a["format"]
+                    fmt_info = _VK_FORMAT_NAMES.get(fmt)
+                    vk_fmt = getattr(vk, fmt_info[0], fmt_info[1]) if fmt_info is not None else 109
+                    attrib_descs.append(vk.VkVertexInputAttributeDescription(
+                        location=a["location"],
+                        binding=a.get("binding", 0),
+                        format=vk_fmt,
+                        offset=a["offset"],
+                    ))
+            vertex_input_state = vk.VkPipelineVertexInputStateCreateInfo(
+                vertexBindingDescriptionCount=len(binding_descs),
+                pVertexBindingDescriptions=binding_descs,
+                vertexAttributeDescriptionCount=len(attrib_descs),
+                pVertexAttributeDescriptions=attrib_descs,
+            ) if (binding_descs or attrib_descs) else vk.VkPipelineVertexInputStateCreateInfo()
             vk_pipe = vk.vkCreateGraphicsPipelines(self.device, vk.VK_NULL_HANDLE, 1, [vk.VkGraphicsPipelineCreateInfo(
                 pStages=stages,
-                pVertexInputState=vk.VkPipelineVertexInputStateCreateInfo(),
+                pVertexInputState=vertex_input_state,
                 pInputAssemblyState=vk.VkPipelineInputAssemblyStateCreateInfo(topology=vk.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST),
                 pViewportState=vk.VkPipelineViewportStateCreateInfo(
                     pViewports=[vk.VkViewport(width=float(width), height=float(height), minDepth=0.0, maxDepth=1.0)],
@@ -1312,7 +1514,8 @@ class _Vulkan:
         return framebuffer
 
     def command(self, resources, render_pass, pipeline, framebuffer, width, height, draw: Draw, copy=None,
-                *, layout=None, parameters=None, elapsed=0.0, command=None, draws=None, has_depth=False):
+                *, layout=None, parameters=None, elapsed=0.0, command=None, draws=None, has_depth=False,
+                vertex_buffer=None, index_buffer=None):
         vk = self.vk
         data = _frame_data(parameters, width, height, elapsed) if parameters is not None else None
         if data is not None and layout is None:
@@ -1342,6 +1545,28 @@ class _Vulkan:
             vk.vkCmdPushConstants(command, layout,
                                   vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT,
                                   parameters["bindings"]["vulkan"]["offset"], len(data), vk.ffi.from_buffer(data))
+        if vertex_buffer is not None:
+            vb_handle = (
+                self.create_buffer(resources, vertex_buffer, vk.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
+                if isinstance(vertex_buffer, (bytes, bytearray, memoryview, str, Path))
+                else vertex_buffer
+            )
+            if isinstance(vb_handle, (list, tuple)):
+                vk.vkCmdBindVertexBuffers(command, 0, len(vb_handle), vb_handle, [0] * len(vb_handle))
+            else:
+                vk.vkCmdBindVertexBuffers(command, 0, 1, [vb_handle], [0])
+        if index_buffer is not None:
+            ib_handle = (
+                self.create_buffer(resources, index_buffer, vk.VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
+                if isinstance(index_buffer, (bytes, bytearray, memoryview, str, Path))
+                else index_buffer
+            )
+            vk_index_type = (
+                vk.VK_INDEX_TYPE_UINT16
+                if getattr(draw, "index_type", "uint16") in ("uint16", "u16")
+                else vk.VK_INDEX_TYPE_UINT32
+            )
+            vk.vkCmdBindIndexBuffer(command, ib_handle, 0, vk_index_type)
 
         extras_map, extras_draws = getattr(self, "pipeline_extras", {}).get(pipeline, (None, None))
         pipeline_map = getattr(pipeline, "pipeline_map", extras_map or {"default": pipeline})
@@ -1350,7 +1575,23 @@ class _Vulkan:
 
         if not draws:
             vk.vkCmdBindPipeline(command, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline)
-            vk.vkCmdDraw(command, draw.vertex_count, 1, 0, 0)
+            if getattr(draw, "indexed", False):
+                vk.vkCmdDrawIndexed(
+                    command,
+                    draw.index_count,
+                    getattr(draw, "instance_count", 1),
+                    getattr(draw, "first_index", 0),
+                    getattr(draw, "vertex_offset", 0),
+                    getattr(draw, "first_instance", 0),
+                )
+            else:
+                vk.vkCmdDraw(
+                    command,
+                    draw.vertex_count,
+                    getattr(draw, "instance_count", 1),
+                    getattr(draw, "first_vertex", 0),
+                    getattr(draw, "first_instance", 0),
+                )
         else:
             current_pipeline = None
             for d in draws:
@@ -1398,7 +1639,6 @@ class _Vulkan:
                     first_v = getattr(d, "first_vertex", 0) if hasattr(d, "first_vertex") else d.get("first_vertex", 0)
                     first_inst = getattr(d, "first_instance", 0) if hasattr(d, "first_instance") else d.get("first_instance", 0)
                     vk.vkCmdDraw(command, v_cnt, inst_cnt, first_v, first_inst)
-
         vk.vkCmdEndRenderPass(command)
         if copy is not None:
             image, buffer = copy
@@ -1462,6 +1702,12 @@ def _offscreen_renderer(
         framebuffer = gpu.framebuffer(resources, render_pass, view, width, height, depth_view=depth_view)
         fence = vk.vkCreateFence(gpu.device, vk.VkFenceCreateInfo(), None)
         resources.callback(vk.vkDestroyFence, gpu.device, fence, None)
+        vertex_buffer = None
+        if getattr(program, "vertex_buffer", None) is not None:
+            vertex_buffer = gpu.create_buffer(resources, program.vertex_buffer, vk.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
+        index_buffer = None
+        if getattr(program, "index_buffer", None) is not None:
+            index_buffer = gpu.create_buffer(resources, program.index_buffer, vk.VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
         command = None
 
         def render(elapsed):
@@ -1469,7 +1715,7 @@ def _offscreen_renderer(
             first = command is None
             command = gpu.command(resources, render_pass, pipeline, framebuffer, width, height, program.draw, (image, buffer),
                                   layout=layout, parameters=program.parameters, elapsed=_time_value(elapsed), command=command,
-                                  has_depth=has_depth)
+                                  has_depth=has_depth, vertex_buffer=vertex_buffer, index_buffer=index_buffer)
             if first:
                 resources.callback(vk.vkDeviceWaitIdle, gpu.device)
             vk.vkResetFences(gpu.device, 1, [fence])
@@ -2220,13 +2466,20 @@ def _swapchain(gpu, resources, program, width, height):
         depth_format = _vulkan_depth_format(gpu.vk, program.depth_stencil.get("format", "d32_sfloat"))
         depth_image, depth_view = gpu.depth_image(resources, width, height, depth_format)
     render_pass, pipeline, layout = gpu.pipeline(resources, program, format, width, height, True)
+    vertex_buffer = None
+    if getattr(program, "vertex_buffer", None) is not None:
+        vertex_buffer = gpu.create_buffer(resources, program.vertex_buffer, vk.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
+    index_buffer = None
+    if getattr(program, "index_buffer", None) is not None:
+        index_buffer = gpu.create_buffer(resources, program.index_buffer, vk.VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
     commands, finished, framebuffers = [], [], []
     for image in gpu.device_function("vkGetSwapchainImagesKHR")(gpu.device, swapchain):
         view = gpu.view(resources, image, format)
         framebuffer = gpu.framebuffer(resources, render_pass, view, width, height, depth_view=depth_view)
         framebuffers.append(framebuffer)
         commands.append(gpu.command(resources, render_pass, pipeline, framebuffer, width, height, program.draw,
-                                    layout=layout, parameters=program.parameters, has_depth=has_depth))
+                                    layout=layout, parameters=program.parameters, has_depth=has_depth,
+                                    vertex_buffer=vertex_buffer, index_buffer=index_buffer))
         semaphore = vk.vkCreateSemaphore(gpu.device, vk.VkSemaphoreCreateInfo(), None)
         resources.callback(vk.vkDestroySemaphore, gpu.device, semaphore, None)
         finished.append(semaphore)
@@ -2236,7 +2489,8 @@ def _swapchain(gpu, resources, program, width, height):
     def record_frame(index, elapsed):
         if program.parameters is not None:
             gpu.command(resources, render_pass, pipeline, framebuffers[index], width, height, program.draw,
-                        layout=layout, parameters=program.parameters, elapsed=elapsed, command=commands[index])
+                        layout=layout, parameters=program.parameters, elapsed=elapsed, command=commands[index],
+                        has_depth=has_depth, vertex_buffer=vertex_buffer, index_buffer=index_buffer)
 
     return swapchain, commands, acquired, finished, record_frame
 
@@ -2683,6 +2937,8 @@ def main() -> int:
         epilog="Use -frames 0 to keep the window open, --output for PNG, or --video for MP4 on Vulkan/Metal.",
     )
     parser.add_argument("manifest", type=Path, nargs="?", default=None, help="Compiled Vulkan, DirectX, or Metal pipeline.json")
+    parser.add_argument("--vertex-buffer", type=Path, default=None, help="Path to binary vertex buffer data")
+    parser.add_argument("--index-buffer", type=Path, default=None, help="Path to binary index buffer data")
     parser.add_argument("--width", type=int, default=800)
     parser.add_argument("--height", type=int, default=600)
     parser.add_argument("--provider", choices=["hardware", "warp", "lavapipe", "swiftshader"],
@@ -2708,7 +2964,12 @@ def main() -> int:
             return 0
         parser.error("the following arguments are required: manifest")
     try:
-        program = load_program(args.manifest)
+        load_kwargs = {}
+        if args.vertex_buffer is not None:
+            load_kwargs["vertex_buffer"] = args.vertex_buffer
+        if args.index_buffer is not None:
+            load_kwargs["index_buffer"] = args.index_buffer
+        program = load_program(args.manifest, **load_kwargs)
         if args.report_capabilities:
             caps = get_device_capabilities(backend=program.target, provider=args.provider)
             print(json.dumps(caps, indent=2))

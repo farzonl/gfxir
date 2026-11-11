@@ -84,15 +84,19 @@ def verify_graphics_interface(interface: object, *, preview: bool = False) -> No
                     mode = io.get("interpolation")
                     if type(location) is not int or location < 0 or location in locations:
                         raise ValueError("Shader interface locations must be unique nonnegative integers.")
-                    if mode not in ("perspective", "flat", "no_perspective") or typ == Type.BOOL:
-                        raise ValueError("Invalid rasterization interface type or interpolation.")
-                    if typ == Type.U32 and mode != "flat":
-                        raise ValueError("Integer interfaces require flat interpolation.")
+                    if stage != "vertex" or direction != "inputs":
+                        if mode not in ("perspective", "flat", "no_perspective") or typ == Type.BOOL:
+                            raise ValueError("Invalid rasterization interface type or interpolation.")
+                        if typ in (Type.U32, Type.I32) and mode != "flat":
+                            raise ValueError("Integer interfaces require flat interpolation.")
+                    else:
+                        if typ not in (Type.F32, Type.VEC2, Type.VEC3, Type.VEC4, Type.U32, Type.I32, Type.U16, Type.I16):
+                            raise ValueError(f"Invalid vertex attribute type: {typ}.")
+                        if mode is not None and mode not in ("perspective", "flat", "no_perspective"):
+                            raise ValueError("Invalid rasterization interface interpolation.")
                     locations[location] = io
             if stage == "vertex" and direction == "outputs" and builtins != {"position"}:
                 raise ValueError("Vertex shaders must declare exactly one clip-position output.")
-            if preview and stage == "vertex" and direction == "inputs" and locations:
-                raise ValueError("The preview does not implement vertex-buffer inputs yet.")
             ports[stage, direction] = locations
     for location, consumer in ports["fragment", "inputs"].items():
         producer = ports["vertex", "outputs"].get(location)

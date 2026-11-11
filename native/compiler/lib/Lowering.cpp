@@ -1758,7 +1758,7 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
         if (builtin) {
           element.StartRow = 0;
         } else if (vertex && input) {
-          element.StartRow = location;
+          element.StartRow = id - 1;
         } else if (!vertex && !input) {
           element.StartRow = location;
         } else {
