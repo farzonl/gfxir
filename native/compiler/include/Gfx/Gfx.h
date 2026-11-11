@@ -55,6 +55,7 @@ struct ShaderInterface {
   ParameterBlockAttr parameters;
   SmallVector<BufferInterfaceElement> buffers;
   std::optional<std::array<int32_t, 3>> workgroupSize;
+  uint32_t sharedMemoryBytes = 0;
 };
 
 std::optional<BufferInterfaceElement>
@@ -97,7 +98,7 @@ struct TargetProfile {
   bool supportsCapability(llvm::StringRef cap) const;
   llvm::LogicalResult verifyWorkgroupSize(llvm::ArrayRef<int32_t> dims,
                                           mlir::Location loc) const;
-  llvm::LogicalResult verifySharedMemory(uint32_t bytes,
+  llvm::LogicalResult verifySharedMemory(uint64_t bytes,
                                          mlir::Location loc) const;
   llvm::LogicalResult verifyCapability(llvm::StringRef cap,
                                        mlir::Location loc) const;
@@ -123,6 +124,9 @@ uint32_t getTypeSize(Type type);
 /// Returns true if the type is a legal pointee type for !gfx.ptr.
 bool isValidPointeeType(Type type);
 
+/// Computes total workgroup shared memory bytes allocated across reachable functions.
+uint64_t computeSharedMemoryBytes(ModuleOp module, func::FuncOp entry);
+
 std::unique_ptr<Pass> createGfxToSPIRVPass(const TargetProfile &profile = TargetProfile());
 std::unique_ptr<Pass> createGfxToLLVMPass(const TargetProfile &profile = TargetProfile());
 std::unique_ptr<Pass> createGfxVerifyPass();
@@ -139,9 +143,11 @@ bool isShaderSymbolName(StringRef name);
 Value buildPortablePow(OpBuilder &builder, Location location, Value base,
                        Value exponent);
 OwningOpRef<ModuleOp> importShader(MLIRContext &context,
-                                   const llvm::json::Object &source);
+                                   const llvm::json::Object &source,
+                                   const TargetProfile &profile = TargetProfile());
 OwningOpRef<ModuleOp> importStructuredShader(MLIRContext &context,
-                                             const llvm::json::Object &source);
+                                             const llvm::json::Object &source,
+                                             const TargetProfile &profile = TargetProfile());
 ShaderInterface reflectShader(ModuleOp module);
 llvm::json::Object serializeReflection(const ShaderInterface &reflection);
 std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,

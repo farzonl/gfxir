@@ -98,4 +98,31 @@ def Gfx_BufferAccessAttr : AttrDef<Gfx_Dialect, "BufferAccess"> {
     operator AccessMode() const { return getValue(); }
   }];
 }
+
+def Gfx_MemoryScope : I32EnumAttr<"MemoryScope", "synchronization memory scope", [
+  I32EnumAttrCase<"Workgroup", 0, "workgroup">,
+  I32EnumAttrCase<"Device", 1, "device">,
+  I32EnumAttrCase<"All", 2, "all">
+]> {
+  let cppNamespace = "::mlir::gfx";
+  let genSpecializedAttr = 0;
+}
+def Gfx_MemoryScopeAttr : EnumAttr<Gfx_Dialect, Gfx_MemoryScope, "memory_scope">;
+
+def Gfx_AtomicOp : I32EnumAttr<"AtomicOp", "integer atomic read-modify-write operation", [
+  I32EnumAttrCase<"Add", 0, "add">,
+  I32EnumAttrCase<"Sub", 1, "sub">,
+  I32EnumAttrCase<"Min", 2, "min">,
+  I32EnumAttrCase<"Max", 3, "max">,
+  I32EnumAttrCase<"UMin", 4, "umin">,
+  I32EnumAttrCase<"UMax", 5, "umax">,
+  I32EnumAttrCase<"And", 6, "and">,
+  I32EnumAttrCase<"Or", 7, "or">,
+  I32EnumAttrCase<"Xor", 8, "xor">,
+  I32EnumAttrCase<"Xchg", 9, "xchg">
+]> {
+  let cppNamespace = "::mlir::gfx";
+  let genSpecializedAttr = 0;
+}
+def Gfx_AtomicOpAttr : EnumAttr<Gfx_Dialect, Gfx_AtomicOp, "atomic_op">;
 #endif

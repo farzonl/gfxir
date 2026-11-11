@@ -226,6 +226,12 @@ def _normalize_buffer_element_type(elem: Any) -> Type:
         return Type.U32
     if elem is bool or elem is Type.BOOL or elem == "bool":
         return Type.BOOL
+    if elem is vec2 or elem is Type.VEC2 or elem in ("vec2", "f32x2", "vector<2xf32>"):
+        return Type.VEC2
+    if elem is vec3 or elem is Type.VEC3 or elem in ("vec3", "f32x3", "vector<3xf32>"):
+        return Type.VEC3
+    if elem is vec4 or elem is Type.VEC4 or elem in ("vec4", "f32x4", "vector<4xf32>"):
+        return Type.VEC4
     if isinstance(elem, str):
         try:
             return Type.from_schema(elem)
@@ -373,6 +379,30 @@ class Value:
     def __rtruediv__(self, other: Value | float | int) -> Value:
         return _binary("div", other, self)
 
+    def __floordiv__(self, other: Value | int) -> Value:
+        return _int_binary("floordiv", self, other)
+
+    def __rfloordiv__(self, other: Value | int) -> Value:
+        return _int_binary("floordiv", other, self)
+
+    def __mod__(self, other: Value | int) -> Value:
+        return _int_binary("mod", self, other)
+
+    def __rmod__(self, other: Value | int) -> Value:
+        return _int_binary("mod", other, self)
+
+    def __lshift__(self, other: Value | int) -> Value:
+        return _int_binary("shl", self, other)
+
+    def __rlshift__(self, other: Value | int) -> Value:
+        return _int_binary("shl", other, self)
+
+    def __rshift__(self, other: Value | int) -> Value:
+        return _int_binary("shr", self, other)
+
+    def __rrshift__(self, other: Value | int) -> Value:
+        return _int_binary("shr", other, self)
+
     def __neg__(self) -> Value:
         if self.node.type not in (Type.F32, Type.I32, *VECTOR_SIZES):
             raise TypeError("Negation requires a floating-point or signed value.")
@@ -385,25 +415,28 @@ class Value:
             raise TypeError("Absolute value requires a numeric value.")
         return Value(Node("abs", self.node.type, (self.node,)))
 
-    def __and__(self, other: Value | bool) -> Value:
-        return _boolean("and", self, other)
+    def __and__(self, other: Value | int | bool) -> Value:
+        return _bitwise_or_boolean("and", self, other)
 
-    def __rand__(self, other: Value | bool) -> Value:
-        return _boolean("and", other, self)
+    def __rand__(self, other: Value | int | bool) -> Value:
+        return _bitwise_or_boolean("and", other, self)
 
-    def __or__(self, other: Value | bool) -> Value:
-        return _boolean("or", self, other)
+    def __or__(self, other: Value | int | bool) -> Value:
+        return _bitwise_or_boolean("or", self, other)
 
-    def __ror__(self, other: Value | bool) -> Value:
-        return _boolean("or", other, self)
+    def __ror__(self, other: Value | int | bool) -> Value:
+        return _bitwise_or_boolean("or", other, self)
 
-    def __xor__(self, other: Value | bool) -> Value:
-        return _boolean("xor", self, other)
+    def __xor__(self, other: Value | int | bool) -> Value:
+        return _bitwise_or_boolean("xor", self, other)
 
-    def __rxor__(self, other: Value | bool) -> Value:
-        return _boolean("xor", other, self)
+    def __rxor__(self, other: Value | int | bool) -> Value:
+        return _bitwise_or_boolean("xor", other, self)
 
     def __invert__(self) -> Value:
+        if self.node.type in (Type.I32, Type.U32):
+            mask = -1 if self.node.type == Type.I32 else 0xFFFF_FFFF
+            return _int_binary("xor", self, mask)
         return _boolean("xor", self, True)
 
     def __lt__(self, other: Value | float | int) -> Value:
@@ -512,6 +545,91 @@ def workgroup_id() -> Value:
     return Value(Node("builtin", "vector<3xi32>", (), literal="workgroup_id"))
 
 
+def shared_array(
+    element_type: Any,
+    shape_or_count: int | Sequence[int],
+    *,
+    name: str | None = None,
+) -> Any:
+    """Allocate a static workgroup-shared array inside a @compute kernel."""
+    raise TypeError("shared_array() can only be called inside a @compute kernel.")
+
+
+def workgroup_barrier() -> None:
+    """Synchronize all threads in the workgroup and order workgroup shared memory accesses."""
+    raise TypeError("workgroup_barrier() can only be called inside a @compute kernel.")
+
+
+def storage_barrier() -> None:
+    """Synchronize all threads in the workgroup and order global storage buffer accesses."""
+    raise TypeError("storage_barrier() can only be called inside a @compute kernel.")
+
+
+def full_barrier() -> None:
+    """Synchronize all threads in the workgroup and order both workgroup and global memory accesses."""
+    raise TypeError("full_barrier() can only be called inside a @compute kernel.")
+
+
+def atomic_add(target: Any, index: Any, value: Value | int) -> Value:
+    """Atomically add value to target[index] and return the previous 32-bit integer value."""
+    raise TypeError("atomic_add() can only be called inside a shader kernel.")
+
+
+def atomic_sub(target: Any, index: Any, value: Value | int) -> Value:
+    """Atomically subtract value from target[index] and return the previous 32-bit integer value."""
+    raise TypeError("atomic_sub() can only be called inside a shader kernel.")
+
+
+def atomic_min(target: Any, index: Any, value: Value | int) -> Value:
+    """Atomically replace target[index] with min(target[index], value) and return the previous value."""
+    raise TypeError("atomic_min() can only be called inside a shader kernel.")
+
+
+def atomic_max(target: Any, index: Any, value: Value | int) -> Value:
+    """Atomically replace target[index] with max(target[index], value) and return the previous value."""
+    raise TypeError("atomic_max() can only be called inside a shader kernel.")
+
+
+def atomic_umin(target: Any, index: Any, value: Value | int) -> Value:
+    """Atomically replace target[index] with unsigned min(target[index], value) and return the previous value."""
+    raise TypeError("atomic_umin() can only be called inside a shader kernel.")
+
+
+def atomic_umax(target: Any, index: Any, value: Value | int) -> Value:
+    """Atomically replace target[index] with unsigned max(target[index], value) and return the previous value."""
+    raise TypeError("atomic_umax() can only be called inside a shader kernel.")
+
+
+def atomic_and(target: Any, index: Any, value: Value | int) -> Value:
+    """Atomically bitwise-AND value into target[index] and return the previous 32-bit integer value."""
+    raise TypeError("atomic_and() can only be called inside a shader kernel.")
+
+
+def atomic_or(target: Any, index: Any, value: Value | int) -> Value:
+    """Atomically bitwise-OR value into target[index] and return the previous 32-bit integer value."""
+    raise TypeError("atomic_or() can only be called inside a shader kernel.")
+
+
+def atomic_xor(target: Any, index: Any, value: Value | int) -> Value:
+    """Atomically bitwise-XOR value into target[index] and return the previous 32-bit integer value."""
+    raise TypeError("atomic_xor() can only be called inside a shader kernel.")
+
+
+def atomic_exchange(target: Any, index: Any, value: Value | int) -> Value:
+    """Atomically store value into target[index] and return the previous 32-bit integer value."""
+    raise TypeError("atomic_exchange() can only be called inside a shader kernel.")
+
+
+def atomic_compare_exchange(
+    target: Any, index: Any, expected: Value | int, desired: Value | int
+) -> Value:
+    """Atomically store desired into target[index] if equal to expected; return the previous value."""
+    raise TypeError("atomic_compare_exchange() can only be called inside a shader kernel.")
+
+
+atomic_cas = atomic_compare_exchange
+
+
 def _operands(lhs: Value | float | int, rhs: Value | float | int,
               broadcast: bool = False) -> tuple[Node, Node]:
     expected = lhs.node.type if isinstance(lhs, Value) else (
@@ -551,6 +669,21 @@ def _compare(predicate: str, lhs: Value | float | int, rhs: Value | float | int)
     elif predicate != "ne":
         predicate = ("s" if left.type == Type.I32 else "u") + predicate
     return Value(Node("cmp", Type.BOOL, (left, right), literal=predicate))
+
+
+def _int_binary(op: str, lhs: Value | int, rhs: Value | int) -> Value:
+    left, right = _operands(lhs, rhs)
+    if left.type not in (Type.I32, Type.U32):
+        raise TypeError("Integer operation requires matching i32 or u32 scalar values.")
+    return Value(Node(op, left.type, (left, right)))
+
+
+def _bitwise_or_boolean(op: str, lhs: Value | int | bool, rhs: Value | int | bool) -> Value:
+    if (isinstance(lhs, Value) and lhs.node.type in (Type.I32, Type.U32)) or (
+        isinstance(rhs, Value) and rhs.node.type in (Type.I32, Type.U32)
+    ):
+        return _int_binary(op, lhs, rhs)
+    return _boolean(op, lhs, rhs)
 
 
 def _boolean(op: str, lhs: Value | bool, rhs: Value | bool) -> Value:

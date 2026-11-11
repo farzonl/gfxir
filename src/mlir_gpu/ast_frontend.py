@@ -12,8 +12,12 @@ from typing import Callable
 from . import sdf, shader_math
 from .frontend import (
     ComputePipeline, Entry, GlobalInvocationId, LocalInvocationId, Node, Pipeline,
-    Type, Value, Vertex, WorkgroupId, _node, global_invocation_id, local_invocation_id,
-    maximum, minimum, select, workgroup_id,
+    Type, Value, Vertex, WorkgroupId, _node, _normalize_buffer_element_type,
+    atomic_add, atomic_and, atomic_compare_exchange, atomic_exchange,
+    atomic_max, atomic_min, atomic_or, atomic_sub, atomic_umax, atomic_umin,
+    atomic_xor, full_barrier, global_invocation_id, local_invocation_id,
+    maximum, minimum, select, shared_array, storage_barrier,
+    workgroup_barrier, workgroup_id,
 )
 from .frontend import i32, u32, vec2, vec3, vec4
 from .parameters import _ParameterValues
@@ -102,6 +106,26 @@ class MatrixValue:
                 comps.append(total)
             return _VECTOR_CONSTRUCTORS[self.column_count](*comps)
         return NotImplemented
+
+
+_ATOMIC_RMW_KINDS = {
+    atomic_add: "add",
+    atomic_sub: "sub",
+    atomic_min: "min",
+    atomic_max: "max",
+    atomic_umin: "umin",
+    atomic_umax: "umax",
+    atomic_and: "and",
+    atomic_or: "or",
+    atomic_xor: "xor",
+    atomic_exchange: "xchg",
+}
+
+_BARRIER_SCOPES = {
+    workgroup_barrier: "workgroup",
+    storage_barrier: "device",
+    full_barrier: "all",
+}
 
 
 _INTRINSICS = {
@@ -197,9 +221,17 @@ class _Builder:
             self.cache[key] = args[0]
             return args[0]
         else:
+            if node.op in ("floordiv", "mod", "shl", "shr") or (
+                node.op in ("and", "or", "xor") and node.type in (Type.I32, Type.U32)
+            ):
+                self.engine.structured = True
             op = {
                 "broadcast": "vector.broadcast", "select": "arith.select",
                 "div": "arith.divf", "neg": "arith.negf" if floating else "arith.subi",
+                "floordiv": "arith.divsi" if signed else "arith.divui",
+                "mod": "arith.remsi" if signed else "arith.remui",
+                "shl": "arith.shli",
+                "shr": "arith.shrsi" if signed else "arith.shrui",
                 "abs": "math.absf" if floating else "math.absi",
                 "and": "arith.andi", "or": "arith.ori", "xor": "arith.xori",
                 **{name: f"math.{name}" for name in ("sin", "cos", "sqrt", "rsqrt", "exp", "exp2", "log", "log2", "floor")},
@@ -237,6 +269,47 @@ class _BufferProxy:
     @property
     def element_schema_name(self) -> str:
         return _mlir_element_type(self.element_type)
+
+    @property
+    def storage_class(self) -> str:
+        return "global"
+
+
+@dataclass(frozen=True)
+class _SharedArrayProxy:
+    name: str
+    ref: _Ref
+    element_type: Type
+    count: int
+    shape: tuple[int, ...]
+
+    @property
+    def element_schema_name(self) -> str:
+        return _mlir_element_type(self.element_type)
+
+    @property
+    def storage_class(self) -> str:
+        return "workgroup"
+
+    @property
+    def alignment(self) -> int | None:
+        return None
+
+
+def _has_nonlocal_jump(statements: Sequence[ast.stmt], in_loop: bool = False) -> bool:
+    for stmt in statements:
+        if isinstance(stmt, ast.Return):
+            return True
+        if isinstance(stmt, (ast.Break, ast.Continue)):
+            if not in_loop:
+                return True
+        elif isinstance(stmt, ast.If):
+            if _has_nonlocal_jump(stmt.body, in_loop) or _has_nonlocal_jump(stmt.orelse, in_loop):
+                return True
+        elif isinstance(stmt, (ast.For, ast.While)):
+            if _has_nonlocal_jump(stmt.body, True) or _has_nonlocal_jump(stmt.orelse, True):
+                return True
+    return False
 
 
 class ASTLowering:
@@ -432,6 +505,9 @@ class ASTLowering:
                 rebuild_values(items[:count]), rebuild_modes(items[count:count + 1]),
                 rebuild_returns(items[count + 1:]),
             )
+        if isinstance(left, MatrixValue) and isinstance(right, MatrixValue) and left.type == right.type:
+            values, rebuild = self.pair(left.columns, right.columns)
+            return values, lambda items: MatrixValue(rebuild(items))
         if isinstance(left, Vertex) and isinstance(right, Vertex):
             values, rebuild = self.pair(
                 (left.position, left.color, dict(left.varyings)),
@@ -470,6 +546,8 @@ class ASTLowering:
                 from .frontend import vec2, vec3, vec4
                 return {Type.VEC2: vec2, Type.VEC3: vec3, Type.VEC4: vec4}[value.node.type](0)
             return self.lift(False if value.node.type == Type.BOOL else 0, value.node.type)
+        if isinstance(value, MatrixValue):
+            return MatrixValue(self.zero(value.columns))
         if isinstance(value, Vertex):
             return Vertex(self.zero(value.position), self.zero(value.color), self.zero(dict(value.varyings)))
         if isinstance(value, dict):
@@ -509,6 +587,14 @@ class ASTLowering:
     def call(self, function, args, kwargs):
         if not callable(function) and not isinstance(function, (_Lambda, _Function)):
             self.fail("Calls must resolve to static Python helpers or registered shader intrinsics.")
+        if function is shared_array:
+            return self._call_shared_array(args, kwargs)
+        if function in _BARRIER_SCOPES:
+            return self._call_barrier(function, args, kwargs)
+        if function in _ATOMIC_RMW_KINDS:
+            return self._call_atomic_rmw(function, args, kwargs)
+        if function is atomic_compare_exchange:
+            return self._call_atomic_cas(args, kwargs)
         if function in (builtins.abs, minimum, maximum, builtins.min, builtins.max):
             if function is builtins.abs and (len(args) != 1 or type(args[0]) not in (Value, int, float, bool)):
                 self.fail("abs requires a scalar or device numeric operand.")
@@ -697,7 +783,10 @@ class ASTLowering:
                 if access_str == "write_only":
                     self.fail(f"Cannot read from write-only buffer '{owner.name}'.")
                 index = self.expression(node.slice, env)
-                return self._buffer_load(owner, index)
+                return self._memory_load(owner, index)
+            if isinstance(owner, _SharedArrayProxy):
+                index = self.expression(node.slice, env)
+                return self._memory_load(owner, index)
             if type(owner) not in (Value, MatrixValue, tuple, list, dict, str, range):
                 self.fail("Subscripts require device vectors or compile-time literal collections.")
             return owner[self.expression(node.slice, env)]
@@ -731,7 +820,9 @@ class ASTLowering:
                 self.fail("Binary operations require device values or literal scalar/tuple constants.")
             operation = {
                 ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
-                ast.Div: operator.truediv, ast.BitAnd: operator.and_, ast.BitOr: operator.or_,
+                ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+                ast.LShift: operator.lshift, ast.RShift: operator.rshift,
+                ast.BitAnd: operator.and_, ast.BitOr: operator.or_,
                 ast.BitXor: operator.xor,
             }.get(type(node.op))
             if isinstance(node.op, ast.Pow):
@@ -790,24 +881,186 @@ class ASTLowering:
                 if access_str == "read_only":
                     self.fail(f"Cannot write to read-only buffer '{owner.name}'.")
                 index = self.expression(target.slice, env)
-                self._buffer_store(owner, index, value)
+                self._memory_store(owner, index, value)
+                return
+            if isinstance(owner, _SharedArrayProxy):
+                index = self.expression(target.slice, env)
+                self._memory_store(owner, index, value)
                 return
             self.fail("Device assignments require local names; attribute/subscript mutation is unsupported.")
         else:
             self.fail("Device assignments require local names; attribute/subscript mutation is unsupported.")
 
-    def _buffer_load(self, owner: _BufferProxy, index: Any) -> Value:
+    def _call_shared_array(self, args, kwargs) -> _SharedArrayProxy:
+        if self.workgroup_size is None:
+            self.fail("shared_array() is only allowed inside a @compute kernel.")
+        if len(args) != 2 or set(kwargs) - {"name"}:
+            self.fail("shared_array() expects (element_type, count_or_shape, *, name=None).")
+        elem_type = _normalize_buffer_element_type(args[0])
+        raw_shape = args[1]
+        if type(raw_shape) is int and not isinstance(raw_shape, bool):
+            if raw_shape <= 0:
+                self.fail(f"shared_array count must be positive, got {raw_shape}.")
+            shape = (raw_shape,)
+            count = raw_shape
+        elif isinstance(raw_shape, (tuple, list)) and len(raw_shape) >= 1:
+            if any(type(d) is not int or isinstance(d, bool) or d <= 0 for d in raw_shape):
+                self.fail(f"shared_array shape dimensions must be positive integers, got {raw_shape!r}.")
+            shape = tuple(raw_shape)
+            count = 1
+            for d in shape:
+                count *= d
+        else:
+            self.fail("shared_array size must be a positive compile-time integer or shape tuple.")
+
+        sym_name = kwargs.get("name")
+        if sym_name is not None and (not isinstance(sym_name, str) or not sym_name.isidentifier()):
+            self.fail(f"shared_array name must be a valid identifier, got {sym_name!r}.")
+
+        elem_schema = _mlir_element_type(elem_type)
+        ptr_type = f"!gfx.ptr<{elem_schema}, workgroup>"
+        attrs = {"count": {"kind": "literal", "type": "i32", "value": count}}
+        if sym_name is not None:
+            attrs["name"] = {"kind": "string", "value": sym_name}
+        ref, = self.root.raw("gfx.shared_alloc", [], types=[ptr_type], attributes=attrs)
+        self.structured = True
+        return _SharedArrayProxy(
+            name=sym_name or ref.name,
+            ref=ref,
+            element_type=elem_type,
+            count=count,
+            shape=shape,
+        )
+
+    def _call_barrier(self, function, args, kwargs) -> None:
+        if self.workgroup_size is None:
+            self.fail(f"{function.__name__}() is only allowed inside a @compute kernel.")
+        if args or kwargs:
+            self.fail(f"{function.__name__}() takes no arguments.")
+        scope = _BARRIER_SCOPES[function]
+        self.builder.raw(
+            "gfx.barrier",
+            [],
+            [],
+            attributes={"scope": {"kind": "memory_scope", "value": scope}},
+        )
+        self.structured = True
+        return None
+
+    def _validate_atomic_target(self, target) -> None:
+        if not isinstance(target, (_BufferProxy, _SharedArrayProxy)):
+            self.fail("Atomic target must be a Buffer or shared_array.")
+        if isinstance(target, _BufferProxy):
+            access_str = target.access.value if hasattr(target.access, "value") else str(target.access)
+            if access_str != "read_write":
+                self.fail(
+                    f"Atomic operations require a read_write buffer, got '{access_str}' on '{target.name}'."
+                )
+        if target.element_type not in (Type.I32, Type.U32):
+            self.fail(
+                f"Atomic operations require Type.I32 or Type.U32 elements, got {target.element_type!r}."
+            )
+
+    def _coerce_atomic_int_operand(self, operand, expected_type: Type) -> _Ref:
+        if isinstance(operand, Value):
+            if operand.type not in (Type.I32, Type.U32):
+                self.fail(f"Atomic integer operand must be i32 or u32, got {operand.type}.")
+            val = (
+                operand
+                if operand.type == expected_type
+                else (i32(operand) if expected_type == Type.I32 else u32(operand))
+            )
+        elif type(operand) is int and not isinstance(operand, bool):
+            val = self.lift(operand, expected_type)
+        else:
+            self.fail(f"Atomic integer operand must be int or device i32/u32, got {type(operand).__name__}.")
+        return self.builder.emit(val.node)
+
+    def _call_atomic_rmw(self, function, args, kwargs) -> Value:
+        if kwargs or len(args) != 3:
+            self.fail(f"{function.__name__}() expects (target, index, value).")
+        target, index, value = args
+        self._validate_atomic_target(target)
+        off_ref = self._element_ptr_ref(target, index)
+        val_ref = self._coerce_atomic_int_operand(value, target.element_type)
+        kind = _ATOMIC_RMW_KINDS[function]
+        if target.element_type == Type.U32 and kind in ("min", "max"):
+            kind = "u" + kind
+        res_ref, = self.builder.raw(
+            "gfx.atomic_rmw",
+            [off_ref, val_ref],
+            types=["i32"],
+            attributes={"kind": {"kind": "atomic_op", "value": kind}},
+        )
+        self.structured = True
+        return self.builder.bind(res_ref, target.element_type)
+
+    def _call_atomic_cas(self, args, kwargs) -> Value:
+        if kwargs or len(args) != 4:
+            self.fail("atomic_compare_exchange() expects (target, index, expected, desired).")
+        target, index, expected, desired = args
+        self._validate_atomic_target(target)
+        off_ref = self._element_ptr_ref(target, index)
+        cmp_ref = self._coerce_atomic_int_operand(expected, target.element_type)
+        val_ref = self._coerce_atomic_int_operand(desired, target.element_type)
+        res_ref, = self.builder.raw(
+            "gfx.atomic_cas",
+            [off_ref, cmp_ref, val_ref],
+            types=["i32"],
+        )
+        self.structured = True
+        return self.builder.bind(res_ref, target.element_type)
+
+    def _linearize_index(self, owner: _BufferProxy | _SharedArrayProxy, index: Any) -> _Ref:
+        if isinstance(index, tuple):
+            if owner.shape is None or len(index) != len(owner.shape):
+                expected_rank = len(owner.shape) if owner.shape is not None else 1
+                self.fail(
+                    f"Multi-dimensional index rank {len(index)} does not match shape rank {expected_rank} "
+                    f"for '{owner.name}'."
+                )
+            coords: list[Value] = []
+            target_int_type = Type.I32
+            for item in index:
+                if isinstance(item, Value):
+                    if item.type not in (Type.I32, Type.U32):
+                        self.fail(f"Subscript coordinate must be an integer, got {item.type}")
+                    if item.type == Type.U32:
+                        target_int_type = Type.U32
+                    coords.append(item)
+                elif type(item) is int and not isinstance(item, bool):
+                    coords.append(self.lift(item, Type.I32))
+                else:
+                    self.fail(f"Subscript coordinate must be an integer, got {type(item).__name__}")
+            norm_coords = [
+                c if c.type == target_int_type else (u32(c) if target_int_type == Type.U32 else i32(c))
+                for c in coords
+            ]
+            linear = norm_coords[0]
+            for coord, dim in zip(norm_coords[1:], owner.shape[1:]):
+                linear = linear * dim + coord
+            return self.builder.emit(linear.node)
+
+        kind = "Shared array" if isinstance(owner, _SharedArrayProxy) else "Buffer"
         idx_val = self.lift(index, Type.I32) if not isinstance(index, Value) else index
         if idx_val.type not in (Type.I32, Type.U32):
-            self.fail(f"Buffer subscript index must be an integer, got {idx_val.type}")
-        idx_ref = self.builder.emit(idx_val.node)
+            self.fail(f"{kind} subscript index must be an integer, got {idx_val.type}")
+        return self.builder.emit(idx_val.node)
+
+    def _element_ptr_ref(self, owner: _BufferProxy | _SharedArrayProxy, index: Any) -> _Ref:
+        idx_ref = self._linearize_index(owner, index)
         elem_schema = owner.element_schema_name
-        ptr_type = f"!gfx.ptr<{elem_schema}, global>"
+        ptr_type = f"!gfx.ptr<{elem_schema}, {owner.storage_class}>"
         off_ref, = self.builder.raw(
             "gfx.ptr_offset",
             [owner.ref, idx_ref],
             types=[ptr_type],
         )
+        return off_ref
+
+    def _memory_load(self, owner: _BufferProxy | _SharedArrayProxy, index: Any) -> Value:
+        off_ref = self._element_ptr_ref(owner, index)
+        elem_schema = owner.element_schema_name
         load_attrs = {}
         if owner.alignment:
             load_attrs["alignment"] = {"kind": "literal", "type": "i32", "value": owner.alignment}
@@ -819,27 +1072,17 @@ class ASTLowering:
         )
         return self.builder.bind(load_ref, owner.element_type)
 
-    def _buffer_store(self, owner: _BufferProxy, index: Any, value: Any) -> None:
-        idx_val = self.lift(index, Type.I32) if not isinstance(index, Value) else index
-        if idx_val.type not in (Type.I32, Type.U32):
-            self.fail(f"Buffer subscript index must be an integer, got {idx_val.type}")
-        idx_ref = self.builder.emit(idx_val.node)
+    def _memory_store(self, owner: _BufferProxy | _SharedArrayProxy, index: Any, value: Any) -> None:
         val = self.lift(value, owner.element_type) if not isinstance(value, Value) else value
-
         elem_type = owner.element_type
         if isinstance(elem_type, Type) and val.type != elem_type:
             val_val = val.type.value if isinstance(val.type, Type) else str(val.type)
             elem_val = elem_type.value if isinstance(elem_type, Type) else str(elem_type)
-            self.fail(f"Type mismatch: cannot store {val_val} into Buffer[{elem_val}]")
+            kind_label = "shared_array" if isinstance(owner, _SharedArrayProxy) else "Buffer"
+            self.fail(f"Type mismatch: cannot store {val_val} into {kind_label}[{elem_val}]")
 
         val_ref = self.builder.emit(val.node)
-        elem_schema = owner.element_schema_name
-        ptr_type = f"!gfx.ptr<{elem_schema}, global>"
-        off_ref, = self.builder.raw(
-            "gfx.ptr_offset",
-            [owner.ref, idx_ref],
-            types=[ptr_type],
-        )
+        off_ref = self._element_ptr_ref(owner, index)
         store_attrs = {}
         if owner.alignment:
             store_attrs["alignment"] = {"kind": "literal", "type": "i32", "value": owner.alignment}
@@ -904,7 +1147,59 @@ class ASTLowering:
             expression = ast.copy_location(ast.BinOp(node.target, node.op, node.value), node)
             self.assign(node.target, self.expression(expression, env), env)
         elif isinstance(node, ast.If):
-            return self.choose(self.expression(node.test, env),
+            cond = self.expression(node.test, env)
+            if (
+                isinstance(cond, Value)
+                and rest
+                and not _has_nonlocal_jump(node.body)
+                and not _has_nonlocal_jump(node.orelse)
+            ):
+                if cond.node.type != Type.BOOL:
+                    self.fail("Device conditions require bool values, not numeric truthiness.")
+                parent = self.builder
+                branches = [_Builder(self, captures=parent.cache) for _ in range(2)]
+                try:
+                    self.builder = branches[0]
+                    then_env = self.resolve(
+                        self.plan(node.body, dict(env), lambda e: e, returned, broken, continued)
+                    )
+                    self.builder = branches[1]
+                    else_env = self.resolve(
+                        self.plan(node.orelse, dict(env), lambda e: e, returned, broken, continued)
+                    )
+                finally:
+                    self.builder = parent
+                unmergeable = (_Function, _Lambda, _BufferProxy, _SharedArrayProxy)
+                common_keys = [k for k in then_env if k in else_env]
+                changed_keys = [
+                    k for k in common_keys
+                    if then_env[k] is not else_env[k] or k not in env
+                ]
+                if not any(
+                    isinstance(then_env[k], unmergeable) or isinstance(else_env[k], unmergeable)
+                    for k in changed_keys
+                ):
+                    self.structured = True
+                    cond_ref = parent.emit(cond.node)
+                    left_updates = {k: then_env[k] for k in changed_keys}
+                    right_updates = {k: else_env[k] for k in changed_keys}
+                    leaves, rebuild = self.pair(left_updates, right_updates)
+                    types = []
+                    for index, branch in enumerate(branches):
+                        args = [branch.emit(pair[index].node) for pair in leaves]
+                        branch.raw("scf.yield", args)
+                        if index == 0:
+                            types = [value.node.type for value, _ in leaves]
+                    refs = parent.raw(
+                        "scf.if", [cond_ref], [typ.schema_name for typ in types], regions=branches
+                    )
+                    merged_updates = rebuild(
+                        [parent.bind(ref, typ) for ref, typ in zip(refs, types)]
+                    )
+                    merged_env = dict(env)
+                    merged_env.update(merged_updates)
+                    return self.plan(rest, merged_env, finish, returned, broken, continued)
+            return self.choose(cond,
                                lambda: self.plan(node.body + rest, dict(env), finish, returned, broken, continued),
                                lambda: self.plan(node.orelse + rest, dict(env), finish, returned, broken, continued))
         elif isinstance(node, (ast.For, ast.While)):
@@ -919,6 +1214,8 @@ class ASTLowering:
             return continued(env)
         elif isinstance(node, ast.Pass) or isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
             pass
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            self.expression(node.value, env)
         else:
             self.fail(f"Unsupported statement: {type(node).__name__}; mutation, exceptions, and dynamic Python execution are not device operations.")
         return self.plan(rest, env, finish, returned, broken, continued)

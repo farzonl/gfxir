@@ -93,28 +93,7 @@ int main(int argc, char **argv) {
   gfx::registerGfxDialects(registry);
   MLIRContext context(registry);
   context.loadAllAvailableDialects();
-  OwningOpRef<ModuleOp> module;
-  if (format == "mlir") {
-    module = parseSourceFile<ModuleOp>(input, &context);
-  } else {
-    auto buffer = llvm::MemoryBuffer::getFile(input);
-    if (!buffer) {
-      llvm::errs() << input << ": " << buffer.getError().message() << "\n";
-      return 1;
-    }
-    auto json = llvm::json::parse((*buffer)->getBuffer());
-    if (!json) {
-      llvm::errs() << "gfx-compile: " << llvm::toString(json.takeError())
-                   << "\n";
-      return 1;
-    }
-    auto object = json->getAsObject();
-    if (!object) {
-      llvm::errs() << "gfx-compile: shader JSON must be an object\n";
-      return 1;
-    }
-    module = gfx::importShader(context, *object);
-  }
+
   gfx::TargetProfile profile;
   if (!targetProfile.empty()) {
     std::string content;
@@ -130,7 +109,12 @@ int main(int argc, char **argv) {
       content = targetProfile;
     }
     auto parsed = llvm::json::parse(content);
-    if (!parsed || !parsed->getAsObject()) {
+    if (!parsed) {
+      llvm::consumeError(parsed.takeError());
+      llvm::errs() << "gfx-compile: target-profile must be valid JSON object\n";
+      return 1;
+    }
+    if (!parsed->getAsObject()) {
       llvm::errs() << "gfx-compile: target-profile must be valid JSON object\n";
       return 1;
     }
@@ -142,8 +126,9 @@ int main(int argc, char **argv) {
     }
     profile = *loaded;
   } else {
-    profile = (target == "vulkan") ? gfx::TargetProfile::getDefaultVulkan()
-                                   : gfx::TargetProfile::getDefaultDirectX();
+    profile = (resolvedTarget == "vulkan")
+                  ? gfx::TargetProfile::getDefaultVulkan()
+                  : gfx::TargetProfile::getDefaultDirectX();
   }
 
   if (!spirvVersion.empty()) {
@@ -174,6 +159,29 @@ int main(int argc, char **argv) {
   if (maxSharedMemoryBytes.getNumOccurrences() > 0)
     profile.max_shared_memory_bytes = maxSharedMemoryBytes;
 
+  OwningOpRef<ModuleOp> module;
+  if (format == "mlir") {
+    module = parseSourceFile<ModuleOp>(input, &context);
+  } else {
+    auto buffer = llvm::MemoryBuffer::getFile(input);
+    if (!buffer) {
+      llvm::errs() << input << ": " << buffer.getError().message() << "\n";
+      return 1;
+    }
+    auto json = llvm::json::parse((*buffer)->getBuffer());
+    if (!json) {
+      llvm::errs() << "gfx-compile: " << llvm::toString(json.takeError())
+                   << "\n";
+      return 1;
+    }
+    auto object = json->getAsObject();
+    if (!object) {
+      llvm::errs() << "gfx-compile: shader JSON must be an object\n";
+      return 1;
+    }
+    module = gfx::importShader(context, *object, profile);
+  }
+
   if (!module || failed(gfx::verifyShaderModule(*module, profile)))
     return 1;
   if (!irOutput.empty() && failed(writeFile(irOutput, [&](auto &stream) {
@@ -188,6 +196,8 @@ int main(int argc, char **argv) {
   if (failed(manager.run(*module)))
     return 1;
   auto reflection = gfx::reflectShader(*module);
+  if (initialReflection.sharedMemoryBytes > reflection.sharedMemoryBytes)
+    reflection.sharedMemoryBytes = initialReflection.sharedMemoryBytes;
   for (const auto &buf : initialReflection.buffers) {
     if (llvm::none_of(reflection.buffers, [&](const auto &b) {
           return b.set == buf.set && b.binding == buf.binding;

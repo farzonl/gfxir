@@ -108,11 +108,12 @@ Value mlir::gfx::buildPortablePow(OpBuilder &builder, Location location,
 
 OwningOpRef<ModuleOp>
 mlir::gfx::importShader(MLIRContext &context,
-                        const llvm::json::Object &source) {
+                        const llvm::json::Object &source,
+                        const TargetProfile &profile) {
   if (source.get("schema_version")) {
     auto version = source.getInteger("schema_version");
     if (version && *version == 2)
-      return importStructuredShader(context, source);
+      return importStructuredShader(context, source, profile);
     if (!version || *version != 1) {
       emitError(UnknownLoc::get(&context),
                 "supported shader input versions are 1 (flat graph) and "
@@ -459,7 +460,7 @@ mlir::gfx::importShader(MLIRContext &context,
     }
   }
   func::ReturnOp::create(builder, location);
-  if (failed(verifyShaderModule(*module)))
+  if (failed(verifyShaderModule(*module, profile)))
     return {};
   return module;
 }
@@ -476,12 +477,18 @@ ShaderInterface mlir::gfx::reflectShader(ModuleOp module) {
       {},
       {},
       {},
-      std::nullopt};
+      std::nullopt,
+      0};
   if (auto wgAttr =
           function->getAttrOfType<DenseI32ArrayAttr>("gfx.workgroup_size")) {
     auto dims = wgAttr.asArrayRef();
     if (dims.size() == 3)
       result.workgroupSize = std::array<int32_t, 3>{dims[0], dims[1], dims[2]};
+  }
+  if (result.stage == Stage::Compute) {
+    uint64_t sharedBytes = computeSharedMemoryBytes(module, function);
+    result.sharedMemoryBytes = static_cast<uint32_t>(
+        std::min<uint64_t>(sharedBytes, std::numeric_limits<uint32_t>::max()));
   }
   for (unsigned i = 0; i < function.getNumArguments(); ++i) {
     if (auto argBuf = getArgumentBufferBinding(function, i))
@@ -567,6 +574,10 @@ mlir::gfx::serializeReflection(const ShaderInterface &reflection) {
   if (reflection.stage == Stage::Compute && reflection.workgroupSize) {
     const auto &wg = *reflection.workgroupSize;
     result["workgroup_size"] = llvm::json::Array{wg[0], wg[1], wg[2]};
+  }
+  if (reflection.stage == Stage::Compute && reflection.sharedMemoryBytes > 0) {
+    result["shared_memory_bytes"] =
+        static_cast<int64_t>(reflection.sharedMemoryBytes);
   }
   if (reflection.parameters)
     result["parameters"] =
