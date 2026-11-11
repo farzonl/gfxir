@@ -25,9 +25,56 @@ class Type(Enum):
     VEC2 = "vector<2xf32>"
     VEC3 = "vector<3xf32>"
     VEC4 = "vector<4xf32>"
+    MAT2X2 = "mat2x2"
+    MAT2X3 = "mat2x3"
+    MAT2X4 = "mat2x4"
+    MAT3X2 = "mat3x2"
+    MAT3X3 = "mat3x3"
+    MAT3X4 = "mat3x4"
+    MAT4X2 = "mat4x2"
+    MAT4X3 = "mat4x3"
+    MAT4X4 = "mat4x4"
+
+    @property
+    def matrix_shape(self) -> tuple[int, int] | None:
+        """Return (columns, rows) for matrix types, or None for non-matrix types.
+
+        Naming follows GLSL/WGSL: ``matCxR`` has C columns of R-component vectors.
+        """
+        match = re.fullmatch(r"mat(\d)x(\d)", self.value)
+        return (int(match.group(1)), int(match.group(2))) if match else None
+
+    @property
+    def is_matrix(self) -> bool:
+        return self.matrix_shape is not None
+
+    @property
+    def matrix_column_type(self) -> Type:
+        """Vector type of one column of a matrix type."""
+        shape = self.matrix_shape
+        if shape is None:
+            raise TypeError(f"{self.name} is not a matrix type.")
+        return {2: Type.VEC2, 3: Type.VEC3, 4: Type.VEC4}[shape[1]]
+
+    @property
+    def matrix_layout(self) -> tuple[int, int, int]:
+        """Return (size, alignment, column_stride) in bytes using std430 rules.
+
+        Columns are laid out like an array of vecR, so each column is padded to the
+        vector alignment (vec2: 8, vec3/vec4: 16).
+        """
+        shape = self.matrix_shape
+        if shape is None:
+            raise TypeError(f"{self.name} is not a matrix type.")
+        columns, rows = shape
+        stride = 8 if rows == 2 else 16
+        return (columns * stride, stride, stride)
 
     @property
     def schema_name(self) -> str:
+        shape = self.matrix_shape
+        if shape is not None:
+            return f"mat{shape[0]}x{shape[1]}"
         return {
             Type.F32: "f32", Type.U32: "u32", Type.I32: "i32",
             Type.F16: "f16", Type.U16: "u16", Type.I16: "i16",
@@ -75,6 +122,9 @@ def natural_alignment(type: Type | str) -> int:
         return 8
     if val in ("i8", "si8", "u8", "i1", "bool"):
         return 1
+    matrix = re.fullmatch(r"mat(\d)x(\d)", val)
+    if matrix:
+        return 8 if matrix.group(2) == "2" else 16
     if val == "vector<2xf32>":
         return 8
     if val in ("vector<3xf32>", "vector<4xf32>"):
@@ -310,6 +360,8 @@ class Value:
         return _binary("sub", other, self)
 
     def __mul__(self, other: Value | float | int) -> Value:
+        if getattr(other, "is_device_matrix", False):
+            return NotImplemented  # defer to MatrixValue.__rmul__ (vector * matrix)
         return _binary("mul", self, other)
 
     def __rmul__(self, other: Value | float | int) -> Value:
@@ -732,12 +784,14 @@ class Entry:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise ValueError(f"Invalid entry-point name: {name!r}.")
         parameters = list(inspect.signature(self.function).parameters.values())
-        from .parameters import ParameterBlock
+        from .parameters import ParameterBlock, is_struct
         parameter_blocks = {}
         for parameter in parameters:
             annotation = resolve_annotation(self.function, parameter.annotation)
             if isinstance(annotation, ParameterBlock):
                 parameter_blocks[parameter.name] = annotation
+            elif is_struct(annotation):
+                parameter_blocks[parameter.name] = annotation.as_parameter_block(name=parameter.name)
 
         if self.kind == "compute":
             interfaces = ()

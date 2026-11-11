@@ -154,7 +154,7 @@ class ObjectParams:
     def as_parameter_block(cls, name: str | None = None) -> Any:
         if Type is None: return None
         from mlir_gpu.parameters import ParameterBlock
-        return ParameterBlock(name or "obj", (("model", Type.MAT4), ("color", Type.VEC4)))
+        return ParameterBlock(name or "obj", (("model", Type.MAT4X4), ("color", Type.VEC4)))
 
     def __eq__(self, o: object) -> bool:
         return isinstance(o, ObjectParams) and self.model == o.model and self.color == o.color
@@ -185,7 +185,7 @@ class CameraParams:
     def as_parameter_block(cls, name: str | None = None) -> Any:
         if Type is None: return None
         from mlir_gpu.parameters import ParameterBlock
-        return ParameterBlock(name or "cam", (("view_proj", Type.MAT4), ("eye_pos", Type.VEC3), ("time", Type.F32)))
+        return ParameterBlock(name or "cam", (("view_proj", Type.MAT4X4), ("eye_pos", Type.VEC3), ("time", Type.F32)))
 
     def __eq__(self, o: object) -> bool:
         return (

@@ -15,6 +15,91 @@ from .frontend import i32, u32, vec2, vec3, vec4
 from .parameters import _ParameterValues
 
 
+_VECTOR_BY_SIZE = {2: Type.VEC2, 3: Type.VEC3, 4: Type.VEC4}
+_VECTOR_CONSTRUCTORS = {2: vec2, 3: vec3, 4: vec4}
+
+
+def _lane(vector: Value, index: int) -> Value:
+    return getattr(vector, "xyzw"[index])
+
+
+@dataclass(frozen=True)
+class MatrixValue:
+    """A device matrix with C columns, each a vector of R components (GLSL/WGSL ``matCxR``)."""
+    columns: tuple[Value, ...]
+    is_device_matrix = True
+
+    def __post_init__(self):
+        if not isinstance(self.columns, tuple) or not 2 <= len(self.columns) <= 4:
+            raise TypeError("MatrixValue requires a tuple of 2 to 4 column vectors.")
+        first = self.columns[0]
+        if not isinstance(first, Value) or first.node.type not in _VECTOR_BY_SIZE.values():
+            raise TypeError("MatrixValue columns must be Values of type VEC2, VEC3 or VEC4.")
+        for col in self.columns:
+            if not isinstance(col, Value) or col.node.type != first.node.type:
+                raise TypeError("MatrixValue columns must all be Values of the same vector type.")
+
+    @property
+    def column_count(self) -> int:
+        return len(self.columns)
+
+    @property
+    def row_count(self) -> int:
+        return {v: k for k, v in _VECTOR_BY_SIZE.items()}[self.columns[0].node.type]
+
+    @property
+    def type(self) -> Type:
+        return Type(f"mat{self.column_count}x{self.row_count}")
+
+    def __getitem__(self, index: int) -> Value:
+        if type(index) is not int or not 0 <= index < self.column_count:
+            raise IndexError(f"Matrix column index out of range (expected 0..{self.column_count - 1}).")
+        return self.columns[index]
+
+    def __len__(self) -> int:
+        return self.column_count
+
+    def __bool__(self) -> bool:
+        raise TypeError("Device values cannot control Python if/loops; use select().")
+
+    def __mul__(self, other: Value | MatrixValue) -> Value | MatrixValue:
+        if isinstance(other, Value):
+            # matCxR * vecC -> vecR: linear combination of the columns.
+            if other.node.type != _VECTOR_BY_SIZE[self.column_count]:
+                raise TypeError(
+                    f"{self.type.value} * vector requires {_VECTOR_BY_SIZE[self.column_count].name}, "
+                    f"got {other.node.type.name}."
+                )
+            result = self.columns[0] * _lane(other, 0)
+            for i in range(1, self.column_count):
+                result = result + self.columns[i] * _lane(other, i)
+            return result
+        if isinstance(other, MatrixValue):
+            # (CaxRa) * (CbxRb) requires Ca == Rb and yields CbxRa.
+            if self.column_count != other.row_count:
+                raise TypeError(f"Cannot multiply {self.type.value} by {other.type.value}: "
+                                f"inner dimensions {self.column_count} and {other.row_count} differ.")
+            return MatrixValue(tuple(self * col for col in other.columns))
+        return NotImplemented
+
+    def __rmul__(self, other: Value) -> Value:
+        if isinstance(other, Value):
+            # vecR * matCxR -> vecC: dot product of the vector with each column.
+            if other.node.type != _VECTOR_BY_SIZE[self.row_count]:
+                raise TypeError(
+                    f"Vector * {self.type.value} requires {_VECTOR_BY_SIZE[self.row_count].name}, "
+                    f"got {other.node.type.name}."
+                )
+            comps = []
+            for col in self.columns:
+                total = _lane(other, 0) * _lane(col, 0)
+                for i in range(1, self.row_count):
+                    total = total + _lane(other, i) * _lane(col, i)
+                comps.append(total)
+            return _VECTOR_CONSTRUCTORS[self.column_count](*comps)
+        return NotImplemented
+
+
 _INTRINSICS = {Node, Value, Vertex, i32, u32, vec2, vec3, vec4, select, maximum, minimum}
 for _module in (shader_math, sdf):
     _INTRINSICS.update(
@@ -249,10 +334,20 @@ class ASTLowering:
             block = parameters[parameter.name]
             values = {}
             for name, typ in block.fields:
-                values[name] = self.root.value("gfx.parameter", [], typ, {
-                    "block": {"kind": "string", "value": block.name},
-                    "field": {"kind": "string", "value": name},
-                })
+                if typ.is_matrix:
+                    cols = tuple(
+                        self.root.value("gfx.parameter", [], typ.matrix_column_type, {
+                            "block": {"kind": "string", "value": block.name},
+                            "field": {"kind": "string", "value": f"{name}_{i}"},
+                        })
+                        for i in range(typ.matrix_shape[0])
+                    )
+                    values[name] = MatrixValue(cols)
+                else:
+                    values[name] = self.root.value("gfx.parameter", [], typ, {
+                        "block": {"kind": "string", "value": block.name},
+                        "field": {"kind": "string", "value": name},
+                    })
             arguments.append(_ParameterValues(values))
             self.structured = True
         self.result = self.call(function, arguments, {})
@@ -522,7 +617,7 @@ class ASTLowering:
             if node.attr.startswith("_"):
                 self.fail("Private attributes and Python introspection are unsupported in device source.")
             owner = self.expression(node.value, env)
-            if not isinstance(owner, (Value, Node, ModuleType, Type, Vertex, Entry, Pipeline, _ParameterValues)) and owner is not Type:
+            if not isinstance(owner, (Value, Node, ModuleType, Type, Vertex, Entry, Pipeline, _ParameterValues, MatrixValue)) and owner is not Type:
                 self.fail("Dynamic attributes on arbitrary Python objects are unsupported.")
             return getattr(owner, node.attr)
         if isinstance(node, (ast.Tuple, ast.List)):
@@ -571,7 +666,7 @@ class ASTLowering:
                     self.fail(f"Cannot read from write-only buffer '{owner.name}'.")
                 index = self.expression(node.slice, env)
                 return self._buffer_load(owner, index)
-            if type(owner) not in (Value, tuple, list, dict, str, range):
+            if type(owner) not in (Value, MatrixValue, tuple, list, dict, str, range):
                 self.fail("Subscripts require device vectors or compile-time literal collections.")
             return owner[self.expression(node.slice, env)]
         if isinstance(node, ast.Lambda):
@@ -600,7 +695,7 @@ class ASTLowering:
             return self.call(function, args, kwargs)
         if isinstance(node, ast.BinOp):
             left, right = self.expression(node.left, env), self.expression(node.right, env)
-            if any(type(value) not in (Value, int, float, bool, str, tuple) for value in (left, right)):
+            if any(type(value) not in (Value, MatrixValue, int, float, bool, str, tuple) for value in (left, right)):
                 self.fail("Binary operations require device values or literal scalar/tuple constants.")
             operation = {
                 ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
