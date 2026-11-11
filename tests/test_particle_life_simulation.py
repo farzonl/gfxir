@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import runpy
 import struct
+import sys
 import tempfile
 import unittest
 
@@ -147,6 +148,217 @@ class TestParticleLifeVulkanExecution(unittest.TestCase):
             self.assertTrue(out_png.is_file())
             decoded = read_png(out_png)
             self.assertEqual((decoded.width, decoded.height), (128, 128))
+
+            diff = imgdiff(
+                out_png,
+                GOLDEN_PARTICLE_LIFE_PNG,
+                cie76_threshold=2.3,
+                max_outlier_fraction=0.002,
+                diff_output=diff_png,
+            )
+            self.assertTrue(diff.passed, diff.summary())
+            self.assertTrue(diff_png.is_file())
+
+
+@unittest.skipUnless(
+    sys.platform == "win32" and os.environ.get("MLIR_GPU_TEST_DIRECTX") == "1",
+    "Set MLIR_GPU_TEST_DIRECTX=1 on Windows to run live DirectX 12 Particle Life simulation",
+)
+class TestParticleLifeDirectXExecution(unittest.TestCase):
+    """Live DirectX 12 / WARP multi-step ping-pong simulation, read_write buffer, write_png, and imgdiff tests."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not (available("llc") and available("dxv") and available("mlir-gpu-directx-view")):
+            raise unittest.SkipTest("DirectX 12 compute execution tools are unavailable")
+        cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
+        cls.example = runpy.run_path(str(ROOT / "examples" / "particle_life_compute.py"))
+
+    def test_directx_read_write_storage_buffer_in_place_update(self):
+        @compute(workgroup_size=(32, 1, 1))
+        def axpy_in_place(
+            gid: GlobalInvocationId,
+            x: Buffer[Type.F32, "read_only"],
+            y: Buffer[Type.F32, "read_write"],
+        ):
+            idx = gid.x
+            if idx < 32:
+                y[idx] = y[idx] + x[idx] * 2.5
+
+        pipe = ComputePipeline(axpy_in_place, dispatch=Dispatch(grid=(1, 1, 1)))
+        x_vals = [float(i) for i in range(32)]
+        y_vals = [10.0 + float(i) * 0.5 for i in range(32)]
+        x_bytes = struct.pack("<32f", *x_vals)
+        y_bytes = struct.pack("<32f", *y_vals)
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = compile_pipeline(pipe, Target.DIRECTX, Path(td) / "dx_rw", TOOLS)
+            res = dispatch_compute(
+                manifest,
+                buffers={"x": x_bytes, "y": y_bytes},
+                validation=self.validation,
+                provider="warp",
+                toolchain=TOOLS,
+            )
+            self.assertIn("Basic Render Driver", res.device)
+            self.assertNotIn("x", res.buffers)
+            self.assertIn("y", res.buffers)
+            out_y = struct.unpack("<32f", res.buffers["y"])
+            for idx in range(32):
+                self.assertAlmostEqual(out_y[idx], y_vals[idx] + x_vals[idx] * 2.5, places=5)
+
+    def test_directx_warp_particle_life_ping_pong_simulation_and_png_imgdiff(self):
+        pos_cpu, vel_cpu, _ = self.example["cpu_simulate_particle_life"](steps=8)
+        pos_init, _, _ = self.example["create_initial_particle_state"]()
+
+        pos_gpu, vel_gpu, rendered = self.example["simulate_and_render_particle_life"](
+            Target.DIRECTX,
+            steps=8,
+            width=128,
+            height=128,
+            validation=self.validation,
+            provider="warp",
+            toolchain=TOOLS,
+        )
+        self.assertIn("Basic Render Driver", rendered.device)
+        self.assertEqual(len(pos_gpu), 64)
+        self.assertEqual(len(vel_gpu), 64)
+
+        max_pos_err = 0.0
+        max_vel_err = 0.0
+        total_displacement = 0.0
+        for i in range(64):
+            gx, gy = pos_gpu[i]
+            vx, vy = vel_gpu[i]
+            self.assertTrue(math.isfinite(gx) and math.isfinite(gy))
+            self.assertTrue(math.isfinite(vx) and math.isfinite(vy))
+            self.assertGreaterEqual(gx, 0.0)
+            self.assertLess(gx, 128.0)
+            self.assertGreaterEqual(gy, 0.0)
+            self.assertLess(gy, 128.0)
+
+            cx, cy = pos_cpu[i]
+            cvx, cvy = vel_cpu[i]
+            max_pos_err = max(max_pos_err, abs(gx - cx), abs(gy - cy))
+            max_vel_err = max(max_vel_err, abs(vx - cvx), abs(vy - cvy))
+            total_displacement += math.hypot(gx - pos_init[i][0], gy - pos_init[i][1])
+
+        self.assertGreater(total_displacement, 1.0)
+        self.assertLess(max_pos_err, 1e-3, f"Max DirectX WARP vs CPU position drift {max_pos_err} exceeded 1e-3")
+        self.assertLess(max_vel_err, 1e-3, f"Max DirectX WARP vs CPU velocity drift {max_vel_err} exceeded 1e-3")
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            out_png = td_path / "particle_life_directx_warp.png"
+            diff_png = td_path / "particle_life_directx_warp_diff.png"
+            write_png(out_png, rendered)
+            self.assertTrue(out_png.is_file())
+            decoded = read_png(out_png)
+            self.assertEqual((decoded.width, decoded.height), (128, 128))
+
+            diff = imgdiff(
+                out_png,
+                GOLDEN_PARTICLE_LIFE_PNG,
+                cie76_threshold=2.3,
+                max_outlier_fraction=0.002,
+                diff_output=diff_png,
+            )
+            self.assertTrue(diff.passed, diff.summary())
+            self.assertTrue(diff_png.is_file())
+
+
+@unittest.skipUnless(
+    sys.platform == "darwin" and os.environ.get("MLIR_GPU_TEST_METAL") == "1",
+    "Set MLIR_GPU_TEST_METAL=1 on macOS to run live Metal Particle Life simulation",
+)
+class TestParticleLifeMetalExecution(unittest.TestCase):
+    """Live Metal multi-step ping-pong simulation, read_write buffer, write_png, and imgdiff tests."""
+
+    @classmethod
+    def setUpClass(cls):
+        required = ("llc", "dxv", "metal-shaderconverter", "mlir-gpu-metal-view")
+        if not all(available(tool) for tool in required):
+            raise unittest.SkipTest("Metal compute execution tools are unavailable")
+        cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
+        cls.example = runpy.run_path(str(ROOT / "examples" / "particle_life_compute.py"))
+
+    def test_metal_read_write_storage_buffer_in_place_update(self):
+        @compute(workgroup_size=(32, 1, 1))
+        def axpy_in_place(
+            gid: GlobalInvocationId,
+            x: Buffer[Type.F32, "read_only"],
+            y: Buffer[Type.F32, "read_write"],
+        ):
+            idx = gid.x
+            if idx < 32:
+                y[idx] = y[idx] + x[idx] * 2.5
+
+        pipe = ComputePipeline(axpy_in_place, dispatch=Dispatch(grid=(1, 1, 1)))
+        x_vals = [float(i) for i in range(32)]
+        y_vals = [10.0 + float(i) * 0.5 for i in range(32)]
+        x_bytes = struct.pack("<32f", *x_vals)
+        y_bytes = struct.pack("<32f", *y_vals)
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = compile_pipeline(pipe, Target.METAL, Path(td) / "mtl_rw", TOOLS)
+            res = dispatch_compute(
+                manifest,
+                buffers={"x": x_bytes, "y": y_bytes},
+                validation=self.validation,
+                toolchain=TOOLS,
+            )
+            self.assertTrue(res.device)
+            self.assertNotIn("x", res.buffers)
+            self.assertIn("y", res.buffers)
+            out_y = struct.unpack("<32f", res.buffers["y"])
+            for idx in range(32):
+                self.assertAlmostEqual(out_y[idx], y_vals[idx] + x_vals[idx] * 2.5, places=5)
+
+    def test_metal_particle_life_ping_pong_simulation_and_png_imgdiff(self):
+        pos_cpu, vel_cpu, _ = self.example["cpu_simulate_particle_life"](steps=8)
+        pos_init, _, _ = self.example["create_initial_particle_state"]()
+
+        pos_gpu, vel_gpu, rendered = self.example["simulate_and_render_particle_life"](
+            Target.METAL,
+            steps=8,
+            width=128,
+            height=128,
+            validation=self.validation,
+            toolchain=TOOLS,
+        )
+        self.assertTrue(rendered.device)
+        self.assertEqual(len(pos_gpu), 64)
+        self.assertEqual(len(vel_gpu), 64)
+
+        max_pos_err = 0.0
+        max_vel_err = 0.0
+        total_displacement = 0.0
+        for i in range(64):
+            gx, gy = pos_gpu[i]
+            vx, vy = vel_gpu[i]
+            self.assertTrue(math.isfinite(gx) and math.isfinite(gy))
+            self.assertTrue(math.isfinite(vx) and math.isfinite(vy))
+            self.assertGreaterEqual(gx, 0.0)
+            self.assertLess(gx, 128.0)
+            self.assertGreaterEqual(gy, 0.0)
+            self.assertLess(gy, 128.0)
+
+            cx, cy = pos_cpu[i]
+            cvx, cvy = vel_cpu[i]
+            max_pos_err = max(max_pos_err, abs(gx - cx), abs(gy - cy))
+            max_vel_err = max(max_vel_err, abs(vx - cvx), abs(vy - cvy))
+            total_displacement += math.hypot(gx - pos_init[i][0], gy - pos_init[i][1])
+
+        self.assertGreater(total_displacement, 1.0)
+        self.assertLess(max_pos_err, 1e-3, f"Max Metal vs CPU position drift {max_pos_err} exceeded 1e-3")
+        self.assertLess(max_vel_err, 1e-3, f"Max Metal vs CPU velocity drift {max_vel_err} exceeded 1e-3")
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            out_png = td_path / "particle_life_metal.png"
+            diff_png = td_path / "particle_life_metal_diff.png"
+            write_png(out_png, rendered)
+            self.assertTrue(out_png.is_file())
 
             diff = imgdiff(
                 out_png,

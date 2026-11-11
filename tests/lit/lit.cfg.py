@@ -46,7 +46,7 @@ config.substitutions.extend([
 ])
 for name in ("gfx-opt", "gfx-compile", "FileCheck", "split-file", "llc",
              "spirv-val", "dxv", "dxil-assemble", "metal-shaderconverter",
-             "mlir-gpu-metal-view"):
+             "mlir-gpu-directx-view", "mlir-gpu-metal-view"):
     tool = shutil.which(name, path=path)
     if tool:
         config.available_features.add(name)
@@ -60,6 +60,12 @@ for name in ("gfx-opt", "gfx-compile", "FileCheck", "split-file", "llc",
 if os.environ.get("MLIR_GPU_TEST_VULKAN") == "1":
     config.available_features.add("vulkan_execution")
 if (
+    sys.platform == "win32"
+    and os.environ.get("MLIR_GPU_TEST_DIRECTX") == "1"
+    and {"llc", "dxv", "mlir-gpu-directx-view"}.issubset(config.available_features)
+):
+    config.available_features.add("directx_execution")
+if (
     sys.platform == "darwin"
     and os.environ.get("MLIR_GPU_TEST_METAL") == "1"
     and {"llc", "dxv", "metal-shaderconverter", "mlir-gpu-metal-view"}
@@ -68,9 +74,8 @@ if (
     config.available_features.add("metal_execution")
 if {"vulkan_execution", "metal_execution"} & config.available_features:
     config.available_features.add("image_execution")
-if "vulkan_execution" in config.available_features:
+if {"vulkan_execution", "directx_execution", "metal_execution"} & config.available_features:
     config.available_features.add("compute_execution")
-    config.environment["GFXIR_LIT_COMPUTE_TARGETS"] = "vulkan"
 execution_targets = [
     target for target, feature in (
         ("vulkan", "vulkan_execution"),
@@ -80,3 +85,13 @@ execution_targets = [
 ]
 if execution_targets:
     config.environment["GFXIR_LIT_EXECUTION_TARGETS"] = ",".join(execution_targets)
+compute_targets = [
+    target for target, feature in (
+        ("vulkan", "vulkan_execution"),
+        ("directx", "directx_execution"),
+        ("metal", "metal_execution"),
+    )
+    if feature in config.available_features
+]
+if compute_targets:
+    config.environment["GFXIR_LIT_COMPUTE_TARGETS"] = ",".join(compute_targets)
