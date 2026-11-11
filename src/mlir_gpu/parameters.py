@@ -525,6 +525,8 @@ TYPE_LAYOUT: dict[Type, tuple[int, int]] = {
     Type.F32: (4, 4),
     Type.U32: (4, 4),
     Type.I32: (4, 4),
+    Type.U16: (2, 2),
+    Type.I16: (2, 2),
     Type.VEC2: (8, 8),
     Type.VEC3: (12, 16),
     Type.VEC4: (16, 16),
@@ -567,11 +569,13 @@ def is_struct(obj: object) -> bool:
 
 def _resolve_field_type(annotation: Any) -> Type | type:
     if isinstance(annotation, Type):
-        if annotation in (Type.F32, Type.U32, Type.I32, Type.VEC2, Type.VEC3, Type.VEC4) or annotation.is_matrix:
+        if annotation in (Type.F32, Type.U32, Type.I32, Type.U16, Type.I16, Type.VEC2, Type.VEC3, Type.VEC4) or annotation.is_matrix:
             return annotation
         raise TypeError(f"Unsupported struct field type: {annotation!r}.")
     if isinstance(annotation, str):
         type_str_map = {
+            "u16": Type.U16, "i16": Type.I16,
+            "uint16": Type.U16, "int16": Type.I16,
             "f32": Type.F32, "u32": Type.U32, "i32": Type.I32,
             "vec2": Type.VEC2, "f32x2": Type.VEC2,
             "vec3": Type.VEC3, "f32x3": Type.VEC3,
@@ -593,6 +597,8 @@ def _resolve_field_type(annotation: Any) -> Type | type:
     # Check function/class by name (e.g. vec2/vec3/vec4 functions, Vec3 classes, and matCxR)
     name = getattr(annotation, "__name__", "")
     type_name_map = {
+        "u16": Type.U16, "i16": Type.I16,
+        "uint16": Type.U16, "int16": Type.I16,
         "f32": Type.F32, "u32": Type.U32, "i32": Type.I32,
         "vec2": Type.VEC2, "f32x2": Type.VEC2,
         "vec3": Type.VEC3, "f32x3": Type.VEC3,
@@ -673,7 +679,10 @@ def _unpack_matrix(buffer: Any, offset: int, typ: Type) -> tuple[float, ...]:
     return tuple(comps)
 
 
-def _make_struct(cls: type) -> type:
+def _make_struct(cls: type, layout: str = "std430") -> type:
+    if layout not in ("std430", "vertex"):
+        raise ValueError(f"Unsupported struct layout: {layout!r}.")
+    is_vertex = (layout == "vertex")
     raw_annotations = getattr(cls, "__annotations__", {})
     if not raw_annotations:
         raise ValueError("Struct must declare at least one field.")
@@ -697,18 +706,38 @@ def _make_struct(cls: type) -> type:
         elif has_default:
             raise TypeError(f"Non-default field {name!r} follows default field.")
 
-        if isinstance(typ, type) and is_struct(typ):
-            size = getattr(typ, "__struct_size__")
-            align = getattr(typ, "__struct_alignment__", 16)
+        if is_vertex:
+            if typ in (Type.F32, Type.U32, Type.I32):
+                size, align = (4, 4)
+            elif typ in (Type.U16, Type.I16):
+                size, align = (2, 2)
+            elif typ == Type.VEC2:
+                size, align = (8, 4)
+            elif typ == Type.VEC3:
+                size, align = (12, 4)
+            elif typ == Type.VEC4:
+                size, align = (16, 4)
+            elif isinstance(typ, Type) and typ.is_matrix:
+                cols, rows = typ.matrix_shape
+                size, align = (cols * rows * 4, 4)
+            elif isinstance(typ, type) and is_struct(typ):
+                size = getattr(typ, "__struct_size__")
+                align = getattr(typ, "__struct_alignment__", 4)
+            else:
+                raise TypeError(f"Unsupported vertex struct field type: {typ!r}.")
         else:
-            size, align = TYPE_LAYOUT[typ]
+            if isinstance(typ, type) and is_struct(typ):
+                size = getattr(typ, "__struct_size__")
+                align = getattr(typ, "__struct_alignment__", 16)
+            else:
+                size, align = TYPE_LAYOUT[typ]
 
         offset = (cursor + align - 1) // align * align
         fields.append(StructField(name=name, type=typ, offset=offset, size=size, alignment=align, default=default))
         cursor = offset + size
 
-    struct_size = (cursor + 15) // 16 * 16
-    struct_alignment = 16
+    struct_size = (cursor + 3) // 4 * 4 if is_vertex else (cursor + 15) // 16 * 16
+    struct_alignment = 4 if is_vertex else 16
 
     def __init__(self, *args, **kwargs):
         if len(args) > len(fields):
@@ -754,6 +783,14 @@ def _make_struct(cls: type) -> type:
                 if not isinstance(val, int) or isinstance(val, bool) or not -2**31 <= val <= 2**31 - 1:
                     raise ValueError(f"Field {f.name!r} requires signed 32-bit integer.")
                 _struct_module.pack_into("<i", data, f.offset, val)
+            elif f.type == Type.U16:
+                if not isinstance(val, int) or isinstance(val, bool) or not 0 <= val <= 0xFFFF:
+                    raise ValueError(f"Field {f.name!r} requires unsigned 16-bit integer.")
+                _struct_module.pack_into("<H", data, f.offset, val)
+            elif f.type == Type.I16:
+                if not isinstance(val, int) or isinstance(val, bool) or not -32768 <= val <= 32767:
+                    raise ValueError(f"Field {f.name!r} requires signed 16-bit integer.")
+                _struct_module.pack_into("<h", data, f.offset, val)
             elif f.type in (Type.VEC2, Type.VEC3, Type.VEC4):
                 count = 2 if f.type == Type.VEC2 else (3 if f.type == Type.VEC3 else 4)
                 comps = _extract_components(val, count)
@@ -785,6 +822,10 @@ def _make_struct(cls: type) -> type:
                 kwargs[f.name] = _struct_module.unpack_from("<I", buffer, f.offset)[0]
             elif f.type == Type.I32:
                 kwargs[f.name] = _struct_module.unpack_from("<i", buffer, f.offset)[0]
+            elif f.type == Type.U16:
+                kwargs[f.name] = _struct_module.unpack_from("<H", buffer, f.offset)[0]
+            elif f.type == Type.I16:
+                kwargs[f.name] = _struct_module.unpack_from("<h", buffer, f.offset)[0]
             elif f.type == Type.VEC2:
                 kwargs[f.name] = _struct_module.unpack_from("<2f", buffer, f.offset)
             elif f.type == Type.VEC3:
@@ -857,7 +898,40 @@ def _make_struct(cls: type) -> type:
             return False
         return all(getattr(self, f.name) == getattr(other, f.name) for f in fields)
 
+    @classmethod
+    def as_input_layout(cls, binding: int = 0) -> dict:
+        def _semantic(name: str, loc: int):
+            nl = name.lower()
+            if nl in ("position", "pos"):
+                return ("POSITION", 0)
+            if nl in ("normal", "norm"):
+                return ("NORMAL", 0)
+            if nl in ("uv", "texcoord") or nl.startswith("texcoord"):
+                return ("TEXCOORD", 0)
+            return (name.upper(), 0)
+
+        attrs = []
+        for i, f in enumerate(fields):
+            sem_name, sem_idx = _semantic(f.name, i)
+            fmt = f.type.schema_name if isinstance(f.type, Type) else str(f.type)
+            attrs.append({
+                "name": f.name,
+                "location": i,
+                "binding": binding,
+                "format": fmt,
+                "offset": f.offset,
+                "size": f.size,
+                "semantic_name": sem_name,
+                "semantic_index": sem_idx,
+            })
+        return {
+            "bindings": [{"binding": binding, "stride": struct_size, "input_rate": "per_vertex"}],
+            "attributes": attrs,
+        }
+
     cls._is_gfx_struct = True
+    cls._is_vertex_struct = is_vertex
+    cls.__struct_layout__ = layout
     cls.__struct_fields__ = tuple(fields)
     cls.__struct_size__ = struct_size
     cls.__struct_alignment__ = struct_alignment
@@ -866,16 +940,19 @@ def _make_struct(cls: type) -> type:
     cls.from_bytes = from_bytes
     cls.to_dict = to_dict
     cls.as_parameter_block = as_parameter_block
+    cls.as_input_layout = as_input_layout
     cls.reflection = reflection
     cls.__repr__ = __repr__
     cls.__eq__ = __eq__
     return cls
 
 
-def struct(cls: type | None = None, **kwargs):
+def struct(cls: type | None = None, *, layout: str = "std430", **kwargs):
     """Decorator to declare a shared host/device struct."""
+    if layout not in ("std430", "vertex"):
+        raise ValueError(f"Unsupported struct layout: {layout!r}.")
     def decorator(target: type) -> type:
-        return _make_struct(target)
+        return _make_struct(target, layout=layout)
     if cls is not None:
         return decorator(cls)
     return decorator

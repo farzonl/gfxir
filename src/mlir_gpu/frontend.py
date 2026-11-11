@@ -782,17 +782,60 @@ class Vertex:
 
 @dataclass(frozen=True)
 class Draw:
-    vertex_count: int = 3
     topology: str = "triangle-list"
+    vertex_count: int | None = 3
+    indexed: bool = False
+    index_count: int | None = None
+    index_type: str | None = None
+    first_index: int = 0
+    vertex_offset: int = 0
+    instance_count: int = 1
+    first_vertex: int = 0
+    first_instance: int = 0
 
     def __post_init__(self):
         if self.topology != "triangle-list":
             raise ValueError("The preview currently supports triangle-list topology only.")
-        if type(self.vertex_count) is not int or not 0 <= self.vertex_count <= 0xFFFFFFFF or self.vertex_count % 3:
-            raise ValueError("Triangle-list vertex_count must be a nonnegative multiple of three fitting in u32.")
+        if type(self.instance_count) is not int or not 1 <= self.instance_count <= 0xFFFFFFFF:
+            raise ValueError("instance_count must be a positive integer fitting in u32.")
+        if type(self.first_instance) is not int or not 0 <= self.first_instance <= 0xFFFFFFFF:
+            raise ValueError("first_instance must be a nonnegative integer fitting in u32.")
+        if self.indexed:
+            if type(self.index_count) is not int or not 0 <= self.index_count <= 0xFFFFFFFF or self.index_count % 3:
+                raise ValueError("Indexed triangle-list index_count must be a nonnegative multiple of three fitting in u32.")
+            if self.index_type not in ("uint16", "uint32", "u16", "u32"):
+                raise ValueError("index_type must be 'uint16' or 'uint32'.")
+            if type(self.first_index) is not int or not 0 <= self.first_index <= 0xFFFFFFFF:
+                raise ValueError("first_index must be a nonnegative integer fitting in u32.")
+            if type(self.vertex_offset) is not int or not -0x80000000 <= self.vertex_offset <= 0x7FFFFFFF:
+                raise ValueError("vertex_offset must fit in i32.")
+        else:
+            if type(self.vertex_count) is not int or not 0 <= self.vertex_count <= 0xFFFFFFFF or self.vertex_count % 3:
+                raise ValueError("Triangle-list vertex_count must be a nonnegative multiple of three fitting in u32.")
+            if type(self.first_vertex) is not int or not 0 <= self.first_vertex <= 0xFFFFFFFF:
+                raise ValueError("first_vertex must be a nonnegative integer fitting in u32.")
 
     def to_dict(self) -> dict:
-        return {"topology": self.topology, "vertex_count": self.vertex_count}
+        if self.indexed:
+            normalized_type = "uint16" if self.index_type in ("uint16", "u16") else "uint32"
+            return {
+                "topology": self.topology,
+                "indexed": True,
+                "index_count": self.index_count,
+                "index_type": normalized_type,
+                "first_index": self.first_index,
+                "vertex_offset": self.vertex_offset,
+                "instance_count": self.instance_count,
+                "first_instance": self.first_instance,
+            }
+        result = {"topology": self.topology, "vertex_count": self.vertex_count}
+        if self.first_vertex != 0:
+            result["first_vertex"] = self.first_vertex
+        if self.instance_count != 1:
+            result["instance_count"] = self.instance_count
+        if self.first_instance != 0:
+            result["first_instance"] = self.first_instance
+        return result
 
 
 @dataclass(frozen=True)
@@ -845,6 +888,7 @@ class Stage:
     source_file: str
     source_line: int
     structured_input: dict | None = None
+    input_layout: dict | None = None
 
     @property
     def structured(self) -> dict | None:
@@ -950,14 +994,22 @@ class Entry:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise ValueError(f"Invalid entry-point name: {name!r}.")
         parameters = list(inspect.signature(self.function).parameters.values())
-        from .parameters import ParameterBlock, is_struct
+        from .parameters import ParameterBlock, is_struct, _resolve_field_type
         parameter_blocks = {}
+        vertex_layout_struct = None
         for parameter in parameters:
             annotation = resolve_annotation(self.function, parameter.annotation)
             if isinstance(annotation, ParameterBlock):
                 parameter_blocks[parameter.name] = annotation
             elif is_struct(annotation):
-                parameter_blocks[parameter.name] = annotation.as_parameter_block(name=parameter.name)
+                if getattr(annotation, "_is_vertex_struct", False) or getattr(annotation, "__struct_layout__", "") == "vertex":
+                    if self.kind != "vertex":
+                        raise TypeError("Vertex layout structs can only be used with @vertex entry points.")
+                    if vertex_layout_struct is not None:
+                        raise TypeError("Only one vertex struct input is supported per vertex shader.")
+                    vertex_layout_struct = (parameter.name, annotation)
+                else:
+                    parameter_blocks[parameter.name] = annotation.as_parameter_block(name=parameter.name)
 
         if self.kind == "compute":
             interfaces = ()
@@ -989,12 +1041,30 @@ class Entry:
             parameter.name for parameter in parameters
             if resolve_annotation(self.function, parameter.annotation) is FragmentCoord or parameter.annotation == "FragmentCoord"
         }
+        input_layout = None
         if self.kind == "vertex":
             if coordinate_parameters:
                 raise TypeError("FragmentCoord parameters require a fragment entry point.")
-            if len(raster_parameters) != 1:
-                raise TypeError("A vertex entry point must take one positional vertex-index argument.")
-            interfaces = (ShaderIO("vertex_index", Type.U32, builtin="vertex_index"),)
+            if vertex_layout_struct is not None:
+                param_name, struct_cls = vertex_layout_struct
+                interfaces = tuple(
+                    ShaderIO(f.name, f.type if isinstance(f.type, Type) else Type.VEC4, location=i, interpolation="perspective")
+                    for i, f in enumerate(struct_cls.__struct_fields__)
+                )
+                input_layout = struct_cls.as_input_layout()
+            elif len(raster_parameters) == 1 and (
+                raster_parameters[0].annotation is inspect.Parameter.empty
+                or raster_parameters[0].name in ("index", "vertex_index")
+                or resolve_annotation(self.function, raster_parameters[0].annotation) in (Type.U32, Type.I32, u32, i32, "u32", "i32", int)
+            ):
+                interfaces = (ShaderIO("vertex_index", Type.U32, builtin="vertex_index"),)
+            elif raster_parameters:
+                interfaces = tuple(
+                    ShaderIO(p.name, _resolve_field_type(resolve_annotation(self.function, p.annotation)), location=i, interpolation="perspective")
+                    for i, p in enumerate(raster_parameters)
+                )
+            else:
+                raise TypeError("A vertex entry point requires vertex inputs or a vertex-index argument.")
         elif varying_interface is None:
             if sum(parameter.name not in coordinate_parameters for parameter in raster_parameters) > 1:
                 raise TypeError("Trace multi-input fragment shaders through Pipeline to resolve their interfaces.")
@@ -1078,7 +1148,7 @@ class Entry:
             validate(output)
         structured = lowering.module(name, self.kind, outputs, output_interface) if lowering.structured else None
         return Stage(name, self.kind, input_nodes, outputs, interfaces, output_interface,
-                     self.function.__code__.co_filename, self.function.__code__.co_firstlineno, structured)
+                     self.function.__code__.co_filename, self.function.__code__.co_firstlineno, structured, input_layout=input_layout)
 
 
 def vertex(function: Callable) -> Entry:
@@ -1178,6 +1248,7 @@ class Pipeline:
     fragment: Entry
     draw: Draw = field(default_factory=Draw)
     depth_stencil: DepthStencil | None = None
+    input_layout: object = None
 
     def __post_init__(self):
         if self.depth_stencil is not None:
