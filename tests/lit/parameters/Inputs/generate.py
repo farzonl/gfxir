@@ -8,7 +8,7 @@ from programs import pipeline
 
 
 def generate(case):
-    if case in ("frame", "material", "limit"):
+    if case in ("frame", "material", "limit", "limit256"):
         return pipeline(case).trace()[1].to_dict()
     shader = pipeline("frame").trace()[1].to_dict()
     ops = operations(shader["functions"][0])
@@ -26,13 +26,23 @@ def generate(case):
     elif case == "unsupported":
         shader["parameters"]["fields"][0]["type"] = "unsupported"
     elif case == "oversized":
-        shader["parameters"]["fields"] = [{"name": f"field{i}", "type": "f32x4"} for i in range(9)]
+        shader["parameters"]["fields"] = [{"name": f"field{i}", "type": "f32x4"} for i in range(17)]
     elif case == "authored_offset":
         shader["parameters"]["fields"][0]["offset"] = 12
     elif case == "authored_binding":
         shader["parameters"]["register"] = 2
     elif case == "stale":
         shader["schema_version"] = 1
+    elif case == "duplicate_block":
+        shader["parameters"] = [
+            {"name": "b1", "fields": [{"name": "f0", "type": "f32"}]},
+            {"name": "b1", "fields": [{"name": "f1", "type": "f32"}]},
+        ]
+    elif case == "cumulative_oversized":
+        shader["parameters"] = [
+            {"name": "b1", "fields": [{"name": f"f{i}", "type": "f32x4"} for i in range(10)]},
+            {"name": "b2", "fields": [{"name": f"g{i}", "type": "f32x4"} for i in range(7)]},
+        ]
     elif case == "unreachable":
         read = copy.deepcopy(op)
         shader["functions"].append({

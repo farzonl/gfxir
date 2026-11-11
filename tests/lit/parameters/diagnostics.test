@@ -18,13 +18,19 @@
 # RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=BINDING
 # RUN: %python %S/Inputs/generate.py stale %t.json
 # RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=SCHEMA
+# RUN: %python %S/Inputs/generate.py duplicate_block %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=DUP-BLOCK
+# RUN: %python %S/Inputs/generate.py cumulative_oversized %t.json
+# RUN: not %gfx-compile %t.json --target vulkan --output %t.bin --reflection %t.reflection 2>&1 | %FileCheck %s --check-prefix=CUMULATIVE-SIZE
 
 # BLOCK: error: 'gfx.parameter' op requires a matching declared parameter block
 # FIELD: error: 'gfx.parameter' op unknown parameter field
 # TYPE: error: 'gfx.parameter' op parameter result type does not match its field
 # DUPLICATE: error: parameter fields must be typed and uniquely named
 # UNSUPPORTED-TYPE: error: parameter field requires only a name and supported type
-# SIZE: error: read-only parameter blocks currently fit within 128 bytes
+# SIZE: error: read-only parameter blocks currently fit within 256 bytes
 # OFFSET: error: parameter field requires only a name and supported type
 # BINDING: error: parameters requires a name and fields, not authored offsets or backend bindings
 # SCHEMA: error: parameter blocks require structured input schema version 2
+# DUP-BLOCK: error: 'builtin.module' op duplicate parameter block name: 'b1'
+# CUMULATIVE-SIZE: error: 'builtin.module' op read-only parameter blocks currently fit within 256 bytes

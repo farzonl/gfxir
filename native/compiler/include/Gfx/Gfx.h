@@ -47,6 +47,13 @@ struct BufferInterfaceElement {
   Type elementType;
 };
 
+struct ReflectedParameterBlock {
+  ParameterBlockAttr block;
+  uint32_t baseOffset = 0;
+  uint32_t registerIndex = 0;
+  uint32_t bufferIndex = 2;
+};
+
 struct ShaderInterface {
   std::string name;
   Stage stage;
@@ -56,6 +63,7 @@ struct ShaderInterface {
   SmallVector<BufferInterfaceElement> buffers;
   std::optional<std::array<int32_t, 3>> workgroupSize;
   uint32_t sharedMemoryBytes = 0;
+  SmallVector<ReflectedParameterBlock> parameterBlocks;
 };
 
 std::optional<BufferInterfaceElement>
@@ -79,9 +87,14 @@ struct ParameterLayout {
   uint32_t alignment = 16;
 };
 ParameterLayout parameterLayout(ParameterBlockAttr block);
+SmallVector<ParameterBlockAttr> getModuleParameterBlocks(ModuleOp module);
 std::vector<ParameterFieldLayout> layoutStructMembers(StructType type);
 LogicalResult getStd430Layout(Type type, uint32_t &size, uint32_t &alignment);
-llvm::json::Object serializeParameters(ParameterBlockAttr block, Stage stage);
+llvm::json::Object serializeParameters(ParameterBlockAttr block, Stage stage,
+                                       uint32_t baseOffset = 0,
+                                       uint32_t registerIndex = 0,
+                                       uint32_t bufferIndex = 2,
+                                       bool isMultiBlock = false);
 LogicalResult emitCHeader(const ParameterLayout &layout, llvm::raw_ostream &os,
                           llvm::StringRef structName);
 LogicalResult emitCHeader(const ShaderInterface &reflection,

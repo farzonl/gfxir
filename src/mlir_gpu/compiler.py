@@ -501,18 +501,32 @@ def _compile_stage(
     directory: Path,
     tools: dict[str, str],
     target_profile: TargetProfile | None = None,
+    pipeline_parameters: list[dict] | dict | None = None,
 ) -> str:
     stem = stage.kind
     native = isinstance(stage, _MLIRStage)
     input_format = "json" if not native or stage.source.suffix.lower() == ".json" else "mlir"
     source = directory / f"{stem}.{input_format}"
     if native:
-        try:
-            shutil.copyfile(stage.source, source)
-        except OSError as error:
-            raise CompileError(f"Cannot read native shader {stage.source}: {error}") from error
+        if pipeline_parameters is not None and input_format == "json":
+            data = json.loads(stage.source.read_text())
+            if data.get("schema_version") == 2 or "parameters" in data or "functions" in data:
+                data["parameters"] = pipeline_parameters
+                source.write_text(json.dumps(data, allow_nan=False, indent=2) + "\n")
+            else:
+                shutil.copyfile(stage.source, source)
+        else:
+            try:
+                shutil.copyfile(stage.source, source)
+            except OSError as error:
+                raise CompileError(f"Cannot read native shader {stage.source}: {error}") from error
     else:
-        source.write_text(json.dumps(stage.to_dict(), allow_nan=False, indent=2) + "\n")
+        stage_data = stage.to_dict()
+        if pipeline_parameters is not None:
+            if stage_data.get("schema_version") == 2 or "parameters" in stage_data or "functions" in stage_data:
+                stage_data = dict(stage_data)
+                stage_data["parameters"] = pipeline_parameters
+        source.write_text(json.dumps(stage_data, allow_nan=False, indent=2) + "\n")
     reflection = directory / f"{stem}.reflection.json"
     output = directory / f"{stem}.{'spv' if target == Target.VULKAN else 'll'}"
     profile_args: list[str] = []
@@ -640,14 +654,86 @@ def compile_pipeline(
                 "binary": str(output),
             }
 
+        # Collect pipeline-wide parameter blocks across all stages in pipeline declaration order
+        ordered_blocks: list[dict] = []
+        seen_names: dict[str, dict] = {}
+        for s in stages:
+            s_dict = s.to_dict() if hasattr(s, "to_dict") else {}
+            if isinstance(s, _MLIRStage) and s.source.suffix.lower() == ".json":
+                try:
+                    s_dict = json.loads(s.source.read_text())
+                except Exception:
+                    s_dict = {}
+            params = s_dict.get("parameters")
+            if not params:
+                continue
+            blocks = params if isinstance(params, list) else [params]
+            for b in blocks:
+                name = b.get("name")
+                if not name:
+                    continue
+                if name not in seen_names:
+                    clean_block = {
+                        "name": b["name"],
+                        "fields": [
+                            {"name": f["name"], "type": f["type"]}
+                            for f in b.get("fields", [])
+                        ]
+                    }
+                    seen_names[name] = clean_block
+                    ordered_blocks.append(clean_block)
+                else:
+                    # Verify fields match
+                    existing_fields = seen_names[name]["fields"]
+                    current_fields = [
+                        {"name": f["name"], "type": f["type"]}
+                        for f in b.get("fields", [])
+                    ]
+                    if existing_fields != current_fields:
+                        raise ValueError(f"Graphics stages require matching parameter block fields: {name!r}.")
+
+        if ordered_blocks:
+            def _calc_block_size(b: dict) -> int:
+                if "size" in b:
+                    return b["size"]
+                type_sizes = {
+                    "f32": (4, 4), "u32": (4, 4), "i32": (4, 4),
+                    "f32x2": (8, 8), "vec2": (8, 8),
+                    "f32x3": (12, 16), "vec3": (12, 16),
+                    "f32x4": (16, 16), "vec4": (16, 16),
+                    "mat4": (64, 16), "mat4x4": (64, 16),
+                    "mat2x2": (16, 8), "mat2x3": (32, 16), "mat2x4": (32, 16),
+                    "mat3x2": (24, 8), "mat3x3": (48, 16), "mat3x4": (48, 16),
+                    "mat4x2": (32, 8), "mat4x3": (64, 16),
+                }
+                offset = 0
+                for f in b.get("fields", []):
+                    if "size" in f and "alignment" in f:
+                        sz, al = f["size"], f["alignment"]
+                    else:
+                        ftype = f.get("type", "f32")
+                        sz, al = type_sizes.get(ftype, (16, 16))
+                    offset = (offset + al - 1) // al * al + sz
+                return (offset + 15) // 16 * 16
+
+            cum_size = sum((_calc_block_size(b) + 15) // 16 * 16 for b in ordered_blocks)
+            if cum_size > 256:
+                raise ValueError(f"Cumulative parameter blocks size ({cum_size}B) exceeds 256 bytes.")
+
+        pipeline_params = ordered_blocks if ordered_blocks else None
+
         entries = []
         for stage in stages:
             try:
-                binary = _compile_stage(stage, target, directory, tools, target_profile=profile)
-            except TypeError as err:
-                if "unexpected keyword argument 'target_profile'" in str(err):
+                binary = _compile_stage(
+                    stage, target, directory, tools,
+                    target_profile=profile,
+                    pipeline_parameters=pipeline_params,
+                )
+            except TypeError:
+                try:
                     binary = _compile_stage(stage, target, directory, tools)
-                else:
+                except Exception:
                     raise
             entries.append({"stage": stage.kind, "entry_point": stage.name, "binary": binary})
         interface = {

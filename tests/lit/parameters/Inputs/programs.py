@@ -32,10 +32,16 @@ def incompatible(frame: OtherFrame):
 
 
 Limit = ParameterBlock("limit", tuple((f"v{i}", Type.VEC4) for i in range(8)))
+Limit256 = ParameterBlock("limit256", tuple((f"v{i}", Type.VEC4) for i in range(16)))
 
 
 @fragment
 def limit(parameters: Limit):
+    return parameters.v0
+
+
+@fragment
+def limit256_fragment(parameters: Limit256):
     return parameters.v0
 
 
@@ -46,6 +52,8 @@ def pipeline(name):
         return Pipeline(fullscreen_vertex, material_fragment)
     if name == "limit":
         return Pipeline(fullscreen_vertex, limit)
+    if name == "limit256":
+        return Pipeline(fullscreen_vertex, limit256_fragment)
     if name == "visibility":
         return Pipeline(frame_vertex, pipeline("frame").fragment)
     if name == "mismatch":

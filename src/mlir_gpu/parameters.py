@@ -536,6 +536,8 @@ def _matrix_type_from_name(name: object) -> Type | None:
     """Resolve 'mat4x4', 'mat3x2', ... to a matrix Type, else None."""
     if not isinstance(name, str):
         return None
+    if name == "mat4":
+        return Type.MAT4X4
     match = re.fullmatch(r"mat(\d)x(\d)", name)
     if not match:
         return None
@@ -675,8 +677,8 @@ def _make_struct(cls: type) -> type:
     raw_annotations = getattr(cls, "__annotations__", {})
     if not raw_annotations:
         raise ValueError("Struct must declare at least one field.")
-    if len(raw_annotations) > 32:
-        raise ValueError("Parameter blocks support at most 32 fields.")
+    if len(raw_annotations) > 64:
+        raise ValueError("Parameter blocks support at most 64 fields.")
 
     fields: list[StructField] = []
     cursor = 0
@@ -884,6 +886,42 @@ def struct(cls: type | None = None, **kwargs):
 # =============================================================================
 
 def verify_parameters(block: object) -> None:
+    if isinstance(block, list):
+        if not block:
+            raise ValueError("Parameters list cannot be empty.")
+        names = set()
+        vulkan_offsets = []
+        dx_registers = set()
+        metal_buffers = set()
+        cumulative_size = 0
+        for item in block:
+            verify_parameters(item)
+            name = item["name"]
+            if name in names:
+                raise ValueError(f"Duplicate parameter block name: {name!r}.")
+            names.add(name)
+            v_offset = item["bindings"]["vulkan"]["offset"]
+            vulkan_offsets.append((v_offset, item["size"]))
+            dx_reg = item["bindings"]["directx"]["register"]
+            if dx_reg in dx_registers:
+                raise ValueError(f"Duplicate DirectX register: {dx_reg}.")
+            dx_registers.add(dx_reg)
+            metal_idx = item["bindings"]["metal"]["buffer_index"]
+            if metal_idx in metal_buffers:
+                raise ValueError(f"Duplicate Metal buffer index: {metal_idx}.")
+            metal_buffers.add(metal_idx)
+            cumulative_size += (item["size"] + 15) // 16 * 16
+
+        if cumulative_size > 256:
+            raise ValueError(f"Cumulative parameter blocks size ({cumulative_size}B) exceeds 256 bytes.")
+        vulkan_offsets.sort(key=lambda x: x[0])
+        prev_end = 0
+        for off, sz in vulkan_offsets:
+            if off < prev_end:
+                raise ValueError("Overlapping Vulkan push constant ranges.")
+            prev_end = off + sz
+        return
+
     if not isinstance(block, dict):
         raise ValueError("Parameter reflection requires a dictionary.")
     schema_version = block.get("schema_version")
@@ -899,7 +937,7 @@ def verify_parameters(block: object) -> None:
         if not isinstance(block["name"], str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", block["name"]):
             raise ValueError("Invalid parameter block name.")
         fields, stages = block["fields"], block["stages"]
-        if (not isinstance(fields, list) or not 1 <= len(fields) <= 32
+        if (not isinstance(fields, list) or not 1 <= len(fields) <= 64
                 or not isinstance(stages, list) or not stages
                 or any(not isinstance(stage, str) or stage not in ("vertex", "fragment", "compute") for stage in stages)
                 or len(set(stages)) != len(stages)):
@@ -942,18 +980,38 @@ def verify_parameters(block: object) -> None:
         if (size > max_size or type(block["size"]) is not int or block["size"] != size
                 or type(block["alignment"]) is not int or block["alignment"] != 16):
             raise ValueError(f"Parameter block has a mismatched size/alignment or exceeds {max_size} bytes.")
-        bindings = {
-            "vulkan": {"storage": "push_constant", "offset": 0},
-            "directx": {"storage": "root_constants", "parameter_index": 0, "register": 0, "space": 0,
-                        "num32bit_constants": size // 4, "visibility": "all", "root_signature_version": "1.1"},
-            "metal": {"storage": "converter_argument_buffer", "buffer_index": 2, "offset": 0, "size": size},
-        }
         actual = block["bindings"]
-        if not isinstance(actual, dict) or set(actual) != set(bindings):
+        if not isinstance(actual, dict) or set(actual) != {"vulkan", "directx", "metal"}:
             raise ValueError("Parameter target bindings do not match the compiler ABI.")
+        vk = actual.get("vulkan")
+        dx = actual.get("directx")
+        mt = actual.get("metal")
+        if not isinstance(vk, dict) or not isinstance(dx, dict) or not isinstance(mt, dict):
+            raise ValueError("Parameter target bindings do not match the compiler ABI.")
+        vk_offset = vk.get("offset")
+        if type(vk_offset) is not int or type(vk_offset) is bool or vk_offset < 0 or vk_offset % 16 != 0:
+            raise ValueError("Parameter target bindings do not match the compiler ABI.")
+        dx_reg = dx.get("register")
+        dx_param = dx.get("parameter_index")
+        if type(dx_reg) is not int or type(dx_reg) is bool or dx_reg < 0 or dx_param != dx_reg:
+            raise ValueError("Parameter target bindings do not match the compiler ABI.")
+        mt_idx = mt.get("buffer_index")
+        if type(mt_idx) is not int or type(mt_idx) is bool or mt_idx < 2:
+            raise ValueError("Parameter target bindings do not match the compiler ABI.")
+        mt_offset = mt.get("offset", 0)
+        if type(mt_offset) is not int or type(mt_offset) is bool or mt_offset < 0 or mt_offset % 16 != 0:
+            raise ValueError("Parameter target bindings do not match the compiler ABI.")
+        if (dx_reg == 0 and vk_offset != 0) or mt_idx != 2 + dx_reg or mt_offset != vk_offset:
+            raise ValueError("Parameter target bindings do not match the compiler ABI.")
+        bindings = {
+            "vulkan": {"storage": "push_constant", "offset": vk_offset},
+            "directx": {"storage": "root_constants", "parameter_index": dx_reg, "register": dx_reg, "space": 0,
+                        "num32bit_constants": size // 4, "visibility": "all", "root_signature_version": "1.1"},
+            "metal": {"storage": "converter_argument_buffer", "buffer_index": mt_idx, "offset": mt_offset, "size": size},
+        }
         for target, expected in bindings.items():
             binding = actual[target]
-            if (not isinstance(binding, dict) or set(binding) != set(expected)
+            if (set(binding) != set(expected)
                     or any(type(binding[key]) is not type(value) or binding[key] != value for key, value in expected.items())):
                 raise ValueError("Parameter target bindings do not match the compiler ABI.")
         return
@@ -988,10 +1046,38 @@ def verify_parameters(block: object) -> None:
     raise ValueError("Unsupported parameter schema, layout, ownership, or access.")
 
 
-def pack_parameters(block: dict, values: Mapping[str, object] | Any) -> bytes:
+def pack_parameters(block: dict | list, values: Mapping[str, object] | Any) -> bytes:
     verify_parameters(block)
+    if isinstance(block, list):
+        if not isinstance(values, Mapping):
+            raise ValueError("Multi-block packing requires a mapping of block names to block values.")
+        block_names = {b["name"] for b in block}
+        if set(values) != block_names:
+            raise ValueError(f"Expected values for blocks {block_names}, got {set(values)}.")
+        total_size = max(b["bindings"]["vulkan"]["offset"] + b["size"] for b in block)
+        total_buffer = bytearray(total_size)
+        for b in block:
+            b_val = values[b["name"]]
+            b_bytes = pack_parameters(b, b_val)
+            offset = b["bindings"]["vulkan"]["offset"]
+            total_buffer[offset : offset + len(b_bytes)] = b_bytes
+        return bytes(total_buffer)
+
     if is_struct(values):
         values = values.to_dict()
+    if isinstance(values, Mapping):
+        expected_field_names = {field["name"] for field in block["fields"]}
+        normalized_values = {}
+        for k, v in values.items():
+            if f"{k}_0" in expected_field_names and k not in expected_field_names:
+                comps = _extract_matrix(v, 4, 4)
+                normalized_values[f"{k}_0"] = comps[0:4]
+                normalized_values[f"{k}_1"] = comps[4:8]
+                normalized_values[f"{k}_2"] = comps[8:12]
+                normalized_values[f"{k}_3"] = comps[12:16]
+            else:
+                normalized_values[k] = v
+        values = normalized_values
     if not isinstance(values, Mapping) or set(values) != {field["name"] for field in block["fields"]}:
         raise ValueError("Supply exactly the reflected parameter fields.")
     data = bytearray(block["size"])

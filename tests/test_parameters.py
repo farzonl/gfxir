@@ -1,4 +1,5 @@
 import copy
+import json
 import runpy
 import struct as py_struct
 import unittest
@@ -6,10 +7,14 @@ import unittest
 from mlir_gpu import (
     FrameParameters, ParameterBlock, Pipeline, StructField, Type,
     Vertex, f32, fragment, fullscreen_vertex, i32, is_struct,
-    mat4x4, pack_parameters, struct, u32, vec2, vec3, vec4, vertex,
+    mat4, mat4x4, pack_parameters, struct, u32, vec2, vec3, vec4, vertex,
 )
 from mlir_gpu.parameters import verify_parameters
-from test_support import ROOT
+from mlir_gpu.interfaces import reflect_pipeline_parameters
+from pathlib import Path
+import tempfile
+from test_support import ROOT, TOOLS, available
+from mlir_gpu.compiler import Target, compile_pipeline
 import compiler_inputs as structured
 
 
@@ -171,7 +176,7 @@ class ParameterPackingTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Declarative Struct Definition Tests (Issue #128)
+# Declarative Struct Definition Tests
 # ---------------------------------------------------------------------------
 
 @struct
@@ -572,4 +577,479 @@ class StructReflectionTests(unittest.TestCase):
         cam = CameraParams(tuple(range(16)), (1.0, 2.0, 3.0), 1.0)
         packed_from_refl = pack_parameters(cam_refl, cam)
         self.assertEqual(packed_from_refl, cam.to_bytes())
+
+
+# ===========================================================================
+# Per-Draw / Per-Object Constants & Multi-Block Parameter ABI
+# ===========================================================================
+
+class TestParameterBlock256ByteLimits(unittest.TestCase):
+    def test_parameter_block_exact_256_bytes_accepted(self):
+        @struct
+        class Block256:
+            m0: mat4
+            m1: mat4
+            m2: mat4
+            m3: mat4
+
+        self.assertEqual(Block256.__struct_size__, 256)
+        refl = Block256.reflection(stages=["vertex"])
+        verify_parameters(refl)
+        self.assertEqual(refl["size"], 256)
+        self.assertEqual(refl["bindings"]["directx"]["num32bit_constants"], 64)
+
+        inst = Block256(
+            tuple(range(16)), tuple(range(16, 32)),
+            tuple(range(32, 48)), tuple(range(48, 64))
+        )
+        raw = inst.to_bytes()
+        self.assertEqual(len(raw), 256)
+        restored = Block256.from_bytes(raw)
+        self.assertEqual(restored, inst)
+
+    def test_parameter_block_64_fields_accepted(self):
+        fields = [(f"f_{i}", Type.F32) for i in range(64)]
+        block = ParameterBlock("fields64", tuple(fields))
+        self.assertEqual(len(block.fields), 64)
+        refl_fields = [
+            {"name": f"f_{i}", "type": "f32", "offset": i * 4, "size": 4, "alignment": 4}
+            for i in range(64)
+        ]
+        refl = {
+            "schema_version": 1,
+            "name": "fields64",
+            "layout": "gfx-std430-v1",
+            "size": 256,
+            "alignment": 16,
+            "ownership": "host",
+            "access": "read-only",
+            "addressable": False,
+            "stages": ["vertex"],
+            "fields": refl_fields,
+            "bindings": {
+                "vulkan": {"storage": "push_constant", "offset": 0},
+                "directx": {"storage": "root_constants", "parameter_index": 0, "register": 0, "space": 0,
+                            "num32bit_constants": 64, "visibility": "all", "root_signature_version": "1.1"},
+                "metal": {"storage": "converter_argument_buffer", "buffer_index": 2, "offset": 0, "size": 256},
+            },
+        }
+        verify_parameters(refl)
+
+    def test_parameter_block_65_fields_rejected(self):
+        refl_fields = [
+            {"name": f"f_{i}", "type": "f32", "offset": i * 4, "size": 4, "alignment": 4}
+            for i in range(65)
+        ]
+        refl = {
+            "schema_version": 1,
+            "name": "fields65",
+            "layout": "gfx-std430-v1",
+            "size": 272,
+            "alignment": 16,
+            "ownership": "host",
+            "access": "read-only",
+            "addressable": False,
+            "stages": ["vertex"],
+            "fields": refl_fields,
+            "bindings": {
+                "vulkan": {"storage": "push_constant", "offset": 0},
+                "directx": {"storage": "root_constants", "parameter_index": 0, "register": 0, "space": 0,
+                            "num32bit_constants": 68, "visibility": "all", "root_signature_version": "1.1"},
+                "metal": {"storage": "converter_argument_buffer", "buffer_index": 2, "offset": 0, "size": 272},
+            },
+        }
+        with self.assertRaises(ValueError):
+            verify_parameters(refl)
+
+    def test_parameter_block_exceeding_256_bytes_rejected(self):
+        fields = [
+            {"name": f"m{i}", "type": "mat4", "offset": i * 64, "size": 64, "alignment": 16}
+            for i in range(5)
+        ]
+        refl = {
+            "schema_version": 1,
+            "name": "oversized",
+            "layout": "gfx-std430-v1",
+            "size": 320,
+            "alignment": 16,
+            "ownership": "host",
+            "access": "read-only",
+            "addressable": False,
+            "stages": ["vertex"],
+            "fields": fields,
+            "bindings": {
+                "vulkan": {"storage": "push_constant", "offset": 0},
+                "directx": {"storage": "root_constants", "parameter_index": 0, "register": 0, "space": 0,
+                            "num32bit_constants": 80, "visibility": "all", "root_signature_version": "1.1"},
+                "metal": {"storage": "converter_argument_buffer", "buffer_index": 2, "offset": 0, "size": 320},
+            },
+        }
+        with self.assertRaises(ValueError):
+            verify_parameters(refl)
+
+
+class TestMultiBlockShaderTracing(unittest.TestCase):
+    def test_vertex_shader_with_multiple_struct_blocks(self):
+        @vertex
+        def vs(v: u32, cam: CameraParams, obj: ObjectParams) -> Vertex:
+            world_pos = obj.model * vec4(1.0, 2.0, 3.0, 1.0)
+            clip_pos = cam.view_proj * world_pos
+            return Vertex(clip_pos)
+
+        @fragment
+        def fs() -> vec4:
+            return vec4(1.0)
+
+        pipeline = Pipeline(vs, fs)
+        stages = pipeline.trace()
+        v_stage = stages[0]
+        params = v_stage.to_dict()["parameters"]
+        self.assertIsInstance(params, list)
+        self.assertEqual(len(params), 2)
+        names = {p["name"] for p in params}
+        self.assertEqual(names, {"cam", "obj"})
+
+        ops = structured.operations(v_stage.to_dict()["functions"][0])
+        param_ops = [op for op in ops if op["op"] == "gfx.parameter"]
+        blocks_accessed = {op["attributes"]["block"]["value"] for op in param_ops}
+        self.assertEqual(blocks_accessed, {"cam", "obj"})
+
+    def test_multi_block_stages_and_operations(self):
+        @fragment
+        def fs_multi(cam: CameraParams, light: LightParams) -> vec4:
+            return vec4(cam.time * light.intensity)
+
+        pipeline = Pipeline(fullscreen_vertex, fs_multi)
+        f_stage = pipeline.trace()[1]
+        params = f_stage.to_dict()["parameters"]
+        self.assertIsInstance(params, list)
+        self.assertEqual(len(params), 2)
+        names = {p["name"] for p in params}
+        self.assertEqual(names, {"cam", "light"})
+
+
+class TestCrossStageReconciliationAndBindings(unittest.TestCase):
+    def test_cross_stage_parameter_reconciliation(self):
+        cam_vs = CameraParams.reflection(stages=["vertex"], name="cam")
+        obj_vs = ObjectParams.reflection(stages=["vertex"], name="obj", binding_offset=80)
+        obj_vs["bindings"]["directx"]["parameter_index"] = 1
+        obj_vs["bindings"]["directx"]["register"] = 1
+        obj_vs["bindings"]["metal"]["buffer_index"] = 3
+        obj_vs["bindings"]["metal"]["offset"] = 80
+        cam_fs = CameraParams.reflection(stages=["fragment"], name="cam")
+        light_fs = LightParams.reflection(stages=["fragment"], name="light", binding_offset=160)
+        light_fs["bindings"]["directx"]["parameter_index"] = 2
+        light_fs["bindings"]["directx"]["register"] = 2
+        light_fs["bindings"]["metal"]["buffer_index"] = 4
+        light_fs["bindings"]["metal"]["offset"] = 160
+        interface = {
+            "vertex": {"parameters": [cam_vs, obj_vs]},
+            "fragment": {"parameters": [cam_fs, light_fs]},
+        }
+        reconciled = reflect_pipeline_parameters(interface)
+        self.assertIsInstance(reconciled, list)
+        self.assertEqual(len(reconciled), 3)
+
+        # cam (80B)
+        cam_info = reconciled[0]
+        self.assertEqual(cam_info["name"], "cam")
+        self.assertEqual(set(cam_info["stages"]), {"vertex", "fragment"})
+        self.assertEqual(cam_info["bindings"]["vulkan"]["offset"], 0)
+        self.assertEqual(cam_info["bindings"]["directx"]["register"], 0)
+        self.assertEqual(cam_info["bindings"]["metal"]["buffer_index"], 2)
+
+        # obj (80B)
+        obj_info = reconciled[1]
+        self.assertEqual(obj_info["name"], "obj")
+        self.assertEqual(obj_info["stages"], ["vertex"])
+        self.assertEqual(obj_info["bindings"]["vulkan"]["offset"], 80)
+        self.assertEqual(obj_info["bindings"]["directx"]["register"], 1)
+        self.assertEqual(obj_info["bindings"]["metal"]["buffer_index"], 3)
+
+        # light (32B)
+        light_info = reconciled[2]
+        self.assertEqual(light_info["name"], "light")
+        self.assertEqual(light_info["stages"], ["fragment"])
+        self.assertEqual(light_info["bindings"]["vulkan"]["offset"], 160)
+        self.assertEqual(light_info["bindings"]["directx"]["register"], 2)
+        self.assertEqual(light_info["bindings"]["metal"]["buffer_index"], 4)
+
+    def test_cumulative_size_exceeding_256_rejected(self):
+        @struct
+        class Block160:
+            m1: mat4
+            m2: mat4
+            v1: vec4
+            v2: vec4
+
+        @struct
+        class Block112:
+            m1: mat4
+            v1: vec4
+            v2: vec4
+            v3: vec4
+
+        interface = {
+            "vertex": {"parameters": Block160.reflection(stages=["vertex"])},
+            "fragment": {"parameters": Block112.reflection(stages=["fragment"])},
+        }
+        # 160 + 112 = 272B > 256B
+        with self.assertRaisesRegex(ValueError, "exceeds 256 bytes"):
+            reflect_pipeline_parameters(interface)
+
+
+class TestMultiBlockPacking(unittest.TestCase):
+    def test_multi_block_contiguous_packing(self):
+        cam = CameraParams(tuple(range(16)), (1.0, 2.0, 3.0), 10.0)
+        obj = ObjectParams(tuple(range(16, 32)), (0.5, 0.5, 0.5, 1.0))
+        light = LightParams((0.0, 1.0, 0.0), 2.5, (1.0, 1.0, 1.0), 0.2)
+
+        reconciled = [
+            CameraParams.reflection(stages=["vertex", "fragment"], name="cam"),
+            {**ObjectParams.reflection(stages=["vertex"], name="obj"), "bindings": {
+                "vulkan": {"storage": "push_constant", "offset": 80},
+                "directx": {"storage": "root_constants", "parameter_index": 1, "register": 1, "space": 0,
+                            "num32bit_constants": 20, "visibility": "all", "root_signature_version": "1.1"},
+                "metal": {"storage": "converter_argument_buffer", "buffer_index": 3, "offset": 80, "size": 80},
+            }},
+            {**LightParams.reflection(stages=["fragment"], name="light"), "bindings": {
+                "vulkan": {"storage": "push_constant", "offset": 160},
+                "directx": {"storage": "root_constants", "parameter_index": 2, "register": 2, "space": 0,
+                            "num32bit_constants": 8, "visibility": "all", "root_signature_version": "1.1"},
+                "metal": {"storage": "converter_argument_buffer", "buffer_index": 4, "offset": 160, "size": 32},
+            }},
+        ]
+
+        packed = pack_parameters(reconciled, {
+            "cam": cam,
+            "obj": obj,
+            "light": light,
+        })
+        self.assertEqual(len(packed), 192)
+        self.assertEqual(packed[0:80], cam.to_bytes())
+        self.assertEqual(packed[80:160], obj.to_bytes())
+        self.assertEqual(packed[160:192], light.to_bytes())
+
+    def test_multi_block_packing_validation(self):
+        reconciled = [
+            CameraParams.reflection(stages=["vertex"]),
+            {**ObjectParams.reflection(stages=["vertex"]), "bindings": {
+                "vulkan": {"storage": "push_constant", "offset": 80},
+                "directx": {"storage": "root_constants", "parameter_index": 1, "register": 1, "space": 0,
+                            "num32bit_constants": 20, "visibility": "all", "root_signature_version": "1.1"},
+                "metal": {"storage": "converter_argument_buffer", "buffer_index": 3, "offset": 80, "size": 80},
+            }},
+        ]
+        # Missing block 'obj'
+        with self.assertRaises(ValueError):
+            pack_parameters(reconciled, {"cam": CameraParams(tuple(range(16)), (0, 0, 0), 0.0)})
+        # Extra unknown block
+        with self.assertRaises(ValueError):
+            pack_parameters(reconciled, {
+                "cam": CameraParams(tuple(range(16)), (0, 0, 0), 0.0),
+                "obj": ObjectParams(tuple(range(16)), (0, 0, 0, 0)),
+                "unknown": 42,
+            })
+        # Non-mapping
+        with self.assertRaises(ValueError):
+            pack_parameters(reconciled, [1, 2, 3])
+
+
+# ---------------------------------------------------------------------------
+# End-to-End Multi-Block Pipeline Compilation Tests
+# ---------------------------------------------------------------------------
+
+@struct
+class E2ECameraParams:
+    view_proj: mat4
+    eye_pos: vec3
+    time: f32 = 0.0
+
+@struct
+class E2EObjectParams:
+    model: mat4
+    color: vec4
+    draw_id: u32 = 0
+
+@struct
+class E2ELightParams:
+    direction: vec3
+    intensity: f32
+    color: vec3
+    ambient: f32
+
+@vertex
+def multi_block_e2e_vs(vertex_index: u32, cam: E2ECameraParams, obj: E2EObjectParams) -> Vertex:
+    world_pos = obj.model * vec4(1.0, 2.0, 3.0, 1.0)
+    clip_pos = cam.view_proj * world_pos
+    return Vertex(clip_pos, color=obj.color)
+
+@fragment
+def multi_block_e2e_fs(color: vec4, cam: E2ECameraParams, light: E2ELightParams) -> vec4:
+    light_term = light.color * (light.intensity + light.ambient)
+    animated_tint = color + vec4(light_term, cam.time * 0.0)
+    return animated_tint
+
+
+@unittest.skipUnless(available("gfx-compile"), "gfx-compile required for e2e compilation tests")
+class TestCompilePipelineMultiBlock(unittest.TestCase):
+    def test_e2e_compile_multi_block_vulkan(self):
+        pipeline = Pipeline(multi_block_e2e_vs, multi_block_e2e_fs)
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            manifest_path = compile_pipeline(pipeline, Target.VULKAN, out_dir / "out", TOOLS)
+            manifest = json.loads(manifest_path.read_text())
+
+            self.assertEqual(manifest["target"], "vulkan")
+            self.assertEqual(manifest["schema_version"], 4)
+            self.assertIn("parameters", manifest)
+            params = manifest["parameters"]
+            self.assertIsInstance(params, list)
+            self.assertEqual(len(params), 3)
+
+            # Reconciled blocks: cam (shared), obj (vs), light (fs)
+            param_names = [p["name"] for p in params]
+            self.assertEqual(param_names, ["cam", "obj", "light"])
+
+            # Verify cumulative sequential offsets
+            self.assertEqual(params[0]["bindings"]["vulkan"]["offset"], 0)
+            self.assertEqual(params[1]["bindings"]["vulkan"]["offset"], 80)
+            self.assertEqual(params[2]["bindings"]["vulkan"]["offset"], 176)
+
+            # Check stages reconciliation
+            self.assertEqual(sorted(params[0]["stages"]), ["fragment", "vertex"])
+            self.assertEqual(params[1]["stages"], ["vertex"])
+            self.assertEqual(params[2]["stages"], ["fragment"])
+
+            # Verify SPV binary file exists on disk
+            spv_file = out_dir / "out" / "vertex.spv"
+            self.assertTrue(spv_file.exists())
+            self.assertGreater(spv_file.stat().st_size, 0)
+
+            # Verify fragment SPV has push constants matching pipeline layout (offset 176 for light)
+            import subprocess, sys
+            spv_fs = out_dir / "out" / "fragment.spv"
+            self.assertTrue(spv_fs.exists())
+            summarize_script = ROOT / "tests" / "lit" / "parameters" / "Inputs" / "summarize.py"
+            res = subprocess.run(
+                [sys.executable, str(summarize_script), "spirv", str(spv_fs)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("176", res.stdout)
+
+            # Verify contiguous parameter byte packing
+            cam_val = E2ECameraParams(tuple(range(16)), (1.0, 2.0, 3.0), 0.5)
+            obj_val = E2EObjectParams(tuple(range(16, 32)), (0.1, 0.2, 0.3, 1.0), 42)
+            light_val = E2ELightParams((0.0, 1.0, 0.0), 1.0, (1.0, 1.0, 1.0), 0.2)
+
+            packed = pack_parameters(params, {
+                "cam": cam_val,
+                "obj": obj_val,
+                "light": light_val,
+            })
+            self.assertEqual(len(packed), 208)
+            self.assertEqual(packed[0:80], cam_val.to_bytes())
+            self.assertEqual(packed[80:176], obj_val.to_bytes())
+            self.assertEqual(packed[176:208], light_val.to_bytes())
+
+    def test_e2e_compile_multi_block_directx(self):
+        if not available("llc", "dxv"):
+            self.skipTest("DirectX compilation tools not available")
+        pipeline = Pipeline(multi_block_e2e_vs, multi_block_e2e_fs)
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            manifest_path = compile_pipeline(pipeline, Target.DIRECTX, out_dir / "out", TOOLS)
+            manifest = json.loads(manifest_path.read_text())
+
+            self.assertEqual(manifest["target"], "directx")
+            params = manifest["parameters"]
+            self.assertEqual(len(params), 3)
+
+            # Verify separate registers assigned (b0, b1, b2)
+            self.assertEqual(params[0]["bindings"]["directx"]["register"], 0)
+            self.assertEqual(params[0]["bindings"]["directx"]["parameter_index"], 0)
+            self.assertEqual(params[1]["bindings"]["directx"]["register"], 1)
+            self.assertEqual(params[1]["bindings"]["directx"]["parameter_index"], 1)
+            self.assertEqual(params[2]["bindings"]["directx"]["register"], 2)
+            self.assertEqual(params[2]["bindings"]["directx"]["parameter_index"], 2)
+
+            # Verify emitted LLVM IR contains separate handlefrombinding and rootsignatures
+            ll_file = out_dir / "out" / "vertex.ll"
+            self.assertTrue(ll_file.exists())
+            content = ll_file.read_text()
+            self.assertIn('handlefrombinding', content)
+            self.assertIn('!dx.rootsignatures', content)
+
+            ll_fs = (out_dir / "out" / "fragment.ll").read_text()
+            import re
+            self.assertRegex(ll_fs, r"@llvm\.dx\.resource\.handlefrombinding[^(]*\(i32 0, i32 2,")
+            self.assertIn('!{!"RootConstants", i32 0, i32 2,', ll_fs)
+
+    def test_cross_stage_float_parameter_block_reconciliation(self):
+        @struct
+        class CrossVsOnlyParams:
+            pos: vec4
+
+        @struct
+        class CrossLightParams:
+            direction: vec3
+            intensity: f32
+            color: vec3
+            ambient: f32
+
+        @vertex
+        def cross_vs(idx: u32, vs_only: CrossVsOnlyParams, light: CrossLightParams) -> Vertex:
+            return Vertex(vs_only.pos + vec4(light.direction, light.intensity))
+
+        @fragment
+        def cross_fs(light: CrossLightParams) -> vec4:
+            return vec4(light.color, light.ambient)
+
+        pipeline = Pipeline(cross_vs, cross_fs)
+        for target in (Target.VULKAN, Target.DIRECTX):
+            if target == Target.DIRECTX and not available("llc", "dxv"):
+                continue
+            with tempfile.TemporaryDirectory() as td:
+                out_dir = Path(td) / "out"
+                manifest_path = compile_pipeline(pipeline, target, out_dir, TOOLS)
+                manifest = json.loads(manifest_path.read_text())
+                params = manifest["parameters"]
+                self.assertEqual(len(params), 2)
+                self.assertEqual(params[0]["name"], "vs_only")
+                self.assertEqual(params[1]["name"], "light")
+                self.assertEqual(params[1]["layout"], "gfx-std430-v1")
+                self.assertEqual(params[1]["schema_version"], 2)
+                if target == Target.VULKAN:
+                    self.assertEqual(params[0]["bindings"]["vulkan"]["offset"], 0)
+                    self.assertEqual(params[1]["bindings"]["vulkan"]["offset"], 16)
+                elif target == Target.DIRECTX:
+                    self.assertEqual(params[0]["bindings"]["directx"]["register"], 0)
+                    self.assertEqual(params[1]["bindings"]["directx"]["register"], 1)
+
+    def test_compile_pipeline_rejects_cumulative_size_exceeding_256(self):
+        @struct
+        class OversizedBlockA:
+            v0: vec4; v1: vec4; v2: vec4; v3: vec4; v4: vec4
+            v5: vec4; v6: vec4; v7: vec4; v8: vec4; v9: vec4  # 160B
+
+        @struct
+        class OversizedBlockB:
+            v0: vec4; v1: vec4; v2: vec4; v3: vec4; v4: vec4
+            v5: vec4; v6: vec4                                # 112B (total = 272B > 256B)
+
+        @vertex
+        def vs_bad(idx: u32, a: OversizedBlockA) -> Vertex:
+            return Vertex(a.v0)
+
+        @fragment
+        def fs_bad(b: OversizedBlockB) -> vec4:
+            return b.v0
+
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaisesRegex(ValueError, "exceeds 256 bytes"):
+                compile_pipeline(Pipeline(vs_bad, fs_bad), Target.VULKAN, Path(td) / "bad", TOOLS)
+
+
 
