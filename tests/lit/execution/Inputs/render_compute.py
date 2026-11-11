@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[4]
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compile and execute a compute shader example to PNG.")
-    parser.add_argument("example", choices=("mandelbrot", "particle_life"))
+    parser.add_argument("example", choices=("mandelbrot", "particle_life", "tiled_particle_life"))
     parser.add_argument("output_prefix", type=Path)
     parser.add_argument("--target", required=True, metavar="ENVIRONMENT_VARIABLE")
     parser.add_argument("--width", type=int, default=256)
@@ -58,7 +58,7 @@ def main() -> None:
                 output.unlink(missing_ok=True)
                 write_png(output, image)
             print(f"Rendered mandelbrot for {target.value}: {image.width}x{image.height} on {image.device}")
-    else:
+    elif args.example == "particle_life":
         ns = runpy.run_path(str(ROOT / "examples" / "particle_life_compute.py"))
         simulate_and_render = ns["simulate_and_render_particle_life"]
         for target in targets:
@@ -74,6 +74,25 @@ def main() -> None:
             output.unlink(missing_ok=True)
             write_png(output, image)
             print(f"Rendered particle_life for {target.value}: {image.width}x{image.height} on {image.device}")
+    else:
+        ns = runpy.run_path(str(ROOT / "examples" / "tiled_particle_life.py"))
+        simulate_and_render = ns["simulate_and_render_tiled_particle_life"]
+        for target in targets:
+            output = target_output_path(args.output_prefix, target.value)
+            res = simulate_and_render(
+                target,
+                steps=args.steps,
+                width=args.width,
+                height=args.height,
+                validation=validation,
+                toolchain=toolchain,
+            )
+            output.unlink(missing_ok=True)
+            write_png(output, res.image)
+            print(
+                f"Rendered tiled_particle_life for {target.value}: "
+                f"{res.image.width}x{res.image.height} on {res.image.device}"
+            )
 
 
 if __name__ == "__main__":
