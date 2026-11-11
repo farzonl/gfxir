@@ -4,7 +4,7 @@ import math
 import struct
 from typing import Optional, Sequence, Tuple
 
-from .math import Mat4, Vec3, Vec4
+from .math import Mat4x4, Vec3, Vec4
 
 try:
     from mlir_gpu.parameters import struct as _gfx_struct
@@ -41,15 +41,15 @@ class Camera:
         self._fov_y = math.radians(fval) if fval > math.pi else fval
 
     @property
-    def view_matrix(self) -> Mat4:
-        return Mat4.look_at(self.eye, self.target, self.up)
+    def view_matrix(self) -> Mat4x4:
+        return Mat4x4.look_at(self.eye, self.target, self.up)
 
     @property
-    def proj_matrix(self) -> Mat4:
-        return Mat4.perspective(self._fov_y, self.aspect, self.near, self.far)
+    def proj_matrix(self) -> Mat4x4:
+        return Mat4x4.perspective(self._fov_y, self.aspect, self.near, self.far)
 
     @property
-    def view_proj(self) -> Mat4:
+    def view_proj(self) -> Mat4x4:
         return self.proj_matrix * self.view_matrix
 
     @property
@@ -92,7 +92,7 @@ class Camera:
 if _gfx_struct is not None:
     @_gfx_struct
     class CameraParams:
-        view_proj: Mat4
+        view_proj: Mat4x4
         eye_pos: Vec3
         time: float = 0.0
 
@@ -105,7 +105,7 @@ if _gfx_struct is not None:
     @classmethod
     def _from_bytes(cls, buffer: bytes | bytearray | memoryview) -> CameraParams:
         inst = _orig_from_bytes(buffer)
-        inst.view_proj = Mat4(inst.view_proj) if not isinstance(inst.view_proj, Mat4) else inst.view_proj
+        inst.view_proj = Mat4x4(inst.view_proj) if not isinstance(inst.view_proj, Mat4x4) else inst.view_proj
         inst.eye_pos = Vec3(*inst.eye_pos) if not isinstance(inst.eye_pos, Vec3) else inst.eye_pos
         return inst
     CameraParams.from_bytes = _from_bytes
@@ -120,11 +120,11 @@ else:
 
         def __init__(
             self,
-            view_proj: Mat4 | Sequence[float],
+            view_proj: Mat4x4 | Sequence[float],
             eye_pos: Vec3 | Sequence[float],
             time: float = 0.0,
         ) -> None:
-            self.view_proj = view_proj if isinstance(view_proj, Mat4) else Mat4(view_proj)
+            self.view_proj = view_proj if isinstance(view_proj, Mat4x4) else Mat4x4(view_proj)
             self.eye_pos = eye_pos if isinstance(eye_pos, Vec3) else Vec3(*eye_pos)
             self.time = float(time)
 
@@ -139,7 +139,7 @@ else:
         def from_bytes(cls, buffer: bytes | bytearray | memoryview) -> CameraParams:
             if len(buffer) < 80:
                 raise ValueError(f"Buffer size {len(buffer)} < 80 bytes")
-            vp = Mat4.from_bytes(buffer[0:64])
+            vp = Mat4x4.from_bytes(buffer[0:64])
             eye = Vec3(*struct.unpack_from("<3f", buffer, 64))
             return cls(vp, eye, struct.unpack_from("<f", buffer, 76)[0])
 

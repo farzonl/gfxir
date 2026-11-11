@@ -6,7 +6,7 @@ import math
 import struct
 from typing import Any, Callable
 
-from examples.minigfx.math import Mat4, Vec2, Vec3, Vec4
+from examples.minigfx.math import Mat4x4, Vec2, Vec3, Vec4
 from examples.minigfx.tonemap import tonemap_and_gamma
 
 try:
@@ -138,7 +138,7 @@ class ObjectParams:
 
     def __init__(self, model: Any = None, color: Any = (1.0, 1.0, 1.0, 1.0), **kwargs: Any) -> None:
         if kwargs: raise TypeError(f"ObjectParams unexpected kwargs: {list(kwargs.keys())}")
-        self.model = model if isinstance(model, Mat4) else (Mat4(model) if model is not None else Mat4.identity())
+        self.model = model if isinstance(model, Mat4x4) else (Mat4x4(model) if model is not None else Mat4x4.identity())
         self.color = _to_vec4(color)
 
     def to_bytes(self) -> bytes:
@@ -148,7 +148,7 @@ class ObjectParams:
     @classmethod
     def from_bytes(cls, buf: bytes | bytearray | memoryview) -> ObjectParams:
         if len(buf) < 80: raise ValueError(f"Buffer < 80B for ObjectParams")
-        return cls(model=Mat4.from_bytes(buf[0:64]), color=Vec4(*struct.unpack_from("<4f", buf, 64)))
+        return cls(model=Mat4x4.from_bytes(buf[0:64]), color=Vec4(*struct.unpack_from("<4f", buf, 64)))
 
     @classmethod
     def as_parameter_block(cls, name: str | None = None) -> Any:
@@ -166,7 +166,7 @@ class CameraParams:
 
     def __init__(self, view_proj: Any = None, eye_pos: Any = (0.0, 0.0, 0.0), time: float = 0.0, **kwargs: Any) -> None:
         if kwargs: raise TypeError(f"CameraParams unexpected kwargs: {list(kwargs.keys())}")
-        self.view_proj = view_proj if isinstance(view_proj, Mat4) else (Mat4(view_proj) if view_proj is not None else Mat4.identity())
+        self.view_proj = view_proj if isinstance(view_proj, Mat4x4) else (Mat4x4(view_proj) if view_proj is not None else Mat4x4.identity())
         self.eye_pos = _to_vec3(eye_pos)
         f_time = float(time)
         if not math.isfinite(f_time): raise ValueError(f"Camera time {f_time} must be finite")
@@ -179,7 +179,7 @@ class CameraParams:
     @classmethod
     def from_bytes(cls, buf: bytes | bytearray | memoryview) -> CameraParams:
         if len(buf) < 80: raise ValueError(f"Buffer < 80B for CameraParams")
-        return cls(view_proj=Mat4.from_bytes(buf[0:64]), eye_pos=Vec3(*struct.unpack_from("<3f", buf, 64)), time=struct.unpack_from("<f", buf, 76)[0])
+        return cls(view_proj=Mat4x4.from_bytes(buf[0:64]), eye_pos=Vec3(*struct.unpack_from("<3f", buf, 64)), time=struct.unpack_from("<f", buf, 76)[0])
 
     @classmethod
     def as_parameter_block(cls, name: str | None = None) -> Any:
@@ -245,8 +245,8 @@ class ShaderFunction:
 
 
 def _cpu_vertex(pos: Any = (0.0, 0.0, 0.0), cam: Any = None, obj: Any = None) -> Vec4:
-    model = getattr(obj, "model", Mat4.identity())
-    vp = getattr(cam, "view_proj", Mat4.identity())
+    model = getattr(obj, "model", Mat4x4.identity())
+    vp = getattr(cam, "view_proj", Mat4x4.identity())
     return vp * (model * _to_vec4(pos))
 
 

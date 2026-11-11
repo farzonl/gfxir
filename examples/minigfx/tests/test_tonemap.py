@@ -7,7 +7,7 @@ Covers:
 - TestGammaRoundtrip: srgb_to_linear(linear_to_srgb(x)) ≈ x across [0.0, 1.0], discrete 8-bit roundtrip
 - TestTonemapAndGamma: combined pass equivalence, reference values, extreme HDR/negative bounds
 - TestPolymorphism: float, int, Vec3, Vec4 inputs, alpha channel preservation
-- TestTypeSafety: rejection of bool, str, None, list, tuple, Vec2, Mat4 with TypeError
+- TestTypeSafety: rejection of bool, str, None, list, tuple, Vec2, Mat4x4 with TypeError
 - TestMonotonicity: strict monotonicity across [0.0, 100.0]
 """
 
@@ -17,7 +17,7 @@ import math
 import unittest
 
 try:
-    from examples.minigfx.math import Mat4, Vec2, Vec3, Vec4
+    from examples.minigfx.math import Mat4x4, Vec2, Vec3, Vec4
 except (ImportError, ModuleNotFoundError):
     from examples.minigfx.tonemap import Vec3, Vec4  # type: ignore[assignment]
 
@@ -25,7 +25,7 @@ except (ImportError, ModuleNotFoundError):
         def __init__(self, x: float = 0.0, y: float = 0.0) -> None:
             self.x, self.y = float(x), float(y)
 
-    class Mat4:  # type: ignore[no-redef]
+    class Mat4x4:  # type: ignore[no-redef]
         @classmethod
         def identity(cls):
             return cls()
@@ -312,7 +312,7 @@ class TestTypeSafety(unittest.TestCase):
             (0.1, 0.2, 0.3),
             (0.1, 0.2, 0.3, 1.0),
             Vec2(0.5, 0.5),
-            Mat4.identity(),
+            Mat4x4.identity(),
             {"r": 1.0},
         ]
         funcs = [aces_tonemap, linear_to_srgb, srgb_to_linear, srgb_gamma, tonemap_and_gamma]

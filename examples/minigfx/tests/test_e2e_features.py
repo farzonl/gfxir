@@ -336,7 +336,7 @@ class TestFeature03PerDrawConstants(unittest.TestCase):
 
     def test_f03_t1_02_per_draw_constants_large_block_support(self):
         self._require_feature()
-        # 192 bytes block (2x Mat4 + 4x Vec4) must be accepted <= 256 bytes
+        # 192 bytes block (2x Mat4x4 + 4x Vec4) must be accepted <= 256 bytes
         size = 192
         self.assertLessEqual(size, 256)
 
@@ -712,20 +712,20 @@ class TestFeature10CpuMathCamera(unittest.TestCase):
 
     def test_f10_t1_02_matrix_multiplication_and_transform(self):
         self._require_math()
-        m_ident = mgfx_math.Mat4.identity()
-        m_trans = mgfx_math.Mat4.translation(10.0, 0.0, 0.0)
+        m_ident = mgfx_math.Mat4x4.identity()
+        m_trans = mgfx_math.Mat4x4.translation(10.0, 0.0, 0.0)
         prod = m_ident * m_trans
         self.assertEqual(len(prod.to_bytes()), 64)
 
     def test_f10_t1_03_perspective_projection_clip_z_zero_to_one(self):
         self._require_math()
         # [0.0, 1.0] clip Z depth convention
-        proj = mgfx_math.Mat4.perspective(math.radians(60), 16/9, 0.1, 100.0)
+        proj = mgfx_math.Mat4x4.perspective(math.radians(60), 16/9, 0.1, 100.0)
         self.assertEqual(len(proj.to_bytes()), 64)
 
     def test_f10_t1_04_camera_look_at_view_matrix(self):
         self._require_math()
-        view = mgfx_math.Mat4.look_at(
+        view = mgfx_math.Mat4x4.look_at(
             mgfx_math.Vec3(0, 0, 5), mgfx_math.Vec3(0, 0, 0), mgfx_math.Vec3(0, 1, 0)
         )
         self.assertEqual(len(view.to_bytes()), 64)
@@ -746,26 +746,26 @@ class TestFeature10CpuMathCamera(unittest.TestCase):
     def test_f10_t2_02_boundary_degenerate_look_at_coincident(self):
         self._require_math()
         with self.assertRaises(ValueError):
-            mgfx_math.Mat4.look_at(
+            mgfx_math.Mat4x4.look_at(
                 mgfx_math.Vec3(1, 1, 1), mgfx_math.Vec3(1, 1, 1), mgfx_math.Vec3(0, 1, 0)
             )
 
     def test_f10_t2_03_boundary_degenerate_look_at_collinear_up(self):
         self._require_math()
         with self.assertRaises(ValueError):
-            mgfx_math.Mat4.look_at(
+            mgfx_math.Mat4x4.look_at(
                 mgfx_math.Vec3(0, 0, 5), mgfx_math.Vec3(0, 0, 0), mgfx_math.Vec3(0, 0, 1)
             )
 
     def test_f10_t2_04_boundary_invalid_perspective_parameters(self):
         self._require_math()
         with self.assertRaises(ValueError):
-            mgfx_math.Mat4.perspective(0.0, 1.0, 0.1, 100.0)
+            mgfx_math.Mat4x4.perspective(0.0, 1.0, 0.1, 100.0)
 
     def test_f10_t2_05_boundary_singular_matrix_inversion(self):
         self._require_math()
         # Zero matrix is singular
-        zero_mat = mgfx_math.Mat4.zero()
+        zero_mat = mgfx_math.Mat4x4.zero()
         with self.assertRaises((ValueError, ZeroDivisionError)):
             zero_mat.inverse()
 

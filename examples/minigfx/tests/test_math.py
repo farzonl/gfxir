@@ -2,9 +2,9 @@
 
 Covers:
 - Vector classes: Vec2, Vec3, Vec4 (arithmetic, dot, cross, norm, zero-vector handling, indexing, std430 serialization)
-- Matrix class: Mat4 (identity, zero, translation, scaling, rotations, multiplication, transpose, analytic inverse, singular detection, serialization)
+- Matrix class: Mat4x4 (identity, zero, translation, scaling, rotations, multiplication, transpose, analytic inverse, singular detection, serialization)
 - Coordinate and projection conventions (right-handed look_at, [0, 1] clip Z perspective)
-- Quaternion class: Quat (identity, from_axis_angle, to_mat4, multiplication, slerp, serialization)
+- Quaternion class: Quat (identity, from_axis_angle, to_mat4x4, multiplication, slerp, serialization)
 - Camera & frustum culling (Gribb-Hartmann [0, 1] clip Z planes, sphere visibility)
 - CameraParams std430 serialization (80 bytes, 16B alignment, round-trip)
 - OrbitController (rotation, pitch clamping, pan, zoom, damping)
@@ -18,15 +18,13 @@ import unittest
 
 from examples.minigfx.camera import Camera, CameraParams, OrbitController
 from examples.minigfx.math import (
-    Mat2,
     Mat2x2,
     Mat2x3,
     Mat2x4,
-    Mat3,
     Mat3x2,
     Mat3x3,
     Mat3x4,
-    Mat4,
+    Mat4x4,
     Mat4x2,
     Mat4x3,
     Mat4x4,
@@ -193,11 +191,11 @@ class TestVec4(unittest.TestCase):
         self.assertEqual(struct.unpack("<4f", data), (1.0, 2.0, 3.0, 4.0))
 
 
-class TestMat4(unittest.TestCase):
-    """Unit tests for Mat4 matrix operations."""
+class TestMat4x4(unittest.TestCase):
+    """Unit tests for Mat4x4 matrix operations."""
 
     def test_identity_and_zero(self):
-        i = Mat4.identity()
+        i = Mat4x4.identity()
         self.assertEqual(len(i.elements), 16)
         self.assertEqual(len(i), 16)
         for r in range(4):
@@ -205,65 +203,65 @@ class TestMat4(unittest.TestCase):
                 expected = 1.0 if r == c else 0.0
                 self.assertEqual(i[r, c], expected)
 
-        z = Mat4.zero()
+        z = Mat4x4.zero()
         self.assertTrue(all(x == 0.0 for x in z.elements))
 
     def test_translation(self):
-        t = Mat4.translation(10.0, -5.0, 2.0)
+        t = Mat4x4.translation(10.0, -5.0, 2.0)
         p = t * Vec4(0.0, 0.0, 0.0, 1.0)
         self.assertEqual(p, Vec4(10.0, -5.0, 2.0, 1.0))
         # Direction vector (w=0) unaffected by translation
         d = t * Vec4(1.0, 2.0, 3.0, 0.0)
         self.assertEqual(d, Vec4(1.0, 2.0, 3.0, 0.0))
 
-        t2 = Mat4.from_translation(Vec3(10.0, -5.0, 2.0))
+        t2 = Mat4x4.from_translation(Vec3(10.0, -5.0, 2.0))
         self.assertEqual(t, t2)
 
     def test_scaling(self):
-        s = Mat4.scaling(2.0, 3.0, 4.0)
+        s = Mat4x4.scaling(2.0, 3.0, 4.0)
         p = s * Vec4(1.0, 1.0, 1.0, 1.0)
         self.assertEqual(p, Vec4(2.0, 3.0, 4.0, 1.0))
         # Uniform scaling
-        su = Mat4.scaling(3.0)
+        su = Mat4x4.scaling(3.0)
         self.assertEqual(su * Vec4(1.0, 2.0, 3.0, 1.0), Vec4(3.0, 6.0, 9.0, 1.0))
 
     def test_rotations_axis_aligned(self):
-        rx = Mat4.rotation_x(math.pi * 0.5)
+        rx = Mat4x4.rotation_x(math.pi * 0.5)
         p = rx * Vec4(0.0, 1.0, 0.0, 1.0)
         self.assertAlmostEqual(p.x, 0.0, places=5)
         self.assertAlmostEqual(p.y, 0.0, places=5)
         self.assertAlmostEqual(p.z, 1.0, places=5)
 
-        ry = Mat4.rotation_y(math.pi * 0.5)
+        ry = Mat4x4.rotation_y(math.pi * 0.5)
         p2 = ry * Vec4(0.0, 0.0, 1.0, 1.0)
         self.assertAlmostEqual(p2.x, 1.0, places=5)
         self.assertAlmostEqual(p2.y, 0.0, places=5)
         self.assertAlmostEqual(p2.z, 0.0, places=5)
 
-        rz = Mat4.rotation_z(math.pi * 0.5)
+        rz = Mat4x4.rotation_z(math.pi * 0.5)
         p3 = rz * Vec4(1.0, 0.0, 0.0, 1.0)
         self.assertAlmostEqual(p3.x, 0.0, places=5)
         self.assertAlmostEqual(p3.y, 1.0, places=5)
         self.assertAlmostEqual(p3.z, 0.0, places=5)
 
     def test_rotation_axis(self):
-        r_axis = Mat4.rotation_axis(Vec3(0, 1, 0), math.pi * 0.5)
-        r_y = Mat4.rotation_y(math.pi * 0.5)
+        r_axis = Mat4x4.rotation_axis(Vec3(0, 1, 0), math.pi * 0.5)
+        r_y = Mat4x4.rotation_y(math.pi * 0.5)
         self.assertEqual(r_axis, r_y)
         # Degenerate zero axis
-        self.assertEqual(Mat4.rotation_axis(Vec3(0, 0, 0), 1.0), Mat4.identity())
+        self.assertEqual(Mat4x4.rotation_axis(Vec3(0, 0, 0), 1.0), Mat4x4.identity())
 
     def test_multiplication_associativity_and_order(self):
-        t = Mat4.translation(1, 2, 3)
-        r = Mat4.rotation_y(math.pi * 0.5)
-        s = Mat4.scaling(2, 2, 2)
+        t = Mat4x4.translation(1, 2, 3)
+        r = Mat4x4.rotation_y(math.pi * 0.5)
+        s = Mat4x4.scaling(2, 2, 2)
         # Associativity: (T * R) * S == T * (R * S)
         self.assertEqual((t * r) * s, t * (r * s))
         # Non-commutativity: T * R != R * T
         self.assertNotEqual(t * r, r * t)
 
     def test_transpose(self):
-        m = Mat4((
+        m = Mat4x4((
             1, 2, 3, 4,
             5, 6, 7, 8,
             9, 10, 11, 12,
@@ -276,13 +274,13 @@ class TestMat4(unittest.TestCase):
                 self.assertEqual(mt[r, c], m[c, r])
 
     def test_analytic_inverse(self):
-        i = Mat4.identity()
+        i = Mat4x4.identity()
         self.assertEqual(i.inverse(), i)
 
         # Composite SRT matrix inverse
-        t = Mat4.translation(5.0, -3.0, 2.0)
-        r = Mat4.rotation_z(0.7)
-        s = Mat4.scaling(2.0, 0.5, 3.0)
+        t = Mat4x4.translation(5.0, -3.0, 2.0)
+        r = Mat4x4.rotation_z(0.7)
+        s = Mat4x4.scaling(2.0, 0.5, 3.0)
         m = t * r * s
         inv = m.inverse()
         prod = m * inv
@@ -292,12 +290,12 @@ class TestMat4(unittest.TestCase):
 
     def test_singular_matrix_inversion(self):
         with self.assertRaises(ValueError):
-            Mat4.zero().inverse()
+            Mat4x4.zero().inverse()
         with self.assertRaises(ValueError):
-            Mat4.scaling(0.0, 1.0, 1.0).inverse()
+            Mat4x4.scaling(0.0, 1.0, 1.0).inverse()
 
     def test_columns_and_elements_and_bytes(self):
-        m = Mat4.identity()
+        m = Mat4x4.identity()
         cols = m.columns
         self.assertEqual(len(cols), 4)
         self.assertIsInstance(cols[0], Vec4)
@@ -306,7 +304,7 @@ class TestMat4(unittest.TestCase):
 
         raw = m.to_bytes()
         self.assertEqual(len(raw), 64)
-        restored = Mat4.from_bytes(raw)
+        restored = Mat4x4.from_bytes(raw)
         self.assertEqual(restored, m)
 
 
@@ -317,7 +315,7 @@ class TestCoordinateAndProjections(unittest.TestCase):
         eye = Vec3(0, 0, 5)
         target = Vec3(0, 0, 0)
         up = Vec3(0, 1, 0)
-        v = Mat4.look_at(eye, target, up)
+        v = Mat4x4.look_at(eye, target, up)
 
         # Eye maps to origin of camera space
         cam_eye = v * Vec4(0, 0, 5, 1)
@@ -340,18 +338,18 @@ class TestCoordinateAndProjections(unittest.TestCase):
     def test_look_at_exceptions(self):
         # Coincident eye and target
         with self.assertRaises(ValueError):
-            Mat4.look_at(Vec3(1, 2, 3), Vec3(1, 2, 3), Vec3(0, 1, 0))
+            Mat4x4.look_at(Vec3(1, 2, 3), Vec3(1, 2, 3), Vec3(0, 1, 0))
         # Zero-length up
         with self.assertRaises(ValueError):
-            Mat4.look_at(Vec3(0, 0, 5), Vec3(0, 0, 0), Vec3(0, 0, 0))
+            Mat4x4.look_at(Vec3(0, 0, 5), Vec3(0, 0, 0), Vec3(0, 0, 0))
         # Collinear up and view direction
         with self.assertRaises(ValueError):
-            Mat4.look_at(Vec3(0, 0, 5), Vec3(0, 0, 0), Vec3(0, 0, 1))
+            Mat4x4.look_at(Vec3(0, 0, 5), Vec3(0, 0, 0), Vec3(0, 0, 1))
 
     def test_perspective_clip_z_zero_to_one(self):
         near = 0.5
         far = 100.0
-        p = Mat4.perspective(math.radians(60.0), 16.0 / 9.0, near, far)
+        p = Mat4x4.perspective(math.radians(60.0), 16.0 / 9.0, near, far)
 
         # Point on near plane (z = -near) maps to clip z/w = 0.0
         near_pt = p * Vec4(0.0, 0.0, -near, 1.0)
@@ -368,15 +366,15 @@ class TestCoordinateAndProjections(unittest.TestCase):
 
     def test_perspective_invalid_parameters(self):
         with self.assertRaises(ValueError):
-            Mat4.perspective(0.0, 1.0, 0.1, 100.0)  # fov_y <= 0
+            Mat4x4.perspective(0.0, 1.0, 0.1, 100.0)  # fov_y <= 0
         with self.assertRaises(ValueError):
-            Mat4.perspective(math.pi, 1.0, 0.1, 100.0)  # fov_y >= pi
+            Mat4x4.perspective(math.pi, 1.0, 0.1, 100.0)  # fov_y >= pi
         with self.assertRaises(ValueError):
-            Mat4.perspective(math.radians(60), -1.0, 0.1, 100.0)  # aspect <= 0
+            Mat4x4.perspective(math.radians(60), -1.0, 0.1, 100.0)  # aspect <= 0
         with self.assertRaises(ValueError):
-            Mat4.perspective(math.radians(60), 1.0, -0.1, 100.0)  # near <= 0
+            Mat4x4.perspective(math.radians(60), 1.0, -0.1, 100.0)  # near <= 0
         with self.assertRaises(ValueError):
-            Mat4.perspective(math.radians(60), 1.0, 10.0, 5.0)  # far <= near
+            Mat4x4.perspective(math.radians(60), 1.0, 10.0, 5.0)  # far <= near
 
 
 class TestQuaternion(unittest.TestCase):
@@ -385,18 +383,18 @@ class TestQuaternion(unittest.TestCase):
     def test_identity(self):
         q = Quat.identity()
         self.assertEqual((q.x, q.y, q.z, q.w), (0.0, 0.0, 0.0, 1.0))
-        self.assertEqual(q.to_mat4(), Mat4.identity())
+        self.assertEqual(q.to_mat4x4(), Mat4x4.identity())
 
     def test_from_axis_angle_and_to_mat4(self):
         # 90 degrees around Y axis
         q = Quat.from_axis_angle(Vec3(0, 1, 0), math.pi * 0.5)
-        m_q = q.to_mat4()
-        m_rot = Mat4.rotation_y(math.pi * 0.5)
+        m_q = q.to_mat4x4()
+        m_rot = Mat4x4.rotation_y(math.pi * 0.5)
         self.assertEqual(m_q, m_rot)
 
         # 90 degrees around X axis
         qx = Quat.from_axis_angle(Vec3(1, 0, 0), math.pi * 0.5)
-        self.assertEqual(qx.to_mat4(), Mat4.rotation_x(math.pi * 0.5))
+        self.assertEqual(qx.to_mat4x4(), Mat4x4.rotation_x(math.pi * 0.5))
 
     def test_multiplication_and_conjugate(self):
         q = Quat.from_axis_angle(Vec3(0, 1, 0), 1.2)
@@ -556,7 +554,7 @@ class TestCameraParamsStd430(unittest.TestCase):
         raw = params.to_bytes()
         self.assertEqual(len(raw), 80)
 
-        # Unpack offset 0 (Mat4, 64B)
+        # Unpack offset 0 (Mat4x4, 64B)
         vp_elems = struct.unpack_from("<16f", raw, 0)
         for a, b in zip(vp_elems, cam.view_proj.elements):
             self.assertAlmostEqual(a, b, places=5)
@@ -679,11 +677,7 @@ class TestCxRMatrices(unittest.TestCase):
     ]
 
     def test_instantiation_all_9_types(self):
-        """Verify default identity instantiation, dimensions, len, and aliases for all 9 types."""
-        self.assertIs(Mat2, Mat2x2)
-        self.assertIs(Mat3, Mat3x3)
-        self.assertIs(Mat4, Mat4x4)
-
+        """Verify default identity instantiation, dimensions and len for all 9 types."""
         for cls, cols, rows in self.ALL_TYPES:
             # Default instantiation -> identity
             m = cls()

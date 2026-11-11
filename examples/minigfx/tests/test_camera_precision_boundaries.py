@@ -31,7 +31,7 @@ import struct
 import unittest
 
 from examples.minigfx.camera import Camera, CameraParams, OrbitController
-from examples.minigfx.math import Mat4, Quat, Vec2, Vec3, Vec4
+from examples.minigfx.math import Mat4x4, Quat, Vec2, Vec3, Vec4
 
 
 class TestPerspectiveDepthPrecision(unittest.TestCase):
@@ -54,7 +54,7 @@ class TestPerspectiveDepthPrecision(unittest.TestCase):
 
         for near, far, fov_deg, aspect in configs:
             fov_rad = math.radians(fov_deg)
-            p = Mat4.perspective(fov_rad, aspect, near, far)
+            p = Mat4x4.perspective(fov_rad, aspect, near, far)
 
             # Test multiple points on near plane (z = -near)
             tan_half_fov = math.tan(fov_rad * 0.5)
@@ -374,7 +374,7 @@ class TestCameraParamsStd430Integrity(unittest.TestCase):
         for i in range(1000):
             # Generate random transform matrix elements
             m_elems = [rng.uniform(-100.0, 100.0) for _ in range(16)]
-            vp = Mat4(m_elems)
+            vp = Mat4x4(m_elems)
             eye = Vec3(rng.uniform(-50.0, 50.0), rng.uniform(-50.0, 50.0), rng.uniform(-50.0, 50.0))
             time_val = rng.uniform(0.0, 10000.0)
 
@@ -414,7 +414,7 @@ class TestCameraParamsStd430Integrity(unittest.TestCase):
 
             # Verify round-trip deserialization
             restored = CameraParams.from_bytes(b)
-            self.assertEqual(restored.view_proj, Mat4(expected_mat))
+            self.assertEqual(restored.view_proj, Mat4x4(expected_mat))
             self.assertEqual(restored.eye_pos, Vec3(*expected_eye))
             self.assertAlmostEqual(restored.time, expected_time, places=5)
 

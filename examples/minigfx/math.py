@@ -3,8 +3,8 @@
 Storage and Coordinate Conventions:
 - Right-handed Cartesian coordinates (+X right, +Y up, +Z towards viewer; view along -Z).
 - Column-major matrix layout: flat tuple of cols * rows floats, indexed as m[r, c] or m[i].
-- Complete set of CxR matrix types: Mat2x2 (Mat2), Mat2x3, Mat2x4, Mat3x2, Mat3x3 (Mat3),
-  Mat3x4, Mat4x2, Mat4x3, Mat4x4 (Mat4).
+- Complete set of CxR matrix types: Mat2x2, Mat2x3, Mat2x4, Mat3x2, Mat3x3,
+  Mat3x4, Mat4x2, Mat4x3, Mat4x4.
 - Column-vector transform convention: v' = M * v.
 - Clip-space Z range: [0.0, 1.0] (DirectX, Metal, Vulkan standard).
 - std430 binary packing via .to_bytes() using IEEE-754 little-endian encoding with column padding.
@@ -182,7 +182,7 @@ class Matrix:
             else:
                 rem = args
         total = cols * rows
-        name = "Mat4" if self.__class__.__name__ in ("Mat4", "Mat4x4") else self.__class__.__name__
+        name = self.__class__.__name__
         if len(rem) == 0:
             self._data = tuple(1.0 if c == r else 0.0 for c in range(cols) for r in range(rows))
         elif len(rem) == 1:
@@ -484,7 +484,7 @@ class Matrix:
         r = cls.rows
         stride = 8 if r == 2 else 16
         min_bytes = c * stride
-        name = "Mat4" if cls.__name__ in ("Mat4", "Mat4x4") else cls.__name__
+        name = cls.__name__
         if len(buffer) < min_bytes:
             raise ValueError(f"Buffer size {len(buffer)} < {min_bytes} bytes for {name}")
         flat: list[float] = []
@@ -516,7 +516,7 @@ class Matrix:
         return False
 
     def __repr__(self) -> str:
-        name = "Mat4" if self.__class__.__name__ in ("Mat4", "Mat4x4") else self.__class__.__name__
+        name = self.__class__.__name__
         return f"{name}({self._data})"
 
 
@@ -527,7 +527,6 @@ class Mat2x2(Matrix):
     __slots__ = ()
 
 
-Mat2 = Mat2x2
 
 
 class Mat2x3(Matrix):
@@ -558,7 +557,6 @@ class Mat3x3(Matrix):
     __slots__ = ()
 
 
-Mat3 = Mat3x3
 
 
 class Mat3x4(Matrix):
@@ -582,14 +580,14 @@ class Mat4x3(Matrix):
     __slots__ = ()
 
 
-class Mat4(Matrix):
+class Mat4x4(Matrix):
     """4x4 column-major transformation matrix."""
 
     cols, rows = 4, 4
     __slots__ = ()
 
     @classmethod
-    def translation(cls, x: float | Sequence[float], y: float = 0.0, z: float = 0.0) -> Mat4:
+    def translation(cls, x: float | Sequence[float], y: float = 0.0, z: float = 0.0) -> Mat4x4:
         if hasattr(x, "__len__") and not isinstance(x, (int, float)):
             tx, ty, tz = float(x[0]), float(x[1]), float(x[2])
         else:
@@ -600,11 +598,11 @@ class Mat4(Matrix):
         ))
 
     @classmethod
-    def from_translation(cls, v: Sequence[float]) -> Mat4:
+    def from_translation(cls, v: Sequence[float]) -> Mat4x4:
         return cls.translation(v)
 
     @classmethod
-    def scaling(cls, x: float | Sequence[float], y: float | None = None, z: float | None = None) -> Mat4:
+    def scaling(cls, x: float | Sequence[float], y: float | None = None, z: float | None = None) -> Mat4x4:
         if hasattr(x, "__len__") and not isinstance(x, (int, float)):
             sx, sy, sz = float(x[0]), float(x[1]), float(x[2])
         elif y is None and z is None:
@@ -619,11 +617,11 @@ class Mat4(Matrix):
         ))
 
     @classmethod
-    def from_scale(cls, v: Sequence[float]) -> Mat4:
+    def from_scale(cls, v: Sequence[float]) -> Mat4x4:
         return cls.scaling(v)
 
     @classmethod
-    def rotation_x(cls, a: float) -> Mat4:
+    def rotation_x(cls, a: float) -> Mat4x4:
         c, s = math.cos(a), math.sin(a)
         return cls((
             1.0, 0.0, 0.0, 0.0,  0.0, c, s, 0.0,
@@ -631,7 +629,7 @@ class Mat4(Matrix):
         ))
 
     @classmethod
-    def rotation_y(cls, a: float) -> Mat4:
+    def rotation_y(cls, a: float) -> Mat4x4:
         c, s = math.cos(a), math.sin(a)
         return cls((
             c,   0.0, -s,  0.0,  0.0, 1.0, 0.0, 0.0,
@@ -639,7 +637,7 @@ class Mat4(Matrix):
         ))
 
     @classmethod
-    def rotation_z(cls, a: float) -> Mat4:
+    def rotation_z(cls, a: float) -> Mat4x4:
         c, s = math.cos(a), math.sin(a)
         return cls((
             c,   s,   0.0, 0.0,  -s,  c,   0.0, 0.0,
@@ -647,7 +645,7 @@ class Mat4(Matrix):
         ))
 
     @classmethod
-    def rotation_axis(cls, axis: Sequence[float], angle: float) -> Mat4:
+    def rotation_axis(cls, axis: Sequence[float], angle: float) -> Mat4x4:
         ax, ay, az = float(axis[0]), float(axis[1]), float(axis[2])
         mag_sq = ax * ax + ay * ay + az * az
         if mag_sq < 1e-12:
@@ -663,7 +661,7 @@ class Mat4(Matrix):
         ))
 
     @classmethod
-    def look_at(cls, eye: Sequence[float], target: Sequence[float], up: Sequence[float]) -> Mat4:
+    def look_at(cls, eye: Sequence[float], target: Sequence[float], up: Sequence[float]) -> Mat4x4:
         ex, ey, ez = float(eye[0]), float(eye[1]), float(eye[2])
         zx, zy, zz = ex - float(target[0]), ey - float(target[1]), ez - float(target[2])
         z_sq = zx * zx + zy * zy + zz * zz
@@ -695,7 +693,7 @@ class Mat4(Matrix):
         ))
 
     @classmethod
-    def perspective(cls, fov_y: float, aspect: float, near: float, far: float) -> Mat4:
+    def perspective(cls, fov_y: float, aspect: float, near: float, far: float) -> Mat4x4:
         if not (0.0 < fov_y < math.pi):
             raise ValueError(f"fov_y must be between 0 and pi radians, got {fov_y}")
         if aspect <= 0.0:
@@ -715,7 +713,6 @@ class Mat4(Matrix):
         ))
 
 
-Mat4x4 = Mat4
 
 _MATRIX_CLASSES: dict[tuple[int, int], type[Matrix]] = {
     (2, 2): Mat2x2,
@@ -778,13 +775,13 @@ class Quat:
             )
         return NotImplemented
 
-    def to_mat4(self) -> Mat4:
+    def to_mat4x4(self) -> Mat4x4:
         q = self.normalize()
         x, y, z, w = q.x, q.y, q.z, q.w
         xx, yy, zz = x * x, y * y, z * z
         xy, xz, yz = x * y, x * z, y * z
         wx, wy, wz = w * x, w * y, w * z
-        return Mat4((
+        return Mat4x4((
             1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz),       2.0 * (xz - wy),       0.0,
             2.0 * (xy - wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx),       0.0,
             2.0 * (xz + wy),       2.0 * (yz - wx),       1.0 - 2.0 * (xx + yy), 0.0,
@@ -828,17 +825,14 @@ __all__ = [
     "Vec4",
     "Matrix",
     "Mat2x2",
-    "Mat2",
     "Mat2x3",
     "Mat2x4",
     "Mat3x2",
     "Mat3x3",
-    "Mat3",
     "Mat3x4",
     "Mat4x2",
     "Mat4x3",
     "Mat4x4",
-    "Mat4",
     "Quat",
 ]
 

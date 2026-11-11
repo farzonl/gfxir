@@ -74,7 +74,7 @@ MiniGfx Unified Model (Single-Source Python):
 │                                                             │
 │  @struct                                                    │
 │  class CameraParams:                                        │
-│      view_proj: Mat4                                        │
+│      view_proj: Mat4x4                                        │
 │      camera_pos: Vec3                                       │
 │                                                             │
 │  # 1. Used on CPU:       params = CameraParams(...)         │
@@ -105,7 +105,7 @@ The three pillars of this architecture are:
    - In Reflection: The compiler emits the exact byte offsets, alignments, and backend-specific bindings (Vulkan push constants, DX12 root constants, Metal argument buffers) into the pipeline manifest.
 
 2. **Unified Computational Semantics**:
-   - Vector and matrix operations in `minigfx.math` (`Vec2`, `Vec3`, `Vec4`, `Mat4`, `Quat`) share coordinate conventions (right-handed, column-major, clip Z in `[0.0, 1.0]`) with GPU shader execution.
+   - Vector and matrix operations in `minigfx.math` (`Vec2`, `Vec3`, `Vec4`, `Mat4x4`, `Quat`) share coordinate conventions (right-handed, column-major, clip Z in `[0.0, 1.0]`) with GPU shader execution.
    - Frustum extraction and culling algorithms on the CPU directly evaluate the exact projection matrices used by the GPU vertex shader.
 
 3. **Native Multi-Backend Generation from One Source**:
@@ -153,7 +153,7 @@ MiniGfx adopts MiniEngine's core architectural patterns while eliminating its bo
                                       ▼
   ┌──────────────────────────────────────────────────────────────────────────────────────┐
   │                          Shared CPU/GPU Structs & Shaders                            │
-  │ - minigfx.math: Vec2, Vec3, Vec4, Mat4, Quat (column-major, clip Z in [0, 1])        │
+  │ - minigfx.math: Vec2, Vec3, Vec4, Mat4x4, Quat (column-major, clip Z in [0, 1])        │
   │ - minigfx.material: PBR-lite embedded shaders (@vertex, @fragment), MaterialParams   │
   │ - minigfx.tonemap: Inlined ACES filmic tonemapper & sRGB gamma conversion            │
   │ - minigfx.debug: Zero-dependency bitmap-glyph SDF debug overlay                      │
@@ -185,7 +185,7 @@ MiniGfx adopts MiniEngine's core architectural patterns while eliminating its bo
 |---|---|---|
 | `GameCore::IGameApp`, `SystemTime` | `minigfx.app.App` (`app.py`) | Replaces Win32 message loop with a clean Python application lifecycle (`startup`, `update`, `render`, `cleanup`) and high-resolution timing. |
 | `Camera`, `CameraController` | `minigfx.camera.Camera`, `OrbitController` (`camera.py`) | Perspective projection ([0, 1] clip Z), view matrix, and orbit navigation implemented in pure Python without DirectXMath. |
-| `Math::VectorMath` (SIMD C++) | `minigfx.math` (`math.py`) | Unified `Vec2`, `Vec3`, `Vec4`, `Mat4`, `Quat` with column-major storage and deterministic std430 binary packing (`.to_bytes()`). |
+| `Math::VectorMath` (SIMD C++) | `minigfx.math` (`math.py`) | Unified `Vec2`, `Vec3`, `Vec4`, `Mat4x4`, `Quat` with column-major storage and deterministic std430 binary packing (`.to_bytes()`). |
 | `Model`, `Mesh`, `IndexOptimize` | `minigfx.scene.Node`, `Mesh`, `obj_loader.py` | Lightweight transform tree, standard Wavefront OBJ parser, and procedural primitive generators (cube, sphere, plane). |
 | `RootSignature`, `DescriptorHeap` | GfxIR Compiler Reflection (`parameters.py`, `compiler.py`) | **Zero manual root signatures**. Manifest reflection automatically maps parameter fields to Vulkan push constants, DX12 root constants, and Metal argument buffers. |
 | `PipelineState`, `D3D12_INPUT_ELEMENT_DESC` | `minigfx.renderer.ForwardRenderer`, `frontend.py` | Vertex attributes declared once in `@vertex` signature; automatic input layout reflection eliminates triple-declaration. |
@@ -206,7 +206,7 @@ MiniGfx adopts MiniEngine's core architectural patterns while eliminating its bo
 | **1. Struct Definitions** | **Duplicated across 2+ files**: Defined in C++ header (`struct alignas(16) CameraData`) and repeated in HLSL (`cbuffer CameraData : register(b0)`). | **Zero Duplication (1 definition)**: Declared once in Python (`@struct class CameraParams`). Used directly for host packing and GPU shading. |
 | **2. Field Synchronization** | **Manual & Error-Prone**: Adding or changing a field requires simultaneous edits in C++ and shader files. Mismatches compile without warnings, producing silent visual bugs. | **Automated Single Source of Truth**: Updating the Python class automatically updates CPU packing, GPU lowering, and reflected pipeline manifests. |
 | **3. Memory Layout & Padding** | **Manual std140/std430 padding**: Developers must manually insert dummy variables (`float _pad[3];`) to satisfy 16-byte alignment rules. | **Compiler-Enforced std430 Alignment**: Struct field offsets, padding, and alignments are calculated and validated automatically by the compiler. |
-| **4. Math Types & Conventions** | **Divergent Libraries**: Host uses `DirectXMath` (`XMVECTOR`, `XMVector3Dot`), shaders use HLSL (`float3`, `dot()`). Matrix ordering conventions frequently conflict. | **Unified Conventions**: CPU `minigfx.math` shares identical types (`Vec3`, `Mat4`), naming, and right-handed column-major conventions with GPU shader AST tracing. |
+| **4. Math Types & Conventions** | **Divergent Libraries**: Host uses `DirectXMath` (`XMVECTOR`, `XMVector3Dot`), shaders use HLSL (`float3`, `dot()`). Matrix ordering conventions frequently conflict. | **Unified Conventions**: CPU `minigfx.math` shares identical types (`Vec3`, `Mat4x4`), naming, and right-handed column-major conventions with GPU shader AST tracing. |
 | **5. Parameter Packing** | **Manual `memcpy` / Suballocation**: C++ engine manually invokes `memcpy` into mapped constant buffers or push constant buffers with 256-byte alignment masking. | **Declarative Serialization**: Struct classes provide `.to_bytes()` returning std430 little-endian binary buffers ready for direct GPU upload. |
 | **6. Resource Binding & Root Signatures** | **Explicit Dual Registration**: C++ code explicitly configures `CD3DX12_ROOT_PARAMETER`, matching HLSL `: register(b0, space0)` annotations. | **Automatic Manifest Reflection**: GfxIR reflects parameter blocks and vertex attributes into manifest JSON with target-specific bindings. |
 | **7. Multi-Backend Shaders** | **Multiple Shading Languages or Transpilers**: Requires authoring HLSL, GLSL, and MSL, or maintaining DXC + SPIRV-Cross + `metal-shaderconverter` build pipelines. | **Single Source Compilation**: One Python shader AST lowers directly to Vulkan SPIR-V, DX12 DXIL, and Apple Metal `.metallib`. 0 external shader files. |
@@ -271,15 +271,15 @@ float4 main(VSOutput pin) : SV_Target {
 ```python
 # --- examples/minigfx/material.py (Single Source of Truth) ---
 from mlir_gpu.parameters import struct
-from minigfx.math import Mat4, Vec3
+from minigfx.math import Mat4x4, Vec3
 from mlir_gpu.frontend import vertex, fragment, Value
 import mlir_gpu.shader_math as sm
 
 # 1. Single struct definition: used on CPU for packing and on GPU for shading
 @struct
 class GlobalConstants:
-    view_proj: Mat4
-    sun_shadow_matrix: Mat4
+    view_proj: Mat4x4
+    sun_shadow_matrix: Mat4x4
     viewer_pos: Vec3
     sun_direction: Vec3
     sun_intensity: Vec3
@@ -399,7 +399,7 @@ The MiniGfx architecture delivers three concrete, measurable benchmarks comparin
 | Subsystem / Module | Microsoft MiniEngine (C++ & HLSL) | MiniGfx (Pure Python) | Reduction Factor | Notes |
 |---|---|---|---|---|
 | **Application & Main Loop** | 1,450 LOC (`GameCore.cpp/.h`, `SystemTime`, `GameInput`) | 150 LOC (`minigfx/app.py`) | **9.7x** | Pure Python lifecycle with high-resolution `time.perf_counter`. |
-| **Math Library** | 3,800 LOC (`Math/Vector.h`, `Matrix4.h`, `Quaternion.h`) | 300 LOC (`minigfx/math.py`) | **12.7x** | Column-major `Vec2/3/4`, `Mat4`, `Quat` with binary packing. |
+| **Math Library** | 3,800 LOC (`Math/Vector.h`, `Matrix4.h`, `Quaternion.h`) | 300 LOC (`minigfx/math.py`) | **12.7x** | Column-major `Vec2/3/4`, `Mat4x4`, `Quat` with binary packing. |
 | **Camera & Navigation** | 1,200 LOC (`Camera.cpp/.h`, `CameraController.cpp/.h`) | 200 LOC (`minigfx/camera.py`) | **6.0x** | `Camera` view/proj generation + `OrbitController`. |
 | **Scene Graph & Mesh Loading** | 3,200 LOC (`Model.cpp/.h`, `Mesh.cpp/.h`, `IndexOptimize`) | 370 LOC (`scene.py` [250] + `obj_loader.py` [120]) | **8.6x** | Transform tree, procedural primitives, zero-dep OBJ parser. |
 | **Root Signature & Pipeline State** | 1,350 LOC (`RootSignature.cpp/.h`, `PipelineState.cpp/.h`) | *0 LOC* (absorbed into compiler reflection) | **∞** | Handled declaratively by GfxIR compiler. |
@@ -523,9 +523,9 @@ examples/minigfx/
   - `--offscreen`: Run in headless offscreen mode without displaying a window.
 
 #### 2. `math.py` — Pure Python Linear Algebra (#136)
-- Implements `Vec2`, `Vec3`, `Vec4`, `Mat4`, and `Quat` with zero external dependencies.
+- Implements `Vec2`, `Vec3`, `Vec4`, `Mat4x4`, and `Quat` with zero external dependencies.
 - Column-major matrix storage matching GPU expectations.
-- Projections: `Mat4.perspective(fov_y, aspect, near, far)` configured for `[0.0, 1.0]` clip Z; `Mat4.look_at(eye, target, up)`.
+- Projections: `Mat4x4.perspective(fov_y, aspect, near, far)` configured for `[0.0, 1.0]` clip Z; `Mat4x4.look_at(eye, target, up)`.
 - Binary packing: `.to_bytes()` outputs IEEE-754 little-endian binary buffers obeying std430 alignment.
 
 #### 3. `camera.py` — Camera & Orbit Controller (#136)

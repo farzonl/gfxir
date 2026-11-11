@@ -1,9 +1,9 @@
 """Numerical limits and edge-case testing suite for MiniGfx CPU math and camera controller.
 
 Covers:
-1. Mat4.inverse() numerical stability across 1,000 random non-singular matrices (T * R * S).
+1. Mat4x4.inverse() numerical stability across 1,000 random non-singular matrices (T * R * S).
 2. Singular matrix detection: zero, rank-deficient (plane projection, identical cols/rows, col multiples), near-singular (|det| < 1e-12).
-3. Quaternion vs matrix rotation equivalence across 100 random axis-angles (norm(Q.to_mat4() * v - R_axis(theta) * v) < 1e-5).
+3. Quaternion vs matrix rotation equivalence across 100 random axis-angles (norm(Q.to_mat4x4() * v - R_axis(theta) * v) < 1e-5).
 4. Quaternion slerp boundary conditions: identical (t in [0, 1]), antipodal (q and -q), orthogonal, and near-parallel.
 5. Vector operations: high magnitude, subnormal/denormalized floats, zero-vector normalization, division by zero, bounds checking.
 6. Camera and frustum culling boundary conditions: extreme aspect/FOV, near-singular look-at, controller extreme dt/damping.
@@ -17,14 +17,14 @@ import struct
 import unittest
 
 from examples.minigfx.camera import Camera, CameraParams, OrbitController
-from examples.minigfx.math import Mat4, Quat, Vec2, Vec3, Vec4
+from examples.minigfx.math import Mat4x4, Quat, Vec2, Vec3, Vec4
 
 
 class MatrixInverseNumericalLimitsTests(unittest.TestCase):
-    """Numerical limits testing of Mat4.inverse() precision and singular detection."""
+    """Numerical limits testing of Mat4x4.inverse() precision and singular detection."""
 
     def test_inverse_precision_1000_random_matrices(self):
-        """Stress-test Mat4.inverse() over 1,000 random non-singular SRT matrices.
+        """Stress-test Mat4x4.inverse() over 1,000 random non-singular SRT matrices.
 
         Verifies ||M * M^-1 - I||_inf < 1e-4 and ||M^-1 * M - I||_inf < 1e-4.
         """
@@ -37,7 +37,7 @@ class MatrixInverseNumericalLimitsTests(unittest.TestCase):
             tx = rng.uniform(-100.0, 100.0)
             ty = rng.uniform(-100.0, 100.0)
             tz = rng.uniform(-100.0, 100.0)
-            t_mat = Mat4.translation(tx, ty, tz)
+            t_mat = Mat4x4.translation(tx, ty, tz)
 
             # Random rotation axis and angle in [-pi, pi]
             ax = rng.uniform(-1.0, 1.0)
@@ -49,7 +49,7 @@ class MatrixInverseNumericalLimitsTests(unittest.TestCase):
             else:
                 ax, ay, az = ax / axis_len, ay / axis_len, az / axis_len
             angle = rng.uniform(-math.pi, math.pi)
-            r_mat = Mat4.rotation_axis((ax, ay, az), angle)
+            r_mat = Mat4x4.rotation_axis((ax, ay, az), angle)
 
             # Random scale in [-10, -0.1] U [0.1, 10] to avoid near-zero scale
             def _rand_scale():
@@ -57,7 +57,7 @@ class MatrixInverseNumericalLimitsTests(unittest.TestCase):
                 return -val if rng.random() < 0.3 else val
 
             sx, sy, sz = _rand_scale(), _rand_scale(), _rand_scale()
-            s_mat = Mat4.scaling(sx, sy, sz)
+            s_mat = Mat4x4.scaling(sx, sy, sz)
 
             # Composite transformation matrix M = T * R * S
             m = t_mat * r_mat * s_mat
@@ -99,17 +99,17 @@ class MatrixInverseNumericalLimitsTests(unittest.TestCase):
         """Verify robust detection of singular and rank-deficient matrices."""
         # 1. Zero matrix
         with self.assertRaises(ValueError) as ctx:
-            Mat4.zero().inverse()
+            Mat4x4.zero().inverse()
         self.assertIn("singular", str(ctx.exception).lower())
 
         # 2. Projection onto plane (rank 3, scale Z = 0)
-        proj_plane = Mat4.scaling(1.0, 1.0, 0.0)
+        proj_plane = Mat4x4.scaling(1.0, 1.0, 0.0)
         with self.assertRaises(ValueError) as ctx:
             proj_plane.inverse()
         self.assertIn("singular", str(ctx.exception).lower())
 
         # 3. Two identical columns
-        col_dup = Mat4((
+        col_dup = Mat4x4((
             1, 2, 3, 4,
             1, 2, 3, 4,  # Column 1 identical to column 0
             5, 6, 7, 8,
@@ -119,7 +119,7 @@ class MatrixInverseNumericalLimitsTests(unittest.TestCase):
             col_dup.inverse()
 
         # 4. Two identical rows
-        row_dup = Mat4((
+        row_dup = Mat4x4((
             1, 1, 3, 4,  # Row 0: (1, 5, 9, 3), Row 1: (1, 5, 9, 3)
             5, 5, 7, 8,
             9, 9, 1, 2,
@@ -129,7 +129,7 @@ class MatrixInverseNumericalLimitsTests(unittest.TestCase):
             row_dup.inverse()
 
         # 5. Col linearly dependent: col 1 = 3 * col 0
-        col_dep = Mat4((
+        col_dep = Mat4x4((
             1, 2, 3, 4,
             3, 6, 9, 12,  # 3x col 0
             5, 1, 2, 3,
@@ -139,23 +139,23 @@ class MatrixInverseNumericalLimitsTests(unittest.TestCase):
             col_dep.inverse()
 
         # 6. All ones matrix (rank 1)
-        all_ones = Mat4((1.0,) * 16)
+        all_ones = Mat4x4((1.0,) * 16)
         with self.assertRaises(ValueError):
             all_ones.inverse()
 
         # 7. Near-singular matrix (|det| < 1e-12)
         # sx = 1e-7, sy = 1e-7, sz = 1.0 => det = 1e-14 < 1e-12
-        near_sing = Mat4.scaling(1e-7, 1e-7, 1.0)
+        near_sing = Mat4x4.scaling(1e-7, 1e-7, 1.0)
         with self.assertRaises(ValueError) as ctx:
             near_sing.inverse()
         self.assertIn("singular", str(ctx.exception).lower())
 
 
 class QuaternionNumericalLimitsTests(unittest.TestCase):
-    """Testing of Quat vs Mat4 rotation equivalence and slerp boundaries."""
+    """Testing of Quat vs Mat4x4 rotation equivalence and slerp boundaries."""
 
     def test_quat_rotation_vs_matrix_rotation_100_random_axes(self):
-        """Verify ||Q.to_mat4() * v - R_axis(theta) * v|| < 1e-5 for 100 random axis-angles."""
+        """Verify ||Q.to_mat4x4() * v - R_axis(theta) * v|| < 1e-5 for 100 random axis-angles."""
         rng = random.Random(1337)
         max_err = 0.0
 
@@ -177,8 +177,8 @@ class QuaternionNumericalLimitsTests(unittest.TestCase):
             vec = Vec4(vx, vy, vz, 1.0)
 
             q = Quat.from_axis_angle(axis, theta)
-            m_q = q.to_mat4()
-            m_axis = Mat4.rotation_axis(axis, theta)
+            m_q = q.to_mat4x4()
+            m_axis = Mat4x4.rotation_axis(axis, theta)
 
             res_q = m_q * vec
             res_m = m_axis * vec
@@ -192,7 +192,7 @@ class QuaternionNumericalLimitsTests(unittest.TestCase):
             )
             if err > max_err:
                 max_err = err
-            self.assertLess(err, 1e-5, f"Quat vs Mat4 rotation divergence err={err}")
+            self.assertLess(err, 1e-5, f"Quat vs Mat4x4 rotation divergence err={err}")
 
             # Also check direct matrix equivalence
             for idx in range(16):
@@ -222,8 +222,8 @@ class QuaternionNumericalLimitsTests(unittest.TestCase):
             # (either +q or -q, i.e. dot(s, q)^2 == 1.0)
             dot = s.x * q.x + s.y * q.y + s.z * q.z + s.w * q.w
             self.assertAlmostEqual(abs(dot), 1.0, places=6)
-            # Verify matrix representation is identical to q.to_mat4()
-            self.assertEqual(s.to_mat4(), q.to_mat4())
+            # Verify matrix representation is identical to q.to_mat4x4()
+            self.assertEqual(s.to_mat4x4(), q.to_mat4x4())
 
         # 3. Orthogonal quaternions: dot(q1, q2) == 0
         # q1 = identity (0, 0, 0, 1)
@@ -337,15 +337,15 @@ class CameraAndControllerNumericalLimitsTests(unittest.TestCase):
     def test_perspective_extreme_fov_and_near_far_ratios(self):
         """Test perspective projection with very wide and narrow FOVs, large near/far ratio."""
         # Ultra wide FOV (179 degrees)
-        p_wide = Mat4.perspective(math.radians(179.0), 1.0, 0.1, 1000.0)
+        p_wide = Mat4x4.perspective(math.radians(179.0), 1.0, 0.1, 1000.0)
         self.assertEqual(len(p_wide.elements), 16)
 
         # Ultra narrow FOV (0.1 degree)
-        p_narrow = Mat4.perspective(math.radians(0.1), 1.0, 0.1, 1000.0)
+        p_narrow = Mat4x4.perspective(math.radians(0.1), 1.0, 0.1, 1000.0)
         self.assertEqual(len(p_narrow.elements), 16)
 
         # Huge ratio near=0.001, far=100000.0
-        p_ratio = Mat4.perspective(math.radians(60.0), 16.0 / 9.0, 0.001, 100000.0)
+        p_ratio = Mat4x4.perspective(math.radians(60.0), 16.0 / 9.0, 0.001, 100000.0)
         # Near point should map to 0.0 clip Z
         near_pt = p_ratio * Vec4(0.0, 0.0, -0.001, 1.0)
         self.assertAlmostEqual(near_pt.z / near_pt.w, 0.0, places=4)
