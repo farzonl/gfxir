@@ -351,20 +351,23 @@ StructuredImporter::import(const llvm::json::Object &source,
   }
   auto module = OwningOpRef<ModuleOp>(ModuleOp::create(*loc));
   if (auto description = source.get("parameters")) {
-    auto object = description->getAsObject();
-    auto name = object ? object->getString("name") : std::nullopt;
-    auto fields = object ? object->getArray("fields") : nullptr;
-    if (!name || !fields || object->size() != 2) {
-      emitError(*loc, "parameters requires a name and fields, not authored "
-                      "offsets or backend bindings");
-      return {};
-    }
     std::function<FailureOr<Type>(const llvm::json::Object &)> parseParamType =
         [&](const llvm::json::Object &f) -> FailureOr<Type> {
       auto typeVal = f.get("type");
       if (!typeVal)
         return failure();
       if (auto typeStr = typeVal->getAsString()) {
+        if (typeStr->starts_with("mat") && typeStr->size() == 6 && (*typeStr)[4] == 'x' &&
+            (*typeStr)[3] >= '2' && (*typeStr)[3] <= '4' && (*typeStr)[5] >= '2' && (*typeStr)[5] <= '4') {
+          int64_t cols = (*typeStr)[3] - '0';
+          int64_t rows = (*typeStr)[5] - '0';
+          return ArrayType::get(builder.getContext(),
+                                VectorType::get({rows}, Float32Type::get(builder.getContext())), cols);
+        }
+        if (*typeStr == "mat4") {
+          return ArrayType::get(builder.getContext(),
+                                VectorType::get({4}, Float32Type::get(builder.getContext())), 4);
+        }
         if (*typeStr == "array") {
           auto count = f.getInteger("count");
           if (!count || *count < 1 || *count > INT32_MAX)
@@ -407,19 +410,19 @@ StructuredImporter::import(const llvm::json::Object &source,
         }
         if (*typeStr == "u8" || *typeStr == "ui8")
           return IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
-        if (*typeStr == "i8")
+        if (*typeStr == "i8" || *typeStr == "si8")
           return IntegerType::get(builder.getContext(), 8, IntegerType::Signed);
         if (*typeStr == "u16" || *typeStr == "ui16")
           return IntegerType::get(builder.getContext(), 16, IntegerType::Unsigned);
-        if (*typeStr == "i16")
+        if (*typeStr == "i16" || *typeStr == "si16")
           return IntegerType::get(builder.getContext(), 16, IntegerType::Signed);
         if (*typeStr == "u32" || *typeStr == "ui32")
           return IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned);
-        if (*typeStr == "i32")
+        if (*typeStr == "i32" || *typeStr == "si32")
           return IntegerType::get(builder.getContext(), 32, IntegerType::Signed);
         if (*typeStr == "u64" || *typeStr == "ui64")
           return IntegerType::get(builder.getContext(), 64, IntegerType::Unsigned);
-        if (*typeStr == "i64")
+        if (*typeStr == "i64" || *typeStr == "si64")
           return IntegerType::get(builder.getContext(), 64, IntegerType::Signed);
         if (typeStr->ends_with("x2") || typeStr->ends_with("x3") || typeStr->ends_with("x4")) {
           int64_t count = typeStr->back() - '0';
@@ -437,34 +440,92 @@ StructuredImporter::import(const llvm::json::Object &source,
       return failure();
     };
 
-    SmallVector<Attribute> attributes;
-    for (const auto &item : *fields) {
-      auto field = item.getAsObject();
-      auto name = field ? field->getString("name") : std::nullopt;
-      if (!field || !name || field->get("offset") || field->get("binding")) {
-        emitError(*loc,
-                  "parameter field requires only a name and supported type");
-        return {};
+    auto parseBlock =
+        [&](const llvm::json::Object &object) -> FailureOr<ParameterBlockAttr> {
+      auto name = object.getString("name");
+      auto fields = object.getArray("fields");
+      if (!name || !fields || object.size() != 2) {
+        emitError(*loc, "parameters requires a name and fields, not authored "
+                        "offsets or backend bindings");
+        return failure();
       }
-      auto parsedType = parseParamType(*field);
-      if (failed(parsedType)) {
-        emitError(*loc,
-                  "parameter field requires only a name and supported type");
-        return {};
+      SmallVector<Attribute> attributes;
+      for (const auto &item : *fields) {
+        auto field = item.getAsObject();
+        auto fieldName = field ? field->getString("name") : std::nullopt;
+        if (!field || !fieldName || field->get("offset") ||
+            field->get("binding")) {
+          emitError(*loc,
+                    "parameter field requires only a name and supported type");
+          return failure();
+        }
+        auto typeVal = field->get("type");
+        if (typeVal && typeVal->getAsString()) {
+          StringRef tStr = *typeVal->getAsString();
+          if (tStr == "mat4" ||
+              (tStr.starts_with("mat") && tStr.size() == 6 && tStr[4] == 'x' &&
+               tStr[3] >= '2' && tStr[3] <= '4' && tStr[5] >= '2' && tStr[5] <= '4')) {
+            int64_t cols = (tStr == "mat4") ? 4 : (tStr[3] - '0');
+            int64_t rows = (tStr == "mat4") ? 4 : (tStr[5] - '0');
+            auto colVecType = VectorType::get({rows}, Float32Type::get(builder.getContext()));
+            for (int i = 0; i < cols; ++i) {
+              std::string subName = (llvm::Twine(*fieldName) + "_" + llvm::Twine(i)).str();
+              auto attribute = ParameterFieldAttr::getChecked(
+                  [&] { return emitError(*loc); }, builder.getContext(),
+                  StringRef(subName), cast<Type>(colVecType));
+              if (!attribute)
+                return failure();
+              attributes.push_back(attribute);
+            }
+            continue;
+          }
+        }
+        auto parsedType = parseParamType(*field);
+        if (failed(parsedType)) {
+          emitError(*loc,
+                    "parameter field requires only a name and supported type");
+          return failure();
+        }
+        auto attribute = ParameterFieldAttr::getChecked(
+            [&] { return emitError(*loc); }, builder.getContext(), *fieldName,
+            *parsedType);
+        if (!attribute)
+          return failure();
+        attributes.push_back(attribute);
       }
-      auto attribute = ParameterFieldAttr::getChecked(
+      auto block = ParameterBlockAttr::getChecked(
           [&] { return emitError(*loc); }, builder.getContext(), *name,
-          *parsedType);
-      if (!attribute)
+          builder.getArrayAttr(attributes));
+      if (!block)
+        return failure();
+      return block;
+    };
+
+    if (auto array = description->getAsArray()) {
+      SmallVector<Attribute> blocks;
+      for (const auto &item : *array) {
+        auto object = item.getAsObject();
+        if (!object) {
+          emitError(*loc, "parameters requires a name and fields, not authored "
+                          "offsets or backend bindings");
+          return {};
+        }
+        auto block = parseBlock(*object);
+        if (failed(block))
+          return {};
+        blocks.push_back(*block);
+      }
+      (*module)->setAttr("gfx.parameters", builder.getArrayAttr(blocks));
+    } else if (auto object = description->getAsObject()) {
+      auto block = parseBlock(*object);
+      if (failed(block))
         return {};
-      attributes.push_back(attribute);
-    }
-    auto block = ParameterBlockAttr::getChecked(
-        [&] { return emitError(*loc); }, builder.getContext(), *name,
-        builder.getArrayAttr(attributes));
-    if (!block)
+      (*module)->setAttr("gfx.parameters", *block);
+    } else {
+      emitError(*loc, "parameters requires a name and fields, not authored "
+                      "offsets or backend bindings");
       return {};
-    (*module)->setAttr("gfx.parameters", block);
+    }
   }
   llvm::StringMap<func::FuncOp> symbols;
   for (const auto &item : *functions) {

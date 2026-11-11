@@ -1,0 +1,11 @@
+# RUN: %python %S/Inputs/generate.py limit256 %t.limit256.json
+# RUN: %gfx-compile %t.limit256.json --target directx --output %t.limit256.ll --reflection %t.limit256.reflection
+# RUN: %python %S/Inputs/summarize.py reflection %t.limit256.reflection | %FileCheck %s --check-prefix=LIMIT256
+# RUN: %gfx-compile %t.limit256.json --target vulkan --output %t.limit256.spv --reflection %t.limit256.reflection
+# RUN: %python %S/Inputs/summarize.py spirv %t.limit256.spv | %FileCheck %s --check-prefix=SPIRV256
+
+# LIMIT256: parameters:
+# LIMIT256-SAME: "num32bit_constants": 64
+# LIMIT256-SAME: "size": 256
+# LIMIT256-SAME: "name": "limit256"
+# SPIRV256: SPIR-V member offsets: [0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240]

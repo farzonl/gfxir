@@ -337,9 +337,35 @@ LogicalResult GfxDialect::verifyOperationAttribute(Operation *op,
     if (failed(defaultLimits.verifyWorkgroupSize(size.asArrayRef(), op->getLoc())))
       return failure();
   } else if (attribute.getName() == "gfx.parameters") {
-    if (!isa<ModuleOp>(op) || !isa<ParameterBlockAttr>(attribute.getValue()))
+    if (!isa<ModuleOp>(op))
       return op->emitOpError("gfx.parameters requires a typed parameter block "
                              "on the shader module");
+    if (auto block = dyn_cast<ParameterBlockAttr>(attribute.getValue())) {
+      // Valid single block (ParameterBlockAttr::verify already validated size <= 256)
+    } else if (auto array = dyn_cast<ArrayAttr>(attribute.getValue())) {
+      if (array.empty())
+        return op->emitOpError("gfx.parameters requires typed parameter blocks "
+                               "on the shader module");
+      llvm::StringSet<> blockNames;
+      uint32_t cumulativeSize = 0;
+      for (Attribute elem : array) {
+        auto block = dyn_cast<ParameterBlockAttr>(elem);
+        if (!block)
+          return op->emitOpError("gfx.parameters requires typed parameter blocks "
+                                 "on the shader module");
+        if (!blockNames.insert(block.getName()).second)
+          return op->emitOpError("duplicate parameter block name: '")
+                 << block.getName() << "'";
+        auto layout = parameterLayout(block);
+        cumulativeSize += (layout.size + 15) / 16 * 16;
+      }
+      if (cumulativeSize > 256)
+        return op->emitOpError(
+            "read-only parameter blocks currently fit within 256 bytes");
+    } else {
+      return op->emitOpError("gfx.parameters requires a typed parameter block "
+                             "on the shader module");
+    }
   } else if (attribute.getName() == "gfx.required_capabilities") {
     auto array = dyn_cast<ArrayAttr>(attribute.getValue());
     if ((!isa<ModuleOp>(op) && !isa<func::FuncOp>(op)) || !array)
@@ -671,11 +697,28 @@ ParameterLayout mlir::gfx::parameterLayout(ParameterBlockAttr block) {
   return layoutFields(block.getFields());
 }
 
+SmallVector<ParameterBlockAttr>
+mlir::gfx::getModuleParameterBlocks(ModuleOp module) {
+  SmallVector<ParameterBlockAttr> result;
+  if (!module)
+    return result;
+  if (auto single =
+          module->getAttrOfType<ParameterBlockAttr>("gfx.parameters")) {
+    result.push_back(single);
+  } else if (auto array = module->getAttrOfType<ArrayAttr>("gfx.parameters")) {
+    for (auto attr : array) {
+      if (auto b = dyn_cast<ParameterBlockAttr>(attr))
+        result.push_back(b);
+    }
+  }
+  return result;
+}
+
 LogicalResult
 ParameterBlockAttr::verify(llvm::function_ref<InFlightDiagnostic()> error,
                            StringRef name, ArrayAttr fields) {
-  if (!isShaderSymbolName(name) || fields.empty() || fields.size() > 32)
-    return error() << "parameter block requires a valid name and 1-32 fields";
+  if (!isShaderSymbolName(name) || fields.empty() || fields.size() > 64)
+    return error() << "parameter block requires a valid name and 1-64 fields";
   llvm::StringSet<> names;
   for (auto attribute : fields) {
     auto field = dyn_cast<ParameterFieldAttr>(attribute);
@@ -685,9 +728,9 @@ ParameterBlockAttr::verify(llvm::function_ref<InFlightDiagnostic()> error,
                                           field.getType())))
       return failure();
   }
-  if (layoutFields(fields).size > 128)
+  if (layoutFields(fields).size > 256)
     return error()
-           << "read-only parameter blocks currently fit within 128 bytes";
+           << "read-only parameter blocks currently fit within 256 bytes";
   return success();
 }
 
@@ -707,20 +750,33 @@ static Type toSignlessParameterValueType(Type type) {
 
 LogicalResult ParameterOp::verify() {
   auto module = (*this)->getParentOfType<ModuleOp>();
-  auto block = module
-                   ? module->getAttrOfType<ParameterBlockAttr>("gfx.parameters")
-                   : ParameterBlockAttr{};
-  if (!(*this)->getParentOfType<func::FuncOp>() || !block ||
-      block.getName() != getBlock())
+  auto blocks = getModuleParameterBlocks(module);
+  if (!(*this)->getParentOfType<func::FuncOp>() || blocks.empty())
     return emitOpError("requires a matching declared parameter block");
-  for (auto attribute : block.getFields()) {
+  ParameterBlockAttr matchedBlock;
+  for (auto b : blocks) {
+    if (b.getName() == getBlock()) {
+      matchedBlock = b;
+      break;
+    }
+  }
+  if (!matchedBlock)
+    return emitOpError("requires a matching declared parameter block");
+  for (auto attribute : matchedBlock.getFields()) {
     auto field = cast<ParameterFieldAttr>(attribute);
-    if (field.getName() == getField())
-      return toSignlessParameterValueType(field.getType()) ==
-                     getValue().getType()
-                 ? success()
-                 : emitOpError(
-                       "parameter result type does not match its field");
+    if (field.getName() == getField()) {
+      Type fType = field.getType();
+      Type valType = getValue().getType();
+      if (fType == valType || toSignlessParameterValueType(fType) == valType)
+        return success();
+      if (auto fInt = dyn_cast<IntegerType>(fType)) {
+        if (auto valInt = dyn_cast<IntegerType>(valType)) {
+          if (fInt.getWidth() == valInt.getWidth())
+            return success();
+        }
+      }
+      return emitOpError("parameter result type does not match its field");
+    }
   }
   return emitOpError("unknown parameter field");
 }

@@ -21,16 +21,24 @@ Type mlir::gfx::parseShaderType(MLIRContext &context, StringRef name) {
     return Float32Type::get(&context);
   if (name == "f64")
     return Float64Type::get(&context);
-  if (name == "i8" || name == "u8" || name == "ui8")
+  if (name == "i8" || name == "u8" || name == "ui8" || name == "si8")
     return IntegerType::get(&context, 8);
-  if (name == "i16" || name == "u16" || name == "ui16")
+  if (name == "i16" || name == "u16" || name == "ui16" || name == "si16")
     return IntegerType::get(&context, 16);
-  if (name == "i32" || name == "u32" || name == "ui32")
+  if (name == "i32" || name == "u32" || name == "ui32" || name == "si32")
     return IntegerType::get(&context, 32);
-  if (name == "i64" || name == "u64" || name == "ui64")
+  if (name == "i64" || name == "u64" || name == "ui64" || name == "si64")
     return IntegerType::get(&context, 64);
   if (name == "bool" || name == "i1")
     return IntegerType::get(&context, 1);
+  if (name.starts_with("mat") && name.size() == 6 && name[4] == 'x' &&
+      name[3] >= '2' && name[3] <= '4' && name[5] >= '2' && name[5] <= '4') {
+    int64_t cols = name[3] - '0';
+    int64_t rows = name[5] - '0';
+    return ArrayType::get(&context, VectorType::get({rows}, Float32Type::get(&context)), cols);
+  }
+  if (name == "mat4")
+    return ArrayType::get(&context, VectorType::get({4}, Float32Type::get(&context)), 4);
 
   if (name.ends_with("x2") || name.ends_with("x3") || name.ends_with("x4")) {
     int64_t count = name.back() - '0';
@@ -478,7 +486,8 @@ ShaderInterface mlir::gfx::reflectShader(ModuleOp module) {
       {},
       {},
       std::nullopt,
-      0};
+      0,
+      {}};
   if (auto wgAttr =
           function->getAttrOfType<DenseI32ArrayAttr>("gfx.workgroup_size")) {
     auto dims = wgAttr.asArrayRef();
@@ -496,29 +505,43 @@ ShaderInterface mlir::gfx::reflectShader(ModuleOp module) {
   }
   SmallVector<func::FuncOp> pending{function};
   llvm::SmallPtrSet<Operation *, 8> visited;
-  bool reachedParamOp = false;
+  llvm::StringSet<> accessedBlockNames;
   while (!pending.empty()) {
     auto current = pending.pop_back_val();
     if (!visited.insert(current).second)
       continue;
-    current.walk([&](ParameterOp) {
-      reachedParamOp = true;
-      result.parameters =
-          module->getAttrOfType<ParameterBlockAttr>("gfx.parameters");
+    current.walk([&](ParameterOp op) {
+      accessedBlockNames.insert(op.getBlock());
     });
     current.walk([&](func::CallOp call) {
       if (auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee()))
         pending.push_back(callee);
     });
   }
-  if (!reachedParamOp) {
+  auto allBlocks = getModuleParameterBlocks(module);
+  bool filterAccessed = !accessedBlockNames.empty();
+  if (!filterAccessed) {
     bool anyParamOpInModule = false;
     module.walk([&](ParameterOp) { anyParamOpInModule = true; });
-    if (!anyParamOpInModule) {
-      result.parameters =
-          module->getAttrOfType<ParameterBlockAttr>("gfx.parameters");
-    }
+    if (anyParamOpInModule)
+      filterAccessed = true;
   }
+  uint32_t pipelineOffset = 0;
+  for (size_t i = 0; i < allBlocks.size(); ++i) {
+    auto b = allBlocks[i];
+    auto layout = parameterLayout(b);
+    bool accessed = !filterAccessed || accessedBlockNames.count(b.getName());
+    if (accessed) {
+      result.parameterBlocks.push_back({
+          b,
+          pipelineOffset,
+          /*registerIndex=*/static_cast<uint32_t>(i),
+          /*bufferIndex=*/static_cast<uint32_t>(2 + i)});
+    }
+    pipelineOffset += (layout.size + 15) / 16 * 16;
+  }
+  if (!result.parameterBlocks.empty())
+    result.parameters = result.parameterBlocks[0].block;
   function.walk([&](Operation *op) {
     if (auto builtin = dyn_cast<BuiltinOp>(op)) {
       result.inputs.push_back({stringifyBuiltin(builtin.getKind()).str(),
@@ -579,9 +602,27 @@ mlir::gfx::serializeReflection(const ShaderInterface &reflection) {
     result["shared_memory_bytes"] =
         static_cast<int64_t>(reflection.sharedMemoryBytes);
   }
-  if (reflection.parameters)
+  if (!reflection.parameterBlocks.empty()) {
+    if (reflection.parameterBlocks.size() == 1 &&
+        reflection.parameterBlocks[0].registerIndex == 0 &&
+        reflection.parameterBlocks[0].baseOffset == 0) {
+      result["parameters"] =
+          serializeParameters(reflection.parameterBlocks[0].block, reflection.stage,
+                              0, 0, 2, /*isMultiBlock=*/false);
+    } else {
+      llvm::json::Array paramsArray;
+      for (const auto &pBlock : reflection.parameterBlocks) {
+        paramsArray.push_back(serializeParameters(
+            pBlock.block, reflection.stage, pBlock.baseOffset,
+            pBlock.registerIndex, pBlock.bufferIndex,
+            /*isMultiBlock=*/true));
+      }
+      result["parameters"] = std::move(paramsArray);
+    }
+  } else if (reflection.parameters) {
     result["parameters"] =
         serializeParameters(reflection.parameters, reflection.stage);
+  }
   if (!reflection.buffers.empty()) {
     llvm::json::Array buffers;
     for (const auto &buf : reflection.buffers) {
@@ -628,9 +669,13 @@ static llvm::json::Object serializeField(const ParameterFieldLayout &item,
 }
 
 llvm::json::Object mlir::gfx::serializeParameters(ParameterBlockAttr block,
-                                                  Stage stage) {
+                                                  Stage stage,
+                                                  uint32_t baseOffset,
+                                                  uint32_t registerIndex,
+                                                  uint32_t bufferIndex,
+                                                  bool isMultiBlock) {
   auto layout = parameterLayout(block);
-  bool isLegacyF32 = (stage != Stage::Compute);
+  bool isLegacyF32 = (stage != Stage::Compute && !isMultiBlock);
   for (const auto &item : layout.fields) {
     if (auto vec = dyn_cast<VectorType>(item.type)) {
       if (!vec.getElementType().isF32()) {
@@ -642,11 +687,56 @@ llvm::json::Object mlir::gfx::serializeParameters(ParameterBlockAttr block,
       break;
     }
   }
-  if (layout.size > 128)
+  bool hasMat4 = false;
+  for (size_t i = 0; i + 3 < layout.fields.size(); ++i) {
+    if (StringRef(layout.fields[i].name).ends_with("_0") &&
+        StringRef(layout.fields[i + 1].name).ends_with("_1") &&
+        StringRef(layout.fields[i + 2].name).ends_with("_2") &&
+        StringRef(layout.fields[i + 3].name).ends_with("_3")) {
+      hasMat4 = true;
+      break;
+    }
+  }
+  if (hasMat4 || layout.size > 128)
     isLegacyF32 = false;
 
   llvm::json::Array fields;
-  for (const auto &item : layout.fields) {
+  for (size_t i = 0; i < layout.fields.size(); ++i) {
+    const auto &item = layout.fields[i];
+    if (i + 3 < layout.fields.size()) {
+      const auto &f0 = layout.fields[i];
+      const auto &f1 = layout.fields[i + 1];
+      const auto &f2 = layout.fields[i + 2];
+      const auto &f3 = layout.fields[i + 3];
+      if (StringRef(f0.name).ends_with("_0") && StringRef(f1.name).ends_with("_1") &&
+          StringRef(f2.name).ends_with("_2") && StringRef(f3.name).ends_with("_3")) {
+        StringRef base0 = StringRef(f0.name).drop_back(2);
+        StringRef base1 = StringRef(f1.name).drop_back(2);
+        StringRef base2 = StringRef(f2.name).drop_back(2);
+        StringRef base3 = StringRef(f3.name).drop_back(2);
+        if (base0 == base1 && base0 == base2 && base0 == base3) {
+          auto v0 = dyn_cast<VectorType>(f0.type);
+          auto v1 = dyn_cast<VectorType>(f1.type);
+          auto v2 = dyn_cast<VectorType>(f2.type);
+          auto v3 = dyn_cast<VectorType>(f3.type);
+          if (v0 && v1 && v2 && v3 &&
+              v0.getElementType().isF32() && v0.getNumElements() == 4 &&
+              v1.getElementType().isF32() && v1.getNumElements() == 4 &&
+              v2.getElementType().isF32() && v2.getNumElements() == 4 &&
+              v3.getElementType().isF32() && v3.getNumElements() == 4) {
+            llvm::json::Object matObj{
+                {"name", base0.str()},
+                {"type", "mat4"},
+                {"offset", static_cast<int64_t>(f0.offset)},
+                {"size", 64},
+                {"alignment", 16}};
+            fields.push_back(std::move(matObj));
+            i += 3;
+            continue;
+          }
+        }
+      }
+    }
     fields.push_back(serializeField(item, isLegacyF32));
   }
 
@@ -682,13 +772,16 @@ llvm::json::Object mlir::gfx::serializeParameters(ParameterBlockAttr block,
                                  {"size", static_cast<int64_t>(legacySize)}}}}}};
   }
 
+  // Compute and graphics stages share the same push-constant / root-constant
+  // ABI; per-block offsets and registers come from the reconciled block list.
   llvm::json::Object bindings{
       {"vulkan",
-       llvm::json::Object{{"storage", "push_constant"}, {"offset", 0}}},
+       llvm::json::Object{{"storage", "push_constant"},
+                          {"offset", static_cast<int64_t>(baseOffset)}}},
       {"directx",
        llvm::json::Object{{"storage", "root_constants"},
-                          {"parameter_index", 0},
-                          {"register", 0},
+                          {"parameter_index", static_cast<int64_t>(registerIndex)},
+                          {"register", static_cast<int64_t>(registerIndex)},
                           {"space", 0},
                           {"num32bit_constants",
                            static_cast<int64_t>((layout.size + 3) / 4)},
@@ -696,8 +789,8 @@ llvm::json::Object mlir::gfx::serializeParameters(ParameterBlockAttr block,
                           {"root_signature_version", "1.1"}}},
       {"metal",
        llvm::json::Object{{"storage", "converter_argument_buffer"},
-                          {"buffer_index", 2},
-                          {"offset", 0},
+                          {"buffer_index", static_cast<int64_t>(bufferIndex)},
+                          {"offset", static_cast<int64_t>(baseOffset)},
                           {"size", static_cast<int64_t>(layout.size)}}}};
 
   return llvm::json::Object{

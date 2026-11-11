@@ -46,9 +46,12 @@ def verify_graphics_interface(interface: object, *, preview: bool = False) -> No
         if not isinstance(reflection, dict) or reflection.get("stage") != stage:
             raise ValueError(f"Invalid {stage} reflection.")
         if "parameters" in reflection:
-            verify_parameters(reflection["parameters"])
-            if reflection["parameters"]["stages"] != [stage]:
-                raise ValueError("Parameter visibility does not match the reflected stage.")
+            params = reflection["parameters"]
+            verify_parameters(params)
+            param_list = params if isinstance(params, list) else [params]
+            for param_block in param_list:
+                if not isinstance(param_block, dict) or param_block.get("stages") != [stage]:
+                    raise ValueError("Parameter visibility does not match the reflected stage.")
         name = reflection.get("name")
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise ValueError(f"Invalid reflected {stage} entry-point name.")
@@ -101,15 +104,107 @@ def verify_graphics_interface(interface: object, *, preview: bool = False) -> No
             raise ValueError("The preview currently supports one f32x4 render target at location 0.")
 
 
-def reflect_pipeline_parameters(interface: dict) -> dict | None:
-    blocks = [interface[stage]["parameters"] for stage in ("vertex", "fragment")
-              if "parameters" in interface[stage]]
-    if not blocks:
+def reflect_pipeline_parameters(interface: dict) -> dict | list[dict] | None:
+    stage_blocks: list[tuple[str, dict]] = []
+    for stage in ("vertex", "fragment"):
+        stage_desc = interface.get(stage, {})
+        if "parameters" in stage_desc and stage_desc["parameters"]:
+            params = stage_desc["parameters"]
+            if isinstance(params, dict):
+                stage_blocks.append((stage, params))
+            elif isinstance(params, list):
+                for p in params:
+                    stage_blocks.append((stage, p))
+
+    if not stage_blocks:
         return None
-    for block in blocks:
+
+    # Reconcile blocks by name
+    reconciled: list[dict] = []
+    by_name: dict[str, dict] = {}
+
+    for stage, block in stage_blocks:
         verify_parameters(block)
-        if {key: value for key, value in block.items() if key != "stages"} != {
-            key: value for key, value in blocks[0].items() if key != "stages"
-        }:
-            raise ValueError("Graphics stages require one matching parameter block layout and bindings.")
-    return {**blocks[0], "stages": [stage for block in blocks for stage in block["stages"]]}
+        name = block["name"]
+        if name not in by_name:
+            entry = {**block, "stages": list(block.get("stages", [stage]))}
+            if stage not in entry["stages"]:
+                entry["stages"].append(stage)
+            by_name[name] = entry
+            reconciled.append(entry)
+        else:
+            existing = by_name[name]
+            if existing.get("layout") != block.get("layout"):
+                if {existing.get("layout"), block.get("layout")}.issubset({"gfx-root-f32-v1", "gfx-std430-v1"}):
+                    existing["layout"] = "gfx-std430-v1"
+                    existing["schema_version"] = 2
+                else:
+                    raise ValueError(f"Graphics stages require matching parameter block layout: {name!r}.")
+            for key in ("size", "alignment"):
+                if existing.get(key) != block.get(key):
+                    raise ValueError(f"Graphics stages require matching parameter block layout: {name!r}.")
+            if len(existing.get("fields", [])) != len(block.get("fields", [])):
+                raise ValueError(f"Graphics stages require matching parameter block fields: {name!r}.")
+            for f1, f2 in zip(existing["fields"], block["fields"]):
+                if {k: v for k, v in f1.items() if k != "stages"} != {k: v for k, v in f2.items() if k != "stages"}:
+                    raise ValueError(f"Graphics stages require matching parameter block fields: {name!r}.")
+            for s in block.get("stages", [stage]):
+                if s not in existing["stages"]:
+                    existing["stages"].append(s)
+
+    # Compute sequential target bindings across all reconciled blocks
+    cumulative_offset = 0
+    for i, entry in enumerate(reconciled):
+        block_size = entry["size"]
+        num32 = (block_size + 3) // 4
+        entry["bindings"] = {
+            "vulkan": {"storage": "push_constant", "offset": cumulative_offset},
+            "directx": {
+                "storage": "root_constants",
+                "parameter_index": i,
+                "register": i,
+                "space": 0,
+                "num32bit_constants": num32,
+                "visibility": "all",
+                "root_signature_version": "1.1",
+            },
+            "metal": {
+                "storage": "converter_argument_buffer",
+                "buffer_index": 2 + i,
+                "offset": cumulative_offset,
+                "size": block_size,
+            },
+        }
+        cumulative_offset += (block_size + 15) // 16 * 16
+
+    if cumulative_offset > 256:
+        raise ValueError(f"Cumulative parameter blocks size ({cumulative_offset}B) exceeds 256 bytes.")
+
+    # Verify that each stage's compiled bindings match the reconciled pipeline bindings
+    has_compiled_bindings = any(
+        block.get("bindings", {}).get("vulkan", {}).get("offset", 0) > 0
+        or block.get("bindings", {}).get("directx", {}).get("register", 0) > 0
+        for _, block in stage_blocks
+    )
+    if has_compiled_bindings:
+        for stage, block in stage_blocks:
+            name = block["name"]
+            pipeline_block = by_name[name]
+            stage_vk_offset = block.get("bindings", {}).get("vulkan", {}).get("offset")
+            pipe_vk_offset = pipeline_block["bindings"]["vulkan"]["offset"]
+            if stage_vk_offset is not None and stage_vk_offset != pipe_vk_offset:
+                raise ValueError(
+                    f"Stage {stage!r} parameter block {name!r} Vulkan offset ({stage_vk_offset}) "
+                    f"desynchronized from pipeline layout ({pipe_vk_offset})."
+                )
+            stage_dx_reg = block.get("bindings", {}).get("directx", {}).get("register")
+            pipe_dx_reg = pipeline_block["bindings"]["directx"]["register"]
+            if stage_dx_reg is not None and stage_dx_reg != pipe_dx_reg:
+                raise ValueError(
+                    f"Stage {stage!r} parameter block {name!r} DirectX register (b{stage_dx_reg}) "
+                    f"desynchronized from pipeline layout (b{pipe_dx_reg})."
+                )
+
+    if len(reconciled) == 1:
+        return reconciled[0]
+    return reconciled

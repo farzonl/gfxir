@@ -548,16 +548,12 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
     SmallVector<BufferBindingOp> bufferBindings;
     shader.walk([&](BufferBindingOp op) { bufferBindings.push_back(op); });
 
-    auto parameters =
-        module->getAttrOfType<ParameterBlockAttr>("gfx.parameters");
+    auto allBlocks = getModuleParameterBlocks(module);
     spirv::GlobalVariableOp parameterVariable;
     bool readsParameters = false;
     shader.walk([&](ParameterOp) { readsParameters = true; });
     bool hasBDAPushConstants =
         enableBDA && (!entryArgBuffers.empty() || !bufferBindings.empty());
-    ParameterLayout paramLayout;
-    if (readsParameters && parameters)
-      paramLayout = parameterLayout(parameters);
 
     auto createBufferBlockStructType =
         [&](Type origElemType, AccessMode access) -> spirv::StructType {
@@ -589,11 +585,18 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
 
     SmallVector<uint32_t> bdaArgMemberIndices;
     SmallVector<uint32_t> bdaOpMemberIndices;
-    if (readsParameters || hasBDAPushConstants) {
+    struct ConsolidatedField {
+      std::string blockName;
+      std::string fieldName;
+      uint32_t memberIndex;
+    };
+    SmallVector<ConsolidatedField> fieldLookup;
+
+    if ((readsParameters && !allBlocks.empty()) || hasBDAPushConstants) {
       SmallVector<Type> types;
       SmallVector<uint32_t> offsets;
       uint32_t nextOffset = 0;
-      if (readsParameters) {
+      if (readsParameters && !allBlocks.empty()) {
         auto toSignless = [](Type t) -> Type {
           if (auto intTy = dyn_cast<IntegerType>(t)) {
             if (!intTy.isSignless())
@@ -610,11 +613,19 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
           }
           return t;
         };
-        for (const auto &field : paramLayout.fields) {
-          types.push_back(toSignless(field.field.getType()));
-          offsets.push_back(field.offset);
+        uint32_t baseOffset = 0;
+        for (auto b : allBlocks) {
+          auto layout = parameterLayout(b);
+          for (const auto &field : layout.fields) {
+            uint32_t memberIdx = types.size();
+            Type memberType = toSignless(field.field.getType());
+            types.push_back(memberType);
+            offsets.push_back(baseOffset + field.offset);
+            fieldLookup.push_back({b.getName().str(), field.field.getName().str(), memberIdx});
+          }
+          baseOffset += (layout.size + 15) / 16 * 16;
         }
-        nextOffset = paramLayout.size;
+        nextOffset = baseOffset;
       }
       if (hasBDAPushConstants) {
         nextOffset = llvm::alignTo(nextOffset, 8u);
@@ -651,24 +662,28 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       parameterVariable = spirv::GlobalVariableOp::create(
           builder, location, pointer, "parameters");
       symbols.insert(parameterVariable);
+
       if (readsParameters) {
         SmallVector<ParameterOp> reads;
         shader.walk([&](ParameterOp op) { reads.push_back(op); });
         for (auto op : reads) {
-          auto field = llvm::find_if(paramLayout.fields, [&](const auto &field) {
-            return field.field.getName() == op.getField();
+          auto found = llvm::find_if(fieldLookup, [&](const ConsolidatedField &cf) {
+            return cf.blockName == op.getBlock() && cf.fieldName == op.getField();
           });
           builder.setInsertionPoint(op);
           auto address =
               spirv::AddressOfOp::create(builder, op.getLoc(), parameterVariable);
           auto index = spirv::ConstantOp::create(
               builder, op.getLoc(), builder.getI32Type(),
-              builder.getI32IntegerAttr(
-                  static_cast<int32_t>(field - paramLayout.fields.begin())));
+              builder.getI32IntegerAttr(found->memberIndex));
           auto member = spirv::AccessChainOp::create(builder, op.getLoc(),
                                                      address, ValueRange{index});
           auto value = spirv::LoadOp::create(builder, op.getLoc(), member);
-          op.getValue().replaceAllUsesWith(value);
+          Value resVal = value.getResult();
+          if (resVal.getType() != op.getValue().getType()) {
+            resVal = spirv::BitcastOp::create(builder, op.getLoc(), op.getValue().getType(), resVal);
+          }
+          op.getValue().replaceAllUsesWith(resVal);
           op.erase();
         }
       }
@@ -726,10 +741,12 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
         Interpolation mode = input ? cast<InputOp>(op).getInterpolation()
                                    : cast<OutputOp>(op).getInterpolation();
         variable->setAttr("location", builder.getI32IntegerAttr(index));
-        if (mode == Interpolation::Flat)
-          variable->setAttr("flat", builder.getUnitAttr());
-        else if (mode == Interpolation::NoPerspective)
-          variable->setAttr("no_perspective", builder.getUnitAttr());
+        if (stage != Stage::Vertex || !input) {
+          if (mode == Interpolation::Flat)
+            variable->setAttr("flat", builder.getUnitAttr());
+          else if (mode == Interpolation::NoPerspective)
+            variable->setAttr("no_perspective", builder.getUnitAttr());
+        }
       }
       interface.push_back(FlatSymbolRefAttr::get(variable.getSymNameAttr()));
       builder.setInsertionPoint(op);
@@ -1088,49 +1105,51 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
         newResTypes.push_back(convertGfxPtr(resType));
       fn.setType(builder.getFunctionType(newArgTypes, newResTypes));
     }
-    auto parameters =
-        module->getAttrOfType<ParameterBlockAttr>("gfx.parameters");
+    auto allBlocks = getModuleParameterBlocks(module);
     SmallVector<ParameterOp> reads;
     module.walk([&](ParameterOp op) { reads.push_back(op); });
-    if (!reads.empty()) {
-      auto layout = parameterLayout(parameters);
-      auto toSignless = [](Type t) -> Type {
-        if (auto intTy = dyn_cast<IntegerType>(t)) {
-          if (!intTy.isSignless())
-            return IntegerType::get(t.getContext(), intTy.getWidth());
-          return t;
-        }
-        if (auto vecTy = dyn_cast<VectorType>(t)) {
-          if (auto intElem = dyn_cast<IntegerType>(vecTy.getElementType())) {
-            if (!intElem.isSignless())
-              return VectorType::get(
-                  vecTy.getShape(),
-                  IntegerType::get(t.getContext(), intElem.getWidth()));
-          }
-        }
-        return t;
+    if (!reads.empty() && !allBlocks.empty()) {
+      struct BlockHandleInfo {
+        ParameterBlockAttr block;
+        ParameterLayout layout;
+        Type handleType;
+        uint32_t blockIdx;
       };
-      SmallVector<Type> members;
-      uint32_t offset = 0;
-      for (const auto &field : layout.fields) {
-        while (offset < field.offset) {
+      SmallVector<BlockHandleInfo> blockInfos;
+      for (size_t i = 0; i < allBlocks.size(); ++i) {
+        auto b = allBlocks[i];
+        auto l = parameterLayout(b);
+        SmallVector<Type> members;
+        uint32_t offset = 0;
+        for (const auto &field : l.fields) {
+          while (offset < field.offset) {
+            members.push_back(builder.getF32Type());
+            offset += 4;
+          }
+          Type memberType = convertGfxPtr(field.field.getType());
+          members.push_back(memberType);
+          offset += field.size;
+        }
+        while (offset < l.size) {
           members.push_back(builder.getF32Type());
           offset += 4;
         }
-        members.push_back(toSignless(field.field.getType()));
-        offset += field.size;
+        auto structure =
+            LLVM::LLVMStructType::getLiteral(module.getContext(), members, true);
+        auto handleType = LLVM::LLVMTargetExtType::get(
+            module.getContext(), "dx.CBuffer", ArrayRef<Type>{structure}, {});
+        blockInfos.push_back({b, l, handleType, static_cast<uint32_t>(i)});
       }
-      while (offset < layout.size) {
-        members.push_back(builder.getF32Type());
-        offset += 4;
-      }
-      auto structure =
-          LLVM::LLVMStructType::getLiteral(module.getContext(), members, true);
-      auto handleType = LLVM::LLVMTargetExtType::get(
-          module.getContext(), "dx.CBuffer", ArrayRef<Type>{structure}, {});
+
       for (auto op : reads) {
-        auto field = llvm::find_if(layout.fields, [&](const auto &field) {
-          return field.field.getName() == op.getField();
+        auto infoIt = llvm::find_if(blockInfos, [&](const BlockHandleInfo &info) {
+          return info.block.getName() == op.getBlock();
+        });
+        if (infoIt == blockInfos.end())
+          continue;
+        const auto &info = *infoIt;
+        auto field = llvm::find_if(info.layout.fields, [&](const auto &f) {
+          return f.field.getName() == op.getField();
         });
         builder.setInsertionPoint(op);
         auto integer = [&](uint32_t value) -> Value {
@@ -1141,18 +1160,25 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
         auto pointerType = LLVM::LLVMPointerType::get(module.getContext());
         auto null = LLVM::ZeroOp::create(builder, op.getLoc(), pointerType);
         auto handle = LLVM::CallIntrinsicOp::create(
-            builder, op.getLoc(), handleType,
+            builder, op.getLoc(), info.handleType,
             builder.getStringAttr("llvm.dx.resource.handlefrombinding"),
-            ValueRange{integer(0), integer(0), integer(1), integer(0), null});
+            ValueRange{integer(0), integer(info.blockIdx), integer(1), integer(0), null});
         auto pointer = LLVM::CallIntrinsicOp::create(
             builder, op.getLoc(),
             LLVM::LLVMPointerType::get(module.getContext(), 2),
             builder.getStringAttr("llvm.dx.resource.getpointer"),
             ValueRange{handle.getResult(0), integer(field->offset)});
-        auto value = LLVM::LoadOp::create(
-            builder, op.getLoc(), toSignless(field->field.getType()),
-            pointer.getResult(0), field->alignment);
-        op.getValue().replaceAllUsesWith(value);
+        Type loadType = convertGfxPtr(field->field.getType());
+        auto value =
+            LLVM::LoadOp::create(builder, op.getLoc(), loadType,
+                                 pointer.getResult(0), field->alignment);
+        Value resVal = value.getResult();
+        if (resVal.getType() != op.getValue().getType()) {
+          resVal = UnrealizedConversionCastOp::create(
+              builder, op.getLoc(), TypeRange{op.getValue().getType()},
+              ValueRange{resVal}).getResult(0);
+        }
+        op.getValue().replaceAllUsesWith(resVal);
         op.erase();
       }
     }
@@ -1607,7 +1633,15 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
   function->addFnAttr("hlsl.shader", shaderKind);
   bool vertex = reflection.stage == Stage::Vertex;
   SmallVector<llvm::hlsl::rootsig::RootElement> elements;
-  if (reflection.parameters) {
+  if (!reflection.parameterBlocks.empty()) {
+    for (const auto &pBlock : reflection.parameterBlocks) {
+      namespace rootsig = llvm::hlsl::rootsig;
+      rootsig::RootConstants constants{
+          parameterLayout(pBlock.block).size / 4,
+          {rootsig::RegisterType::BReg, pBlock.registerIndex}};
+      elements.push_back(constants);
+    }
+  } else if (reflection.parameters) {
     namespace rootsig = llvm::hlsl::rootsig;
     rootsig::RootConstants constants{
         (parameterLayout(reflection.parameters).size + 3) / 4,
@@ -1689,18 +1723,47 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
                             : (!vertex && !input
                                    ? llvm::dxbc::PSV::SemanticKind::Target
                                    : llvm::dxbc::PSV::SemanticKind::Arbitrary);
-        StringRef semantic = builtin
-                                 ? (position ? "SV_Position" : "SV_VertexID")
-                                 : (!vertex && !input ? "SV_Target" : "TEXCOORD");
+        std::string semanticStr;
+        uint32_t semanticIndex = location;
+        if (builtin) {
+          semanticStr = position ? "SV_Position" : "SV_VertexID";
+        } else if (!vertex && !input) {
+          semanticStr = "SV_Target";
+        } else if (vertex && input) {
+          StringRef name = io.name;
+          if (name.equals_insensitive("position") || name.equals_insensitive("pos")) {
+            semanticStr = "POSITION";
+            semanticIndex = 0;
+          } else if (name.equals_insensitive("normal") || name.equals_insensitive("norm")) {
+            semanticStr = "NORMAL";
+            semanticIndex = 0;
+          } else if (name.equals_insensitive("uv") || name.starts_with_insensitive("texcoord")) {
+            semanticStr = "TEXCOORD";
+            semanticIndex = 0;
+          } else {
+            semanticStr = name.upper();
+            semanticIndex = 0;
+          }
+        } else {
+          semanticStr = "TEXCOORD";
+        }
+        StringRef semantic = semanticStr;
         auto vector = dyn_cast<VectorType>(io.type);
         auto scalar = vector ? vector.getElementType() : io.type;
         auto component = scalar.isInteger(32) ? llvm::dxil::ElementType::U32
                                               : llvm::dxil::ElementType::F32;
         uint8_t columns = position ? 4 : vector ? vector.getNumElements() : 1;
         llvm::hlsl::SemanticSignatureElement element(id++, semantic, component,
-                                                     kind, {location}, columns);
-        element.StartRow =
-            builtin ? 0 : (vertex || input ? location + 1 : location);
+                                                     kind, {semanticIndex}, columns);
+        if (builtin) {
+          element.StartRow = 0;
+        } else if (vertex && input) {
+          element.StartRow = location;
+        } else if (!vertex && !input) {
+          element.StartRow = location;
+        } else {
+          element.StartRow = location + 1;
+        }
         element.StartCol = 0;
         auto mode = io.interpolation == Interpolation::Flat
                         ? llvm::dxbc::PSV::InterpolationMode::Constant

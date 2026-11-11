@@ -1,0 +1,208 @@
+// RUN: %split-file %s %t
+// RUN: %gfx-compile %t/valid_multi.json --target vulkan --output %t/valid_multi.spv --reflection %t/valid_multi.vk.refl --lowered-output %t/valid_multi.vk.mlir
+// RUN: %FileCheck %s --check-prefix=CHECK-VK-REFL < %t/valid_multi.vk.refl
+// RUN: %python %S/Inputs/summarize.py spirv %t/valid_multi.spv | %FileCheck %s --check-prefix=CHECK-VK-SPIRV
+// RUN: %FileCheck %s --check-prefix=CHECK-VK-LOWERED < %t/valid_multi.vk.mlir
+
+// RUN: %gfx-compile %t/valid_multi.json --target directx --output %t/valid_multi.ll --reflection %t/valid_multi.dx.refl
+// RUN: %FileCheck %s --check-prefix=CHECK-DX-REFL < %t/valid_multi.dx.refl
+// RUN: %FileCheck %s --check-prefix=CHECK-DX-LL < %t/valid_multi.ll
+
+// RUN: not %gfx-compile %t/oversized_multi.json --target vulkan --output %t/bad.spv --reflection %t/bad.refl 2>&1 | %FileCheck %s --check-prefix=CHECK-ERR-CUMULATIVE
+// RUN: not %gfx-compile %t/duplicate_blocks.json --target vulkan --output %t/bad.spv --reflection %t/bad.refl 2>&1 | %FileCheck %s --check-prefix=CHECK-ERR-DUP
+
+// =============================================================================
+// Vulkan Consolidation Checks
+// =============================================================================
+
+// CHECK-VK-REFL: "parameters":[
+// CHECK-VK-REFL: "offset":0,"storage":"push_constant"
+// CHECK-VK-REFL: "name":"frame"
+// CHECK-VK-REFL: "offset":16,"storage":"push_constant"
+// CHECK-VK-REFL: "name":"object"
+
+// CHECK-VK-SPIRV: SPIR-V member offsets: [0, 4, 16]
+
+// CHECK-VK-LOWERED: spirv.GlobalVariable @parameters : !spirv.ptr<!spirv.struct<(f32 [0], f32 [4], vector<4xf32> [16])>, PushConstant>
+// CHECK-VK-LOWERED: %[[P0:.*]] = spirv.mlir.addressof @parameters
+// CHECK-VK-LOWERED: %[[IDX0:.*]] = spirv.Constant 0 : i32
+// CHECK-VK-LOWERED: %{{.*}} = spirv.AccessChain %[[P0]][%[[IDX0]]]
+// CHECK-VK-LOWERED: %[[P1:.*]] = spirv.mlir.addressof @parameters
+// CHECK-VK-LOWERED: %[[IDX1:.*]] = spirv.Constant 1 : i32
+// CHECK-VK-LOWERED: %{{.*}} = spirv.AccessChain %[[P1]][%[[IDX1]]]
+// CHECK-VK-LOWERED: %[[P2:.*]] = spirv.mlir.addressof @parameters
+// CHECK-VK-LOWERED: %[[IDX2:.*]] = spirv.Constant 2 : i32
+// CHECK-VK-LOWERED: %{{.*}} = spirv.AccessChain %[[P2]][%[[IDX2]]]
+
+// =============================================================================
+// DirectX DXIL Lowering Checks
+// =============================================================================
+
+// CHECK-DX-REFL: "parameters":[
+// CHECK-DX-REFL: "directx":{
+// CHECK-DX-REFL-DAG: "parameter_index":0
+// CHECK-DX-REFL-DAG: "register":0
+// CHECK-DX-REFL-DAG: "storage":"root_constants"
+// CHECK-DX-REFL: "name":"frame"
+// CHECK-DX-REFL: "directx":{
+// CHECK-DX-REFL-DAG: "parameter_index":1
+// CHECK-DX-REFL-DAG: "register":1
+// CHECK-DX-REFL-DAG: "storage":"root_constants"
+// CHECK-DX-REFL: "name":"object"
+
+// CHECK-DX-LL: define void @test_fs()
+// CHECK-DX-LL: call target("dx.CBuffer", <{ float, float }>) @llvm.dx.resource.handlefrombinding.tdx.CBuffer_sl_f32f32st(i32 0, i32 0, i32 1, i32 0, ptr null)
+// CHECK-DX-LL: call target("dx.CBuffer", <{ <4 x float> }>) @llvm.dx.resource.handlefrombinding.tdx.CBuffer_sl_v4f32st(i32 0, i32 1, i32 1, i32 0, ptr null)
+// CHECK-DX-LL: !dx.rootsignatures = !{![[SIG:[0-9]+]]}
+// CHECK-DX-LL: ![[R0:[0-9]+]] = !{!"RootConstants", i32 0, i32 0, i32 0, i32 2}
+// CHECK-DX-LL: ![[R1:[0-9]+]] = !{!"RootConstants", i32 0, i32 1, i32 0, i32 4}
+// CHECK-DX-LL: ![[DESC:[0-9]+]] = !{![[R0]], ![[R1]]}
+// CHECK-DX-LL: ![[SIG]] = !{ptr @test_fs, ![[DESC]], i32 2}
+
+// =============================================================================
+// Diagnostic Limit & Error Checks
+// =============================================================================
+
+// CHECK-ERR-CUMULATIVE: error: {{.*}}read-only parameter blocks currently fit within 256 bytes
+// CHECK-ERR-DUP: error: {{.*}}duplicate parameter block name: 'shared_block'
+
+//--- valid_multi.json
+{
+  "schema_version": 2,
+  "parameters": [
+    {
+      "name": "frame",
+      "fields": [
+        {"name": "time", "type": "f32"},
+        {"name": "factor", "type": "f32"}
+      ]
+    },
+    {
+      "name": "object",
+      "fields": [
+        {"name": "tint", "type": "f32x4"}
+      ]
+    }
+  ],
+  "functions": [{
+    "name": "test_fs",
+    "stage": "fragment",
+    "results": [],
+    "body": {"blocks": [{"name": "entry", "arguments": [], "operations": [
+      {
+        "op": "gfx.parameter",
+        "results": [{"name": "t", "type": "f32"}],
+        "attributes": {
+          "block": {"kind": "string", "value": "frame"},
+          "field": {"kind": "string", "value": "time"}
+        }
+      },
+      {
+        "op": "gfx.parameter",
+        "results": [{"name": "fac", "type": "f32"}],
+        "attributes": {
+          "block": {"kind": "string", "value": "frame"},
+          "field": {"kind": "string", "value": "factor"}
+        }
+      },
+      {
+        "op": "arith.addf",
+        "args": ["t", "fac"],
+        "results": [{"name": "sum", "type": "f32"}]
+      },
+      {
+        "op": "vector.from_elements",
+        "args": ["sum", "sum", "sum", "sum"],
+        "results": [{"name": "sum_vec", "type": "f32x4"}]
+      },
+      {
+        "op": "gfx.parameter",
+        "results": [{"name": "tint", "type": "f32x4"}],
+        "attributes": {
+          "block": {"kind": "string", "value": "object"},
+          "field": {"kind": "string", "value": "tint"}
+        }
+      },
+      {
+        "op": "arith.addf",
+        "args": ["sum_vec", "tint"],
+        "results": [{"name": "out_color", "type": "f32x4"}]
+      },
+      {
+        "op": "gfx.output",
+        "args": ["out_color"],
+        "results": [],
+        "attributes": {
+          "location": {"kind": "literal", "type": "i32", "value": 0},
+          "name": {"kind": "string", "value": "target0"},
+          "interpolation": {"kind": "interpolation", "value": "perspective"}
+        }
+      },
+      {"op": "func.return"}
+    ]}]}
+  }]
+}
+
+//--- oversized_multi.json
+{
+  "schema_version": 2,
+  "parameters": [
+    {
+      "name": "blockA",
+      "fields": [
+        {"name": "v0", "type": "f32x4"}, {"name": "v1", "type": "f32x4"},
+        {"name": "v2", "type": "f32x4"}, {"name": "v3", "type": "f32x4"},
+        {"name": "v4", "type": "f32x4"}, {"name": "v5", "type": "f32x4"},
+        {"name": "v6", "type": "f32x4"}, {"name": "v7", "type": "f32x4"},
+        {"name": "v8", "type": "f32x4"}, {"name": "v9", "type": "f32x4"}
+      ]
+    },
+    {
+      "name": "blockB",
+      "fields": [
+        {"name": "v0", "type": "f32x4"}, {"name": "v1", "type": "f32x4"},
+        {"name": "v2", "type": "f32x4"}, {"name": "v3", "type": "f32x4"},
+        {"name": "v4", "type": "f32x4"}, {"name": "v5", "type": "f32x4"},
+        {"name": "v6", "type": "f32x4"}
+      ]
+    }
+  ],
+  "functions": [{
+    "name": "test_fs",
+    "stage": "fragment",
+    "results": [],
+    "body": {"blocks": [{"name": "entry", "arguments": [], "operations": [
+      {"op": "gfx.parameter", "results": [{"name": "a", "type": "f32x4"}], "attributes": {"block": {"kind": "string", "value": "blockA"}, "field": {"kind": "string", "value": "v0"}}},
+      {"op": "gfx.parameter", "results": [{"name": "b", "type": "f32x4"}], "attributes": {"block": {"kind": "string", "value": "blockB"}, "field": {"kind": "string", "value": "v0"}}},
+      {"op": "arith.addf", "args": ["a", "b"], "results": [{"name": "res", "type": "f32x4"}]},
+      {"op": "gfx.output", "args": ["res"], "results": [], "attributes": {"location": {"kind": "literal", "type": "i32", "value": 0}, "name": {"kind": "string", "value": "target0"}, "interpolation": {"kind": "interpolation", "value": "perspective"}}},
+      {"op": "func.return"}
+    ]}]}
+  }]
+}
+
+//--- duplicate_blocks.json
+{
+  "schema_version": 2,
+  "parameters": [
+    {
+      "name": "shared_block",
+      "fields": [{"name": "a", "type": "f32"}]
+    },
+    {
+      "name": "shared_block",
+      "fields": [{"name": "b", "type": "f32"}]
+    }
+  ],
+  "functions": [{
+    "name": "test_fs",
+    "stage": "fragment",
+    "results": [],
+    "body": {"blocks": [{"name": "entry", "arguments": [], "operations": [
+      {"op": "gfx.parameter", "results": [{"name": "a", "type": "f32"}], "attributes": {"block": {"kind": "string", "value": "shared_block"}, "field": {"kind": "string", "value": "a"}}},
+      {"op": "vector.from_elements", "args": ["a", "a", "a", "a"], "results": [{"name": "v", "type": "f32x4"}]},
+      {"op": "gfx.output", "args": ["v"], "results": [], "attributes": {"location": {"kind": "literal", "type": "i32", "value": 0}, "name": {"kind": "string", "value": "target0"}, "interpolation": {"kind": "interpolation", "value": "perspective"}}},
+      {"op": "func.return"}
+    ]}]}
+  }]
+}

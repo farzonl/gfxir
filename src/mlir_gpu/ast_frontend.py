@@ -338,10 +338,13 @@ class ASTLowering:
                                  types=[node.type.schema_name], attributes=attrs)
             self.root.cache[id(node)] = ref
         parameters = parameters or {}
-        blocks = list(parameters.values())
-        if blocks and any(block != blocks[0] for block in blocks):
-            self.fail("This parameter ABI supports one matching block per shader module.")
-        self.parameters = blocks[0] if blocks else None
+        seen_names = set()
+        self.parameter_blocks = []
+        for block in parameters.values():
+            if block.name not in seen_names:
+                seen_names.add(block.name)
+                self.parameter_blocks.append(block)
+        self.parameters = self.parameter_blocks[0] if self.parameter_blocks else None
 
         from .frontend import BufferBinding, BufferType, AccessMode, resolve_annotation
         self.buffer_bindings = {}
@@ -1355,8 +1358,11 @@ class ASTLowering:
             if wg_size:
                 func_obj["workgroup_size"] = list(wg_size)
             result = {"schema_version": 2, **self.location(), "functions": [func_obj]}
-            if self.parameters:
-                result["parameters"] = self.parameters.to_dict()
+            if self.parameter_blocks:
+                if len(self.parameter_blocks) == 1:
+                    result["parameters"] = self.parameter_blocks[0].to_dict()
+                else:
+                    result["parameters"] = [b.to_dict() for b in self.parameter_blocks]
             return result
         for node, interface in zip(outputs, interfaces):
             ref = self.root.emit(node)
@@ -1373,8 +1379,11 @@ class ASTLowering:
             "name": name, "stage": kind, "results": [],
             "body": {"blocks": [self.root.block]}, **self.location(),
         }]}
-        if self.parameters:
-            result["parameters"] = self.parameters.to_dict()
+        if self.parameter_blocks:
+            if len(self.parameter_blocks) == 1:
+                result["parameters"] = self.parameter_blocks[0].to_dict()
+            else:
+                result["parameters"] = [b.to_dict() for b in self.parameter_blocks]
         return result
 
 

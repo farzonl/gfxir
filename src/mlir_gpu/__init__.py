@@ -94,6 +94,7 @@ from . import shader_math, sdf
 mat2x2, mat2x3, mat2x4 = Type.MAT2X2, Type.MAT2X3, Type.MAT2X4
 mat3x2, mat3x3, mat3x4 = Type.MAT3X2, Type.MAT3X3, Type.MAT3X4
 mat4x2, mat4x3, mat4x4 = Type.MAT4X2, Type.MAT4X3, Type.MAT4X4
+mat4 = mat4x4
 
 __all__ = [
     "AccessMode", "Buffer", "BufferBinding", "BufferType", "CompileError", "ComputeDispatchResult",
@@ -108,9 +109,9 @@ __all__ = [
     "atomic_sub", "atomic_umax", "atomic_umin", "atomic_xor", "compile_pipeline", "compute",
     "compute_session", "dispatch_compute", "f32", "fragment", "full_barrier", "fullscreen_vertex",
     "global_invocation_id", "i32", "imgdiff", "is_struct", "load_compute_program",
-    "local_invocation_id", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4", "mat4x2",
-    "mat4x3", "mat4x4", "maximum", "minimum", "natural_alignment", "pack_parameters", "read_png",
-    "render_compute_rgba", "sdf", "select", "shader_math", "shared_array", "storage_barrier",
-    "struct", "u32", "vec2", "vec3", "vec4", "verify_multi_draw_manifest", "vertex",
-    "workgroup_barrier", "workgroup_id", "write_png",
+    "local_invocation_id", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4", "mat4",
+    "mat4x2", "mat4x3", "mat4x4", "maximum", "minimum", "natural_alignment", "pack_parameters",
+    "read_png", "render_compute_rgba", "sdf", "select", "shader_math", "shared_array",
+    "storage_barrier", "struct", "u32", "vec2", "vec3", "vec4", "verify_multi_draw_manifest",
+    "vertex", "workgroup_barrier", "workgroup_id", "write_png",
 ]
