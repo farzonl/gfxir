@@ -1,5 +1,6 @@
 import json
 import math
+import sys
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
@@ -417,6 +418,7 @@ class DepthBackendCliGenerationTests(unittest.TestCase):
                         f_idx = args.index("--depth-format")
                         self.assertEqual(args[f_idx + 1], "d32_sfloat")
 
+    @unittest.skipUnless(sys.platform == "darwin", "Metal requires macOS")
     def test_metal_libraries_cli_all_ops(self):
         toolchain = MagicMock()
         toolchain.find.return_value = "mlir-gpu-metal-view"

@@ -1,4 +1,5 @@
 import json
+import sys
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
@@ -454,6 +455,7 @@ class NativeViewerCliArgumentTests(unittest.TestCase):
             with _directx_shaders(prog_no_depth, toolchain) as (dir_path, args):
                 self.assertNotIn("--depth", args)
 
+    @unittest.skipUnless(sys.platform == "darwin", "Metal requires macOS")
     def test_metal_libraries_cli_arguments(self):
         toolchain = MagicMock()
         toolchain.find.return_value = "mlir-gpu-metal-view"

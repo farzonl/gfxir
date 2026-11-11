@@ -1,6 +1,8 @@
 import json
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -20,7 +22,7 @@ from mlir_gpu import (
     vec4,
     vertex,
 )
-from mlir_gpu.compiler import Target
+from mlir_gpu.compiler import CompileError, Target, Toolchain
 from mlir_gpu.interfaces import COMPARE_OPS, SUPPORTED_DEPTH_FORMATS
 from mlir_gpu.viewer import (
     GraphicsProgram,
@@ -32,6 +34,25 @@ from mlir_gpu.viewer import (
     _vulkan_depth_format,
     load_program,
 )
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+LLVM_BIN = Path(os.environ["LLVM_BIN"]) if "LLVM_BIN" in os.environ else None
+GPU_TOOLS_BIN = Path(os.environ["GPU_TOOLS_BIN"]) if "GPU_TOOLS_BIN" in os.environ else None
+TOOLS = Toolchain(LLVM_BIN, GPU_TOOLS_BIN)
+
+
+def _find_metal_viewer():
+    candidates = [
+        REPO_ROOT / ".tools" / "bin" / "mlir-gpu-metal-view",
+        REPO_ROOT / "build" / "native" / "mlir-gpu-metal-view",
+    ]
+    which = shutil.which("mlir-gpu-metal-view")
+    if which:
+        candidates.append(Path(which))
+    for c in candidates:
+        if c.is_file() and os.access(c, os.X_OK):
+            return c
+    return REPO_ROOT / "build" / "native" / "mlir-gpu-metal-view"
 
 
 def _create_mock_vk():
@@ -426,7 +447,7 @@ class DirectXDepthStateTests(unittest.TestCase):
                 self.assertNotIn("--depth-format", args)
 
     def test_directx_source_contracts(self):
-        cpp_source = Path("/tmp/gfxir-131/native/directx_viewer.cpp").read_text()
+        cpp_source = (REPO_ROOT / "native" / "directx_viewer.cpp").read_text(encoding="utf-8")
 
         # Check compare func parser covers all 8 comparison funcs
         for op in ["less_equal", "less", "equal", "greater", "greater_equal", "not_equal", "always", "never"]:
@@ -463,14 +484,20 @@ class DirectXDepthStateTests(unittest.TestCase):
         self.assertIn("description.DSVFormat = DXGI_FORMAT_UNKNOWN;", cpp_source)
 
 
+@unittest.skipUnless(sys.platform == "darwin", "Metal requires macOS")
 class MetalDepthStateTests(unittest.TestCase):
     def test_metal_native_binary_built_and_executable(self):
-        binary = Path("/tmp/gfxir-131/build/native/mlir-gpu-metal-view")
+        binary = _find_metal_viewer()
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            self.skipTest("mlir-gpu-metal-view binary not found or not executable")
         self.assertTrue(binary.exists(), "mlir-gpu-metal-view binary does not exist")
         self.assertTrue(os.access(binary, os.X_OK), "mlir-gpu-metal-view is not executable")
 
     def test_metal_cli_flag_parsing_empirical(self):
-        binary = "/tmp/gfxir-131/build/native/mlir-gpu-metal-view"
+        binary = _find_metal_viewer()
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            self.skipTest("mlir-gpu-metal-view binary not found or not executable")
+        binary = str(binary)
 
         # 1. Reject invalid compare op
         proc = subprocess.run(
@@ -509,7 +536,7 @@ class MetalDepthStateTests(unittest.TestCase):
             self.assertIn("Missing --width", proc.stderr)
 
     def test_metal_source_contracts(self):
-        mm_source = Path("/tmp/gfxir-131/native/metal_viewer.mm").read_text()
+        mm_source = (REPO_ROOT / "native" / "metal_viewer.mm").read_text(encoding="utf-8")
 
         # Check all 8 compare function mappings
         for op in ["less_equal", "less", "equal", "greater", "greater_equal", "not_equal", "always", "never"]:
@@ -557,6 +584,12 @@ class MetalDepthStateTests(unittest.TestCase):
 
 
 class EndToEndPipelineDepthStateTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            TOOLS.preflight(Target.VULKAN)
+        except CompileError as error:
+            self.skipTest(str(error))
+
     def test_pipeline_compilation_with_default_depth_stencil(self):
         @fragment
         def fs() -> Value:
@@ -564,7 +597,7 @@ class EndToEndPipelineDepthStateTests(unittest.TestCase):
 
         pipe = Pipeline(fullscreen_vertex, fs, Draw(), DepthStencil())
         with tempfile.TemporaryDirectory() as tmp_dir:
-            out_manifest = compile_pipeline(pipe, Target.VULKAN, Path(tmp_dir) / "build")
+            out_manifest = compile_pipeline(pipe, Target.VULKAN, Path(tmp_dir) / "build", toolchain=TOOLS)
             self.assertTrue(out_manifest.exists())
             data = json.loads(out_manifest.read_text())
             self.assertIn("depth_stencil", data)
@@ -589,7 +622,7 @@ class EndToEndPipelineDepthStateTests(unittest.TestCase):
 
         pipe = Pipeline(fullscreen_vertex, fs, Draw(), depth_stencil=None)
         with tempfile.TemporaryDirectory() as tmp_dir:
-            out_manifest = compile_pipeline(pipe, Target.VULKAN, Path(tmp_dir) / "build")
+            out_manifest = compile_pipeline(pipe, Target.VULKAN, Path(tmp_dir) / "build", toolchain=TOOLS)
             data = json.loads(out_manifest.read_text())
             self.assertNotIn("depth_stencil", data)
 
@@ -610,7 +643,7 @@ class EndToEndPipelineDepthStateTests(unittest.TestCase):
         }
         pipe = Pipeline(fullscreen_vertex, fs, Draw(), depth_stencil=custom_dict)
         with tempfile.TemporaryDirectory() as tmp_dir:
-            out_manifest = compile_pipeline(pipe, Target.VULKAN, Path(tmp_dir) / "build")
+            out_manifest = compile_pipeline(pipe, Target.VULKAN, Path(tmp_dir) / "build", toolchain=TOOLS)
             data = json.loads(out_manifest.read_text())
             self.assertIn("depth_stencil", data)
             self.assertEqual(data["depth_stencil"], custom_dict)
