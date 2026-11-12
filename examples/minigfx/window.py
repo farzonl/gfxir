@@ -1,4 +1,4 @@
-"""Interactive GPU window presenter for MiniGfx (Metal and Vulkan via GfxIR)."""
+"""Interactive GPU window presenter for MiniGfx (DirectX 12, Metal, and Vulkan via GfxIR)."""
 
 from __future__ import annotations
 
@@ -36,9 +36,12 @@ def _ensure_toolchain_paths() -> None:
     extra_dirs.extend(
         [
             _REPO_ROOT / "build" / "compiler" / "bin",
+            _REPO_ROOT / "build" / "native",
+            _REPO_ROOT / "build" / "native" / "Release",
             _REPO_ROOT / ".toolchains" / "llvm-build" / "bin",
             _REPO_ROOT / ".tools" / "bin",
             _REPO_ROOT / ".sdk" / "bin",
+            _REPO_ROOT / ".sdk" / "bin" / "x64",
             Path("/usr/local/bin"),
             Path("/opt/homebrew/bin"),
         ]
@@ -173,7 +176,7 @@ def build_hud_overlay_vertices(
 
 
 def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
-    """Compile embedded MiniGfx Python shaders via GfxIR to native GPU binaries (.metallib or .spv)."""
+    """Compile embedded MiniGfx Python shaders via GfxIR to native GPU binaries (.dxil, .metallib, or .spv)."""
     _ensure_toolchain_paths()
     from mlir_gpu.ast_frontend import ASTLowering
     from mlir_gpu.compiler import Target, TargetProfile, Toolchain, _compile_stage
@@ -181,7 +184,7 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
     import mlir_gpu.shader_math as sm
 
     target = Target(target_name)
-    ext = "spv" if target == Target.VULKAN else "metallib"
+    ext = "spv" if target == Target.VULKAN else ("dxil" if target == Target.DIRECTX else "metallib")
 
     cache_key_src = f"minigfx_window_shaders_v2_{target_name}"
     digest = hashlib.sha256(cache_key_src.encode("utf-8")).hexdigest()[:12]
@@ -573,6 +576,227 @@ class _MetalWindowBackend:
     def destroy(self) -> None:
         if getattr(self, "_ctx", None):
             self._lib.mgfx_metal_destroy(self._ctx)
+            self._ctx = None
+
+
+def _build_directx_bridge_dll() -> Path:
+    """Compile _directx_bridge.cpp into a cached shared library on Windows."""
+    src_cpp = Path(__file__).resolve().parent / "_directx_bridge.cpp"
+    src_hash = hashlib.sha256(src_cpp.read_bytes()).hexdigest()[:12]
+    out_dir = _REPO_ROOT / "build" / "minigfx_cache"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dll = out_dir / f"minigfx_directx_{src_hash}.dll"
+    if dll.is_file():
+        return dll
+
+    tmp_prefix = f".tmp_{os.getpid()}_{src_hash}"
+    tmp_dll = out_dir / f"{tmp_prefix}.dll"
+    errors: List[str] = []
+
+    def _cleanup_tmp() -> None:
+        for ext in (".dll", ".lib", ".exp", ".obj", ".pdb", ".ilk", ".cmd"):
+            cand = out_dir / f"{tmp_prefix}{ext}"
+            if cand.exists():
+                cand.unlink(missing_ok=True)
+
+    clang_bin = shutil.which("clang++")
+    if clang_bin:
+        cmd = [clang_bin, "-std=c++20", "-O2", "-shared", str(src_cpp), "-ld3d12", "-ldxgi", "-luser32", "-o", str(tmp_dll)]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0 and tmp_dll.is_file():
+            tmp_dll.replace(dll)
+            _cleanup_tmp()
+            return dll
+        errors.append(f"clang++ exited with {res.returncode}:\n{res.stderr or res.stdout}")
+        _cleanup_tmp()
+
+    cl_bin = shutil.which("cl") or shutil.which("cl.exe")
+    if cl_bin:
+        cmd = [
+            cl_bin, "/nologo", "/std:c++20", "/O2", "/EHsc", "/LD", str(src_cpp),
+            f"/Fo{out_dir / (tmp_prefix + '.obj')}", f"/Fe{tmp_dll}", "d3d12.lib", "dxgi.lib", "user32.lib",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0 and tmp_dll.is_file():
+            tmp_dll.replace(dll)
+            _cleanup_tmp()
+            return dll
+        errors.append(f"cl.exe exited with {res.returncode}:\n{res.stderr or res.stdout}")
+        _cleanup_tmp()
+
+    pf_x86 = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
+    vswhere = Path(pf_x86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if vswhere.is_file():
+        vs_res = subprocess.run(
+            [str(vswhere), "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
+            capture_output=True, text=True,
+        )
+        vs_root = vs_res.stdout.strip()
+        if vs_res.returncode == 0 and vs_root:
+            vcvars = Path(vs_root) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+            if vcvars.is_file():
+                cmd_script = out_dir / f"{tmp_prefix}.cmd"
+                cmd_script.write_text(
+                    f'@call "{vcvars}" >nul\r\n@if errorlevel 1 exit /b %errorlevel%\r\n'
+                    f'@cl.exe /nologo /std:c++20 /O2 /EHsc /LD "{src_cpp}" '
+                    f'/Fo"{out_dir / (tmp_prefix + ".obj")}" /Fe"{tmp_dll}" d3d12.lib dxgi.lib user32.lib\r\n',
+                    encoding="utf-8",
+                )
+                res = subprocess.run(["cmd.exe", "/d", "/c", str(cmd_script)], capture_output=True, text=True)
+                if res.returncode == 0 and tmp_dll.is_file():
+                    tmp_dll.replace(dll)
+                    _cleanup_tmp()
+                    return dll
+                errors.append(f"MSVC (vcvars64) exited with {res.returncode}:\n{res.stderr or res.stdout}")
+                _cleanup_tmp()
+
+    detail = "\n".join(errors) if errors else "Neither clang++ nor MSVC cl.exe (Visual Studio C++ tools) was found."
+    raise RuntimeError(f"Failed to build MiniGfx DirectX 12 bridge:\n{detail}")
+
+
+class _DirectXWindowBackend:
+    """Native DirectX 12 GPU presenter driving a GLFW Win32 HWND."""
+
+    OVERLAY_BUF_ID = 0
+
+    def __init__(self, glfw_mod: Any, window: Any, fb_w: int, fb_h: int, shaders: Dict[str, Path]) -> None:
+        lib = ctypes.CDLL(str(_build_directx_bridge_dll()))
+        lib.mgfx_dx12_create.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
+        lib.mgfx_dx12_create.restype = ctypes.c_void_p
+        lib.mgfx_dx12_last_error.argtypes = [ctypes.c_void_p]
+        lib.mgfx_dx12_last_error.restype = ctypes.c_char_p
+        lib.mgfx_dx12_device_name.argtypes = [ctypes.c_void_p]
+        lib.mgfx_dx12_device_name.restype = ctypes.c_char_p
+        lib.mgfx_dx12_create_pipeline.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        lib.mgfx_dx12_create_pipeline.restype = ctypes.c_int
+        lib.mgfx_dx12_upload_buffer.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+        lib.mgfx_dx12_upload_buffer.restype = ctypes.c_int
+        lib.mgfx_dx12_begin_frame.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float]
+        lib.mgfx_dx12_begin_frame.restype = ctypes.c_int
+        lib.mgfx_dx12_draw.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+        ]
+        lib.mgfx_dx12_draw.restype = ctypes.c_int
+        lib.mgfx_dx12_end_frame.argtypes = [ctypes.c_void_p]
+        lib.mgfx_dx12_end_frame.restype = ctypes.c_int
+        lib.mgfx_dx12_end_frame_capture.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+        lib.mgfx_dx12_end_frame_capture.restype = ctypes.c_int
+        lib.mgfx_dx12_destroy.argtypes = [ctypes.c_void_p]
+        lib.mgfx_dx12_destroy.restype = None
+
+        self._lib = lib
+        hwnd = glfw_mod.get_win32_window(window)
+        enable_val = 1 if os.environ.get("MLIR_GPU_TEST_VALIDATION", "").strip().lower() in ("1", "true", "yes") else 0
+        use_warp = 1 if (
+            os.environ.get("MLIR_GPU_DIRECTX_PROVIDER", "").strip().lower() == "warp"
+            or os.environ.get("MINIGFX_DIRECTX_WARP", "").strip().lower() in ("1", "true", "yes")
+        ) else 0
+
+        err_buf = ctypes.create_string_buffer(1024)
+        self._ctx = lib.mgfx_dx12_create(ctypes.c_void_p(hwnd), fb_w, fb_h, enable_val, use_warp, err_buf, len(err_buf))
+        if not self._ctx:
+            raise RuntimeError(f"DirectX 12 initialization failed: {err_buf.value.decode('utf-8', errors='replace')}")
+
+        dev_raw = lib.mgfx_dx12_device_name(self._ctx)
+        self.device_name = dev_raw.decode("utf-8", errors="replace") if dev_raw else "DirectX 12"
+
+        vs_mesh = str(shaders["mesh_vs"]).encode("utf-8")
+        self.pipe_pbr = lib.mgfx_dx12_create_pipeline(self._ctx, vs_mesh, str(shaders["pbr_fs"]).encode("utf-8"), 1, 0)
+        self.pipe_normal = lib.mgfx_dx12_create_pipeline(self._ctx, vs_mesh, str(shaders["normal_fs"]).encode("utf-8"), 1, 0)
+        self.pipe_overlay = lib.mgfx_dx12_create_pipeline(
+            self._ctx, str(shaders["overlay_vs"]).encode("utf-8"), str(shaders["overlay_fs"]).encode("utf-8"), 0, 1
+        )
+        if min(self.pipe_pbr, self.pipe_normal, self.pipe_overlay) < 0:
+            msg = self._last_error_str()
+            self.destroy()
+            raise RuntimeError(f"DirectX 12 pipeline creation failed: {msg}")
+
+        self._mesh_cache: Dict[int, Tuple[int, int]] = {}
+        self._next_buf_id = 1
+        self._capture_requested = False
+        self.last_captured_frame: Optional[Tuple[int, int, bytes]] = None
+
+    def _last_error_str(self) -> str:
+        err = self._lib.mgfx_dx12_last_error(self._ctx)
+        return err.decode("utf-8", errors="replace") if err else "unknown DirectX 12 error"
+
+    def request_frame_capture(self) -> None:
+        """Capture the rendered RGBA8 swapchain backbuffer on the next render() call."""
+        self._capture_requested = True
+
+    def _ensure_mesh(self, mesh: Mesh) -> Tuple[int, int]:
+        key = id(mesh)
+        cached = self._mesh_cache.get(key)
+        if cached is not None:
+            return cached
+        raw, vcount = pack_mesh_triangles(mesh)
+        buf_id = self._next_buf_id
+        self._next_buf_id += 1
+        if vcount > 0:
+            if self._lib.mgfx_dx12_upload_buffer(self._ctx, buf_id, raw, len(raw)) != 0:
+                raise RuntimeError(f"DirectX 12 vertex buffer upload failed: {self._last_error_str()}")
+        self._mesh_cache[key] = (buf_id, vcount)
+        return buf_id, vcount
+
+    def render(
+        self,
+        fb_w: int,
+        fb_h: int,
+        cam_bytes: bytes,
+        light_bytes: bytes,
+        draws: Sequence[Tuple[Mesh, bytes, bytes, bool]],
+        hud_bytes: bytes,
+        hud_vert_count: int,
+    ) -> None:
+        if not self._ctx:
+            return
+        prepared: List[Tuple[int, int, int, bytes, bytes]] = []
+        for mesh, obj_bytes, mat_bytes, is_normal_debug in draws:
+            buf_id, vcount = self._ensure_mesh(mesh)
+            if vcount > 0:
+                prepared.append((self.pipe_normal if is_normal_debug else self.pipe_pbr, buf_id, vcount, obj_bytes, mat_bytes))
+
+        if hud_vert_count > 0 and hud_bytes:
+            if self._lib.mgfx_dx12_upload_buffer(self._ctx, self.OVERLAY_BUF_ID, hud_bytes, len(hud_bytes)) != 0:
+                raise RuntimeError(f"DirectX 12 HUD buffer upload failed: {self._last_error_str()}")
+
+        rc = self._lib.mgfx_dx12_begin_frame(self._ctx, fb_w, fb_h, 0.035, 0.04, 0.065, 1.0)
+        if rc == 1:
+            return
+        if rc != 0:
+            raise RuntimeError(f"DirectX 12 begin_frame failed: {self._last_error_str()}")
+
+        for active_pipe, buf_id, vcount, obj_bytes, mat_bytes in prepared:
+            rc = self._lib.mgfx_dx12_draw(
+                self._ctx, active_pipe, buf_id, vcount,
+                cam_bytes, len(cam_bytes), obj_bytes, len(obj_bytes),
+                mat_bytes, len(mat_bytes), light_bytes, len(light_bytes), -1,
+            )
+            if rc != 0:
+                raise RuntimeError(f"DirectX 12 draw failed: {self._last_error_str()}")
+
+        if hud_vert_count > 0 and hud_bytes:
+            rc = self._lib.mgfx_dx12_draw(
+                self._ctx, self.pipe_overlay, self.OVERLAY_BUF_ID, hud_vert_count,
+                None, 0, None, 0, None, 0, None, 0, -1,
+            )
+            if rc != 0:
+                raise RuntimeError(f"DirectX 12 HUD draw failed: {self._last_error_str()}")
+
+        if self._capture_requested:
+            self._capture_requested = False
+            cap_buf = ctypes.create_string_buffer(fb_w * fb_h * 4)
+            if self._lib.mgfx_dx12_end_frame_capture(self._ctx, cap_buf, len(cap_buf)) != 0:
+                raise RuntimeError(f"DirectX 12 frame capture failed: {self._last_error_str()}")
+            self.last_captured_frame = (fb_w, fb_h, cap_buf.raw)
+        elif self._lib.mgfx_dx12_end_frame(self._ctx) != 0:
+            raise RuntimeError(f"DirectX 12 end_frame failed: {self._last_error_str()}")
+
+    def destroy(self) -> None:
+        if getattr(self, "_ctx", None):
+            self._lib.mgfx_dx12_destroy(self._ctx)
             self._ctx = None
 
 
@@ -1250,17 +1474,25 @@ class InteractiveWindow:
         glfw.set_scroll_callback(self.window, self._on_scroll)
 
         fb_w, fb_h = glfw.get_framebuffer_size(self.window)
-        shaders = compile_minigfx_shaders("metal" if target == "metal" else "vulkan")
 
         try:
-            if target == "metal":
+            if target == "directx":
+                if sys.platform != "win32":
+                    raise RuntimeError("DirectX 12 window backend is only supported on Windows.")
+                shaders = compile_minigfx_shaders("directx")
+                self.backend: Any = _DirectXWindowBackend(glfw, self.window, fb_w, fb_h, shaders)
+            elif target == "metal":
                 if sys.platform != "darwin":
                     raise RuntimeError("Metal window backend is only supported on macOS.")
-                self.backend: Any = _MetalWindowBackend(glfw, self.window, fb_w, fb_h, shaders)
+                shaders = compile_minigfx_shaders("metal")
+                self.backend = _MetalWindowBackend(glfw, self.window, fb_w, fb_h, shaders)
             elif target == "vulkan":
+                shaders = compile_minigfx_shaders("vulkan")
                 self.backend = _VulkanWindowBackend(glfw, self.window, fb_w, fb_h, shaders)
             else:
-                raise RuntimeError(f"Interactive window on {sys.platform} supports 'metal' or 'vulkan' (got {target!r}).")
+                raise RuntimeError(
+                    f"Interactive window on {sys.platform} supports 'directx', 'metal', or 'vulkan' (got {target!r})."
+                )
         except Exception:
             glfw.destroy_window(self.window)
             self.window = None
@@ -1279,6 +1511,7 @@ class InteractiveWindow:
             glfw.KEY_1: "1",
             glfw.KEY_2: "2",
             glfw.KEY_3: "3",
+            glfw.KEY_M: "m",
             glfw.KEY_SPACE: " ",
             glfw.KEY_Q: "q",
             glfw.KEY_ESCAPE: "escape",
