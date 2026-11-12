@@ -381,6 +381,104 @@ f 2 4 3
             self.assertTrue(shaders[stage_key].is_file())
             self.assertGreater(shaders[stage_key].stat().st_size, 0)
 
+    def test_window_directx_shader_compilation(self) -> None:
+        """Verifies embedded window shaders compile to DXIL containers when DirectX toolchain is available."""
+        import shutil
+        from examples.minigfx.window import _ensure_toolchain_paths, compile_minigfx_shaders
+
+        _ensure_toolchain_paths()
+        if any(shutil.which(tool) is None for tool in ("gfx-compile", "llc", "dxv")):
+            self.skipTest("gfx-compile, llc, or dxv not available in PATH")
+
+        shaders = compile_minigfx_shaders("directx")
+        for stage_key in ("mesh_vs", "pbr_fs", "normal_fs", "overlay_vs", "overlay_fs"):
+            self.assertIn(stage_key, shaders)
+            dxil_path = shaders[stage_key]
+            self.assertEqual(dxil_path.suffix, ".dxil")
+            self.assertTrue(dxil_path.is_file())
+            raw = dxil_path.read_bytes()
+            self.assertGreater(len(raw), 32)
+            self.assertEqual(raw[:4], b"DXBC")
+
+    @unittest.skipUnless(sys.platform == "win32", "DirectX 12 window backend requires Windows")
+    def test_directx_interactive_window_rendering_and_material_modes(self) -> None:
+        """Verifies DirectX 12 interactive window presents PBR, dielectric, normal debug, HUD, and resize."""
+        import shutil
+        from examples.minigfx.window import _ensure_toolchain_paths
+
+        try:
+            import glfw  # noqa: F401
+        except ImportError:
+            self.skipTest("glfw package is not installed")
+
+        _ensure_toolchain_paths()
+        if any(shutil.which(tool) is None for tool in ("gfx-compile", "llc", "dxv")):
+            self.skipTest("DirectX shader toolchain (gfx-compile, llc, dxv) not available in PATH")
+
+        prev_val = os.environ.get("MLIR_GPU_TEST_VALIDATION")
+        os.environ["MLIR_GPU_TEST_VALIDATION"] = "1"
+        app = None
+        try:
+            args = ModelViewerApp.parse_args(["--target", "directx", "--width", "320", "--height", "240", "--frames", "2"])
+            app = ModelViewerApp(args)
+            try:
+                app.startup()
+            except RuntimeError as exc:
+                msg = str(exc)
+                if "interactive desktop session" in msg or "Failed to initialize GLFW" in msg or "Failed to create GLFW window" in msg:
+                    self.skipTest(f"Interactive desktop presentation unavailable: {msg}")
+                raise
+
+            self.assertIsNotNone(app._window)
+            backend = app._window.backend
+            self.assertTrue(bool(backend.device_name))
+
+            app.is_running = True
+            app.dt = 1.0 / 60.0
+            app.elapsed_time = 0.2
+
+            # Frame 1: metallic PBR + HUD capture
+            backend.request_frame_capture()
+            app.frame_count = 1
+            app.update(app.dt)
+            app.render()
+            self.assertIsNotNone(backend.last_captured_frame)
+            cap_w, cap_h, pbr_rgba = backend.last_captured_frame
+            self.assertEqual(len(pbr_rgba), cap_w * cap_h * 4)
+
+            cx, cy = cap_w // 2, cap_h // 2
+            center_off = (cy * cap_w + cx) * 4
+            center_rgb = tuple(pbr_rgba[center_off : center_off + 3])
+            self.assertGreater(sum(center_rgb), 80)
+
+            # Frame 2: normal debug mode produces distinct surface colors at viewport center
+            app.handle_key_press("3")
+            backend.request_frame_capture()
+            app.frame_count = 2
+            app.render()
+            _, _, norm_rgba = backend.last_captured_frame
+            norm_rgb = tuple(norm_rgba[center_off : center_off + 3])
+            self.assertNotEqual(center_rgb, norm_rgb)
+
+            # Frame 3: dielectric material + window resize
+            app.handle_key_press("2")
+            app._window.glfw.set_window_size(app._window.window, 360, 270)
+            app._window.poll_and_sync(app)
+            backend.request_frame_capture()
+            app.frame_count = 3
+            app.render()
+            res_w, res_h, resized_rgba = backend.last_captured_frame
+            self.assertEqual(len(resized_rgba), res_w * res_h * 4)
+            self.assertGreater(res_w, 0)
+            self.assertGreater(res_h, 0)
+        finally:
+            if app is not None:
+                app.cleanup()
+            if prev_val is None:
+                os.environ.pop("MLIR_GPU_TEST_VALIDATION", None)
+            else:
+                os.environ["MLIR_GPU_TEST_VALIDATION"] = prev_val
+
     def test_offscreen_render_uses_gpu_viewer(self) -> None:
         """Verifies that offscreen rendering dispatches through mlir_gpu.viewer.render_offscreen."""
         import examples.minigfx.samples.model_viewer as mv_module

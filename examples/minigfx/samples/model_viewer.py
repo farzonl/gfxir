@@ -54,9 +54,12 @@ from examples.minigfx.scene import (
 # Ensure local repository compiler toolchain directories are accessible in PATH
 for _extra_bin in [
     _repo_root / "build" / "compiler" / "bin",
+    _repo_root / "build" / "native",
+    _repo_root / "build" / "native" / "Release",
     _repo_root / ".tools" / "bin",
     _repo_root / ".toolchains" / "llvm-build" / "bin",
     _repo_root / ".sdk" / "bin",
+    _repo_root / ".sdk" / "bin" / "x64",
 ]:
     if _extra_bin.is_dir() and str(_extra_bin) not in os.environ.get("PATH", "").split(os.pathsep):
         os.environ["PATH"] = (
