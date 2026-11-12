@@ -232,6 +232,34 @@ def compute_binary_silhouette_mask(
     return mask
 
 
+def compute_foreground_coverage(
+    rgba: bytes | bytearray | Any,
+    bg_color: Tuple[int, ...] = (13, 13, 20, 255),
+) -> float:
+    """Compute robust foreground coverage percentage rejecting background clear color and degenerate pixels."""
+    if hasattr(rgba, "convert") and hasattr(rgba, "tobytes"):
+        rgba = rgba.convert("RGBA").tobytes()
+    elif not isinstance(rgba, (bytes, bytearray)):
+        raise TypeError(f"Expected bytes or PIL Image, got {type(rgba).__name__}")
+
+    total_pixels = len(rgba) // 4
+    if total_pixels == 0:
+        return 0.0
+
+    if len(bg_color) == 3:
+        bg_bytes = bytes((*bg_color, 255))
+    else:
+        bg_bytes = bytes(bg_color[:4])
+    black_opaque = bytes((0, 0, 0, 255))
+    black_zero = bytes((0, 0, 0, 0))
+
+    fg_count = sum(
+        1 for i in range(0, total_pixels * 4, 4)
+        if rgba[i : i + 4] not in (bg_bytes, black_opaque, black_zero)
+    )
+    return (fg_count / total_pixels) * 100.0
+
+
 def compute_silhouette_match_ratio(
     im1: Sequence[bool] | bytes | bytearray | Any,
     im2: Sequence[bool] | bytes | bytearray | Any,
@@ -266,64 +294,51 @@ def render_scene_frame(
     height: int = 64,
     time: float | None = None,
 ) -> RenderedImage:
-    """Render a deterministic offscreen frame for the given backend and scene."""
-    if time is None:
-        time = frame_index / 60.0
+    """Render a deterministic offscreen frame via ModelViewerApp and genuine GPU execution."""
+    from examples.minigfx.samples.model_viewer import ModelViewerApp
 
-    # Background clear color (13, 13, 20, 255)
-    bg = (13, 13, 20, 255)
-    pixels = bytearray(bytes(bg) * (width * height))
+    valid_targets = ("vulkan", "metal", "directx")
+    if not isinstance(backend, str):
+        raise TypeError(f"Target backend must be a string, got {type(backend).__name__}")
+    backend = backend.lower()
+    if backend not in valid_targets:
+        raise ValueError(f"Invalid target backend {backend!r}; choose from {valid_targets}")
 
-    # Dynamic directional lighting angle based on continuous simulation time
-    theta = time * 0.8
-    lx = math.cos(theta)
-    ly = -0.5
-    lz = math.sin(theta)
-    l_len = math.sqrt(lx * lx + ly * ly + lz * lz)
-    lx, ly, lz = lx / l_len, ly / l_len, lz / l_len
+    if isinstance(frame_index, bool) or not isinstance(frame_index, int) or frame_index < 0:
+        raise ValueError(f"Frame index must be a non-negative integer, got frame_index={frame_index}")
 
-    # Center object: sphere rasterization
-    cx, cy = width / 2.0, height / 2.0
-    radius = min(width, height) * 0.35
+    for dim_name, dim_val in (("width", width), ("height", height)):
+        if isinstance(dim_val, bool) or not isinstance(dim_val, int) or dim_val <= 0:
+            raise ValueError(f"Dimensions must be positive integers, got {dim_name}={dim_val}")
 
-    # Realistic backend floating-point rasterization jitter simulation (sub-ULP, max delta <= 1)
-    backend_jitter = 0
-    if backend == "metal":
-        backend_jitter = 1
-    elif backend == "directx":
-        backend_jitter = -1 if frame_index % 2 == 0 else 0
-
-    for y in range(height):
-        ny = (y - cy) / radius
-        row_offset = y * width * 4
-        for x in range(width):
-            nx = (x - cx) / radius
-            r2 = nx * nx + ny * ny
-            if r2 <= 1.0:
-                nz = math.sqrt(max(0.0, 1.0 - r2))
-                ndotl = max(0.0, nx * (-lx) + ny * (-ly) + nz * (-lz))
-                base_r, base_g, base_b = 180, 50, 50
-                diffuse = 0.2 + 0.8 * ndotl
-                out_r = min(255, max(0, int(base_r * diffuse) + (backend_jitter if (x + y) % 7 == 0 else 0)))
-                out_g = min(255, max(0, int(base_g * diffuse)))
-                out_b = min(255, max(0, int(base_b * diffuse)))
-                pix_offset = row_offset + x * 4
-                pixels[pix_offset : pix_offset + 4] = bytes([out_r, out_g, out_b, 255])
-
-    rgba_bytes = bytes(pixels)
-    if RenderedImage is not None:
-        return RenderedImage(width=width, height=height, rgba=rgba_bytes, device=backend)
-
-    from dataclasses import dataclass
-
-    @dataclass(frozen=True)
-    class _FallbackRenderedImage:
-        width: int
-        height: int
-        rgba: bytes
-        device: str
-
-    return _FallbackRenderedImage(width=width, height=height, rgba=rgba_bytes, device=backend)  # type: ignore
+    args = ModelViewerApp.parse_args([
+        "--offscreen",
+        "--target", backend,
+        "--width", str(width),
+        "--height", str(height),
+        "--frames", str(frame_index + 1),
+    ])
+    app = ModelViewerApp(args)
+    app.debug_overlay = None
+    try:
+        app.startup()
+    except Exception:
+        app.cleanup()
+        raise
+    try:
+        if time is not None:
+            frames = int(round(time * 60.0))
+            for f in range(frames + 1):
+                app.frame_count = f
+                app.update(1.0 / 60.0)
+            app.elapsed_time = time
+        else:
+            for f in range(frame_index + 1):
+                app.frame_count = f
+                app.update(1.0 / 60.0)
+        return app.render_offscreen_frame()
+    finally:
+        app.cleanup()
 
 
 def get_golden_parity_rules_path() -> Path:
@@ -625,18 +640,94 @@ class TestSilhouetteMatching(unittest.TestCase):
 
     def test_anti_false_success_coverage_guard(self):
         """Rejects empty/black framebuffers where foreground coverage is <= 1%."""
-        bg = (13, 13, 20, 255)
-        empty_frame = bytes(bg) * (64 * 64)
-        mask = compute_binary_silhouette_mask(empty_frame, bg_color=bg)
-        coverage_pct = (sum(mask) / len(mask)) * 100.0
-        self.assertEqual(coverage_pct, 0.0)
-        self.assertLessEqual(coverage_pct, 1.0, "Empty frame must have coverage <= 1.0%")
+        bg_bytes = bytes((13, 13, 20, 255))
+        black_opaque = bytes((0, 0, 0, 255))
+        black_zero = bytes((0, 0, 0, 0))
+
+        for degenerate_buffer, desc in [
+            (bg_bytes * (64 * 64), "background clear color"),
+            (black_opaque * (64 * 64), "all-black opaque"),
+            (black_zero * (64 * 64), "all-zero"),
+            (b"", "empty buffer"),
+        ]:
+            total_pixels = len(degenerate_buffer) // 4
+            if total_pixels == 0:
+                cov = 0.0
+            else:
+                fg_count = sum(
+                    1 for i in range(0, total_pixels * 4, 4)
+                    if degenerate_buffer[i : i + 4] not in (bg_bytes, black_opaque, black_zero)
+                )
+                cov = (fg_count / total_pixels) * 100.0
+            self.assertEqual(cov, 0.0)
+            self.assertLessEqual(cov, 1.0, f"Degenerate frame ({desc}) must have coverage <= 1.0%")
 
         # Normal scene frame has substantive coverage
-        rendered = render_scene_frame("vulkan", width=64, height=64)
-        rendered_mask = compute_binary_silhouette_mask(rendered.rgba, bg_color=bg)
-        rendered_coverage = (sum(rendered_mask) / len(rendered_mask)) * 100.0
-        self.assertGreater(rendered_coverage, 1.0, "Rendered scene must have foreground coverage > 1.0%")
+        try:
+            rendered = render_scene_frame("vulkan", width=64, height=64)
+        except ViewerError as exc:
+            self.skipTest(f"Live graphics device or driver not available on this host: {exc}")
+        viewer_bg = bytes((5, 5, 10, 255))
+        total_pixels = len(rendered.rgba) // 4
+        if total_pixels == 0:
+            rendered_cov = 0.0
+        else:
+            fg_count = sum(
+                1 for i in range(0, total_pixels * 4, 4)
+                if rendered.rgba[i : i + 4] not in (bg_bytes, viewer_bg, black_opaque, black_zero)
+            )
+            rendered_cov = (fg_count / total_pixels) * 100.0
+        self.assertGreater(
+            rendered_cov, 1.0, f"Rendered scene must have foreground coverage > 1.0%, got {rendered_cov:.2f}%"
+        )
+
+    def test_degenerate_buffers_foreground_coverage_below_threshold(self):
+        """Degenerate buffers (black opaque, black zero, clear-color, empty, non-aligned) produce coverage <= 1.0%."""
+        bg_bytes = bytes((13, 13, 20, 255))
+        black_opaque = bytes((0, 0, 0, 255))
+        black_zero = bytes((0, 0, 0, 0))
+
+        cases = [
+            ("all-black opaque", black_opaque * (48 * 48)),
+            ("all-zero", black_zero * (48 * 48)),
+            ("background clear color", bg_bytes * (48 * 48)),
+            ("empty buffer", b""),
+        ]
+
+        # Non-aligned buffers (1..3 trailing partial bytes)
+        for n_bytes in (5, 6, 7, 9, 13):
+            full_px = n_bytes // 4
+            rem = n_bytes % 4
+            cases.append((f"{n_bytes}-byte all-zero", (black_zero * full_px) + b"\x00" * rem))
+            cases.append((f"{n_bytes}-byte all-black opaque", (black_opaque * full_px) + black_opaque[:rem]))
+            cases.append((f"{n_bytes}-byte background clear color", (bg_bytes * full_px) + bg_bytes[:rem]))
+
+        for name, buf in cases:
+            with self.subTest(case=name):
+                total_pixels = len(buf) // 4
+                if total_pixels == 0:
+                    cov = 0.0
+                else:
+                    fg_count = sum(
+                        1 for i in range(0, total_pixels * 4, 4)
+                        if buf[i : i + 4] not in (bg_bytes, black_opaque, black_zero)
+                    )
+                    cov = (fg_count / total_pixels) * 100.0
+                self.assertEqual(cov, 0.0)
+                self.assertLessEqual(cov, 1.0, f"Degenerate buffer '{name}' must have coverage <= 1.0%, got {cov:.2f}%")
+                self.assertEqual(compute_foreground_coverage(buf), 0.0)
+
+    def test_foreground_coverage_three_tuple_bg_color_normalized(self):
+        """3-tuple bg_color without explicit alpha correctly identifies clear pixels as background (0.0%)."""
+        bg_3tuple = (13, 13, 20)
+        clear_buffer = bytes((13, 13, 20, 255)) * (48 * 48)
+        cov = compute_foreground_coverage(clear_buffer, bg_color=bg_3tuple)
+        self.assertEqual(cov, 0.0, f"Expected 0.0% coverage for clear buffer with 3-tuple bg_color, got {cov:.2f}%")
+
+        # Mixed buffer with known foreground pixel
+        mixed_buffer = (bytes((13, 13, 20, 255)) * 3) + bytes((255, 0, 0, 255))
+        mixed_cov = compute_foreground_coverage(mixed_buffer, bg_color=bg_3tuple)
+        self.assertAlmostEqual(mixed_cov, 25.0, places=2)
 
     def test_silhouette_empty_and_solid_frames(self):
         """Verifies boundary states: 100% background and 100% foreground."""
@@ -674,21 +765,30 @@ class TestOffscreenFrameRendering(unittest.TestCase):
 
     def test_offscreen_frame_0_reproducibility(self):
         """Rendering frame 0 twice produces bitwise identical buffers."""
-        f0_a = render_scene_frame("vulkan", frame_index=0, width=32, height=32)
-        f0_b = render_scene_frame("vulkan", frame_index=0, width=32, height=32)
+        try:
+            f0_a = render_scene_frame("vulkan", frame_index=0, width=32, height=32)
+            f0_b = render_scene_frame("vulkan", frame_index=0, width=32, height=32)
+        except ViewerError as exc:
+            self.skipTest(f"Live graphics device or driver not available on this host: {exc}")
         self.assertEqual(compute_max_channel_delta(f0_a.rgba, f0_b.rgba), 0)
 
     def test_offscreen_frame_10_animation_advancement(self):
         """Frame 10 produces non-zero delta relative to Frame 0 due to orbital motion."""
-        f0 = render_scene_frame("vulkan", frame_index=0, width=32, height=32)
-        f10 = render_scene_frame("vulkan", frame_index=10, width=32, height=32)
+        try:
+            f0 = render_scene_frame("vulkan", frame_index=0, width=32, height=32)
+            f10 = render_scene_frame("vulkan", frame_index=10, width=32, height=32)
+        except ViewerError as exc:
+            self.skipTest(f"Live graphics device or driver not available on this host: {exc}")
         delta = compute_max_channel_delta(f0.rgba, f10.rgba)
         self.assertGreater(delta, 0, "Temporal advancement at frame 10 must alter lighting/pixels")
 
     def test_offscreen_frame_60_steady_state(self):
         """Frame 60 exhibits significant simulation advancement relative to Frame 10."""
-        f10 = render_scene_frame("vulkan", frame_index=10, width=32, height=32)
-        f60 = render_scene_frame("vulkan", frame_index=60, width=32, height=32)
+        try:
+            f10 = render_scene_frame("vulkan", frame_index=10, width=32, height=32)
+            f60 = render_scene_frame("vulkan", frame_index=60, width=32, height=32)
+        except ViewerError as exc:
+            self.skipTest(f"Live graphics device or driver not available on this host: {exc}")
         delta = compute_max_channel_delta(f10.rgba, f60.rgba)
         self.assertGreater(delta, 5, "Frame 60 must have significant orbital displacement")
 
@@ -696,7 +796,10 @@ class TestOffscreenFrameRendering(unittest.TestCase):
         """write_png generates a valid W3C PNG file with correct header and dimensions."""
         if write_png is None:
             self.skipTest("write_png is not available")
-        img = render_scene_frame("vulkan", frame_index=0, width=32, height=32)
+        try:
+            img = render_scene_frame("vulkan", frame_index=0, width=32, height=32)
+        except ViewerError as exc:
+            self.skipTest(f"Live graphics device or driver not available on this host: {exc}")
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
             p = Path(tf.name)
         p.unlink(missing_ok=True)
@@ -748,6 +851,88 @@ class TestOffscreenFrameRendering(unittest.TestCase):
         view_proj = proj * view
         self.assertIsInstance(view_proj, mgfx_math.Mat4x4)
 
+    def test_render_scene_frame_case_insensitive_backends_do_not_raise_system_exit_or_value_error(self):
+        """Valid backends with uppercase or title-case letters are normalized and do not raise SystemExit or ValueError."""
+        for backend_variant in ("Vulkan", "Metal", "DirectX", "VULKAN", "METAL", "DIRECTX"):
+            with self.subTest(backend=backend_variant):
+                try:
+                    render_scene_frame(backend=backend_variant, width=64, height=64)
+                except ViewerError:
+                    # Expected in test environments without live graphics runtime
+                    pass
+                except (SystemExit, ValueError) as exc:
+                    self.fail(f"backend={backend_variant!r} raised unexpected {type(exc).__name__}: {exc}")
+
+    def test_render_scene_frame_invalid_frame_index_raises_value_error(self):
+        """Pre-validation on negative, non-integer, or boolean frame_index raises ValueError instead of SystemExit."""
+        invalid_indices = (-1, -5, float("nan"), float("inf"), True, False, 1.5, "0")
+        for f_idx in invalid_indices:
+            with self.subTest(frame_index=f_idx):
+                with self.assertRaises(ValueError) as ctx:
+                    render_scene_frame(frame_index=f_idx)  # type: ignore[arg-type]
+                self.assertIn("Frame index must be a non-negative integer", str(ctx.exception))
+
+    def test_render_scene_frame_invalid_backend_raises_type_error(self):
+        """Pre-validation on non-string backend raises TypeError."""
+        for invalid_backend in (123, None, ["vulkan"], 3.14):
+            with self.subTest(backend=invalid_backend):
+                with self.assertRaises(TypeError) as ctx:
+                    render_scene_frame(backend=invalid_backend)  # type: ignore[arg-type]
+                self.assertIn("Target backend must be a string", str(ctx.exception))
+
+    def test_render_scene_frame_invalid_backend_raises_value_error(self):
+        """Pre-validation on invalid backend raises ValueError instead of SystemExit."""
+        for invalid_target in ("", "none", "opengl", "software", "unsupported_backend"):
+            with self.subTest(target=invalid_target):
+                with self.assertRaises(ValueError) as ctx:
+                    render_scene_frame(backend=invalid_target)
+                self.assertIn("Invalid target backend", str(ctx.exception))
+
+    def test_render_scene_frame_invalid_dimensions_raise_value_error(self):
+        """Pre-validation on non-positive or non-integer width/height raises ValueError instead of SystemExit."""
+        invalid_dims = (0, -1, -999999, float("nan"), float("inf"), True, False, 1.5, "64")
+        for d in invalid_dims:
+            with self.subTest(dim="width", val=d):
+                with self.assertRaises(ValueError) as ctx:
+                    render_scene_frame(width=d, height=64)  # type: ignore[arg-type]
+                self.assertIn("Dimensions must be positive integers", str(ctx.exception))
+            with self.subTest(dim="height", val=d):
+                with self.assertRaises(ValueError) as ctx:
+                    render_scene_frame(width=64, height=d)  # type: ignore[arg-type]
+                self.assertIn("Dimensions must be positive integers", str(ctx.exception))
+
+    def test_simulation_stepping_bitwise_parity_between_time_and_frame_index(self):
+        """Simulation advancement matches bitwise between time=N/60.0 and frame_index=N."""
+        from examples.minigfx.samples.model_viewer import ModelViewerApp
+
+        app_time = ModelViewerApp(ModelViewerApp.parse_args(["--offscreen", "--frames", "61"]))
+        frames = int(round(1.0 * 60.0))
+        for f in range(frames + 1):
+            app_time.frame_count = f
+            app_time.update(1.0 / 60.0)
+        app_time.elapsed_time = 1.0
+
+        app_frame = ModelViewerApp(ModelViewerApp.parse_args(["--offscreen", "--frames", "61"]))
+        for f in range(60 + 1):
+            app_frame.frame_count = f
+            app_frame.update(1.0 / 60.0)
+
+        try:
+            self.assertEqual(app_time.light_angle, app_frame.light_angle)
+            self.assertEqual(app_time.light_params.direction.x, app_frame.light_params.direction.x)
+            self.assertEqual(app_time.light_params.direction.y, app_frame.light_params.direction.y)
+            self.assertEqual(app_time.light_params.direction.z, app_frame.light_params.direction.z)
+        finally:
+            app_time.cleanup()
+            app_frame.cleanup()
+
+        try:
+            r_time = render_scene_frame("vulkan", time=1.0, width=32, height=32)
+            r_frame = render_scene_frame("vulkan", frame_index=60, width=32, height=32)
+            self.assertEqual(compute_max_channel_delta(r_time.rgba, r_frame.rgba), 0)
+        except ViewerError:
+            pass
+
 
 # ===========================================================================
 # Suite 4: TestCrossBackendParity
@@ -760,18 +945,75 @@ class TestCrossBackendParity(unittest.TestCase):
         if imgdiff is None:
             self.skipTest("tests.lit.execution.Inputs.imgdiff is not available")
 
-    def test_cross_backend_synthetic_vulkan_metal_dx12_parity(self):
+    def test_offline_embedded_pipeline_compilation_cross_backend(self):
+        """Verifies that embedded shader pipelines compile to valid manifests unconditionally across Vulkan, Metal, and DirectX."""
+        from examples.minigfx.samples.model_viewer import ModelViewerApp
+
+        for target in ("vulkan", "metal", "directx"):
+            with self.subTest(target=target):
+                args = ModelViewerApp.parse_args([
+                    "--offscreen",
+                    "--frames", "0",
+                    "--target", target,
+                    "--width", "32",
+                    "--height", "32",
+                ])
+                app = ModelViewerApp(args)
+                try:
+                    manifest_path = app.compile_embedded_pipeline(target)
+                    self.assertTrue(manifest_path.is_file(), f"{target} pipeline manifest missing at {manifest_path}")
+                finally:
+                    app.cleanup()
+
+    def test_cross_backend_render_parity(self):
         """Verifies multi-backend render parity across Vulkan, Metal, and DirectX 12."""
-        backends = ["vulkan", "metal", "directx"]
+        backends: List[str] = []
+        candidate_backends = ["vulkan"]
+        if sys.platform == "darwin":
+            candidate_backends.append("metal")
+        elif sys.platform == "win32":
+            candidate_backends.append("directx")
+
         frames = [0, 10, 60]
+        renders: Dict[str, Dict[int, RenderedImage]] = {}
+
+        for b in candidate_backends:
+            try:
+                backend_renders = {}
+                for f_idx in frames:
+                    frame = render_scene_frame(b, frame_index=f_idx, width=48, height=48)
+                    bg_bytes = bytes((13, 13, 20, 255))
+                    viewer_bg = bytes((5, 5, 10, 255))
+                    black_opaque = bytes((0, 0, 0, 255))
+                    black_zero = bytes((0, 0, 0, 0))
+                    total_pixels = len(frame.rgba) // 4
+                    if total_pixels == 0:
+                        cov = 0.0
+                    else:
+                        fg_count = sum(
+                            1 for i in range(0, total_pixels * 4, 4)
+                            if frame.rgba[i : i + 4] not in (bg_bytes, viewer_bg, black_opaque, black_zero)
+                        )
+                        cov = (fg_count / total_pixels) * 100.0
+                    self.assertGreater(
+                        cov, 1.0, f"Candidate frame on backend {b} at frame {f_idx} has insufficient foreground coverage ({cov:.2f}% <= 1.0%)"
+                    )
+                    backend_renders[f_idx] = frame
+                renders[b] = backend_renders
+                backends.append(b)
+            except ViewerError as exc:
+                continue
+
+        if len(backends) < 2:
+            self.skipTest(
+                f"Cross-backend render parity requires at least 2 active backends (available on this host: {backends})"
+            )
 
         for f_idx in frames:
-            renders = {b: render_scene_frame(b, frame_index=f_idx, width=48, height=48) for b in backends}
-            # Pairwise assertions
             for i in range(len(backends)):
                 for j in range(i + 1, len(backends)):
                     b1, b2 = backends[i], backends[j]
-                    r1, r2 = renders[b1], renders[b2]
+                    r1, r2 = renders[b1][f_idx], renders[b2][f_idx]
 
                     # 1. Maximum per-channel delta <= 2/255
                     max_d = compute_max_channel_delta(r1.rgba, r2.rgba)
@@ -780,7 +1022,9 @@ class TestCrossBackendParity(unittest.TestCase):
                     )
 
                     # 2. Binary silhouette match ratio >= 99.5%
-                    ratio = compute_silhouette_match_ratio(r1.rgba, r2.rgba)
+                    ratio = compute_silhouette_match_ratio(
+                        r1.rgba, r2.rgba, threshold=1, bg_color=(5, 5, 10, 255)
+                    )
                     self.assertGreaterEqual(
                         ratio, 99.5, f"Silhouette match ratio {ratio:.2f}% < 99.5% between {b1} and {b2}"
                     )
@@ -793,7 +1037,10 @@ class TestCrossBackendParity(unittest.TestCase):
 
     def test_cross_backend_rejection_on_color_divergence(self):
         """Artificially divergent color buffer triggers parity failure."""
-        r_ref = render_scene_frame("vulkan", width=32, height=32)
+        try:
+            r_ref = render_scene_frame("vulkan", width=32, height=32)
+        except ViewerError as exc:
+            self.skipTest(f"Live graphics device or driver not available on this host: {exc}")
         # Shift green channel by 15 units
         altered_rgba = bytearray(r_ref.rgba)
         for i in range(1, len(altered_rgba), 4):
@@ -804,7 +1051,10 @@ class TestCrossBackendParity(unittest.TestCase):
 
     def test_cross_backend_rejection_on_orientation_inversion(self):
         """Inverted Y coordinate (upside-down rendering) is caught as a parity failure."""
-        r_ref = render_scene_frame("vulkan", width=32, height=32)
+        try:
+            r_ref = render_scene_frame("vulkan", width=32, height=32)
+        except ViewerError as exc:
+            self.skipTest(f"Live graphics device or driver not available on this host: {exc}")
         w, h = 32, 32
         row_size = w * 4
         # Flip vertically
@@ -866,8 +1116,11 @@ class TestCrossBackendParity(unittest.TestCase):
             img_vk = tdp / "vulkan.png"
             img_mt = tdp / "metal.png"
 
-            r_vk = render_scene_frame("vulkan", frame_index=0, width=32, height=32)
-            r_mt = render_scene_frame("metal", frame_index=0, width=32, height=32)
+            try:
+                r_vk = render_scene_frame("vulkan", frame_index=0, width=32, height=32)
+                r_mt = render_scene_frame("metal", frame_index=0, width=32, height=32)
+            except ViewerError as exc:
+                self.skipTest(f"Live graphics device or driver not available on this host: {exc}")
 
             write_png(img_vk, r_vk)
             write_png(img_mt, r_mt)
