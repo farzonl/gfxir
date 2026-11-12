@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import inspect
+import json
 import math
 import os
 import sys
@@ -10,12 +12,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 from examples.minigfx.app import App
 from examples.minigfx.camera import Camera, CameraParams, OrbitController
 from examples.minigfx.material import LightParams, MaterialParams
 from examples.minigfx.math import Mat4x4, Quat, Vec2, Vec3, Vec4
-from examples.minigfx.samples.model_viewer import ModelViewerApp
+from examples.minigfx.samples.model_viewer import ModelViewerApp, ModelVertex, model_vertex_shader
+from mlir_gpu.viewer import RenderedImage, ViewerError
 
 
 class TestModelViewerApp(unittest.TestCase):
@@ -186,8 +190,10 @@ class TestModelViewerApp(unittest.TestCase):
 
         self.assertEqual(dir_paused, dir_after)
 
-    def test_zero_light_intensity_render_safety(self) -> None:
+    @patch("examples.minigfx.samples.model_viewer.render_offscreen")
+    def test_zero_light_intensity_render_safety(self, mock_render: MagicMock) -> None:
         """Verifies rendering proceeds cleanly without divide-by-zero when light intensity is zero."""
+        mock_render.return_value = RenderedImage(640, 480, b"\x00" * (640 * 480 * 4), "test_device")
         args = ModelViewerApp.parse_args(["--offscreen", "--frames", "0"])
         app = ModelViewerApp(args)
 
@@ -195,29 +201,54 @@ class TestModelViewerApp(unittest.TestCase):
         commands = app.render()
         self.assertIsInstance(commands, list)
 
-    def test_missing_model_file_procedural_fallback(self) -> None:
-        """Verifies passing non-existent model path falls back to default procedural mesh."""
+    def test_missing_model_file_raises_file_not_found(self) -> None:
+        """Verifies passing a non-existent model path raises FileNotFoundError immediately."""
         args = ModelViewerApp.parse_args(["--offscreen", "--frames", "0", "--model", "missing_model_file.obj"])
-        app = ModelViewerApp(args)
+        with self.assertRaises(FileNotFoundError):
+            ModelViewerApp(args)
 
-        self.assertGreater(len(app.scene.children), 0)
-        self.assertIsNotNone(app.model_node.mesh)
-        self.assertGreater(len(app.model_node.mesh.vertices), 0)
-
-    def test_corrupted_model_file_fallback(self) -> None:
-        """Verifies corrupted OBJ file triggers graceful fallback to default procedural mesh."""
+    def test_corrupted_model_file_raises_value_error(self) -> None:
+        """Verifies corrupted OBJ file without valid geometry raises ValueError immediately."""
         with tempfile.NamedTemporaryFile("w", suffix=".obj", delete=False) as f:
             f.write("corrupted obj content with invalid syntax $$$$")
             corrupt_path = f.name
 
         try:
             args = ModelViewerApp.parse_args(["--offscreen", "--frames", "0", "--model", corrupt_path])
-            app = ModelViewerApp(args)
-            self.assertGreater(len(app.scene.children), 0)
-            self.assertIsNotNone(app.model_node.mesh)
+            with self.assertRaises(ValueError):
+                ModelViewerApp(args)
         finally:
             if os.path.exists(corrupt_path):
                 os.unlink(corrupt_path)
+
+    def test_malformed_syntax_model_file_raises_value_error(self) -> None:
+        """Verifies OBJ file with malformed syntax raises ValueError immediately."""
+        with tempfile.NamedTemporaryFile("w", suffix=".obj", delete=False) as f:
+            f.write("v 1.0 2.0\n")
+            malformed_path = f.name
+
+        try:
+            args = ModelViewerApp.parse_args(["--offscreen", "--frames", "0", "--model", malformed_path])
+            with self.assertRaises(ValueError):
+                ModelViewerApp(args)
+        finally:
+            if os.path.exists(malformed_path):
+                os.unlink(malformed_path)
+
+    def test_empty_model_argument_raises_error(self) -> None:
+        """Verifies empty --model argument string raises an error immediately."""
+        args = ModelViewerApp.parse_args(["--offscreen", "--frames", "0", "--model", ""])
+        with self.assertRaises((ValueError, FileNotFoundError)):
+            ModelViewerApp(args)
+
+    def test_omitted_model_argument_loads_default_model(self) -> None:
+        """Verifies omitting --model argument loads the default procedural model mesh."""
+        args = ModelViewerApp.parse_args(["--offscreen", "--frames", "0"])
+        app = ModelViewerApp(args)
+        self.assertIsNone(app.model_path)
+        self.assertIsNotNone(app.model_node.mesh)
+        self.assertEqual(len(app.model_node.mesh.vertices), 42)
+        self.assertEqual(len(app.model_node.mesh.indices), 240)
 
     def test_custom_valid_obj_model_loading(self) -> None:
         """Verifies custom valid Wavefront OBJ file is loaded successfully into central model node."""
@@ -271,14 +302,17 @@ f 2 4 3
         self.assertEqual(exit_code, 0)
         self.assertEqual(app.frame_count, 0)
 
-    def test_headless_execution_with_finite_frames(self) -> None:
+    @patch("examples.minigfx.samples.model_viewer.render_offscreen")
+    def test_headless_execution_with_finite_frames(self, mock_render: MagicMock) -> None:
         """Verifies finite-frame execution renders requested number of frames and terminates."""
+        mock_render.return_value = RenderedImage(640, 480, b"\x00" * (640 * 480 * 4), "test_device")
         args = ModelViewerApp.parse_args(["--offscreen", "--frames", "3"])
         app = ModelViewerApp(args)
         exit_code = app.run()
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(app.frame_count, 3)
+        self.assertEqual(mock_render.call_count, 3)
 
     def test_command_line_argument_parsing_validation(self) -> None:
         """Verifies CLI parser validation rules for dimensions, frame counts, and backend targets."""
@@ -346,6 +380,90 @@ f 2 4 3
             self.assertIn(stage_key, shaders)
             self.assertTrue(shaders[stage_key].is_file())
             self.assertGreater(shaders[stage_key].stat().st_size, 0)
+
+    def test_offscreen_render_uses_gpu_viewer(self) -> None:
+        """Verifies that offscreen rendering dispatches through mlir_gpu.viewer.render_offscreen."""
+        import examples.minigfx.samples.model_viewer as mv_module
+
+        source = inspect.getsource(mv_module.ModelViewerApp.render_offscreen_frame)
+        self.assertIn("render_offscreen", source, "render_offscreen must be invoked directly")
+
+    def test_deterministic_offscreen_timing(self) -> None:
+        """Verifies that offscreen mode enforces deterministic 60.0 FPS / 16.7 ms timing."""
+        args = ModelViewerApp.parse_args(["--offscreen", "--frames", "1"])
+        app = ModelViewerApp(args)
+
+        app.update(dt=0.000001)  # Simulate microsecond spike
+        self.assertEqual(app.fps, 60.0)
+        self.assertAlmostEqual(app.dt, 1.0 / 60.0, places=5)
+
+    def test_embedded_pipeline_compilation(self) -> None:
+        """Verifies genuine shader compilation produces valid pipeline manifest and input layout."""
+        args = ModelViewerApp.parse_args(["--offscreen", "--frames", "0", "--target", "vulkan"])
+        app = ModelViewerApp(args)
+
+        manifest_path = app.compile_embedded_pipeline("vulkan")
+        self.assertTrue(manifest_path.exists())
+        manifest = json.loads(manifest_path.read_text())
+
+        self.assertIn("input_layout", manifest)
+        self.assertIn("entries", manifest)
+        self.assertEqual(len(manifest["entries"]), 2)
+        self.assertEqual(manifest["target"], "vulkan")
+
+    def test_clean_architecture_zero_base_class_monkeypatching(self) -> None:
+        """Verifies that importing model_viewer does not mutate base App, OrbitController, or DebugOverlay."""
+        from examples.minigfx.app import App as BaseApp
+        from examples.minigfx.camera import OrbitController as BaseOrbitController
+        import examples.minigfx.samples.model_viewer as mv_module
+
+        # Base App parser must NOT be contaminated with model_viewer-specific flags
+        base_parser = BaseApp.build_parser()
+        base_options = [opt for action in base_parser._actions for opt in action.option_strings]
+        self.assertNotIn("--model", base_options, "Base App.build_parser must not contain --model")
+        self.assertNotIn("--output", base_options, "Base App.build_parser must not contain --output")
+
+        # OrbitController class must not have monkeypatched property aliases
+        self.assertNotIn("azimuth", BaseOrbitController.__dict__, "OrbitController must not be monkeypatched with azimuth")
+        self.assertNotIn("elevation", BaseOrbitController.__dict__, "OrbitController must not be monkeypatched with elevation")
+
+    def test_dedicated_overlay_pipeline_compilation_and_draw_routing(self) -> None:
+        """Verifies dedicated overlay pipeline is compiled with depth disabled and routed to text quads."""
+        args = ModelViewerApp.parse_args(["--offscreen", "--frames", "0", "--target", "vulkan"])
+        app = ModelViewerApp(args)
+
+        pbr_manifest_path = app.compile_embedded_pipeline("vulkan")
+        self.assertTrue(pbr_manifest_path.exists())
+
+        overlay_manifest_path = pbr_manifest_path.parent.parent / "overlay" / "pipeline.json"
+        self.assertTrue(overlay_manifest_path.exists(), "Dedicated overlay pipeline.json must exist")
+
+        overlay_manifest = json.loads(overlay_manifest_path.read_text())
+        self.assertEqual(overlay_manifest["target"], "vulkan")
+        self.assertEqual(len(overlay_manifest["entries"]), 2)
+
+        depth_stencil = overlay_manifest.get("depth_stencil", {})
+        self.assertFalse(depth_stencil.get("depth_test_enable"), "Overlay pipeline must have depth test disabled")
+        self.assertFalse(depth_stencil.get("depth_write_enable"), "Overlay pipeline must have depth write disabled")
+        self.assertEqual(depth_stencil.get("depth_compare_op"), "always", "Overlay depth compare op must be always")
+
+        with patch("examples.minigfx.samples.model_viewer.render_offscreen") as mock_render:
+            mock_render.return_value = RenderedImage(640, 480, b"\x00" * (640 * 480 * 4), "test_device")
+            app.render_offscreen_frame()
+
+            multi_manifest_path = pbr_manifest_path.parent.parent / "multi_manifest.json"
+            self.assertTrue(multi_manifest_path.exists(), "multi_manifest.json must be generated")
+            multi_manifest = json.loads(multi_manifest_path.read_text())
+
+            self.assertIn("pbr_forward", multi_manifest["pipelines"])
+            self.assertIn("overlay", multi_manifest["pipelines"])
+
+            draws = multi_manifest["draws"]
+            overlay_draws = [d for d in draws if d["pipeline"] == "overlay"]
+            self.assertGreater(len(overlay_draws), 0, "Text quads must produce at least one overlay draw call")
+
+            for od in overlay_draws:
+                self.assertEqual(od["constant_size"], 48, "Overlay draw call must submit 48-byte OverlayParams constants")
 
 
 if __name__ == "__main__":

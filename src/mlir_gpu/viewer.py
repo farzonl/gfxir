@@ -53,8 +53,10 @@ class Shader:
 class PipelineState:
     vertex: Shader
     fragment: Shader
-    parameters: dict | None = None
+    parameters: dict | list | None = None
     interface: dict | None = None
+    depth_stencil: dict | None = None
+    input_layout: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +198,8 @@ def load_program(manifest: Path, *, vertex_buffer: Path | bytes | None = None, i
                 fragment=p_shaders["fragment"],
                 parameters=p_def.get("parameters"),
                 interface=p_def.get("interface"),
+                depth_stencil=p_def.get("depth_stencil"),
+                input_layout=p_def.get("input_layout"),
             )
 
         draw_calls: list[DrawCall] = []
@@ -609,6 +613,60 @@ def _metal_libraries(program: GraphicsProgram, toolchain: Toolchain):
             layout = directory / "frame-layout.json"
             layout.write_text(json.dumps(program.parameters, allow_nan=False))
             arguments.extend(["--frame-layout", str(layout)])
+        draws_list = getattr(program, "draws", None)
+        pipes_dict = getattr(program, "pipelines", None)
+        has_multi_spec = (
+            isinstance(draws_list, (list, tuple))
+            and len(draws_list) > 0
+            and (
+                len(draws_list) > 1
+                or (isinstance(pipes_dict, dict) and set(pipes_dict.keys()) != {"default"})
+                or any(
+                    (getattr(d, "parameters", None) if hasattr(d, "parameters") else d.get("parameters")) is not None
+                    or (getattr(d, "constant_size", 0) if hasattr(d, "constant_size") else d.get("constant_size", 0)) > 0
+                    for d in draws_list
+                )
+            )
+        )
+        if has_multi_spec:
+            multi_pipes: dict[str, Any] = {}
+            for pipe_id, p_state in (pipes_dict or {}).items():
+                safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", pipe_id)
+                pipe_libs: dict[str, str] = {}
+                for stage, shader in (("vertex", p_state.vertex), ("fragment", p_state.fragment)):
+                    primary = getattr(program, stage)
+                    if shader.code == primary.code and shader.entry_point == primary.entry_point:
+                        pipe_libs[stage] = str(directory / f"{stage}.metallib")
+                        continue
+                    lib_path = directory / f"{safe_id}_{stage}.metallib"
+                    if program.target == "directx":
+                        source = directory / f"{safe_id}_{stage}.dxil"
+                        validated = directory / f"{safe_id}_{stage}.validated.dxil"
+                        source.write_bytes(shader.code)
+                        _run([toolchain.find("dxv"), str(source), "-o", str(validated)])
+                        _check_binary(validated, b"DXBC", 32)
+                        convert_dxil_to_metallib(validated, lib_path, shader.entry_point, toolchain.find("metal-shaderconverter"))
+                    else:
+                        lib_path.write_bytes(shader.code)
+                    pipe_libs[stage] = str(lib_path)
+                multi_pipes[pipe_id] = {
+                    "vertex": pipe_libs["vertex"],
+                    "vertex_entry": p_state.vertex.entry_point,
+                    "fragment": pipe_libs["fragment"],
+                    "fragment_entry": p_state.fragment.entry_point,
+                    "parameters": p_state.parameters,
+                    "depth_stencil": p_state.depth_stencil,
+                    "input_layout": p_state.input_layout or program.input_layout,
+                }
+            multi_draws = []
+            for d in draws_list:
+                if hasattr(d, "to_dict"):
+                    multi_draws.append(d.to_dict())
+                elif isinstance(d, dict):
+                    multi_draws.append(dict(d))
+            multi_spec = directory / "multi-spec.json"
+            multi_spec.write_text(json.dumps({"pipelines": multi_pipes, "draws": multi_draws}, allow_nan=False))
+            arguments.extend(["--multi-spec", str(multi_spec)])
         yield directory, arguments
 
 
@@ -1414,8 +1472,12 @@ class _Vulkan:
                 max_size = max(max_size, (c_off if c_off > 0 else 80) + 80)
         for p in getattr(program, "pipelines", {}).values():
             p_params = getattr(p, "parameters", None)
-            if p_params is not None and isinstance(p_params, dict) and "bindings" in p_params and "vulkan" in p_params["bindings"]:
+            if isinstance(p_params, dict) and "bindings" in p_params and "vulkan" in p_params["bindings"]:
                 max_size = max(max_size, p_params["bindings"]["vulkan"]["offset"] + p_params["size"])
+            elif isinstance(p_params, list):
+                for block in p_params:
+                    if isinstance(block, dict) and "bindings" in block and "vulkan" in block["bindings"]:
+                        max_size = max(max_size, block["bindings"]["vulkan"]["offset"] + block["size"])
 
         if max_size > 0:
             if max_size > self.max_push_constants:
@@ -1464,6 +1526,31 @@ class _Vulkan:
                 vertexAttributeDescriptionCount=len(attrib_descs),
                 pVertexAttributeDescriptions=attrib_descs,
             ) if (binding_descs or attrib_descs) else vk.VkPipelineVertexInputStateCreateInfo()
+            pipe_depth_state = depth_stencil_state
+            p_ds = getattr(p_state, "depth_stencil", None)
+            if depth_format is not None and isinstance(p_ds, dict):
+                p_cmp_str = p_ds.get("depth_compare_op", "less_equal")
+                p_cmp_ops = {
+                    "never": vk.VK_COMPARE_OP_NEVER,
+                    "less": vk.VK_COMPARE_OP_LESS,
+                    "equal": vk.VK_COMPARE_OP_EQUAL,
+                    "less_equal": vk.VK_COMPARE_OP_LESS_OR_EQUAL,
+                    "greater": vk.VK_COMPARE_OP_GREATER,
+                    "not_equal": vk.VK_COMPARE_OP_NOT_EQUAL,
+                    "greater_equal": vk.VK_COMPARE_OP_GREATER_OR_EQUAL,
+                    "always": vk.VK_COMPARE_OP_ALWAYS,
+                }
+                if p_cmp_str not in p_cmp_ops:
+                    raise ViewerError(f"Unsupported depth compare op: '{p_cmp_str}'.")
+                pipe_depth_state = vk.VkPipelineDepthStencilStateCreateInfo(
+                    depthTestEnable=vk.VK_TRUE if p_ds.get("depth_test_enable", True) else vk.VK_FALSE,
+                    depthWriteEnable=vk.VK_TRUE if p_ds.get("depth_write_enable", True) else vk.VK_FALSE,
+                    depthCompareOp=p_cmp_ops[p_cmp_str],
+                    depthBoundsTestEnable=vk.VK_FALSE,
+                    stencilTestEnable=vk.VK_FALSE,
+                    minDepthBounds=0.0,
+                    maxDepthBounds=1.0,
+                )
             vk_pipe = vk.vkCreateGraphicsPipelines(self.device, vk.VK_NULL_HANDLE, 1, [vk.VkGraphicsPipelineCreateInfo(
                 pStages=stages,
                 pVertexInputState=vertex_input_state,
@@ -1477,7 +1564,7 @@ class _Vulkan:
                     frontFace=vk.VK_FRONT_FACE_COUNTER_CLOCKWISE, lineWidth=1.0,
                 ),
                 pMultisampleState=vk.VkPipelineMultisampleStateCreateInfo(rasterizationSamples=vk.VK_SAMPLE_COUNT_1_BIT),
-                pDepthStencilState=depth_stencil_state,
+                pDepthStencilState=pipe_depth_state,
                 pColorBlendState=vk.VkPipelineColorBlendStateCreateInfo(pAttachments=[vk.VkPipelineColorBlendAttachmentState(
                     colorWriteMask=vk.VK_COLOR_COMPONENT_R_BIT | vk.VK_COLOR_COMPONENT_G_BIT | vk.VK_COLOR_COMPONENT_B_BIT | vk.VK_COLOR_COMPONENT_A_BIT,
                 )]),
@@ -1555,18 +1642,21 @@ class _Vulkan:
                 vk.vkCmdBindVertexBuffers(command, 0, len(vb_handle), vb_handle, [0] * len(vb_handle))
             else:
                 vk.vkCmdBindVertexBuffers(command, 0, 1, [vb_handle], [0])
+        ib_handle = None
+        current_index_type = None
         if index_buffer is not None:
             ib_handle = (
                 self.create_buffer(resources, index_buffer, vk.VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
                 if isinstance(index_buffer, (bytes, bytearray, memoryview, str, Path))
                 else index_buffer
             )
-            vk_index_type = (
+            idx_type_str = getattr(draw, "index_type", None) or "uint16"
+            current_index_type = (
                 vk.VK_INDEX_TYPE_UINT16
-                if getattr(draw, "index_type", "uint16") in ("uint16", "u16")
+                if idx_type_str in ("uint16", "u16")
                 else vk.VK_INDEX_TYPE_UINT32
             )
-            vk.vkCmdBindIndexBuffer(command, ib_handle, 0, vk_index_type)
+            vk.vkCmdBindIndexBuffer(command, ib_handle, 0, current_index_type)
 
         extras_map, extras_draws = getattr(self, "pipeline_extras", {}).get(pipeline, (None, None))
         pipeline_map = getattr(pipeline, "pipeline_map", extras_map or {"default": pipeline})
@@ -1615,7 +1705,8 @@ class _Vulkan:
                         p_bytes = struct.pack(f"<{len(float_vals)}f", *float_vals) if float_vals else bytes(c_sz or 16)
                     else:
                         p_bytes = bytes(c_sz or 16)
-                    actual_off = c_off if c_off > 0 else 80
+                    default_off = parameters.get("size", 80) if isinstance(parameters, dict) else 0
+                    actual_off = c_off if (c_off > 0 or parameters is None) else default_off
                     vk.vkCmdPushConstants(command, layout,
                                           vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT,
                                           actual_off, len(p_bytes), vk.ffi.from_buffer(p_bytes))
@@ -1627,6 +1718,12 @@ class _Vulkan:
 
                 d_type = getattr(d, "type", "standard") if hasattr(d, "type") else d.get("type", "standard")
                 if d_type == "indexed":
+                    if ib_handle is not None:
+                        d_idx_str = (getattr(d, "index_type", None) if hasattr(d, "index_type") else d.get("index_type")) or "uint16"
+                        d_vk_idx_type = vk.VK_INDEX_TYPE_UINT16 if d_idx_str in ("uint16", "u16") else vk.VK_INDEX_TYPE_UINT32
+                        if d_vk_idx_type != current_index_type:
+                            vk.vkCmdBindIndexBuffer(command, ib_handle, 0, d_vk_idx_type)
+                            current_index_type = d_vk_idx_type
                     idx_cnt = getattr(d, "index_count", 0) if hasattr(d, "index_count") else d.get("index_count", 0)
                     inst_cnt = getattr(d, "instance_count", 1) if hasattr(d, "instance_count") else d.get("instance_count", 1)
                     first_idx = getattr(d, "first_index", 0) if hasattr(d, "first_index") else d.get("first_index", 0)

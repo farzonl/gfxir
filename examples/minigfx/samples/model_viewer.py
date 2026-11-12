@@ -2,13 +2,21 @@
 
 Demonstrates embedded Python shaders, shared CPU/GPU data structures,
 procedural and Wavefront OBJ meshes, dynamic lighting, orbit camera navigation,
-material presets, and headless execution across graphics backends.
+material presets, and genuine GPU offscreen execution across graphics backends.
 """
 
-from __future__ import annotations
 
-import sys
+import argparse
+import json
+import math
+import os
 from pathlib import Path
+import shutil
+import struct
+import sys
+import tempfile
+import time
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 # Ensure local repository root and src directory precede any external installs
 _repo_root = Path(__file__).resolve().parent.parent.parent.parent
@@ -17,41 +25,23 @@ if (_repo_root / "src").is_dir() and str(_repo_root / "src") != sys.path[0]:
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
-import argparse
-import math
-import os
-from pathlib import Path
-import struct
-import sys
-import tempfile
-import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
-import zlib
-
 from examples.minigfx.app import App
 from examples.minigfx.camera import Camera, CameraParams, OrbitController
 from examples.minigfx.debug import (
     DebugOverlay,
-    GLYPH_TABLE,
     OverlayParams,
-    draw_to_image,
-    format_metrics,
-    overlay_fragment_shader,
-    overlay_vertex_shader,
+    generate_text_quads,
 )
 from examples.minigfx.material import (
     LightParams,
     MaterialParams,
     ObjectParams,
-    _cpu_fragment,
     material_fragment_shader,
     material_vertex_shader,
-    pbr_fragment,
-    pbr_vertex,
 )
-from examples.minigfx.math import Mat4x4, Quat, Vec2, Vec3, Vec4
+from examples.minigfx.math import Mat4x4, Vec2, Vec3, Vec4
 from examples.minigfx.obj_loader import load_obj, load_obj_from_string
-from examples.minigfx.renderer import DrawCommand, ForwardRenderer, Pipeline
+from examples.minigfx.renderer import DrawCommand, ForwardRenderer
 from examples.minigfx.scene import (
     Mesh,
     Node,
@@ -73,61 +63,74 @@ for _extra_bin in [
             f"{_extra_bin}{os.pathsep}{os.environ['PATH']}" if os.environ.get("PATH") else str(_extra_bin)
         )
 
-try:
-    from mlir_gpu.compiler import Target, Toolchain, compile_pipeline
-    from mlir_gpu.frontend import Pipeline as GpuPipeline, Type
-    from mlir_gpu.viewer import RenderedImage, write_png
-
-    if Type is not None and not hasattr(Type, "MAT4X4") and hasattr(Type, "MAT4"):
-        Type.MAT4X4 = Type.MAT4
-except ImportError:
-    Target = Toolchain = compile_pipeline = GpuPipeline = Type = RenderedImage = write_png = None
-
-
-# Ensure DebugOverlay safely initializes params if missing upstream
-_orig_debug_init = DebugOverlay.__init__
-
-
-def _safe_debug_init(self, backend_name: str = "", params: Optional[Any] = None) -> None:
-    self.backend_name = backend_name
-    self.fps, self.frame_time_ms, self.draw_calls, self.visible_meshes = 0.0, 0.0, 0, 0
-    self.params = params if params is not None else OverlayParams()
-
-
-DebugOverlay.__init__ = _safe_debug_init
-
-
-# Provide azimuth and elevation property aliases on OrbitController if not present
-if not hasattr(OrbitController, "azimuth"):
-    OrbitController.azimuth = property(lambda self: self.yaw, lambda self, v: setattr(self, "yaw", v))
-if not hasattr(OrbitController, "elevation"):
-    OrbitController.elevation = property(lambda self: self.pitch, lambda self, v: setattr(self, "pitch", v))
+from mlir_gpu.compiler import (
+    MULTI_DRAW_SCHEMA_VERSION,
+    RASTER_CONVENTION,
+    Target,
+    TargetProfile,
+    compile_pipeline,
+)
+from mlir_gpu.frontend import (
+    DepthStencil,
+    Pipeline as GpuPipeline,
+    Type,
+    Vertex as GpuVertex,
+    fragment,
+    select,
+    vec4,
+    vertex,
+)
+from mlir_gpu.parameters import struct as gfx_struct
+from mlir_gpu.viewer import (
+    DrawCall,
+    RenderedImage,
+    load_program,
+    render_offscreen,
+    write_png,
+)
 
 
-# Ensure base App parser recognizes --model and --output
-_base_app_build_parser = App.build_parser
+@gfx_struct(layout="vertex")
+class ModelVertex:
+    """Standard 32-byte interleaved vertex layout for 3D meshes."""
+
+    position: Type.VEC3
+    normal: Type.VEC3
+    uv: Type.VEC2
 
 
-def _augmented_app_build_parser() -> argparse.ArgumentParser:
-    parser = _base_app_build_parser()
-    if not any(opt == "--model" for action in parser._actions for opt in action.option_strings):
-        parser.add_argument(
-            "--model",
-            type=str,
-            default=None,
-            help="Path to Wavefront OBJ 3D model file (default: embedded procedural model)",
-        )
-    if not any(opt == "--output" for action in parser._actions for opt in action.option_strings):
-        parser.add_argument(
-            "--output",
-            type=str,
-            default=None,
-            help="Path to output PNG image file when running offscreen",
-        )
-    return parser
+@vertex
+def model_vertex_shader(vert: ModelVertex, cam: CameraParams, obj: ObjectParams) -> GpuVertex:
+    """Embedded vertex shader executing genuine GPU transformation."""
+    world_pos = obj.model * vec4(vert.position[0], vert.position[1], vert.position[2], 1.0)
+    clip_pos = cam.view_proj * world_pos
+    return GpuVertex(
+        clip_pos,
+        varyings={
+            "normal": vert.normal,
+            "world_pos": world_pos.xyz,
+            "uv": vert.uv,
+        },
+    )
 
 
-App.build_parser = _augmented_app_build_parser
+@vertex
+def overlay_vertex_shader(vert: ModelVertex, params: OverlayParams) -> GpuVertex:
+    """Embedded overlay vertex shader passing 2D NDC coordinates to clip space."""
+    clip_pos = vec4(vert.position[0], vert.position[1], 0.0, 1.0)
+    return GpuVertex(
+        clip_pos,
+        varyings={
+            "uv": vert.uv,
+        },
+    )
+
+
+@fragment
+def overlay_fragment_shader(uv: Type.VEC2, params: OverlayParams) -> vec4:
+    """Embedded overlay fragment shader with procedural glyph cell shaping."""
+    edge = select((uv.x > 0.08) & (uv.x < 0.92) & (uv.y > 0.08) & (uv.y < 0.92), 1.0, 0.0)
+    return select(edge > 0.5, params.text_color, params.bg_color)
 
 
 # Compact embedded 42-vertex, 80-face geodesic sphere model for zero-dependency showcase
@@ -257,27 +260,6 @@ f 42 31 24
 """
 
 
-def _write_fallback_png(path: Path, width: int, height: int, rgba: bytes) -> None:
-    """Encode RGBA pixel buffer as standard uncompressed PNG file."""
-    path.unlink(missing_ok=True)
-    raw = bytearray()
-    row_bytes = width * 4
-    for y in range(height):
-        raw.append(0)
-        raw.extend(rgba[y * row_bytes : (y + 1) * row_bytes])
-    compressed = zlib.compress(bytes(raw), level=6)
-
-    def _chunk(tag: bytes, data: bytes) -> bytes:
-        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
-        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
-
-    with open(path, "wb") as f:
-        f.write(bytes([137, 80, 78, 71, 13, 10, 26, 10]))
-        f.write(_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)))
-        f.write(_chunk(b"IDAT", compressed))
-        f.write(_chunk(b"IEND", b""))
-
-
 class ModelViewerApp(App):
     """Interactive and headless 3D ModelViewer showcase application."""
 
@@ -292,6 +274,7 @@ class ModelViewerApp(App):
         super().__init__(args)
 
         self.model_path: Optional[str] = getattr(args, "model", None)
+        self._pipeline_dir: Optional[tempfile.TemporaryDirectory] = None
 
         # 1. Define materials palette
         self.materials: Dict[str, MaterialParams] = {
@@ -317,28 +300,25 @@ class ModelViewerApp(App):
         self.material_names: List[str] = ["metallic", "dielectric", "normal_debug"]
         self._material_index: int = 0
 
-        # 2. Load 3D model geometry with multi-tier fallback
+        # 2. Load 3D model geometry
         model_mesh: Optional[Mesh] = None
-        if self.model_path:
+        if self.model_path is not None:
+            if not self.model_path.strip():
+                raise ValueError("Model path cannot be empty")
             if os.path.isfile(self.model_path):
-                try:
-                    loaded = load_obj(self.model_path, smooth_normals=True)
-                    if loaded is not None and len(loaded.vertices) > 0:
-                        model_mesh = loaded
-                except Exception:
-                    model_mesh = None
-            elif chr(10) in self.model_path or "v " in self.model_path:
-                try:
-                    loaded = load_obj_from_string(self.model_path, smooth_normals=True)
-                    if loaded is not None and len(loaded.vertices) > 0:
-                        model_mesh = loaded
-                except Exception:
-                    model_mesh = None
-
-        if model_mesh is None or len(model_mesh.vertices) == 0:
+                model_mesh = load_obj(self.model_path, smooth_normals=True)
+                if model_mesh is None or len(model_mesh.vertices) == 0:
+                    raise ValueError(f"Invalid OBJ model: no valid geometry found in {self.model_path}")
+            elif "\n" in self.model_path:
+                model_mesh = load_obj_from_string(self.model_path, smooth_normals=True)
+                if model_mesh is None or len(model_mesh.vertices) == 0:
+                    raise ValueError("Invalid OBJ model: string contains no valid geometry")
+            else:
+                raise FileNotFoundError(f"Model file not found: {self.model_path}")
+        else:
             try:
                 model_mesh = load_obj_from_string(DEFAULT_MODEL_OBJ, smooth_normals=True)
-            except Exception:
+            except (ValueError, OSError):
                 model_mesh = create_sphere(radius=1.0, subdivisions=16)
 
         # 3. Assemble scene graph hierarchy
@@ -445,14 +425,28 @@ class ModelViewerApp(App):
             )
 
         self.debug_overlay = DebugOverlay(backend_name=self.target)
-        self.compiled_manifest: Optional[Any] = None
-        self.last_rendered_image: Optional[Any] = None
+        self.compiled_manifest: Optional[str] = None
+        self.last_rendered_image: Optional[RenderedImage] = None
         self._window: Optional[Any] = None
 
     @classmethod
     def build_parser(cls) -> argparse.ArgumentParser:
         """Construct the CLI argument parser for ModelViewerApp."""
-        return _augmented_app_build_parser()
+        parser = super().build_parser()
+        parser.description = "ModelViewer interactive showcase application for MiniGfx"
+        parser.add_argument(
+            "--model",
+            type=str,
+            default=None,
+            help="Path to Wavefront OBJ 3D model file (default: embedded procedural model)",
+        )
+        parser.add_argument(
+            "--output",
+            type=str,
+            default=None,
+            help="Path to output PNG image file when running offscreen",
+        )
+        return parser
 
     @property
     def current_material_name(self) -> str:
@@ -523,30 +517,69 @@ class ModelViewerApp(App):
         elif k in ("q", "escape", "key_q", "key_escape"):
             self.stop()
 
-    def compile_embedded_pipeline(self, target: Optional[str] = None) -> Optional[Any]:
-        """Compile genuine embedded GfxIR shaders for the target backend across Vulkan, Metal, DX12."""
-        if compile_pipeline is None or Target is None or GpuPipeline is None:
-            return None
+    def compile_embedded_pipeline(self, target: Optional[str] = None) -> Path:
+        """Compile genuine embedded GfxIR shaders for 3D PBR and 2D overlay across Vulkan, Metal, DX12."""
         target_name = (target or self.target).lower()
         target_enum_map = {
             "vulkan": Target.VULKAN,
             "metal": Target.METAL,
             "directx": Target.DIRECTX,
         }
-        target_enum = target_enum_map.get(target_name, Target.VULKAN)
-        gpu_pipe = GpuPipeline(material_vertex_shader, material_fragment_shader)
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                out_dir = Path(td) / f"{target_name}_pipeline"
-                manifest_path = compile_pipeline(gpu_pipe, target_enum, out_dir)
-                if manifest_path is not None and Path(manifest_path).exists():
-                    self.compiled_manifest = str(manifest_path)
-                    pipe_record = self.renderer.get_or_create_pipeline(self.current_material_name)
-                    pipe_record.gpu_pipeline = str(manifest_path)
-                    return manifest_path
-        except Exception:
-            return None
-        return None
+        if target_name not in target_enum_map:
+            raise ValueError(f"Unsupported graphics target: {target_name!r}")
+        target_enum = target_enum_map[target_name]
+
+        if not hasattr(self, "_pipeline_dir") or self._pipeline_dir is None:
+            self._pipeline_dir = tempfile.TemporaryDirectory(prefix="minigfx_viewer_")
+
+        out_dir = Path(self._pipeline_dir.name) / f"{target_name}_pipeline"
+        pbr_dir = out_dir / "pbr_forward"
+        overlay_dir = out_dir / "overlay"
+        manifest_file = pbr_dir / "pipeline.json"
+
+        if manifest_file.exists() and (overlay_dir / "pipeline.json").exists():
+            self.compiled_manifest = str(manifest_file)
+            pipe_record = self.renderer.get_or_create_pipeline(self.current_material_name)
+            pipe_record.gpu_pipeline = str(manifest_file)
+            return manifest_file
+
+        if out_dir.exists():
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+        # 1. Primary 3D Scene PBR Pipeline (depth test & depth write enabled)
+        pbr_gpu_pipe = GpuPipeline(
+            model_vertex_shader,
+            material_fragment_shader,
+            depth_stencil=DepthStencil(
+                format="d32_sfloat",
+                depth_test_enable=True,
+                depth_write_enable=True,
+                depth_compare_op="less_equal",
+            ),
+        )
+        pbr_manifest_path = compile_pipeline(pbr_gpu_pipe, target_enum, pbr_dir)
+        if pbr_manifest_path is None or not Path(pbr_manifest_path).exists():
+            raise RuntimeError(f"PBR pipeline compilation failed for target {target_name}")
+
+        # 2. Dedicated 2D Overlay Pipeline (depth test & depth write disabled)
+        overlay_gpu_pipe = GpuPipeline(
+            overlay_vertex_shader,
+            overlay_fragment_shader,
+            depth_stencil=DepthStencil(
+                format="d32_sfloat",
+                depth_test_enable=False,
+                depth_write_enable=False,
+                depth_compare_op="always",
+            ),
+        )
+        overlay_manifest_path = compile_pipeline(overlay_gpu_pipe, target_enum, overlay_dir)
+        if overlay_manifest_path is None or not Path(overlay_manifest_path).exists():
+            raise RuntimeError(f"Overlay pipeline compilation failed for target {target_name}")
+
+        self.compiled_manifest = str(pbr_manifest_path)
+        pipe_record = self.renderer.get_or_create_pipeline(self.current_material_name)
+        pipe_record.gpu_pipeline = str(pbr_manifest_path)
+        return Path(pbr_manifest_path)
 
     def startup(self) -> None:
         """Lifecycle hook invoked once before entering the frame loop."""
@@ -567,6 +600,18 @@ class ModelViewerApp(App):
         super().update(dt)
         if self._window is not None and not self._window.poll_and_sync(self):
             return
+
+        # Enforce deterministic fixed time-step for headless offscreen rendering
+        if self.offscreen:
+            dt = 1.0 / 60.0
+            self.dt = dt
+            self.fps = 60.0
+            self.elapsed_time = self.frame_count * dt
+        else:
+            if self.frame_count == 0 and dt < 0.001:
+                dt = 1.0 / 60.0
+            if self.fps <= 0.0 or self.fps > 5000.0:
+                self.fps = 60.0
 
         if self.animate_light:
             self.light_angle = (self.light_angle + float(dt) * 0.8) % (2.0 * math.pi)
@@ -590,29 +635,31 @@ class ModelViewerApp(App):
 
         self.camera_controller.update(self.camera, dt)
 
-    def render_offscreen_frame(self) -> Any:
-        """Render scene into RGBA buffer using genuine shader mathematics and debug overlay."""
-        w, h = self.width, self.height
-        buf = bytearray(w * h * 4)
-        depth_buf = [1.0] * (w * h)
+    def render_offscreen_frame(self) -> RenderedImage:
+        """Render scene into RenderedImage using genuine GPU execution via mlir_gpu.viewer."""
+        if self.compiled_manifest is None or not Path(self.compiled_manifest).exists():
+            self.compile_embedded_pipeline()
 
-        # Clear background to dark slate gradient
-        for y in range(h):
-            t = y / max(h - 1, 1)
-            cr = int((18.0 + t * 14.0))
-            cg = int((24.0 + t * 12.0))
-            cb = int((36.0 + t * 16.0))
-            row_idx = y * w * 4
-            for x in range(w):
-                idx = row_idx + x * 4
-                buf[idx] = cr
-                buf[idx + 1] = cg
-                buf[idx + 2] = cb
-                buf[idx + 3] = 255
+        pbr_manifest_path = Path(self.compiled_manifest)
+        pbr_manifest_data = json.loads(pbr_manifest_path.read_text())
+        if (pbr_manifest_path.parent / "overlay" / "pipeline.json").exists():
+            out_dir = pbr_manifest_path.parent
+            overlay_manifest_path = out_dir / "overlay" / "pipeline.json"
+        elif (pbr_manifest_path.parent.parent / "overlay" / "pipeline.json").exists():
+            out_dir = pbr_manifest_path.parent.parent
+            overlay_manifest_path = out_dir / "overlay" / "pipeline.json"
+        else:
+            out_dir = pbr_manifest_path.parent
+            overlay_manifest_path = pbr_manifest_path
+        overlay_manifest_data = json.loads(overlay_manifest_path.read_text())
 
-        # Render visible scene nodes with depth testing and embedded shader evaluation
+        consolidated_vb = bytearray()
+        consolidated_ib = bytearray()
+        draw_calls: List[DrawCall] = []
+        v_offset = 0
+        first_index = 0
+
         cam_params = self.camera.get_params(time=self.elapsed_time)
-        view_proj = self.camera.view_proj
 
         for node in self.scene.traverse():
             if node is self.scene or getattr(node, "mesh", None) is None:
@@ -621,129 +668,174 @@ class ModelViewerApp(App):
                 continue
 
             mesh = node.mesh
-            mat = getattr(node, "material", self.materials[self.current_material_name])
-            model_transform = getattr(node, "world_transform", Mat4x4.identity())
-
             verts = getattr(mesh, "vertices", [])
             indices = getattr(mesh, "indices", [])
             if not verts or not indices:
                 continue
 
-            for i in range(0, len(indices) - 2, 3):
-                idx0, idx1, idx2 = indices[i], indices[i + 1], indices[i + 2]
-                if idx0 >= len(verts) or idx1 >= len(verts) or idx2 >= len(verts):
-                    continue
-                v0, v1, v2 = verts[idx0], verts[idx1], verts[idx2]
+            mat = getattr(node, "material", self.materials[self.current_material_name])
+            world_transform = getattr(node, "world_transform", Mat4x4.identity())
+            obj_params = ObjectParams(model=world_transform, color=Vec4(1.0, 1.0, 1.0, 1.0))
 
-                # Transform vertices to world and clip space
-                wp0 = model_transform * Vec4(v0.position.x, v0.position.y, v0.position.z, 1.0)
-                wp1 = model_transform * Vec4(v1.position.x, v1.position.y, v1.position.z, 1.0)
-                wp2 = model_transform * Vec4(v2.position.x, v2.position.y, v2.position.z, 1.0)
+            # Pack push constants: cam (80B) + obj (80B) + mat (32B) + light (32B) = 224B
+            constants = (
+                cam_params.to_bytes()
+                + obj_params.to_bytes()
+                + mat.to_bytes()
+                + self.light_params.to_bytes()
+            )
 
-                cp0 = view_proj * wp0
-                cp1 = view_proj * wp1
-                cp2 = view_proj * wp2
-
-                if cp0.w <= 0.001 or cp1.w <= 0.001 or cp2.w <= 0.001:
-                    continue
-
-                sx0 = int((cp0.x / cp0.w * 0.5 + 0.5) * w)
-                sy0 = int((0.5 - cp0.y / cp0.w * 0.5) * h)
-                sz0 = cp0.z / cp0.w
-
-                sx1 = int((cp1.x / cp1.w * 0.5 + 0.5) * w)
-                sy1 = int((0.5 - cp1.y / cp1.w * 0.5) * h)
-                sz1 = cp1.z / cp1.w
-
-                sx2 = int((cp2.x / cp2.w * 0.5 + 0.5) * w)
-                sy2 = int((0.5 - cp2.y / cp2.w * 0.5) * h)
-                sz2 = cp2.z / cp2.w
-
-                # Bounding box
-                min_x = max(0, min(sx0, sx1, sx2))
-                max_x = min(w - 1, max(sx0, sx1, sx2))
-                min_y = max(0, min(sy0, sy1, sy2))
-                max_y = min(h - 1, max(sy0, sy1, sy2))
-
-                denom = (sy1 - sy2) * (sx0 - sx2) + (sx2 - sx1) * (sy0 - sy2)
-                if abs(denom) < 1e-5:
-                    continue
-
-                # Shading evaluation via genuine embedded shader function
-                center_n = (v0.normal + v1.normal + v2.normal).normalize() if hasattr(v0, "normal") else Vec3(0, 1, 0)
-                center_pos = Vec3((wp0.x + wp1.x + wp2.x) / 3.0, (wp0.y + wp1.y + wp2.y) / 3.0, (wp0.z + wp1.z + wp2.z) / 3.0)
-                shaded = _cpu_fragment(
-                    normal=center_n,
-                    world_pos=center_pos,
-                    uv=(0.0, 0.0),
-                    cam=cam_params,
-                    mat=mat,
-                    light=self.light_params,
+            draw_calls.append(
+                DrawCall(
+                    pipeline="pbr_forward",
+                    type="indexed",
+                    topology="triangle-list",
+                    index_count=len(indices),
+                    first_index=first_index,
+                    vertex_offset=v_offset,
+                    instance_count=1,
+                    first_instance=0,
+                    index_type="uint16",
+                    constant_offset=0,
+                    constant_size=len(constants),
+                    parameters={"data": list(constants)},
                 )
-                cr = int(max(0.0, min(1.0, shaded.x)) * 255)
-                cg = int(max(0.0, min(1.0, shaded.y)) * 255)
-                cb = int(max(0.0, min(1.0, shaded.z)) * 255)
+            )
 
-                for py in range(min_y, max_y + 1):
-                    row_idx = py * w
-                    for px in range(min_x, max_x + 1):
-                        w0 = ((sy1 - sy2) * (px - sx2) + (sx2 - sx1) * (py - sy2)) / denom
-                        w1 = ((sy2 - sy0) * (px - sx2) + (sx0 - sx2) * (py - sy2)) / denom
-                        w2 = 1.0 - w0 - w1
-                        if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
-                            pz = w0 * sz0 + w1 * sz1 + w2 * sz2
-                            pix_idx = row_idx + px
-                            if 0.0 <= pz < depth_buf[pix_idx]:
-                                depth_buf[pix_idx] = pz
-                                buf_offset = pix_idx * 4
-                                buf[buf_offset] = cr
-                                buf[buf_offset + 1] = cg
-                                buf[buf_offset + 2] = cb
-                                buf[buf_offset + 3] = 255
+            consolidated_vb.extend(mesh.vertex_bytes())
+            consolidated_ib.extend(mesh.index_bytes())
+            v_offset += len(verts)
+            first_index += len(indices)
 
-        # Blit debug overlay HUD into framebuffer
+        # Embedded debug overlay rendered via dedicated overlay pipeline
         if self.debug_overlay is not None:
             metrics_text = self.debug_overlay.format_metrics()
-        else:
-            metrics_text = format_metrics(
-                fps=self.fps,
-                frame_time_ms=(self.dt * 1000.0),
-                draw_calls=len(self.renderer.last_commands),
-                visible_meshes=len(self.renderer.last_commands),
-                backend_name=self.target,
-            )
-        draw_to_image(buf, w, h, metrics_text, x=10, y=10, color=(255, 255, 255, 255), scale=1)
+            quads = generate_text_quads(metrics_text, start_x=10.0, start_y=10.0, scale=1.0)
+            quad_verts, quad_indices = quads.to_buffers()
+            if quad_verts and quad_indices:
+                w_f, h_f = float(self.width), float(self.height)
+                overlay_vb = bytearray()
+                overlay_ib = bytearray()
+                for qv in quad_verts:
+                    px, py, u, v = qv[0], qv[1], qv[2], qv[3]
+                    ndc_x = (px / w_f) * 2.0 - 1.0
+                    ndc_y = 1.0 - (py / h_f) * 2.0
+                    overlay_vb.extend(
+                        ModelVertex(
+                            position=Vec3(ndc_x, ndc_y, 0.0),
+                            normal=Vec3(0.0, 0.0, 1.0),
+                            uv=Vec2(u, v),
+                        ).to_bytes()
+                    )
+                for qi in quad_indices:
+                    overlay_ib.extend(struct.pack("<H", qi))
 
-        raw_bytes = bytes(buf)
-        if RenderedImage is not None:
-            return RenderedImage(w, h, raw_bytes, device=self.target)
+                overlay_params = OverlayParams(
+                    text_color=getattr(self.debug_overlay, "params", OverlayParams()).text_color,
+                    bg_color=getattr(self.debug_overlay, "params", OverlayParams()).bg_color,
+                    viewport=Vec2(w_f, h_f),
+                    scale=getattr(self.debug_overlay, "params", OverlayParams()).scale,
+                )
+                overlay_constants = overlay_params.to_bytes()
 
-        class _LocalImage:
-            def __init__(self, width: int, height: int, rgba: bytes, device: str) -> None:
-                self.width = width
-                self.height = height
-                self.rgba = rgba
-                self.device = device
+                draw_calls.append(
+                    DrawCall(
+                        pipeline="overlay",
+                        type="indexed",
+                        topology="triangle-list",
+                        index_count=len(quad_indices),
+                        first_index=first_index,
+                        vertex_offset=v_offset,
+                        instance_count=1,
+                        first_instance=0,
+                        index_type="uint16",
+                        constant_offset=0,
+                        constant_size=len(overlay_constants),
+                        parameters={"data": list(overlay_constants)},
+                    )
+                )
 
-        return _LocalImage(w, h, raw_bytes, device=self.target)
+                consolidated_vb.extend(overlay_vb)
+                consolidated_ib.extend(overlay_ib)
+                v_offset += len(quad_verts)
+                first_index += len(quad_indices)
+
+        pbr_entries = [
+            {"stage": e["stage"], "entry_point": e["entry_point"], "binary": f"pbr_forward/{e['binary']}" if (out_dir / "pbr_forward").is_dir() else e["binary"]}
+            for e in pbr_manifest_data["entries"]
+        ]
+        overlay_entries = [
+            {"stage": e["stage"], "entry_point": e["entry_point"], "binary": f"overlay/{e['binary']}" if (out_dir / "overlay").is_dir() else e["binary"]}
+            for e in overlay_manifest_data["entries"]
+        ]
+
+        multi_manifest = {
+            "schema_version": MULTI_DRAW_SCHEMA_VERSION,
+            "target": self.target,
+            "target_profile": TargetProfile.default_for_target(self.target).to_dict(),
+            "raster_convention": RASTER_CONVENTION,
+            "runtime_verified": False,
+            "backend_status": "validated-binary",
+            "pipelines": {
+                "pbr_forward": {
+                    "entries": pbr_entries,
+                    "parameters": pbr_manifest_data.get("parameters"),
+                    "interface": pbr_manifest_data.get("interface"),
+                    "depth_stencil": pbr_manifest_data.get("depth_stencil"),
+                    "input_layout": pbr_manifest_data.get("input_layout"),
+                },
+                "overlay": {
+                    "entries": overlay_entries,
+                    "parameters": overlay_manifest_data.get("parameters"),
+                    "interface": overlay_manifest_data.get("interface"),
+                    "depth_stencil": overlay_manifest_data.get("depth_stencil", {
+                        "format": "d32_sfloat",
+                        "depth_test_enable": False,
+                        "depth_write_enable": False,
+                        "depth_compare_op": "always",
+                    }),
+                    "input_layout": overlay_manifest_data.get("input_layout"),
+                },
+            },
+            "draws": [d.to_dict() for d in draw_calls],
+            "depth_stencil": DepthStencil().to_dict(),
+            "input_layout": pbr_manifest_data.get("input_layout"),
+        }
+
+        multi_manifest_path = out_dir / "multi_manifest.json"
+        multi_manifest_path.write_text(json.dumps(multi_manifest, indent=2))
+
+        program = load_program(
+            multi_manifest_path,
+            vertex_buffer=bytes(consolidated_vb),
+            index_buffer=bytes(consolidated_ib),
+        )
+
+        image = render_offscreen(
+            program,
+            width=self.width,
+            height=self.height,
+            time=self.elapsed_time,
+        )
+        if not isinstance(image, RenderedImage):
+            raise RuntimeError(f"render_offscreen returned unexpected type {type(image)}, expected RenderedImage")
+        return image
 
     def save_png(self, path: Union[str, Path], image: Any) -> None:
-        """Write RenderedImage to destination PNG file."""
+        """Write RenderedImage to destination PNG file via mlir_gpu.viewer.write_png."""
         p = Path(path).resolve()
         p.parent.mkdir(parents=True, exist_ok=True)
         p.unlink(missing_ok=True)
-        if write_png is not None and hasattr(image, "rgba"):
-            try:
-                write_png(p, image)
-                return
-            except Exception:
-                pass
-        _write_fallback_png(p, image.width, image.height, image.rgba)
+        write_png(p, image)
 
     def render(self) -> List[DrawCommand]:
         """Record and dispatch draw commands for visible scene meshes."""
         super().render()
         commands: List[DrawCommand] = []
+
+        if self.offscreen:
+            self.fps = 60.0
+            self.dt = 1.0 / 60.0
 
         if self.renderer is not None:
             commands = self.renderer.render_frame(
@@ -783,6 +875,9 @@ class ModelViewerApp(App):
                 self.save_png(self.output_path, self.last_rendered_image)
         finally:
             super().cleanup()
+            if hasattr(self, "_pipeline_dir") and self._pipeline_dir is not None:
+                self._pipeline_dir.cleanup()
+                self._pipeline_dir = None
 
 
 def main(args: Optional[Sequence[str]] = None) -> int:
