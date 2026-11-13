@@ -13,7 +13,7 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from examples.minigfx.debug import GLYPH_TABLE
-from examples.minigfx.material import CameraParams, LightParams, MaterialParams, ObjectParams
+from examples.minigfx.material import CameraParams, LightParams, MaterialParams, ObjectParams, Sampler, Texture
 from examples.minigfx.math import Mat4x4, Vec3, Vec4
 from examples.minigfx.scene import Mesh
 
@@ -180,19 +180,36 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
     _ensure_toolchain_paths()
     from mlir_gpu.ast_frontend import ASTLowering
     from mlir_gpu.compiler import Target, TargetProfile, Toolchain, _compile_stage
-    from mlir_gpu.frontend import Buffer, Node, ShaderIO, Stage, Type, Value, Vertex, _node, fragment, u32, vec2, vec3, vec4
+    from mlir_gpu.frontend import (
+        Buffer,
+        Node,
+        ShaderIO,
+        Stage,
+        Texture2D,
+        Type,
+        Value,
+        Vertex,
+        _node,
+        fragment,
+        sample_texture,
+        u32,
+        vec2,
+        vec3,
+        vec4,
+    )
     import mlir_gpu.shader_math as sm
 
     target = Target(target_name)
     ext = "spv" if target == Target.VULKAN else ("dxil" if target == Target.DIRECTX else "metallib")
 
-    cache_key_src = f"minigfx_window_shaders_v2_{target_name}"
+    cache_key_src = f"minigfx_window_shaders_v3_{target_name}"
     digest = hashlib.sha256(cache_key_src.encode("utf-8")).hexdigest()[:12]
     cache_dir = _REPO_ROOT / "build" / "minigfx_cache" / f"shaders_{target_name}_{digest}"
 
     expected = {
         "mesh_vs": cache_dir / f"mesh_vs.{ext}",
         "pbr_fs": cache_dir / f"pbr_fs.{ext}",
+        "textured_pbr_fs": cache_dir / f"textured_pbr_fs.{ext}",
         "normal_fs": cache_dir / f"normal_fs.{ext}",
         "overlay_vs": cache_dir / f"overlay_vs.{ext}",
         "overlay_fs": cache_dir / f"overlay_fs.{ext}",
@@ -253,6 +270,45 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
         return vec4(srgb, mat.albedo.w)
 
     @fragment
+    def _textured_pbr_fs(
+        normal: Value,
+        world_pos: Value,
+        uv: Value,
+        albedo_tex: Texture2D[1],
+        albedo_sampler: Sampler[2],
+        cam: CameraParams,
+        mat: MaterialParams,
+        light: LightParams,
+    ) -> Value:
+        texel = sample_texture(albedo_tex, albedo_sampler, uv)
+        base_color = mat.albedo * texel
+        n = sm.normalize(normal)
+        l = sm.normalize(light.direction)
+        v = sm.normalize(cam.eye_pos - world_pos)
+
+        n_dot_l = sm.clamp(sm.dot(n, l), 0.0, 1.0)
+        diffuse = base_color.xyz * n_dot_l * light.intensity * (1.0 - mat.metallic) * light.color
+
+        hemi = n.y * 0.35 + 0.65
+        ambient = base_color.xyz * (light.ambient * hemi + mat.ambient)
+
+        h = sm.normalize(l + v)
+        n_dot_h = sm.clamp(sm.dot(n, h), 0.0, 1.0)
+        horizon = sm.clamp(n_dot_l * 4.0, 0.0, 1.0)
+        spec_pow = sm.pow(n_dot_h, 2.0 / (mat.roughness * mat.roughness + 0.01)) * light.intensity * horizon
+        spec_tint = base_color.xyz * mat.metallic + vec3(1.0, 1.0, 1.0) * (1.0 - mat.metallic)
+        specular = spec_tint * spec_pow * light.color
+
+        n_dot_v = sm.clamp(sm.dot(n, v), 0.0, 1.0)
+        fresnel = sm.pow(1.0 - n_dot_v, 4.0) * (0.04 + 0.25 * mat.metallic)
+        rim = base_color.xyz * fresnel * (light.ambient * 2.0 + 0.08)
+
+        hdr = ambient + diffuse + specular + rim
+        ldr = sm.clamp((hdr * (hdr * 2.51 + 0.03)) / (hdr * (hdr * 2.43 + 0.59) + 0.14), 0.0, 1.0)
+        srgb = sm.pow(ldr, 1.0 / 2.2)
+        return vec4(srgb, base_color.w)
+
+    @fragment
     def _normal_fs(normal: Value, world_pos: Value, uv: Value) -> Value:
         n = sm.normalize(normal)
         rgb = sm.clamp(n * 0.5 + 0.5, 0.0, 1.0)
@@ -296,6 +352,7 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
 
     mesh_varyings = tuple(io for io in mesh_out_iface if io.builtin is None)
     pbr_fs_stage = _pbr_fs.trace(mesh_varyings)
+    textured_pbr_fs_stage = _textured_pbr_fs.trace(mesh_varyings)
     normal_fs_stage = _normal_fs.trace(mesh_varyings)
 
     ov_low = ASTLowering(_overlay_vs, vs_in_nodes, vs_in_iface, {})
@@ -326,6 +383,7 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
     jobs = [
         ("mesh_vs", mesh_vs_stage, full_params),
         ("pbr_fs", pbr_fs_stage, full_params),
+        ("textured_pbr_fs", textured_pbr_fs_stage, full_params),
         ("normal_fs", normal_fs_stage, None),
         ("overlay_vs", overlay_vs_stage, None),
         ("overlay_fs", overlay_fs_stage, None),
@@ -417,6 +475,21 @@ class _MetalWindowBackend:
         lib.mgfx_metal_upload_buffer.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
         lib.mgfx_metal_upload_buffer.restype = ctypes.c_int
 
+        lib.mgfx_metal_upload_texture_sampler.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.mgfx_metal_upload_texture_sampler.restype = ctypes.c_int
+
         lib.mgfx_metal_begin_frame.argtypes = [
             ctypes.c_void_p,
             ctypes.c_int,
@@ -439,6 +512,19 @@ class _MetalWindowBackend:
             ctypes.c_size_t,
         ]
         lib.mgfx_metal_draw.restype = ctypes.c_int
+
+        lib.mgfx_metal_draw_textured.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+        ]
+        lib.mgfx_metal_draw_textured.restype = ctypes.c_int
 
         lib.mgfx_metal_end_frame.argtypes = [ctypes.c_void_p]
         lib.mgfx_metal_end_frame.restype = ctypes.c_int
@@ -465,6 +551,15 @@ class _MetalWindowBackend:
             1,
             0,
         )
+        self.pipe_textured_pbr = lib.mgfx_metal_create_pipeline(
+            self._ctx,
+            str(shaders["mesh_vs"]).encode("utf-8"),
+            b"_mesh_vs",
+            str(shaders["textured_pbr_fs"]).encode("utf-8"),
+            b"_textured_pbr_fs",
+            1,
+            0,
+        )
         self.pipe_normal = lib.mgfx_metal_create_pipeline(
             self._ctx,
             str(shaders["mesh_vs"]).encode("utf-8"),
@@ -483,7 +578,7 @@ class _MetalWindowBackend:
             0,
             1,
         )
-        if min(self.pipe_pbr, self.pipe_normal, self.pipe_overlay) < 0:
+        if min(self.pipe_pbr, self.pipe_textured_pbr, self.pipe_normal, self.pipe_overlay) < 0:
             err = lib.mgfx_metal_last_error(self._ctx)
             msg = err.decode("utf-8", errors="replace") if err else "unknown pipeline error"
             self.destroy()
@@ -491,6 +586,8 @@ class _MetalWindowBackend:
 
         self._mesh_cache: Dict[int, Tuple[int, int]] = {}
         self._next_buf_id = 1
+        self._tex_cache: Dict[Tuple[int, Tuple[str, str, str, str]], int] = {}
+        self._next_tex_id = 0
 
     def _ensure_mesh(self, mesh: Mesh) -> Tuple[int, int]:
         key = id(mesh)
@@ -507,13 +604,44 @@ class _MetalWindowBackend:
         self._mesh_cache[key] = (buf_id, vcount)
         return buf_id, vcount
 
+    def _ensure_texture_sampler(self, tex: Any, samp: Optional[Any]) -> int:
+        s = samp if samp is not None else Sampler()
+        samp_key = (s.mag_filter, s.min_filter, s.address_mode_u, s.address_mode_v)
+        cache_key = (id(tex), samp_key)
+        cached = self._tex_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        addr_map = {"repeat": 0, "clamp_to_edge": 1, "mirror_repeat": 2}
+        tex_id = self._next_tex_id
+        self._next_tex_id += 1
+        rc = self._lib.mgfx_metal_upload_texture_sampler(
+            self._ctx,
+            tex_id,
+            int(tex.width),
+            int(tex.height),
+            1 if tex.format == "rgba32_sfloat" else 0,
+            tex.data,
+            len(tex.data),
+            1 if s.min_filter == "linear" else 0,
+            1 if s.mag_filter == "linear" else 0,
+            addr_map[s.address_mode_u],
+            addr_map[s.address_mode_v],
+        )
+        if rc != 0:
+            err = self._lib.mgfx_metal_last_error(self._ctx)
+            raise RuntimeError(
+                f"Metal texture upload failed: {err.decode('utf-8', errors='replace') if err else rc}"
+            )
+        self._tex_cache[cache_key] = tex_id
+        return tex_id
+
     def render(
         self,
         fb_w: int,
         fb_h: int,
         cam_bytes: bytes,
         light_bytes: bytes,
-        draws: Sequence[Tuple[Mesh, bytes, bytes, bool]],
+        draws: Sequence[Tuple[Any, ...]],
         hud_bytes: bytes,
         hud_vert_count: int,
     ) -> None:
@@ -526,7 +654,10 @@ class _MetalWindowBackend:
             err = self._lib.mgfx_metal_last_error(self._ctx)
             raise RuntimeError(f"Metal begin_frame failed: {err.decode('utf-8', errors='replace') if err else rc}")
 
-        for mesh, obj_bytes, mat_bytes, is_normal_debug in draws:
+        for draw_item in draws:
+            mesh, obj_bytes, mat_bytes, is_normal_debug = draw_item[:4]
+            tex = draw_item[4] if len(draw_item) > 4 else None
+            samp = draw_item[5] if len(draw_item) > 5 else None
             buf_id, vcount = self._ensure_mesh(mesh)
             if vcount == 0:
                 continue
@@ -541,6 +672,20 @@ class _MetalWindowBackend:
                     len(vs_consts),
                     None,
                     0,
+                )
+            elif tex is not None:
+                fs_consts = cam_bytes + mat_bytes + light_bytes
+                tex_id = self._ensure_texture_sampler(tex, samp)
+                self._lib.mgfx_metal_draw_textured(
+                    self._ctx,
+                    self.pipe_textured_pbr,
+                    buf_id,
+                    vcount,
+                    vs_consts,
+                    len(vs_consts),
+                    fs_consts,
+                    len(fs_consts),
+                    tex_id,
                 )
             else:
                 fs_consts = cam_bytes + mat_bytes + light_bytes
@@ -671,6 +816,11 @@ class _DirectXWindowBackend:
         lib.mgfx_dx12_create_pipeline.restype = ctypes.c_int
         lib.mgfx_dx12_upload_buffer.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
         lib.mgfx_dx12_upload_buffer.restype = ctypes.c_int
+        lib.mgfx_dx12_upload_texture_sampler.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+        lib.mgfx_dx12_upload_texture_sampler.restype = ctypes.c_int
         lib.mgfx_dx12_begin_frame.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float]
         lib.mgfx_dx12_begin_frame.restype = ctypes.c_int
         lib.mgfx_dx12_draw.argtypes = [
@@ -704,17 +854,20 @@ class _DirectXWindowBackend:
 
         vs_mesh = str(shaders["mesh_vs"]).encode("utf-8")
         self.pipe_pbr = lib.mgfx_dx12_create_pipeline(self._ctx, vs_mesh, str(shaders["pbr_fs"]).encode("utf-8"), 1, 0)
+        self.pipe_textured_pbr = lib.mgfx_dx12_create_pipeline(self._ctx, vs_mesh, str(shaders["textured_pbr_fs"]).encode("utf-8"), 1, 0)
         self.pipe_normal = lib.mgfx_dx12_create_pipeline(self._ctx, vs_mesh, str(shaders["normal_fs"]).encode("utf-8"), 1, 0)
         self.pipe_overlay = lib.mgfx_dx12_create_pipeline(
             self._ctx, str(shaders["overlay_vs"]).encode("utf-8"), str(shaders["overlay_fs"]).encode("utf-8"), 0, 1
         )
-        if min(self.pipe_pbr, self.pipe_normal, self.pipe_overlay) < 0:
+        if min(self.pipe_pbr, self.pipe_textured_pbr, self.pipe_normal, self.pipe_overlay) < 0:
             msg = self._last_error_str()
             self.destroy()
             raise RuntimeError(f"DirectX 12 pipeline creation failed: {msg}")
 
         self._mesh_cache: Dict[int, Tuple[int, int]] = {}
         self._next_buf_id = 1
+        self._tex_cache: Dict[Tuple[int, Tuple[str, str, str, str]], int] = {}
+        self._next_tex_id = 0
         self._capture_requested = False
         self.last_captured_frame: Optional[Tuple[int, int, bytes]] = None
 
@@ -740,23 +893,61 @@ class _DirectXWindowBackend:
         self._mesh_cache[key] = (buf_id, vcount)
         return buf_id, vcount
 
+    def _ensure_texture_sampler(self, tex: Any, samp: Optional[Any]) -> int:
+        s = samp if samp is not None else Sampler()
+        samp_key = (s.mag_filter, s.min_filter, s.address_mode_u, s.address_mode_v)
+        cache_key = (id(tex), samp_key)
+        cached = self._tex_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        addr_map = {"repeat": 0, "clamp_to_edge": 1, "mirror_repeat": 2}
+        tex_id = self._next_tex_id
+        self._next_tex_id += 1
+        rc = self._lib.mgfx_dx12_upload_texture_sampler(
+            self._ctx,
+            tex_id,
+            int(tex.width),
+            int(tex.height),
+            1 if tex.format == "rgba32_sfloat" else 0,
+            tex.data,
+            len(tex.data),
+            1 if s.min_filter == "linear" else 0,
+            1 if s.mag_filter == "linear" else 0,
+            addr_map[s.address_mode_u],
+            addr_map[s.address_mode_v],
+        )
+        if rc != 0:
+            raise RuntimeError(f"DirectX 12 texture upload failed: {self._last_error_str()}")
+        self._tex_cache[cache_key] = tex_id
+        return tex_id
+
     def render(
         self,
         fb_w: int,
         fb_h: int,
         cam_bytes: bytes,
         light_bytes: bytes,
-        draws: Sequence[Tuple[Mesh, bytes, bytes, bool]],
+        draws: Sequence[Tuple[Any, ...]],
         hud_bytes: bytes,
         hud_vert_count: int,
     ) -> None:
         if not self._ctx:
             return
-        prepared: List[Tuple[int, int, int, bytes, bytes]] = []
-        for mesh, obj_bytes, mat_bytes, is_normal_debug in draws:
+        prepared: List[Tuple[int, int, int, bytes, bytes, int]] = []
+        for draw_item in draws:
+            mesh, obj_bytes, mat_bytes, is_normal_debug = draw_item[:4]
+            tex = draw_item[4] if len(draw_item) > 4 else None
+            samp = draw_item[5] if len(draw_item) > 5 else None
             buf_id, vcount = self._ensure_mesh(mesh)
-            if vcount > 0:
-                prepared.append((self.pipe_normal if is_normal_debug else self.pipe_pbr, buf_id, vcount, obj_bytes, mat_bytes))
+            if vcount == 0:
+                continue
+            if is_normal_debug:
+                prepared.append((self.pipe_normal, buf_id, vcount, obj_bytes, mat_bytes, -1))
+            elif tex is not None:
+                tex_id = self._ensure_texture_sampler(tex, samp)
+                prepared.append((self.pipe_textured_pbr, buf_id, vcount, obj_bytes, mat_bytes, tex_id))
+            else:
+                prepared.append((self.pipe_pbr, buf_id, vcount, obj_bytes, mat_bytes, -1))
 
         if hud_vert_count > 0 and hud_bytes:
             if self._lib.mgfx_dx12_upload_buffer(self._ctx, self.OVERLAY_BUF_ID, hud_bytes, len(hud_bytes)) != 0:
@@ -768,11 +959,11 @@ class _DirectXWindowBackend:
         if rc != 0:
             raise RuntimeError(f"DirectX 12 begin_frame failed: {self._last_error_str()}")
 
-        for active_pipe, buf_id, vcount, obj_bytes, mat_bytes in prepared:
+        for active_pipe, buf_id, vcount, obj_bytes, mat_bytes, tex_id in prepared:
             rc = self._lib.mgfx_dx12_draw(
                 self._ctx, active_pipe, buf_id, vcount,
                 cam_bytes, len(cam_bytes), obj_bytes, len(obj_bytes),
-                mat_bytes, len(mat_bytes), light_bytes, len(light_bytes), -1,
+                mat_bytes, len(mat_bytes), light_bytes, len(light_bytes), tex_id,
             )
             if rc != 0:
                 raise RuntimeError(f"DirectX 12 draw failed: {self._last_error_str()}")
@@ -813,6 +1004,9 @@ class _VulkanWindowBackend:
         self._cleanup_callbacks: List[Any] = []
         self._swapchain_cleanup: List[Any] = []
         self._mesh_buffers: Dict[int, Tuple[Any, Any, Any, int]] = {}
+        self._texture_cache: Dict[int, Tuple[Any, Any, Any]] = {}
+        self._sampler_cache: Dict[Tuple[str, str, str, str], Any] = {}
+        self._textured_draw_sets: Dict[Tuple[int, int, Tuple[str, str, str, str]], Any] = {}
         self._hud_buffer: Optional[Tuple[Any, Any, Any, int]] = None
 
         req_exts = list(glfw_mod.get_required_instance_extensions() or [])
@@ -919,12 +1113,46 @@ class _VulkanWindowBackend:
         )
         self._cleanup_callbacks.append(lambda: vk.vkDestroyDescriptorSetLayout(self.device, self.desc_set_layout, None))
 
+        self.desc_set_layout_textured = vk.vkCreateDescriptorSetLayout(
+            self.device,
+            vk.VkDescriptorSetLayoutCreateInfo(
+                pBindings=[
+                    vk.VkDescriptorSetLayoutBinding(
+                        binding=0,
+                        descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                        descriptorCount=1,
+                        stageFlags=vk.VK_SHADER_STAGE_VERTEX_BIT,
+                    ),
+                    vk.VkDescriptorSetLayoutBinding(
+                        binding=1,
+                        descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                        descriptorCount=1,
+                        stageFlags=vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                    ),
+                    vk.VkDescriptorSetLayoutBinding(
+                        binding=2,
+                        descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLER,
+                        descriptorCount=1,
+                        stageFlags=vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                    ),
+                ]
+            ),
+            None,
+        )
+        self._cleanup_callbacks.append(
+            lambda: vk.vkDestroyDescriptorSetLayout(self.device, self.desc_set_layout_textured, None)
+        )
+
         self.desc_pool = vk.vkCreateDescriptorPool(
             self.device,
             vk.VkDescriptorPoolCreateInfo(
                 flags=vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-                maxSets=256,
-                pPoolSizes=[vk.VkDescriptorPoolSize(type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount=256)],
+                maxSets=512,
+                pPoolSizes=[
+                    vk.VkDescriptorPoolSize(type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount=512),
+                    vk.VkDescriptorPoolSize(type=vk.VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, descriptorCount=256),
+                    vk.VkDescriptorPoolSize(type=vk.VK_DESCRIPTOR_TYPE_SAMPLER, descriptorCount=256),
+                ],
             ),
             None,
         )
@@ -1196,6 +1424,24 @@ class _VulkanWindowBackend:
         )
         self._swapchain_cleanup.append(lambda: vk.vkDestroyPipelineLayout(self.device, self.layout_mesh, None))
 
+        self.layout_mesh_textured = vk.vkCreatePipelineLayout(
+            self.device,
+            vk.VkPipelineLayoutCreateInfo(
+                pSetLayouts=[self.desc_set_layout_textured],
+                pPushConstantRanges=[
+                    vk.VkPushConstantRange(
+                        stageFlags=vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                        offset=0,
+                        size=224,
+                    )
+                ],
+            ),
+            None,
+        )
+        self._swapchain_cleanup.append(
+            lambda: vk.vkDestroyPipelineLayout(self.device, self.layout_mesh_textured, None)
+        )
+
         self.layout_overlay = vk.vkCreatePipelineLayout(
             self.device,
             vk.VkPipelineLayoutCreateInfo(pSetLayouts=[self.desc_set_layout], pPushConstantRanges=[]),
@@ -1285,6 +1531,9 @@ class _VulkanWindowBackend:
             return pipe
 
         self.pipe_pbr = _make_pipe("mesh_vs", "_mesh_vs", "pbr_fs", "_pbr_fs", self.layout_mesh, True, False)
+        self.pipe_textured_pbr = _make_pipe(
+            "mesh_vs", "_mesh_vs", "textured_pbr_fs", "_textured_pbr_fs", self.layout_mesh_textured, True, False
+        )
         self.pipe_normal = _make_pipe("mesh_vs", "_mesh_vs", "normal_fs", "_normal_fs", self.layout_mesh, True, False)
         self.pipe_overlay = _make_pipe("overlay_vs", "_overlay_vs", "overlay_fs", "_overlay_fs", self.layout_overlay, False, True)
 
@@ -1298,6 +1547,270 @@ class _VulkanWindowBackend:
             return None, 0
         buf, mem, dset, _ = self._alloc_ssbo(raw)
         self._mesh_buffers[key] = (buf, mem, dset, vcount)
+        return dset, vcount
+
+    def _ensure_texture(self, tex: Any) -> Any:
+        vk = self.vk
+        key = id(tex)
+        cached = self._texture_cache.get(key)
+        if cached is not None:
+            return cached[2]
+
+        vk_fmt = vk.VK_FORMAT_R32G32B32A32_SFLOAT if tex.format == "rgba32_sfloat" else vk.VK_FORMAT_R8G8B8A8_UNORM
+        image = vk.vkCreateImage(
+            self.device,
+            vk.VkImageCreateInfo(
+                imageType=vk.VK_IMAGE_TYPE_2D,
+                format=vk_fmt,
+                extent=vk.VkExtent3D(width=int(tex.width), height=int(tex.height), depth=1),
+                mipLevels=1,
+                arrayLayers=1,
+                samples=vk.VK_SAMPLE_COUNT_1_BIT,
+                tiling=vk.VK_IMAGE_TILING_OPTIMAL,
+                usage=vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT | vk.VK_IMAGE_USAGE_SAMPLED_BIT,
+                sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+                initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+            ),
+            None,
+        )
+        img_req = vk.vkGetImageMemoryRequirements(self.device, image)
+        img_mem = vk.vkAllocateMemory(
+            self.device,
+            vk.VkMemoryAllocateInfo(
+                allocationSize=img_req.size,
+                memoryTypeIndex=self._find_mem_type(img_req.memoryTypeBits, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+            ),
+            None,
+        )
+        vk.vkBindImageMemory(self.device, image, img_mem, 0)
+
+        staging_buf = vk.vkCreateBuffer(
+            self.device,
+            vk.VkBufferCreateInfo(
+                size=len(tex.data),
+                usage=vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+            ),
+            None,
+        )
+        s_req = vk.vkGetBufferMemoryRequirements(self.device, staging_buf)
+        s_mem = vk.vkAllocateMemory(
+            self.device,
+            vk.VkMemoryAllocateInfo(
+                allocationSize=s_req.size,
+                memoryTypeIndex=self._find_mem_type(
+                    s_req.memoryTypeBits,
+                    vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                ),
+            ),
+            None,
+        )
+        vk.vkBindBufferMemory(self.device, staging_buf, s_mem, 0)
+        ptr = vk.vkMapMemory(self.device, s_mem, 0, len(tex.data), 0)
+        vk.ffi.memmove(ptr, tex.data, len(tex.data))
+        vk.vkUnmapMemory(self.device, s_mem)
+
+        upload_cmd = vk.vkAllocateCommandBuffers(
+            self.device,
+            vk.VkCommandBufferAllocateInfo(
+                commandPool=self.cmd_pool,
+                level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                commandBufferCount=1,
+            ),
+        )[0]
+        upload_fence = vk.vkCreateFence(self.device, vk.VkFenceCreateInfo(), None)
+        try:
+            subres = vk.VkImageSubresourceRange(
+                aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, baseMipLevel=0, levelCount=1, baseArrayLayer=0, layerCount=1
+            )
+            vk.vkBeginCommandBuffer(
+                upload_cmd, vk.VkCommandBufferBeginInfo(flags=vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
+            )
+            vk.vkCmdPipelineBarrier(
+                upload_cmd,
+                vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0,
+                0,
+                None,
+                0,
+                None,
+                1,
+                [
+                    vk.VkImageMemoryBarrier(
+                        srcAccessMask=0,
+                        dstAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                        oldLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+                        newLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                        dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                        image=image,
+                        subresourceRange=subres,
+                    )
+                ],
+            )
+            vk.vkCmdCopyBufferToImage(
+                upload_cmd,
+                staging_buf,
+                image,
+                vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                [
+                    vk.VkBufferImageCopy(
+                        bufferOffset=0,
+                        bufferRowLength=0,
+                        bufferImageHeight=0,
+                        imageSubresource=vk.VkImageSubresourceLayers(
+                            aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, mipLevel=0, baseArrayLayer=0, layerCount=1
+                        ),
+                        imageOffset=vk.VkOffset3D(x=0, y=0, z=0),
+                        imageExtent=vk.VkExtent3D(width=int(tex.width), height=int(tex.height), depth=1),
+                    )
+                ],
+            )
+            vk.vkCmdPipelineBarrier(
+                upload_cmd,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                0,
+                None,
+                0,
+                None,
+                1,
+                [
+                    vk.VkImageMemoryBarrier(
+                        srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                        dstAccessMask=vk.VK_ACCESS_SHADER_READ_BIT,
+                        oldLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        newLayout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                        dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                        image=image,
+                        subresourceRange=subres,
+                    )
+                ],
+            )
+            vk.vkEndCommandBuffer(upload_cmd)
+            vk.vkQueueSubmit(self.queue, 1, [vk.VkSubmitInfo(pCommandBuffers=[upload_cmd])], upload_fence)
+            vk.vkWaitForFences(self.device, 1, [upload_fence], vk.VK_TRUE, 10_000_000_000)
+        finally:
+            vk.vkDestroyFence(self.device, upload_fence, None)
+            vk.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, [upload_cmd])
+            vk.vkDestroyBuffer(self.device, staging_buf, None)
+            vk.vkFreeMemory(self.device, s_mem, None)
+
+        view = vk.vkCreateImageView(
+            self.device,
+            vk.VkImageViewCreateInfo(
+                image=image,
+                viewType=vk.VK_IMAGE_VIEW_TYPE_2D,
+                format=vk_fmt,
+                subresourceRange=vk.VkImageSubresourceRange(
+                    aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, levelCount=1, layerCount=1
+                ),
+            ),
+            None,
+        )
+        self._texture_cache[key] = (image, img_mem, view)
+        return view
+
+    def _ensure_sampler(self, samp: Optional[Any]) -> Tuple[Any, Tuple[str, str, str, str]]:
+        vk = self.vk
+        s = samp if samp is not None else Sampler()
+        key = (s.mag_filter, s.min_filter, s.address_mode_u, s.address_mode_v)
+        cached = self._sampler_cache.get(key)
+        if cached is not None:
+            return cached, key
+        filt_map = {"nearest": vk.VK_FILTER_NEAREST, "linear": vk.VK_FILTER_LINEAR}
+        addr_map = {
+            "repeat": vk.VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            "clamp_to_edge": vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            "mirror_repeat": vk.VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+        }
+        vk_samp = vk.vkCreateSampler(
+            self.device,
+            vk.VkSamplerCreateInfo(
+                magFilter=filt_map[s.mag_filter],
+                minFilter=filt_map[s.min_filter],
+                mipmapMode=vk.VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                addressModeU=addr_map[s.address_mode_u],
+                addressModeV=addr_map[s.address_mode_v],
+                addressModeW=vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                mipLodBias=0.0,
+                anisotropyEnable=vk.VK_FALSE,
+                maxAnisotropy=1.0,
+                compareEnable=vk.VK_FALSE,
+                compareOp=vk.VK_COMPARE_OP_ALWAYS,
+                minLod=0.0,
+                maxLod=0.0,
+                borderColor=vk.VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+                unnormalizedCoordinates=vk.VK_FALSE,
+            ),
+            None,
+        )
+        self._sampler_cache[key] = vk_samp
+        return vk_samp, key
+
+    def _ensure_textured_mesh_set(self, mesh: Mesh, tex: Any, samp: Optional[Any]) -> Tuple[Any, int]:
+        vk = self.vk
+        _, vcount = self._ensure_mesh(mesh)
+        if vcount == 0:
+            return None, 0
+        buf, _, _, _ = self._mesh_buffers[id(mesh)]
+        img_view = self._ensure_texture(tex)
+        vk_samp, samp_key = self._ensure_sampler(samp)
+        combo_key = (id(mesh), id(tex), samp_key)
+        cached_set = self._textured_draw_sets.get(combo_key)
+        if cached_set is not None:
+            return cached_set, vcount
+
+        dset = vk.vkAllocateDescriptorSets(
+            self.device,
+            vk.VkDescriptorSetAllocateInfo(
+                descriptorPool=self.desc_pool, pSetLayouts=[self.desc_set_layout_textured]
+            ),
+        )[0]
+        buf_info = [vk.VkDescriptorBufferInfo(buffer=buf, offset=0, range=max(vcount * 32, 64))]
+        tex_info = [
+            vk.VkDescriptorImageInfo(
+                sampler=vk.VK_NULL_HANDLE,
+                imageView=img_view,
+                imageLayout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            )
+        ]
+        samp_info = [
+            vk.VkDescriptorImageInfo(
+                sampler=vk_samp,
+                imageView=vk.VK_NULL_HANDLE,
+                imageLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+            )
+        ]
+        writes = [
+            vk.VkWriteDescriptorSet(
+                dstSet=dset,
+                dstBinding=0,
+                descriptorCount=1,
+                descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=buf_info,
+            ),
+            vk.VkWriteDescriptorSet(
+                dstSet=dset,
+                dstBinding=1,
+                descriptorCount=1,
+                descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                pImageInfo=tex_info,
+            ),
+            vk.VkWriteDescriptorSet(
+                dstSet=dset,
+                dstBinding=2,
+                descriptorCount=1,
+                descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLER,
+                pImageInfo=samp_info,
+            ),
+        ]
+        vk.vkUpdateDescriptorSets(self.device, len(writes), writes, 0, None)
+        self._textured_draw_sets[combo_key] = dset
         return dset, vcount
 
     def _update_hud(self, raw: bytes) -> Optional[Any]:
@@ -1325,7 +1838,7 @@ class _VulkanWindowBackend:
         fb_h: int,
         cam_bytes: bytes,
         light_bytes: bytes,
-        draws: Sequence[Tuple[Mesh, bytes, bytes, bool]],
+        draws: Sequence[Tuple[Any, ...]],
         hud_bytes: bytes,
         hud_vert_count: int,
     ) -> None:
@@ -1364,22 +1877,32 @@ class _VulkanWindowBackend:
             vk.VK_SUBPASS_CONTENTS_INLINE,
         )
 
-        for mesh, obj_bytes, mat_bytes, is_normal_debug in draws:
-            dset, vcount = self._ensure_mesh(mesh)
+        for draw_item in draws:
+            mesh, obj_bytes, mat_bytes, is_normal_debug = draw_item[:4]
+            tex = draw_item[4] if len(draw_item) > 4 else None
+            samp = draw_item[5] if len(draw_item) > 5 else None
+            if not is_normal_debug and tex is not None:
+                dset, vcount = self._ensure_textured_mesh_set(mesh, tex, samp)
+                active_pipe = self.pipe_textured_pbr
+                active_layout = self.layout_mesh_textured
+            else:
+                dset, vcount = self._ensure_mesh(mesh)
+                active_pipe = self.pipe_normal if is_normal_debug else self.pipe_pbr
+                active_layout = self.layout_mesh
             if vcount == 0 or dset is None:
                 continue
             vk.vkCmdBindPipeline(
                 self.cmd_buf,
                 vk.VK_PIPELINE_BIND_POINT_GRAPHICS,
-                self.pipe_normal if is_normal_debug else self.pipe_pbr,
+                active_pipe,
             )
             vk.vkCmdBindDescriptorSets(
-                self.cmd_buf, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, self.layout_mesh, 0, 1, [dset], 0, None
+                self.cmd_buf, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, active_layout, 0, 1, [dset], 0, None
             )
             pc = cam_bytes + obj_bytes + mat_bytes + light_bytes
             vk.vkCmdPushConstants(
                 self.cmd_buf,
-                self.layout_mesh,
+                active_layout,
                 vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT,
                 0,
                 len(pc),
@@ -1435,6 +1958,15 @@ class _VulkanWindowBackend:
             vk.vkDestroyBuffer(self.device, buf, None)
             vk.vkFreeMemory(self.device, mem, None)
         self._mesh_buffers.clear()
+        self._textured_draw_sets.clear()
+        for vk_samp in self._sampler_cache.values():
+            vk.vkDestroySampler(self.device, vk_samp, None)
+        self._sampler_cache.clear()
+        for img, mem, view in self._texture_cache.values():
+            vk.vkDestroyImageView(self.device, view, None)
+            vk.vkDestroyImage(self.device, img, None)
+            vk.vkFreeMemory(self.device, mem, None)
+        self._texture_cache.clear()
         while self._cleanup_callbacks:
             fn = self._cleanup_callbacks.pop()
             try:
@@ -1588,7 +2120,7 @@ class InteractiveWindow:
         ).to_bytes()
 
         mat_mode = getattr(app, "current_material_name", "metallic")
-        draws: List[Tuple[Mesh, bytes, bytes, bool]] = []
+        draws: List[Tuple[Any, ...]] = []
         for cmd in commands:
             mesh = getattr(cmd, "mesh", None)
             node = getattr(cmd, "node", None)
@@ -1600,7 +2132,19 @@ class InteractiveWindow:
                 mat = MaterialParams()
             obj_bytes = ObjectParams(model=model_mat, color=mat.albedo).to_bytes()
             is_normal_debug = (mat_mode == "normal_debug") and (node is getattr(app, "model_node", None))
-            draws.append((mesh, obj_bytes, mat.to_bytes(), is_normal_debug))
+            tex = getattr(mat, "albedo_texture", None)
+            samp = getattr(mat, "sampler", None)
+            if tex is None:
+                cmd_textures = getattr(cmd, "textures", None)
+                if cmd_textures:
+                    tex = next(iter(cmd_textures.values()))
+                    cmd_samplers = getattr(cmd, "samplers", None)
+                    if cmd_samplers:
+                        samp = next(iter(cmd_samplers.values()))
+            if tex is not None:
+                draws.append((mesh, obj_bytes, mat.to_bytes(), is_normal_debug, tex, samp))
+            else:
+                draws.append((mesh, obj_bytes, mat.to_bytes(), is_normal_debug))
 
         dpi_scale = max(1, round(fb_w / max(win_w, 1)))
         hud_text_1 = (

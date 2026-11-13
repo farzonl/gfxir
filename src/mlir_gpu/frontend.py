@@ -324,6 +324,240 @@ class ReflectedBufferBinding:
     pointer_type: PointerType
 
 
+@dataclass(frozen=True)
+class TextureBinding:
+    sample_type: Type = Type.VEC4
+    dimension: str = "2d"
+    set: int = 0
+    binding: int | None = None
+    name: str = ""
+
+    def __post_init__(self):
+        norm = _normalize_buffer_element_type(self.sample_type) if not isinstance(self.sample_type, Type) else self.sample_type
+        if norm != Type.VEC4:
+            raise TypeError(f"Texture2D sample_type currently requires Type.VEC4, got {norm!r}")
+        object.__setattr__(self, "sample_type", norm)
+        if self.dimension != "2d":
+            raise ValueError(f"Unsupported texture dimension: {self.dimension!r}; expected '2d'")
+        if type(self.set) is not int or self.set < 0:
+            raise ValueError(f"descriptor set index must be a non-negative integer, got {self.set!r}")
+        if self.binding is not None and (type(self.binding) is not int or self.binding < 0):
+            raise ValueError(f"descriptor binding index must be a non-negative integer, got {self.binding!r}")
+
+    def __str__(self) -> str:
+        return f"Texture2D[{self.sample_type.value}]"
+
+
+class Texture2D:
+    """2D sampled texture descriptor annotation for shader parameters.
+
+    Usage:
+        def frag(uv: vec2, albedo: Texture2D, samp: Sampler): ...
+        def frag_explicit(uv: vec2, albedo: Texture2D[0], samp: Sampler[1]): ...
+    """
+
+    def __class_getitem__(cls, item: Any) -> TextureBinding:
+        if isinstance(item, tuple):
+            if len(item) == 2:
+                first, second = item
+                if type(first) is int and type(second) is int:
+                    return TextureBinding(set=first, binding=second)
+                if type(second) is int:
+                    return TextureBinding(sample_type=_normalize_buffer_element_type(first), binding=second)
+                raise TypeError("Texture2D[...] 2-tuple expects (set, binding) or (sample_type, binding)")
+            if len(item) == 3:
+                sample_t, set_idx, bind_idx = item
+                if type(set_idx) is not int or type(bind_idx) is not int:
+                    raise TypeError("Texture2D[sample_type, set, binding] expects integer set and binding")
+                return TextureBinding(
+                    sample_type=_normalize_buffer_element_type(sample_t),
+                    set=set_idx,
+                    binding=bind_idx,
+                )
+            raise TypeError(f"Texture2D[...] expects 1 to 3 parameters, got {len(item)}")
+        if type(item) is int:
+            return TextureBinding(binding=item)
+        return TextureBinding(sample_type=_normalize_buffer_element_type(item))
+
+
+@dataclass(frozen=True)
+class SamplerBinding:
+    set: int = 0
+    binding: int | None = None
+    name: str = ""
+
+    def __post_init__(self):
+        if type(self.set) is not int or self.set < 0:
+            raise ValueError(f"descriptor set index must be a non-negative integer, got {self.set!r}")
+        if self.binding is not None and (type(self.binding) is not int or self.binding < 0):
+            raise ValueError(f"descriptor binding index must be a non-negative integer, got {self.binding!r}")
+
+    def __str__(self) -> str:
+        return "Sampler"
+
+
+class Sampler:
+    """Sampler descriptor annotation for shader parameters.
+
+    Usage:
+        def frag(uv: vec2, albedo: Texture2D, samp: Sampler): ...
+        def frag_explicit(uv: vec2, albedo: Texture2D[0], samp: Sampler[1]): ...
+    """
+
+    def __class_getitem__(cls, item: Any) -> SamplerBinding:
+        if isinstance(item, tuple):
+            if len(item) == 2 and type(item[0]) is int and type(item[1]) is int:
+                return SamplerBinding(set=item[0], binding=item[1])
+            raise TypeError("Sampler[...] expects a binding int or (set, binding) tuple")
+        if type(item) is int:
+            return SamplerBinding(binding=item)
+        raise TypeError(f"Sampler[...] expects an integer binding index, got {type(item).__name__}")
+
+
+@dataclass(frozen=True)
+class ReflectedTextureBinding:
+    name: str
+    set_index: int
+    binding_index: int
+    dimension: str = "2d"
+    sample_type: Type = Type.VEC4
+
+
+@dataclass(frozen=True)
+class ReflectedSamplerBinding:
+    name: str
+    set_index: int
+    binding_index: int
+
+
+TEXTURE_FORMATS: dict[str, int] = {
+    "rgba8_unorm": 4,
+    "rgba32_sfloat": 16,
+}
+SAMPLER_FILTERS = frozenset({"nearest", "linear"})
+SAMPLER_ADDRESS_MODES = frozenset({"repeat", "clamp_to_edge", "mirror_repeat"})
+
+
+@dataclass(frozen=True)
+class TextureData:
+    """Host-side 2D texture pixel payload and format descriptor."""
+
+    width: int
+    height: int
+    data: bytes
+    format: str = "rgba8_unorm"
+
+    def __post_init__(self):
+        if type(self.width) is not int or self.width < 1:
+            raise ValueError(f"TextureData width must be a positive integer, got {self.width!r}")
+        if type(self.height) is not int or self.height < 1:
+            raise ValueError(f"TextureData height must be a positive integer, got {self.height!r}")
+        if self.format not in TEXTURE_FORMATS:
+            raise ValueError(
+                f"Unsupported texture format {self.format!r}; expected one of {sorted(TEXTURE_FORMATS)}"
+            )
+        if not isinstance(self.data, (bytes, bytearray, memoryview)):
+            raise TypeError(f"TextureData data must be bytes-like, got {type(self.data).__name__}")
+        raw = bytes(self.data)
+        expected = self.width * self.height * TEXTURE_FORMATS[self.format]
+        if len(raw) != expected:
+            raise ValueError(
+                f"TextureData ({self.width}x{self.height}, {self.format}) expects {expected} bytes, got {len(raw)}"
+            )
+        object.__setattr__(self, "data", raw)
+
+    @property
+    def bytes_per_pixel(self) -> int:
+        return TEXTURE_FORMATS[self.format]
+
+    @property
+    def row_bytes(self) -> int:
+        return self.width * self.bytes_per_pixel
+
+    @classmethod
+    def from_rgba8(cls, width: int, height: int, pixels: Sequence[Sequence[int]] | bytes) -> TextureData:
+        if isinstance(pixels, (bytes, bytearray, memoryview)):
+            return cls(width=width, height=height, data=bytes(pixels), format="rgba8_unorm")
+        buf = bytearray()
+        for rgba in pixels:
+            if len(rgba) != 4:
+                raise ValueError("Each RGBA8 pixel must have 4 channel values.")
+            buf.extend(int(c) & 0xFF for c in rgba)
+        return cls(width=width, height=height, data=bytes(buf), format="rgba8_unorm")
+
+    @classmethod
+    def from_rgba_f32(cls, width: int, height: int, pixels: Sequence[Sequence[float]]) -> TextureData:
+        buf = bytearray()
+        for rgba in pixels:
+            if len(rgba) != 4:
+                raise ValueError("Each RGBA32F pixel must have 4 channel values.")
+            buf.extend(struct.pack("<4f", *(float(c) for c in rgba)))
+        return cls(width=width, height=height, data=bytes(buf), format="rgba32_sfloat")
+
+    @classmethod
+    def checkerboard(
+        cls,
+        width: int = 8,
+        height: int = 8,
+        color_a: tuple[int, int, int, int] = (255, 255, 255, 255),
+        color_b: tuple[int, int, int, int] = (0, 0, 0, 255),
+        tile_size: int = 1,
+    ) -> TextureData:
+        if type(tile_size) is not int or tile_size < 1:
+            raise ValueError(f"tile_size must be a positive integer, got {tile_size!r}")
+        buf = bytearray()
+        for y in range(height):
+            for x in range(width):
+                even = ((x // tile_size) + (y // tile_size)) % 2 == 0
+                buf.extend(color_a if even else color_b)
+        return cls(width=width, height=height, data=bytes(buf), format="rgba8_unorm")
+
+
+@dataclass(frozen=True)
+class SamplerDesc:
+    """Host-side sampler state configuration."""
+
+    mag_filter: str = "linear"
+    min_filter: str = "linear"
+    address_mode_u: str = "repeat"
+    address_mode_v: str = "repeat"
+
+    def __post_init__(self):
+        if self.mag_filter not in SAMPLER_FILTERS:
+            raise ValueError(
+                f"Invalid mag_filter {self.mag_filter!r}; expected one of {sorted(SAMPLER_FILTERS)}"
+            )
+        if self.min_filter not in SAMPLER_FILTERS:
+            raise ValueError(
+                f"Invalid min_filter {self.min_filter!r}; expected one of {sorted(SAMPLER_FILTERS)}"
+            )
+        if self.address_mode_u not in SAMPLER_ADDRESS_MODES:
+            raise ValueError(
+                f"Invalid address_mode_u {self.address_mode_u!r}; expected one of {sorted(SAMPLER_ADDRESS_MODES)}"
+            )
+        if self.address_mode_v not in SAMPLER_ADDRESS_MODES:
+            raise ValueError(
+                f"Invalid address_mode_v {self.address_mode_v!r}; expected one of {sorted(SAMPLER_ADDRESS_MODES)}"
+            )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "mag_filter": self.mag_filter,
+            "min_filter": self.min_filter,
+            "address_mode_u": self.address_mode_u,
+            "address_mode_v": self.address_mode_v,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SamplerDesc:
+        return cls(
+            mag_filter=str(data.get("mag_filter", "linear")),
+            min_filter=str(data.get("min_filter", "linear")),
+            address_mode_u=str(data.get("address_mode_u", "repeat")),
+            address_mode_v=str(data.get("address_mode_v", "repeat")),
+        )
+
+
 f32 = Type.F32
 i32 = Type.I32
 u32 = Type.U32
@@ -630,6 +864,27 @@ def atomic_compare_exchange(
 atomic_cas = atomic_compare_exchange
 
 
+def sample_texture(texture: Any, sampler: Any, uv: Any) -> Any:
+    """Sample a 2D texture at normalized UV coordinates with implicit LOD (fragment shaders)."""
+    if hasattr(texture, "sample_cpu"):
+        return texture.sample_cpu(sampler, uv)
+    raise TypeError("sample_texture() can only be called inside a @fragment shader.")
+
+
+def sample_texture_level(texture: Any, sampler: Any, uv: Any, lod: Any) -> Any:
+    """Sample a 2D texture at normalized UV coordinates with an explicit mip LOD."""
+    if hasattr(texture, "sample_level_cpu"):
+        return texture.sample_level_cpu(sampler, uv, lod)
+    raise TypeError("sample_texture_level() can only be called inside a shader.")
+
+
+def load_texture(texture: Any, coord: Any, level: Any = 0) -> Any:
+    """Load an unfiltered RGBA texel from a 2D texture at integer texel coordinates."""
+    if hasattr(texture, "load_cpu"):
+        return texture.load_cpu(coord, level)
+    raise TypeError("load_texture() can only be called inside a shader.")
+
+
 def _operands(lhs: Value | float | int, rhs: Value | float | int,
               broadcast: bool = False) -> tuple[Node, Node]:
     expected = lhs.node.type if isinstance(lhs, Value) else (
@@ -926,13 +1181,27 @@ class Stage:
         }
 
 
+def _normalize_resource_annotation(annotation: Any) -> BufferBinding | TextureBinding | SamplerBinding | None:
+    if annotation is Texture2D:
+        return TextureBinding()
+    if annotation is Sampler:
+        return SamplerBinding()
+    if isinstance(annotation, (BufferBinding, TextureBinding, SamplerBinding)):
+        return annotation
+    return None
+
+
 def resolve_annotation(fn: Callable, annotation: Any) -> Any:
     if not isinstance(annotation, str):
         return annotation
-    eval_globals = {
+    builtin_resource_globals = {
         "Buffer": Buffer,
         "BufferBinding": BufferBinding,
         "BufferType": BufferType,
+        "Texture2D": Texture2D,
+        "TextureBinding": TextureBinding,
+        "Sampler": Sampler,
+        "SamplerBinding": SamplerBinding,
         "AccessMode": AccessMode,
         "Type": Type,
         "PointerType": PointerType,
@@ -945,6 +1214,7 @@ def resolve_annotation(fn: Callable, annotation: Any) -> Any:
         "i32": i32,
         "u32": u32,
     }
+    eval_globals = dict(builtin_resource_globals)
     if hasattr(fn, "__globals__"):
         eval_globals.update(fn.__globals__)
     eval_locals = {}
@@ -957,9 +1227,14 @@ def resolve_annotation(fn: Callable, annotation: Any) -> Any:
     try:
         return eval(annotation, eval_globals, eval_locals)
     except Exception:
-        if hasattr(fn, "__globals__"):
-            return fn.__globals__.get(annotation, annotation)
-        return annotation
+        fallback_globals = dict(eval_globals)
+        fallback_globals.update(builtin_resource_globals)
+        try:
+            return eval(annotation, fallback_globals, eval_locals)
+        except Exception:
+            if hasattr(fn, "__globals__"):
+                return fn.__globals__.get(annotation, annotation)
+            return annotation
 
 
 @dataclass(frozen=True)
@@ -973,7 +1248,7 @@ class Entry:
         results = []
         binding_counter = 0
         for param in inspect.signature(self.function).parameters.values():
-            ann = resolve_annotation(self.function, param.annotation)
+            ann = _normalize_resource_annotation(resolve_annotation(self.function, param.annotation))
             if isinstance(ann, BufferBinding):
                 set_idx = ann.set
                 binding_idx = ann.binding if ann.binding is not None else binding_counter
@@ -987,19 +1262,78 @@ class Entry:
                     access=mode,
                     pointer_type=PointerType(elem_type, ann.storage_class, ann.alignment),
                 ))
+            elif isinstance(ann, (TextureBinding, SamplerBinding)):
+                binding_idx = ann.binding if ann.binding is not None else binding_counter
+                binding_counter = max(binding_counter + 1, binding_idx + 1)
         return results
 
-    def trace(self, varying_interface: tuple[ShaderIO, ...] | None = None) -> Stage:
+    @property
+    def reflected_texture_bindings(self) -> list[ReflectedTextureBinding]:
+        results = []
+        binding_counter = 0
+        for param in inspect.signature(self.function).parameters.values():
+            ann = _normalize_resource_annotation(resolve_annotation(self.function, param.annotation))
+            if ann is not None:
+                binding_idx = ann.binding if ann.binding is not None else binding_counter
+                binding_counter = max(binding_counter + 1, binding_idx + 1)
+                if isinstance(ann, TextureBinding):
+                    results.append(ReflectedTextureBinding(
+                        name=param.name,
+                        set_index=ann.set,
+                        binding_index=binding_idx,
+                        dimension=ann.dimension,
+                        sample_type=ann.sample_type,
+                    ))
+        return results
+
+    @property
+    def reflected_sampler_bindings(self) -> list[ReflectedSamplerBinding]:
+        results = []
+        binding_counter = 0
+        for param in inspect.signature(self.function).parameters.values():
+            ann = _normalize_resource_annotation(resolve_annotation(self.function, param.annotation))
+            if ann is not None:
+                binding_idx = ann.binding if ann.binding is not None else binding_counter
+                binding_counter = max(binding_counter + 1, binding_idx + 1)
+                if isinstance(ann, SamplerBinding):
+                    results.append(ReflectedSamplerBinding(
+                        name=param.name,
+                        set_index=ann.set,
+                        binding_index=binding_idx,
+                    ))
+        return results
+
+    def _next_set0_binding_offset(self, start_offset: int = 0) -> int:
+        binding_counter = start_offset
+        used_set0 = False
+        for param in inspect.signature(self.function).parameters.values():
+            ann = _normalize_resource_annotation(resolve_annotation(self.function, param.annotation))
+            if ann is not None:
+                binding_idx = ann.binding if ann.binding is not None else binding_counter
+                if ann.set == 0:
+                    used_set0 = True
+                    binding_counter = max(binding_counter + 1, binding_idx + 1)
+        return binding_counter if used_set0 else start_offset
+
+    def trace(
+        self,
+        varying_interface: tuple[ShaderIO, ...] | None = None,
+        *,
+        binding_offset: int = 0,
+    ) -> Stage:
         name = self.function.__name__
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise ValueError(f"Invalid entry-point name: {name!r}.")
         parameters = list(inspect.signature(self.function).parameters.values())
         from .parameters import ParameterBlock, is_struct, _resolve_field_type
         parameter_blocks = {}
+        resource_parameters: set[str] = set()
         vertex_layout_struct = None
         for parameter in parameters:
             annotation = resolve_annotation(self.function, parameter.annotation)
-            if isinstance(annotation, ParameterBlock):
+            if _normalize_resource_annotation(annotation) is not None:
+                resource_parameters.add(parameter.name)
+            elif isinstance(annotation, ParameterBlock):
                 parameter_blocks[parameter.name] = annotation
             elif is_struct(annotation):
                 if getattr(annotation, "_is_vertex_struct", False) or getattr(annotation, "__struct_layout__", "") == "vertex":
@@ -1015,7 +1349,15 @@ class Entry:
             interfaces = ()
             input_nodes = ()
             from .ast_frontend import ASTLowering
-            lowering = ASTLowering(self.function, input_nodes, interfaces, parameter_blocks, workgroup_size=self.workgroup_size)
+            lowering = ASTLowering(
+                self.function,
+                input_nodes,
+                interfaces,
+                parameter_blocks,
+                workgroup_size=self.workgroup_size,
+                stage_kind="compute",
+                binding_offset=binding_offset,
+            )
             structured_data = lowering.module(name, "compute", (), (), workgroup_size=self.workgroup_size)
             return Stage(
                 name=name,
@@ -1029,7 +1371,11 @@ class Entry:
                 structured_input=structured_data,
             )
 
-        raster_parameters = [parameter for parameter in parameters if parameter.name not in parameter_blocks]
+        raster_parameters = [
+            parameter
+            for parameter in parameters
+            if parameter.name not in parameter_blocks and parameter.name not in resource_parameters
+        ]
         if any(parameter.kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
                for parameter in parameters):
             raise TypeError("Entry points require positional device arguments.")
@@ -1092,7 +1438,14 @@ class Entry:
             raise TypeError("A fragment entry point may declare FragmentCoord only once.")
         input_nodes = tuple(Node("input", interface.type, literal=interface.name) for interface in interfaces)
         from .ast_frontend import ASTLowering
-        lowering = ASTLowering(self.function, input_nodes, interfaces, parameter_blocks)
+        lowering = ASTLowering(
+            self.function,
+            input_nodes,
+            interfaces,
+            parameter_blocks,
+            stage_kind=self.kind,
+            binding_offset=binding_offset,
+        )
         result = lowering.result
         if self.kind == "vertex":
             if not isinstance(result, Vertex):
@@ -1263,7 +1616,13 @@ class Pipeline:
         if not isinstance(self.draw, Draw):
             raise TypeError("Pipeline draw configuration must be a Draw object.")
         vertex_stage = self.vertex.trace()
-        fragment_stage = self.fragment.trace(tuple(
+        offset_fn = getattr(self.vertex, "_next_set0_binding_offset", None)
+        next_binding = offset_fn(0) if callable(offset_fn) else 0
+        varyings = tuple(
             interface for interface in vertex_stage.output_interface if interface.builtin is None
-        ))
+        )
+        if next_binding > 0 or hasattr(self.fragment, "_next_set0_binding_offset"):
+            fragment_stage = self.fragment.trace(varyings, binding_offset=next_binding)
+        else:
+            fragment_stage = self.fragment.trace(varyings)
         return vertex_stage, fragment_stage

@@ -34,8 +34,14 @@ from .compiler import (
     _run,
     convert_dxil_to_metallib,
 )
-from .frontend import Dispatch, Draw
-from .interfaces import reflect_pipeline_parameters, verify_graphics_interface, verify_depth_stencil
+from .frontend import Dispatch, Draw, SamplerDesc, TextureData
+from .interfaces import (
+    reflect_pipeline_parameters,
+    reflect_pipeline_resources,
+    verify_depth_stencil,
+    verify_graphics_interface,
+    verify_stage_resources,
+)
 from .parameters import FrameParameters, pack_parameters, verify_parameters
 
 
@@ -72,6 +78,13 @@ class GraphicsProgram:
     pipelines: dict[str, Any] = None
     draws: list[Any] = None
     depth_stencil: dict | None = None
+    interface: dict | None = None
+    buffer_bindings: tuple[dict, ...] = ()
+    texture_bindings: tuple[dict, ...] = ()
+    sampler_bindings: tuple[dict, ...] = ()
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None
+    textures: Mapping[str, TextureData] | None = None
+    samplers: Mapping[str, SamplerDesc] | None = None
 
     def __post_init__(self) -> None:
         if self.pipelines is None:
@@ -88,6 +101,8 @@ class ComputeProgram:
     buffers: tuple[dict, ...] = ()
     dispatch: Dispatch = Dispatch()
     parameters: dict | None = None
+    textures: tuple[dict, ...] = ()
+    samplers: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -104,7 +119,134 @@ class RenderedImage:
     device: str
 
 
-def load_program(manifest: Path, *, vertex_buffer: Path | bytes | None = None, index_buffer: Path | bytes | None = None) -> GraphicsProgram:
+def _validate_resource_maps(
+    buffer_bindings: tuple[dict, ...] | list[dict],
+    texture_bindings: tuple[dict, ...] | list[dict],
+    sampler_bindings: tuple[dict, ...] | list[dict],
+    *,
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
+    require_complete: bool = True,
+) -> tuple[dict[str, bytes], dict[str, TextureData], dict[str, SamplerDesc]]:
+    buf_names = {b["name"] for b in buffer_bindings}
+    tex_names = {t["name"] for t in texture_bindings}
+    samp_names = {s["name"] for s in sampler_bindings}
+
+    resolved_buffers: dict[str, bytes] = {}
+    if buffers is not None:
+        extra_buf = sorted(set(buffers) - buf_names)
+        if extra_buf:
+            raise ViewerError(f"Unknown buffer resource name(s): {', '.join(extra_buf)}.")
+        for name, val in buffers.items():
+            if not isinstance(val, (bytes, bytearray, memoryview)) or len(val) == 0:
+                raise ViewerError(f"Buffer resource {name!r} must be a non-empty byte buffer.")
+            resolved_buffers[name] = bytes(val)
+
+    resolved_textures: dict[str, TextureData] = {}
+    if textures is not None:
+        extra_tex = sorted(set(textures) - tex_names)
+        if extra_tex:
+            raise ViewerError(f"Unknown texture resource name(s): {', '.join(extra_tex)}.")
+        for name, val in textures.items():
+            if not isinstance(val, TextureData):
+                raise ViewerError(f"Texture resource {name!r} must be a TextureData instance.")
+            resolved_textures[name] = val
+
+    resolved_samplers: dict[str, SamplerDesc] = {}
+    if samplers is not None:
+        extra_samp = sorted(set(samplers) - samp_names)
+        if extra_samp:
+            raise ViewerError(f"Unknown sampler resource name(s): {', '.join(extra_samp)}.")
+        for name, val in samplers.items():
+            if not isinstance(val, SamplerDesc):
+                raise ViewerError(f"Sampler resource {name!r} must be a SamplerDesc instance.")
+            resolved_samplers[name] = val
+
+    if require_complete:
+        missing_buf = sorted(buf_names - set(resolved_buffers))
+        if missing_buf:
+            raise ViewerError(f"Missing required buffer binding(s): {', '.join(missing_buf)}.")
+        missing_tex = sorted(tex_names - set(resolved_textures))
+        if missing_tex:
+            raise ViewerError(f"Missing required texture binding(s): {', '.join(missing_tex)}.")
+        missing_samp = sorted(samp_names - set(resolved_samplers))
+        if missing_samp:
+            raise ViewerError(f"Missing required sampler binding(s): {', '.join(missing_samp)}.")
+
+    return resolved_buffers, resolved_textures, resolved_samplers
+
+
+def _resolve_program_resources(
+    program: GraphicsProgram,
+    *,
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
+) -> tuple[dict[str, bytes], dict[str, TextureData], dict[str, SamplerDesc]]:
+    merged_buffers = dict(program.buffers) if program.buffers is not None else {}
+    if buffers is not None:
+        merged_buffers.update(buffers)
+    merged_textures = dict(program.textures) if program.textures is not None else {}
+    if textures is not None:
+        merged_textures.update(textures)
+    merged_samplers = dict(program.samplers) if program.samplers is not None else {}
+    if samplers is not None:
+        merged_samplers.update(samplers)
+    return _validate_resource_maps(
+        program.buffer_bindings,
+        program.texture_bindings,
+        program.sampler_bindings,
+        buffers=merged_buffers if (merged_buffers or buffers is not None) else None,
+        textures=merged_textures if (merged_textures or textures is not None) else None,
+        samplers=merged_samplers if (merged_samplers or samplers is not None) else None,
+        require_complete=True,
+    )
+
+
+def _with_resource_overrides(
+    program: GraphicsProgram,
+    *,
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
+) -> GraphicsProgram:
+    if buffers is None and textures is None and samplers is None:
+        return program
+    resolved_buffers, resolved_textures, resolved_samplers = _resolve_program_resources(
+        program, buffers=buffers, textures=textures, samplers=samplers
+    )
+    return GraphicsProgram(
+        vertex=program.vertex,
+        fragment=program.fragment,
+        target=program.target,
+        draw=program.draw,
+        parameters=program.parameters,
+        input_layout=program.input_layout,
+        vertex_buffer=program.vertex_buffer,
+        index_buffer=program.index_buffer,
+        pipelines=program.pipelines,
+        draws=program.draws,
+        depth_stencil=program.depth_stencil,
+        interface=program.interface,
+        buffer_bindings=program.buffer_bindings,
+        texture_bindings=program.texture_bindings,
+        sampler_bindings=program.sampler_bindings,
+        buffers=resolved_buffers,
+        textures=resolved_textures,
+        samplers=resolved_samplers,
+    )
+
+
+def load_program(
+    manifest: Path,
+    *,
+    vertex_buffer: Path | bytes | None = None,
+    index_buffer: Path | bytes | None = None,
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
+) -> GraphicsProgram:
     manifest = Path(manifest).resolve()
     data = json.loads(manifest.read_text())
     if isinstance(data, dict) and type(data.get("schema_version")) is int and data.get("schema_version") == 1:
@@ -249,6 +391,25 @@ def load_program(manifest: Path, *, vertex_buffer: Path | bytes | None = None, i
             ib_val = data["index_buffer"]
             index_buffer = manifest.parent / ib_val if isinstance(ib_val, str) else ib_val
 
+        multi_buf_bindings: list[dict] = []
+        multi_tex_bindings: list[dict] = []
+        multi_samp_bindings: list[dict] = []
+        if isinstance(first_pipe.interface, dict) and set(first_pipe.interface) == {"vertex", "fragment"}:
+            try:
+                multi_buf_bindings, multi_tex_bindings, multi_samp_bindings = reflect_pipeline_resources(first_pipe.interface)
+            except ValueError as error:
+                raise ViewerError(f"Invalid graphics resource interface in multi-draw manifest: {error}") from error
+        if buffers is not None or textures is not None or samplers is not None:
+            _validate_resource_maps(
+                multi_buf_bindings,
+                multi_tex_bindings,
+                multi_samp_bindings,
+                buffers=buffers,
+                textures=textures,
+                samplers=samplers,
+                require_complete=False,
+            )
+
         return GraphicsProgram(
             vertex=first_pipe.vertex,
             fragment=first_pipe.fragment,
@@ -261,6 +422,13 @@ def load_program(manifest: Path, *, vertex_buffer: Path | bytes | None = None, i
             pipelines=pipelines,
             draws=draw_calls,
             depth_stencil=multi_depth_stencil,
+            interface=first_pipe.interface,
+            buffer_bindings=tuple(multi_buf_bindings),
+            texture_bindings=tuple(multi_tex_bindings),
+            sampler_bindings=tuple(multi_samp_bindings),
+            buffers=dict(buffers) if buffers is not None else None,
+            textures=dict(textures) if textures is not None else None,
+            samplers=dict(samplers) if samplers is not None else None,
         )
 
     draw_data = data.get("draw")
@@ -371,6 +539,21 @@ def load_program(manifest: Path, *, vertex_buffer: Path | bytes | None = None, i
             instance_count=draw.instance_count,
             first_instance=draw.first_instance,
         )
+    buf_bindings: list[dict] = []
+    tex_bindings: list[dict] = []
+    samp_bindings: list[dict] = []
+    if data["schema_version"] in (3, 4) and isinstance(data.get("interface"), dict):
+        buf_bindings, tex_bindings, samp_bindings = reflect_pipeline_resources(data["interface"])
+    if buffers is not None or textures is not None or samplers is not None:
+        _validate_resource_maps(
+            buf_bindings,
+            tex_bindings,
+            samp_bindings,
+            buffers=buffers,
+            textures=textures,
+            samplers=samplers,
+            require_complete=False,
+        )
     return GraphicsProgram(
         vertex=shaders["vertex"],
         fragment=shaders["fragment"],
@@ -383,6 +566,13 @@ def load_program(manifest: Path, *, vertex_buffer: Path | bytes | None = None, i
         pipelines={"default": pipe_state},
         draws=[single_draw],
         depth_stencil=depth_stencil,
+        interface=data.get("interface"),
+        buffer_bindings=tuple(buf_bindings),
+        texture_bindings=tuple(tex_bindings),
+        sampler_bindings=tuple(samp_bindings),
+        buffers=dict(buffers) if buffers is not None else None,
+        textures=dict(textures) if textures is not None else None,
+        samplers=dict(samplers) if samplers is not None else None,
     )
 
 
@@ -462,6 +652,62 @@ def load_compute_program(manifest: Path) -> ComputeProgram:
         })
     validated_buffers.sort(key=lambda item: (item["set"], item["binding"]))
 
+    raw_textures = data.get("textures", [])
+    if not isinstance(raw_textures, list):
+        raise ViewerError("Compute manifest textures field must be a list.")
+    validated_textures: list[dict] = []
+    for tex in raw_textures:
+        if not isinstance(tex, dict):
+            raise ViewerError("Invalid texture binding entry in compute manifest.")
+        name = tex.get("name")
+        set_idx = tex.get("set")
+        binding_idx = tex.get("binding")
+        dim = tex.get("dimension", "2d")
+        sample_type = tex.get("sample_type", "f32x4")
+        if not isinstance(name, str) or not name or name in seen_names:
+            raise ViewerError(f"Invalid or duplicate texture name in compute manifest: {name!r}.")
+        if type(set_idx) is not int or set_idx < 0 or type(binding_idx) is not int or binding_idx < 0:
+            raise ViewerError(f"Texture {name!r} has invalid set/binding indices.")
+        if (set_idx, binding_idx) in seen_slots:
+            raise ViewerError(f"Duplicate descriptor slot ({set_idx}, {binding_idx}) in compute manifest.")
+        if dim != "2d" or sample_type != "f32x4":
+            raise ViewerError(f"Texture {name!r} has unsupported dimension/sample_type ({dim!r}/{sample_type!r}).")
+        seen_names.add(name)
+        seen_slots.add((set_idx, binding_idx))
+        validated_textures.append({
+            "name": name,
+            "set": set_idx,
+            "binding": binding_idx,
+            "dimension": dim,
+            "sample_type": sample_type,
+        })
+    validated_textures.sort(key=lambda item: (item["set"], item["binding"]))
+
+    raw_samplers = data.get("samplers", [])
+    if not isinstance(raw_samplers, list):
+        raise ViewerError("Compute manifest samplers field must be a list.")
+    validated_samplers: list[dict] = []
+    for samp in raw_samplers:
+        if not isinstance(samp, dict):
+            raise ViewerError("Invalid sampler binding entry in compute manifest.")
+        name = samp.get("name")
+        set_idx = samp.get("set")
+        binding_idx = samp.get("binding")
+        if not isinstance(name, str) or not name or name in seen_names:
+            raise ViewerError(f"Invalid or duplicate sampler name in compute manifest: {name!r}.")
+        if type(set_idx) is not int or set_idx < 0 or type(binding_idx) is not int or binding_idx < 0:
+            raise ViewerError(f"Sampler {name!r} has invalid set/binding indices.")
+        if (set_idx, binding_idx) in seen_slots:
+            raise ViewerError(f"Duplicate descriptor slot ({set_idx}, {binding_idx}) in compute manifest.")
+        seen_names.add(name)
+        seen_slots.add((set_idx, binding_idx))
+        validated_samplers.append({
+            "name": name,
+            "set": set_idx,
+            "binding": binding_idx,
+        })
+    validated_samplers.sort(key=lambda item: (item["set"], item["binding"]))
+
     parameters = None
     if "parameters" in data or "parameters" in compute_refl:
         parameters = data.get("parameters")
@@ -505,6 +751,8 @@ def load_compute_program(manifest: Path) -> ComputeProgram:
         buffers=tuple(validated_buffers),
         dispatch=dispatch,
         parameters=parameters,
+        textures=tuple(validated_textures),
+        samplers=tuple(validated_samplers),
     )
 
 
@@ -556,6 +804,75 @@ def write_png(path: Path, image: RenderedImage) -> None:
     encoded = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
     with Path(path).open("xb") as output:
         output.write(encoded)
+
+
+def _write_native_graphics_resources(directory: Path, program: GraphicsProgram) -> Path | None:
+    resolved_buffers, resolved_textures, resolved_samplers = _resolve_program_resources(program)
+    if not (program.buffer_bindings or program.texture_bindings or program.sampler_bindings):
+        return None
+
+    buf_paths: dict[str, str] = {}
+    for idx, (name, raw) in enumerate(sorted(resolved_buffers.items())):
+        p = directory / f"gfx_buf_{idx}.bin"
+        p.write_bytes(raw)
+        buf_paths[name] = str(p)
+
+    tex_paths: dict[str, str] = {}
+    for idx, (name, tex) in enumerate(sorted(resolved_textures.items())):
+        p = directory / f"gfx_tex_{idx}.bin"
+        p.write_bytes(tex.data)
+        tex_paths[name] = str(p)
+
+    stages_payload: dict[str, dict] = {}
+    for stage in ("vertex", "fragment"):
+        stage_buffers = []
+        for b in program.buffer_bindings:
+            if stage in b.get("stages", [stage]):
+                raw = resolved_buffers[b["name"]]
+                stage_buffers.append({
+                    "name": b["name"],
+                    "set": b["set"],
+                    "binding": b["binding"],
+                    "access": b["access"],
+                    "size": len(raw),
+                    "input_path": buf_paths[b["name"]],
+                    "output_path": "",
+                })
+        stage_textures = []
+        for t in program.texture_bindings:
+            if stage in t.get("stages", [stage]):
+                tex = resolved_textures[t["name"]]
+                stage_textures.append({
+                    "name": t["name"],
+                    "set": t["set"],
+                    "binding": t["binding"],
+                    "width": tex.width,
+                    "height": tex.height,
+                    "format": tex.format,
+                    "path": tex_paths[t["name"]],
+                })
+        stage_samplers = []
+        for s in program.sampler_bindings:
+            if stage in s.get("stages", [stage]):
+                samp = resolved_samplers[s["name"]]
+                stage_samplers.append({
+                    "name": s["name"],
+                    "set": s["set"],
+                    "binding": s["binding"],
+                    "mag_filter": samp.mag_filter,
+                    "min_filter": samp.min_filter,
+                    "address_mode_u": samp.address_mode_u,
+                    "address_mode_v": samp.address_mode_v,
+                })
+        stages_payload[stage] = {
+            "buffers": stage_buffers,
+            "textures": stage_textures,
+            "samplers": stage_samplers,
+        }
+
+    res_path = directory / "resources.json"
+    res_path.write_text(json.dumps(stages_payload, allow_nan=False))
+    return res_path
 
 
 @contextmanager
@@ -667,6 +984,9 @@ def _metal_libraries(program: GraphicsProgram, toolchain: Toolchain):
             multi_spec = directory / "multi-spec.json"
             multi_spec.write_text(json.dumps({"pipelines": multi_pipes, "draws": multi_draws}, allow_nan=False))
             arguments.extend(["--multi-spec", str(multi_spec)])
+        res_path = _write_native_graphics_resources(directory, program)
+        if res_path is not None:
+            arguments.extend(["--resources", str(res_path)])
         yield directory, arguments
 
 
@@ -788,6 +1108,9 @@ def _directx_shaders(program: GraphicsProgram, toolchain: Toolchain):
             else:
                 ib_path = Path(program.index_buffer).resolve()
             arguments.extend(["--index-buffer", str(ib_path)])
+        res_path = _write_native_graphics_resources(directory, program)
+        if res_path is not None:
+            arguments.extend(["--resources", str(res_path)])
         yield directory, arguments
 
 
@@ -843,7 +1166,12 @@ def render_directx_offscreen(
     program: GraphicsProgram, width: int = 640, height: int = 480,
     validation: bool = False, toolchain: Toolchain | None = None, time: float = 0.0,
     provider: str | None = None,
+    *,
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
 ) -> RenderedImage:
+    program = _with_resource_overrides(program, buffers=buffers, textures=textures, samplers=samplers)
     elapsed = _time_value(time)
     kwargs = {"provider": provider} if provider is not None else {}
     with _directx_offscreen_renderer(program, width, height, validation, toolchain, **kwargs) as render:
@@ -854,7 +1182,12 @@ def show_directx_window(
     program: GraphicsProgram, width: int = 800, height: int = 600, frames: int = 0,
     validation: bool = False, toolchain: Toolchain | None = None, time: float | None = None,
     provider: str | None = None,
+    *,
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
 ) -> None:
+    program = _with_resource_overrides(program, buffers=buffers, textures=textures, samplers=samplers)
     _dimensions(width, height)
     _validate_provider(provider, "directx")
     if type(frames) is not int or frames < 0:
@@ -871,7 +1204,12 @@ def show_directx_window(
 def render_metal_offscreen(
     program: GraphicsProgram, width: int = 640, height: int = 480,
     validation: bool = False, toolchain: Toolchain | None = None, time: float = 0.0,
+    *,
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
 ) -> RenderedImage:
+    program = _with_resource_overrides(program, buffers=buffers, textures=textures, samplers=samplers)
     elapsed = _time_value(time)
     with _metal_offscreen_renderer(program, width, height, validation, toolchain) as render:
         return render(elapsed)
@@ -897,7 +1235,12 @@ def _metal_offscreen_renderer(
 def show_metal_window(
     program: GraphicsProgram, width: int = 800, height: int = 600, frames: int = 0,
     validation: bool = False, toolchain: Toolchain | None = None, time: float | None = None,
+    *,
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
 ) -> None:
+    program = _with_resource_overrides(program, buffers=buffers, textures=textures, samplers=samplers)
     _dimensions(width, height)
     if type(frames) is not int or frames < 0:
         raise ViewerError("Frame count must be a nonnegative integer (0 means until closed).")
@@ -986,7 +1329,9 @@ class _Vulkan:
         _validate_provider(provider, "vulkan")
         vk = self.vk = _binding("vulkan")
         self.resources = resources
+        self.compute_only = compute_only
         self.surface = None
+        self.pipeline_set_layouts: dict[object, list[object]] = {}
         self.validation_errors: list[str] = []
         resources.callback(self.check_validation)
         extensions = list(glfw.get_required_instance_extensions() or []) if window else []
@@ -1302,6 +1647,154 @@ class _Vulkan:
                 vk.vkUnmapMemory(self.device, memory)
         return buffer
 
+    def sampled_image(self, resources, tex: TextureData):
+        vk = self.vk
+        vk_formats = {
+            "rgba8_unorm": vk.VK_FORMAT_R8G8B8A8_UNORM,
+            "rgba32_sfloat": vk.VK_FORMAT_R32G32B32A32_SFLOAT,
+        }
+        if tex.format not in vk_formats:
+            raise ViewerError(f"Unsupported Vulkan texture format: {tex.format!r}.")
+        vk_format = vk_formats[tex.format]
+        properties = vk.vkGetPhysicalDeviceFormatProperties(self.physical, vk_format)
+        if not properties.optimalTilingFeatures & vk.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT:
+            raise ViewerError(f"The Vulkan device does not support sampled image format {tex.format!r}.")
+
+        image = vk.vkCreateImage(self.device, vk.VkImageCreateInfo(
+            imageType=vk.VK_IMAGE_TYPE_2D,
+            format=vk_format,
+            extent=vk.VkExtent3D(width=tex.width, height=tex.height, depth=1),
+            mipLevels=1,
+            arrayLayers=1,
+            samples=vk.VK_SAMPLE_COUNT_1_BIT,
+            tiling=vk.VK_IMAGE_TILING_OPTIMAL,
+            usage=vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT | vk.VK_IMAGE_USAGE_SAMPLED_BIT,
+            sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+            initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+        ), None)
+        memory = None
+
+        def destroy():
+            vk.vkDestroyImage(self.device, image, None)
+            if memory is not None:
+                vk.vkFreeMemory(self.device, memory, None)
+
+        resources.callback(destroy)
+        requirements = vk.vkGetImageMemoryRequirements(self.device, image)
+        memory = vk.vkAllocateMemory(self.device, vk.VkMemoryAllocateInfo(
+            allocationSize=requirements.size,
+            memoryTypeIndex=self.memory_type(requirements.memoryTypeBits, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+        ), None)
+        vk.vkBindImageMemory(self.device, image, memory, 0)
+
+        with ExitStack() as staging:
+            staging_buf = self.create_buffer(staging, tex.data, vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
+            cmd = vk.vkAllocateCommandBuffers(self.device, vk.VkCommandBufferAllocateInfo(
+                commandPool=self.pool, level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount=1,
+            ))[0]
+            staging.callback(vk.vkFreeCommandBuffers, self.device, self.pool, 1, [cmd])
+            fence = vk.vkCreateFence(self.device, vk.VkFenceCreateInfo(), None)
+            staging.callback(vk.vkDestroyFence, self.device, fence, None)
+
+            subresource = vk.VkImageSubresourceRange(
+                aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, baseMipLevel=0, levelCount=1, baseArrayLayer=0, layerCount=1,
+            )
+            vk.vkBeginCommandBuffer(cmd, vk.VkCommandBufferBeginInfo(flags=vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT))
+            vk.vkCmdPipelineBarrier(
+                cmd,
+                vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0,
+                0, None,
+                0, None,
+                1, [vk.VkImageMemoryBarrier(
+                    srcAccessMask=0,
+                    dstAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                    oldLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+                    newLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                    dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                    image=image,
+                    subresourceRange=subresource,
+                )],
+            )
+            vk.vkCmdCopyBufferToImage(
+                cmd,
+                staging_buf,
+                image,
+                vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                [vk.VkBufferImageCopy(
+                    bufferOffset=0,
+                    bufferRowLength=0,
+                    bufferImageHeight=0,
+                    imageSubresource=vk.VkImageSubresourceLayers(
+                        aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, mipLevel=0, baseArrayLayer=0, layerCount=1,
+                    ),
+                    imageOffset=vk.VkOffset3D(x=0, y=0, z=0),
+                    imageExtent=vk.VkExtent3D(width=tex.width, height=tex.height, depth=1),
+                )],
+            )
+            dst_stage = (
+                vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                if self.compute_only
+                else (vk.VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+            )
+            vk.vkCmdPipelineBarrier(
+                cmd,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                dst_stage,
+                0,
+                0, None,
+                0, None,
+                1, [vk.VkImageMemoryBarrier(
+                    srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                    dstAccessMask=vk.VK_ACCESS_SHADER_READ_BIT,
+                    oldLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    newLayout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                    dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                    image=image,
+                    subresourceRange=subresource,
+                )],
+            )
+            vk.vkEndCommandBuffer(cmd)
+            vk.vkQueueSubmit(self.queue, 1, [vk.VkSubmitInfo(pCommandBuffers=[cmd])], fence)
+            vk.vkWaitForFences(self.device, 1, [fence], vk.VK_TRUE, 10_000_000_000)
+
+        return image, self.view(resources, image, vk_format)
+
+    def sampler(self, resources, desc: SamplerDesc):
+        vk = self.vk
+        filters = {
+            "nearest": vk.VK_FILTER_NEAREST,
+            "linear": vk.VK_FILTER_LINEAR,
+        }
+        address_modes = {
+            "repeat": vk.VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            "clamp_to_edge": vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            "mirror_repeat": vk.VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+        }
+        vk_sampler = vk.vkCreateSampler(self.device, vk.VkSamplerCreateInfo(
+            magFilter=filters[desc.mag_filter],
+            minFilter=filters[desc.min_filter],
+            mipmapMode=vk.VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            addressModeU=address_modes[desc.address_mode_u],
+            addressModeV=address_modes[desc.address_mode_v],
+            addressModeW=vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            mipLodBias=0.0,
+            anisotropyEnable=vk.VK_FALSE,
+            maxAnisotropy=1.0,
+            compareEnable=vk.VK_FALSE,
+            compareOp=vk.VK_COMPARE_OP_ALWAYS,
+            minLod=0.0,
+            maxLod=0.0,
+            borderColor=vk.VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+            unnormalizedCoordinates=vk.VK_FALSE,
+        ), None)
+        resources.callback(vk.vkDestroySampler, self.device, vk_sampler, None)
+        return vk_sampler
+
     def compute_pipeline(self, resources, program: ComputeProgram):
         vk = self.vk
         wgx, wgy, wgz = program.workgroup_size
@@ -1313,9 +1806,14 @@ class _Vulkan:
         ):
             raise ViewerError("The compute kernel's workgroup_size exceeds the Vulkan device limits.")
 
+        all_sets = (
+            [buf["set"] for buf in program.buffers]
+            + [tex["set"] for tex in getattr(program, "textures", ())]
+            + [samp["set"] for samp in getattr(program, "samplers", ())]
+        )
         set_layouts = []
-        if program.buffers:
-            max_set = max(buf["set"] for buf in program.buffers)
+        if all_sets:
+            max_set = max(all_sets)
             for set_idx in range(max_set + 1):
                 bindings = [
                     vk.VkDescriptorSetLayoutBinding(
@@ -1326,6 +1824,24 @@ class _Vulkan:
                     )
                     for buf in program.buffers
                     if buf["set"] == set_idx
+                ] + [
+                    vk.VkDescriptorSetLayoutBinding(
+                        binding=tex["binding"],
+                        descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                        descriptorCount=1,
+                        stageFlags=vk.VK_SHADER_STAGE_COMPUTE_BIT,
+                    )
+                    for tex in getattr(program, "textures", ())
+                    if tex["set"] == set_idx
+                ] + [
+                    vk.VkDescriptorSetLayoutBinding(
+                        binding=samp["binding"],
+                        descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLER,
+                        descriptorCount=1,
+                        stageFlags=vk.VK_SHADER_STAGE_COMPUTE_BIT,
+                    )
+                    for samp in getattr(program, "samplers", ())
+                    if samp["set"] == set_idx
                 ]
                 set_layout = vk.vkCreateDescriptorSetLayout(
                     self.device,
@@ -1487,8 +2003,65 @@ class _Vulkan:
                 offset=0,
                 size=max_size,
             ))
-        layout = vk.vkCreatePipelineLayout(self.device, vk.VkPipelineLayoutCreateInfo(pPushConstantRanges=ranges), None)
+
+        buf_bindings = getattr(program, "buffer_bindings", ())
+        tex_bindings = getattr(program, "texture_bindings", ())
+        samp_bindings = getattr(program, "sampler_bindings", ())
+        all_sets = (
+            [b["set"] for b in buf_bindings]
+            + [t["set"] for t in tex_bindings]
+            + [s["set"] for s in samp_bindings]
+        )
+        set_layouts = []
+        if all_sets:
+            max_set = max(all_sets)
+            for set_idx in range(max_set + 1):
+                bindings = [
+                    vk.VkDescriptorSetLayoutBinding(
+                        binding=b["binding"],
+                        descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                        descriptorCount=1,
+                        stageFlags=self.parameter_stages(b),
+                    )
+                    for b in buf_bindings
+                    if b["set"] == set_idx
+                ] + [
+                    vk.VkDescriptorSetLayoutBinding(
+                        binding=t["binding"],
+                        descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                        descriptorCount=1,
+                        stageFlags=self.parameter_stages(t),
+                    )
+                    for t in tex_bindings
+                    if t["set"] == set_idx
+                ] + [
+                    vk.VkDescriptorSetLayoutBinding(
+                        binding=s["binding"],
+                        descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLER,
+                        descriptorCount=1,
+                        stageFlags=self.parameter_stages(s),
+                    )
+                    for s in samp_bindings
+                    if s["set"] == set_idx
+                ]
+                set_layout = vk.vkCreateDescriptorSetLayout(
+                    self.device,
+                    vk.VkDescriptorSetLayoutCreateInfo(pBindings=bindings),
+                    None,
+                )
+                resources.callback(vk.vkDestroyDescriptorSetLayout, self.device, set_layout, None)
+                set_layouts.append(set_layout)
+
+        layout_info = (
+            vk.VkPipelineLayoutCreateInfo(pSetLayouts=set_layouts, pPushConstantRanges=ranges)
+            if set_layouts
+            else vk.VkPipelineLayoutCreateInfo(pPushConstantRanges=ranges)
+        )
+        layout = vk.vkCreatePipelineLayout(self.device, layout_info, None)
         resources.callback(vk.vkDestroyPipelineLayout, self.device, layout, None)
+        if not hasattr(self, "pipeline_set_layouts"):
+            self.pipeline_set_layouts = {}
+        self.pipeline_set_layouts[layout] = set_layouts
         pipeline_map = {}
         default_pipeline = None
 
@@ -1591,6 +2164,101 @@ class _Vulkan:
             }[stage]
         return flags
 
+    def create_graphics_descriptor_sets(self, resources, program, layout):
+        vk = self.vk
+        set_layouts = getattr(self, "pipeline_set_layouts", {}).get(layout, [])
+        if not set_layouts:
+            return []
+        resolved_buffers, resolved_textures, resolved_samplers = _resolve_program_resources(program)
+        buf_bindings = getattr(program, "buffer_bindings", ())
+        tex_bindings = getattr(program, "texture_bindings", ())
+        samp_bindings = getattr(program, "sampler_bindings", ())
+
+        pool_sizes = []
+        if buf_bindings:
+            pool_sizes.append(vk.VkDescriptorPoolSize(
+                type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount=len(buf_bindings),
+            ))
+        if tex_bindings:
+            pool_sizes.append(vk.VkDescriptorPoolSize(
+                type=vk.VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                descriptorCount=len(tex_bindings),
+            ))
+        if samp_bindings:
+            pool_sizes.append(vk.VkDescriptorPoolSize(
+                type=vk.VK_DESCRIPTOR_TYPE_SAMPLER,
+                descriptorCount=len(samp_bindings),
+            ))
+
+        desc_pool = vk.vkCreateDescriptorPool(
+            self.device,
+            vk.VkDescriptorPoolCreateInfo(maxSets=len(set_layouts), pPoolSizes=pool_sizes),
+            None,
+        )
+        resources.callback(vk.vkDestroyDescriptorPool, self.device, desc_pool, None)
+        descriptor_sets = list(vk.vkAllocateDescriptorSets(
+            self.device,
+            vk.VkDescriptorSetAllocateInfo(
+                descriptorPool=desc_pool,
+                descriptorSetCount=len(set_layouts),
+                pSetLayouts=set_layouts,
+            ),
+        ))
+
+        keep_alive = []
+        writes = []
+        for buf_meta in buf_bindings:
+            raw = resolved_buffers[buf_meta["name"]]
+            vk_buf, _, alloc_size = self.storage_buffer(resources, len(raw), raw)
+            info = vk.VkDescriptorBufferInfo(buffer=vk_buf, offset=0, range=alloc_size)
+            keep_alive.append(info)
+            writes.append(vk.VkWriteDescriptorSet(
+                dstSet=descriptor_sets[buf_meta["set"]],
+                dstBinding=buf_meta["binding"],
+                dstArrayElement=0,
+                descriptorCount=1,
+                descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=[info],
+            ))
+        for tex_meta in tex_bindings:
+            tex_data = resolved_textures[tex_meta["name"]]
+            _, vk_view = self.sampled_image(resources, tex_data)
+            info = vk.VkDescriptorImageInfo(
+                sampler=vk.VK_NULL_HANDLE,
+                imageView=vk_view,
+                imageLayout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            )
+            keep_alive.append(info)
+            writes.append(vk.VkWriteDescriptorSet(
+                dstSet=descriptor_sets[tex_meta["set"]],
+                dstBinding=tex_meta["binding"],
+                dstArrayElement=0,
+                descriptorCount=1,
+                descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                pImageInfo=[info],
+            ))
+        for samp_meta in samp_bindings:
+            samp_desc = resolved_samplers[samp_meta["name"]]
+            vk_samp = self.sampler(resources, samp_desc)
+            info = vk.VkDescriptorImageInfo(
+                sampler=vk_samp,
+                imageView=vk.VK_NULL_HANDLE,
+                imageLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+            )
+            keep_alive.append(info)
+            writes.append(vk.VkWriteDescriptorSet(
+                dstSet=descriptor_sets[samp_meta["set"]],
+                dstBinding=samp_meta["binding"],
+                dstArrayElement=0,
+                descriptorCount=1,
+                descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLER,
+                pImageInfo=[info],
+            ))
+        if writes:
+            vk.vkUpdateDescriptorSets(self.device, len(writes), writes, 0, None)
+        return descriptor_sets
+
     def framebuffer(self, resources, render_pass, view, width, height, depth_view=None):
         vk = self.vk
         attachments = [view] if depth_view is None else [view, depth_view]
@@ -1602,7 +2270,7 @@ class _Vulkan:
 
     def command(self, resources, render_pass, pipeline, framebuffer, width, height, draw: Draw, copy=None,
                 *, layout=None, parameters=None, elapsed=0.0, command=None, draws=None, has_depth=False,
-                vertex_buffer=None, index_buffer=None):
+                vertex_buffer=None, index_buffer=None, descriptor_sets=None):
         vk = self.vk
         data = _frame_data(parameters, width, height, elapsed) if parameters is not None else None
         if data is not None and layout is None:
@@ -1627,6 +2295,20 @@ class _Vulkan:
             renderArea=vk.VkRect2D(extent=vk.VkExtent2D(width=width, height=height)),
             pClearValues=clear_values,
         ), vk.VK_SUBPASS_CONTENTS_INLINE)
+
+        if descriptor_sets:
+            if layout is None:
+                raise ViewerError("Descriptor sets require the reflected pipeline layout.")
+            vk.vkCmdBindDescriptorSets(
+                command,
+                vk.VK_PIPELINE_BIND_POINT_GRAPHICS,
+                layout,
+                0,
+                len(descriptor_sets),
+                descriptor_sets,
+                0,
+                None,
+            )
 
         if data is not None:
             vk.vkCmdPushConstants(command, layout,
@@ -1757,7 +2439,12 @@ class _Vulkan:
 def render_offscreen(
     program: GraphicsProgram, width: int = 640, height: int = 480,
     validation: bool = False, time: float = 0.0, provider: str | None = None,
+    *,
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
 ) -> RenderedImage:
+    program = _with_resource_overrides(program, buffers=buffers, textures=textures, samplers=samplers)
     elapsed = _time_value(time)
     kwargs = {"provider": provider} if provider is not None else {}
     with _offscreen_renderer(program, width, height, validation, **kwargs) as render:
@@ -1767,7 +2454,12 @@ def render_offscreen(
 @contextmanager
 def _offscreen_renderer(
     program: GraphicsProgram, width: int, height: int, validation: bool, provider: str | None = None,
+    *,
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
 ):
+    program = _with_resource_overrides(program, buffers=buffers, textures=textures, samplers=samplers)
     _dimensions(width, height)
     _frame_parameters(program.parameters)
     if program.target == "directx" and sys.platform != "darwin":
@@ -1796,6 +2488,9 @@ def _offscreen_renderer(
             depth_image, depth_view = gpu.depth_image(resources, width, height, depth_format)
         buffer, memory = gpu.readback_buffer(resources, width * height * 4)
         render_pass, pipeline, layout = gpu.pipeline(resources, program, format, width, height, False)
+        create_sets = getattr(gpu, "create_graphics_descriptor_sets", None)
+        descriptor_sets = create_sets(resources, program, layout) if create_sets is not None else []
+        desc_kwargs = {"descriptor_sets": descriptor_sets} if descriptor_sets else {}
         framebuffer = gpu.framebuffer(resources, render_pass, view, width, height, depth_view=depth_view)
         fence = vk.vkCreateFence(gpu.device, vk.VkFenceCreateInfo(), None)
         resources.callback(vk.vkDestroyFence, gpu.device, fence, None)
@@ -1812,7 +2507,7 @@ def _offscreen_renderer(
             first = command is None
             command = gpu.command(resources, render_pass, pipeline, framebuffer, width, height, program.draw, (image, buffer),
                                   layout=layout, parameters=program.parameters, elapsed=_time_value(elapsed), command=command,
-                                  has_depth=has_depth, vertex_buffer=vertex_buffer, index_buffer=index_buffer)
+                                  has_depth=has_depth, vertex_buffer=vertex_buffer, index_buffer=index_buffer, **desc_kwargs)
             if first:
                 resources.callback(vk.vkDeviceWaitIdle, gpu.device)
             vk.vkResetFences(gpu.device, 1, [fence])
@@ -1831,7 +2526,12 @@ def _offscreen_renderer(
 def render_vulkan_offscreen(
     program: GraphicsProgram, width: int = 640, height: int = 480,
     validation: bool = False, time: float = 0.0, provider: str | None = None,
+    *,
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
 ) -> RenderedImage:
+    program = _with_resource_overrides(program, buffers=buffers, textures=textures, samplers=samplers)
     _validate_provider(provider, "vulkan")
     if program.target != "vulkan":
         raise ViewerError("Vulkan rendering requires Vulkan artifacts; use the Metal preview for DXIL.")
@@ -1841,7 +2541,12 @@ def render_vulkan_offscreen(
 @contextmanager
 def _vulkan_offscreen_renderer(
     program: GraphicsProgram, width: int, height: int, validation: bool, provider: str | None = None,
+    *,
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
 ):
+    program = _with_resource_overrides(program, buffers=buffers, textures=textures, samplers=samplers)
     _validate_provider(provider, "vulkan")
     if program.target != "vulkan":
         raise ViewerError("Vulkan rendering requires Vulkan artifacts; use the Metal preview for DXIL.")
@@ -1854,7 +2559,16 @@ def _prepare_compute_inputs(
     buffers: Mapping[str, bytes | bytearray | memoryview | int] | None,
     parameters: Mapping[str, object] | bytes | bytearray | memoryview | None,
     grid: tuple[int, int, int] | None,
-) -> tuple[tuple[int, int, int], bytes | None, list[tuple[dict, int, bytes | None]]]:
+    *,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
+) -> tuple[
+    tuple[int, int, int],
+    bytes | None,
+    list[tuple[dict, int, bytes | None]],
+    list[tuple[dict, TextureData]],
+    list[tuple[dict, SamplerDesc]],
+]:
     active_grid = program.dispatch.grid if grid is None else tuple(grid)
     if (
         len(active_grid) != 3
@@ -1913,7 +2627,45 @@ def _prepare_compute_inputs(
                 f"Compute buffer {name!r} must be a byte buffer (bytes/bytearray/memoryview) or positive int byte size."
             )
 
-    return (active_grid[0], active_grid[1], active_grid[2]), packed_params, prepared
+    prog_textures = getattr(program, "textures", ())
+    provided_tex = dict(textures or {})
+    reflected_tex_names = {tex["name"] for tex in prog_textures}
+    extra_tex = sorted(set(provided_tex) - reflected_tex_names)
+    if extra_tex:
+        raise ViewerError(f"Unknown compute texture name(s): {', '.join(extra_tex)}.")
+    missing_tex = sorted(reflected_tex_names - set(provided_tex))
+    if missing_tex:
+        raise ViewerError(f"Missing required compute texture binding(s): {', '.join(missing_tex)}.")
+    prepared_textures: list[tuple[dict, TextureData]] = []
+    for tex in prog_textures:
+        val = provided_tex[tex["name"]]
+        if not isinstance(val, TextureData):
+            raise ViewerError(f"Compute texture {tex['name']!r} must be a TextureData instance.")
+        prepared_textures.append((tex, val))
+
+    prog_samplers = getattr(program, "samplers", ())
+    provided_samp = dict(samplers or {})
+    reflected_samp_names = {samp["name"] for samp in prog_samplers}
+    extra_samp = sorted(set(provided_samp) - reflected_samp_names)
+    if extra_samp:
+        raise ViewerError(f"Unknown compute sampler name(s): {', '.join(extra_samp)}.")
+    missing_samp = sorted(reflected_samp_names - set(provided_samp))
+    if missing_samp:
+        raise ViewerError(f"Missing required compute sampler binding(s): {', '.join(missing_samp)}.")
+    prepared_samplers: list[tuple[dict, SamplerDesc]] = []
+    for samp in prog_samplers:
+        val = provided_samp[samp["name"]]
+        if not isinstance(val, SamplerDesc):
+            raise ViewerError(f"Compute sampler {samp['name']!r} must be a SamplerDesc instance.")
+        prepared_samplers.append((samp, val))
+
+    return (
+        (active_grid[0], active_grid[1], active_grid[2]),
+        packed_params,
+        prepared,
+        prepared_textures,
+        prepared_samplers,
+    )
 
 
 @contextmanager
@@ -1937,10 +2689,14 @@ def _vulkan_compute_session(
         def run(
             *,
             buffers: Mapping[str, bytes | bytearray | memoryview | int] | None = None,
+            textures: Mapping[str, TextureData] | None = None,
+            samplers: Mapping[str, SamplerDesc] | None = None,
             parameters: Mapping[str, object] | bytes | bytearray | memoryview | None = None,
             grid: tuple[int, int, int] | None = None,
         ) -> ComputeDispatchResult:
-            active_grid, packed_params, prepared = _prepare_compute_inputs(program, buffers, parameters, grid)
+            active_grid, packed_params, prepared, prepared_textures, prepared_samplers = _prepare_compute_inputs(
+                program, buffers, parameters, grid, textures=textures, samplers=samplers
+            )
             gx, gy, gz = active_grid
             if (
                 gx > gpu.max_compute_workgroup_count[0]
@@ -1956,14 +2712,34 @@ def _vulkan_compute_session(
                     vk_buf, vk_mem, alloc_size = gpu.storage_buffer(step_resources, byte_size, initial_data)
                     allocated.append((buf_meta, byte_size, vk_buf, vk_mem, alloc_size))
 
+                allocated_textures: list[tuple[dict, object]] = []
+                for tex_meta, tex_data in prepared_textures:
+                    _, vk_view = gpu.sampled_image(step_resources, tex_data)
+                    allocated_textures.append((tex_meta, vk_view))
+
+                allocated_samplers: list[tuple[dict, object]] = []
+                for samp_meta, samp_desc in prepared_samplers:
+                    vk_samp = gpu.sampler(step_resources, samp_desc)
+                    allocated_samplers.append((samp_meta, vk_samp))
+
                 descriptor_sets = []
                 if set_layouts:
-                    pool_sizes = [
-                        vk.VkDescriptorPoolSize(
+                    pool_sizes = []
+                    if allocated:
+                        pool_sizes.append(vk.VkDescriptorPoolSize(
                             type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                             descriptorCount=len(allocated),
-                        )
-                    ]
+                        ))
+                    if allocated_textures:
+                        pool_sizes.append(vk.VkDescriptorPoolSize(
+                            type=vk.VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                            descriptorCount=len(allocated_textures),
+                        ))
+                    if allocated_samplers:
+                        pool_sizes.append(vk.VkDescriptorPoolSize(
+                            type=vk.VK_DESCRIPTOR_TYPE_SAMPLER,
+                            descriptorCount=len(allocated_samplers),
+                        ))
                     desc_pool = vk.vkCreateDescriptorPool(
                         gpu.device,
                         vk.VkDescriptorPoolCreateInfo(
@@ -1980,11 +2756,11 @@ def _vulkan_compute_session(
                     )
                     descriptor_sets = list(vk.vkAllocateDescriptorSets(gpu.device, alloc_info))
 
-                    buf_infos = []
+                    keep_alive = []
                     writes = []
                     for buf_meta, _, vk_buf, _, alloc_size in allocated:
                         info = vk.VkDescriptorBufferInfo(buffer=vk_buf, offset=0, range=alloc_size)
-                        buf_infos.append(info)
+                        keep_alive.append(info)
                         writes.append(vk.VkWriteDescriptorSet(
                             dstSet=descriptor_sets[buf_meta["set"]],
                             dstBinding=buf_meta["binding"],
@@ -1992,6 +2768,36 @@ def _vulkan_compute_session(
                             descriptorCount=1,
                             descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                             pBufferInfo=[info],
+                        ))
+                    for tex_meta, vk_view in allocated_textures:
+                        info = vk.VkDescriptorImageInfo(
+                            sampler=vk.VK_NULL_HANDLE,
+                            imageView=vk_view,
+                            imageLayout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        )
+                        keep_alive.append(info)
+                        writes.append(vk.VkWriteDescriptorSet(
+                            dstSet=descriptor_sets[tex_meta["set"]],
+                            dstBinding=tex_meta["binding"],
+                            dstArrayElement=0,
+                            descriptorCount=1,
+                            descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                            pImageInfo=[info],
+                        ))
+                    for samp_meta, vk_samp in allocated_samplers:
+                        info = vk.VkDescriptorImageInfo(
+                            sampler=vk_samp,
+                            imageView=vk.VK_NULL_HANDLE,
+                            imageLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+                        )
+                        keep_alive.append(info)
+                        writes.append(vk.VkWriteDescriptorSet(
+                            dstSet=descriptor_sets[samp_meta["set"]],
+                            dstBinding=samp_meta["binding"],
+                            dstArrayElement=0,
+                            descriptorCount=1,
+                            descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLER,
+                            pImageInfo=[info],
                         ))
                     vk.vkUpdateDescriptorSets(gpu.device, len(writes), writes, 0, None)
 
@@ -2086,6 +2892,8 @@ def _write_native_compute_spec(
     active_grid: tuple[int, int, int],
     packed_params: bytes | None,
     prepared: list[tuple[dict, int, bytes | None]],
+    prepared_textures: list[tuple[dict, TextureData]] | tuple = (),
+    prepared_samplers: list[tuple[dict, SamplerDesc]] | tuple = (),
 ) -> tuple[Path, list[tuple[dict, int, Path]]]:
     rc_path_str = ""
     if packed_params is not None:
@@ -2118,13 +2926,45 @@ def _write_native_compute_spec(
             "output_path": output_path_str,
         })
 
-    spec_path = step_dir / "compute_spec.json"
-    spec_path.write_text(json.dumps({
+    spec_textures: list[dict] = []
+    for idx, (tex_meta, tex_data) in enumerate(prepared_textures):
+        tex_path = step_dir / f"tex_{idx}.bin"
+        tex_path.write_bytes(tex_data.data)
+        spec_textures.append({
+            "name": tex_meta["name"],
+            "set": tex_meta["set"],
+            "binding": tex_meta["binding"],
+            "width": tex_data.width,
+            "height": tex_data.height,
+            "format": tex_data.format,
+            "path": str(tex_path),
+        })
+
+    spec_samplers: list[dict] = []
+    for samp_meta, samp_desc in prepared_samplers:
+        spec_samplers.append({
+            "name": samp_meta["name"],
+            "set": samp_meta["set"],
+            "binding": samp_meta["binding"],
+            "min_filter": samp_desc.min_filter,
+            "mag_filter": samp_desc.mag_filter,
+            "address_mode_u": samp_desc.address_mode_u,
+            "address_mode_v": samp_desc.address_mode_v,
+        })
+
+    payload: dict[str, object] = {
         "workgroup_size": list(program.workgroup_size),
         "grid": list(active_grid),
         "root_constants_path": rc_path_str,
         "buffers": spec_buffers,
-    }, allow_nan=False))
+    }
+    if spec_textures:
+        payload["textures"] = spec_textures
+    if spec_samplers:
+        payload["samplers"] = spec_samplers
+
+    spec_path = step_dir / "compute_spec.json"
+    spec_path.write_text(json.dumps(payload, allow_nan=False))
     return spec_path, expected_outputs
 
 
@@ -2183,11 +3023,15 @@ def _directx_compute_session(
         def run(
             *,
             buffers: Mapping[str, bytes | bytearray | memoryview | int] | None = None,
+            textures: Mapping[str, TextureData] | None = None,
+            samplers: Mapping[str, SamplerDesc] | None = None,
             parameters: Mapping[str, object] | bytes | bytearray | memoryview | None = None,
             grid: tuple[int, int, int] | None = None,
         ) -> ComputeDispatchResult:
             nonlocal step_counter
-            active_grid, packed_params, prepared = _prepare_compute_inputs(program, buffers, parameters, grid)
+            active_grid, packed_params, prepared, prepared_textures, prepared_samplers = _prepare_compute_inputs(
+                program, buffers, parameters, grid, textures=textures, samplers=samplers
+            )
             if any(dim > 65535 for dim in active_grid):
                 raise ViewerError("Compute dispatch grid exceeds DirectX 12 per-dimension threadgroup limit (65535).")
             step_dir = work_dir / f"step_{step_counter}"
@@ -2195,7 +3039,7 @@ def _directx_compute_session(
             step_dir.mkdir(parents=True, exist_ok=True)
             try:
                 spec_path, expected_outputs = _write_native_compute_spec(
-                    step_dir, program, active_grid, packed_params, prepared
+                    step_dir, program, active_grid, packed_params, prepared, prepared_textures, prepared_samplers
                 )
                 text = _directx_run(
                     [viewer_exe, *warp_args, "--compute", str(shader_path), "--compute-spec", str(spec_path)],
@@ -2257,17 +3101,21 @@ def _metal_compute_session(
         def run(
             *,
             buffers: Mapping[str, bytes | bytearray | memoryview | int] | None = None,
+            textures: Mapping[str, TextureData] | None = None,
+            samplers: Mapping[str, SamplerDesc] | None = None,
             parameters: Mapping[str, object] | bytes | bytearray | memoryview | None = None,
             grid: tuple[int, int, int] | None = None,
         ) -> ComputeDispatchResult:
             nonlocal step_counter
-            active_grid, packed_params, prepared = _prepare_compute_inputs(program, buffers, parameters, grid)
+            active_grid, packed_params, prepared, prepared_textures, prepared_samplers = _prepare_compute_inputs(
+                program, buffers, parameters, grid, textures=textures, samplers=samplers
+            )
             step_dir = work_dir / f"step_{step_counter}"
             step_counter += 1
             step_dir.mkdir(parents=True, exist_ok=True)
             try:
                 spec_path, expected_outputs = _write_native_compute_spec(
-                    step_dir, program, active_grid, packed_params, prepared
+                    step_dir, program, active_grid, packed_params, prepared, prepared_textures, prepared_samplers
                 )
                 text = _metal_run(
                     [
@@ -2323,6 +3171,8 @@ def dispatch_compute(
     program: ComputeProgram | Path,
     *,
     buffers: Mapping[str, bytes | bytearray | memoryview | int] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
     parameters: Mapping[str, object] | bytes | bytearray | memoryview | None = None,
     grid: tuple[int, int, int] | None = None,
     validation: bool = False,
@@ -2330,7 +3180,7 @@ def dispatch_compute(
     toolchain: Toolchain | None = None,
 ) -> ComputeDispatchResult:
     with compute_session(program, validation=validation, provider=provider, toolchain=toolchain) as run:
-        return run(buffers=buffers, parameters=parameters, grid=grid)
+        return run(buffers=buffers, textures=textures, samplers=samplers, parameters=parameters, grid=grid)
 
 
 def render_compute_rgba(
@@ -2340,6 +3190,8 @@ def render_compute_rgba(
     *,
     output_buffer: str = "output_buffer",
     buffers: Mapping[str, bytes | bytearray | memoryview | int] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
     parameters: Mapping[str, object] | bytes | bytearray | memoryview | None = None,
     grid: tuple[int, int, int] | None = None,
     validation: bool = False,
@@ -2361,6 +3213,8 @@ def render_compute_rgba(
     result = dispatch_compute(
         loaded,
         buffers=merged_buffers,
+        textures=textures,
+        samplers=samplers,
         parameters=parameters,
         grid=active_grid,
         validation=validation,
@@ -2563,6 +3417,9 @@ def _swapchain(gpu, resources, program, width, height):
         depth_format = _vulkan_depth_format(gpu.vk, program.depth_stencil.get("format", "d32_sfloat"))
         depth_image, depth_view = gpu.depth_image(resources, width, height, depth_format)
     render_pass, pipeline, layout = gpu.pipeline(resources, program, format, width, height, True)
+    create_sets = getattr(gpu, "create_graphics_descriptor_sets", None)
+    descriptor_sets = create_sets(resources, program, layout) if create_sets is not None else []
+    desc_kwargs = {"descriptor_sets": descriptor_sets} if descriptor_sets else {}
     vertex_buffer = None
     if getattr(program, "vertex_buffer", None) is not None:
         vertex_buffer = gpu.create_buffer(resources, program.vertex_buffer, vk.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
@@ -2576,7 +3433,7 @@ def _swapchain(gpu, resources, program, width, height):
         framebuffers.append(framebuffer)
         commands.append(gpu.command(resources, render_pass, pipeline, framebuffer, width, height, program.draw,
                                     layout=layout, parameters=program.parameters, has_depth=has_depth,
-                                    vertex_buffer=vertex_buffer, index_buffer=index_buffer))
+                                    vertex_buffer=vertex_buffer, index_buffer=index_buffer, **desc_kwargs))
         semaphore = vk.vkCreateSemaphore(gpu.device, vk.VkSemaphoreCreateInfo(), None)
         resources.callback(vk.vkDestroySemaphore, gpu.device, semaphore, None)
         finished.append(semaphore)
@@ -2587,13 +3444,20 @@ def _swapchain(gpu, resources, program, width, height):
         if program.parameters is not None:
             gpu.command(resources, render_pass, pipeline, framebuffers[index], width, height, program.draw,
                         layout=layout, parameters=program.parameters, elapsed=elapsed, command=commands[index],
-                        has_depth=has_depth, vertex_buffer=vertex_buffer, index_buffer=index_buffer)
+                        has_depth=has_depth, vertex_buffer=vertex_buffer, index_buffer=index_buffer, **desc_kwargs)
 
     return swapchain, commands, acquired, finished, record_frame
 
 
-def show_window(program: GraphicsProgram, width: int = 800, height: int = 600, frames: int = 0,
-                validation: bool = False, time: float | None = None, provider: str | None = None) -> int:
+def show_window(
+    program: GraphicsProgram, width: int = 800, height: int = 600, frames: int = 0,
+    validation: bool = False, time: float | None = None, provider: str | None = None,
+    *,
+    buffers: Mapping[str, bytes | bytearray | memoryview] | None = None,
+    textures: Mapping[str, TextureData] | None = None,
+    samplers: Mapping[str, SamplerDesc] | None = None,
+) -> int:
+    program = _with_resource_overrides(program, buffers=buffers, textures=textures, samplers=samplers)
     _dimensions(width, height)
     _frame_parameters(program.parameters)
     _validate_provider(provider, "vulkan")
