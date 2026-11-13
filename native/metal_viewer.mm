@@ -121,9 +121,386 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
     throw std::runtime_error("Unsupported depth compare op: " + op);
 }
 
+struct MetalBufferResource {
+    std::string name;
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    std::string access;
+    size_t size = 0;
+    size_t alignedSize = 0;
+    bool isUAV = false;
+    std::string outputPath;
+    id<MTLBuffer> buffer = nil;
+};
+
+struct MetalTextureResource {
+    std::string name;
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    NSUInteger width = 0;
+    NSUInteger height = 0;
+    id<MTLTexture> texture = nil;
+};
+
+struct MetalSamplerResource {
+    std::string name;
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    id<MTLSamplerState> sampler = nil;
+};
+
+struct MetalStageResources {
+    std::vector<MetalBufferResource> buffers;
+    std::vector<MetalTextureResource> textures;
+    std::vector<MetalSamplerResource> samplers;
+    id<MTLBuffer> srvUavTable = nil;
+    id<MTLBuffer> samplerTable = nil;
+};
+
+static MTLSamplerMinMagFilter parseMetalFilter(const std::string& mode) {
+    if (mode == "nearest") return MTLSamplerMinMagFilterNearest;
+    if (mode == "linear") return MTLSamplerMinMagFilterLinear;
+    throw std::runtime_error("Unsupported sampler filter: " + mode);
+}
+
+static MTLSamplerAddressMode parseMetalAddressMode(const std::string& mode) {
+    if (mode == "repeat") return MTLSamplerAddressModeRepeat;
+    if (mode == "clamp_to_edge") return MTLSamplerAddressModeClampToEdge;
+    if (mode == "mirror_repeat") return MTLSamplerAddressModeMirrorRepeat;
+    throw std::runtime_error("Unsupported sampler address mode: " + mode);
+}
+
+static MetalStageResources loadStageResources(id<MTLDevice> device, id<MTLCommandQueue> queue, NSDictionary* spec) {
+    MetalStageResources stage;
+    if (!spec) return stage;
+    NSError* error = nil;
+
+    id rawBuffers = spec[@"buffers"];
+    if (rawBuffers != nil) {
+        if (![rawBuffers isKindOfClass:[NSArray class]])
+            throw failure(@"Resource spec 'buffers' must be an array");
+        NSArray* bufferSpecs = rawBuffers;
+        stage.buffers.reserve(bufferSpecs.count);
+        for (id item in bufferSpecs) {
+            if (![item isKindOfClass:[NSDictionary class]])
+                throw failure(@"Invalid buffer entry in resource spec");
+            NSDictionary* dict = item;
+            NSString* nameNs = dict[@"name"];
+            NSString* accessNs = dict[@"access"];
+            NSNumber* sizeNs = dict[@"size"];
+            if (![nameNs isKindOfClass:[NSString class]] || ![accessNs isKindOfClass:[NSString class]] ||
+                ![sizeNs isKindOfClass:[NSNumber class]])
+                throw failure(@"Buffer entry is missing required fields");
+
+            MetalBufferResource entry;
+            entry.name = nameNs.UTF8String;
+            entry.access = accessNs.UTF8String;
+            if (entry.access != "read_only" && entry.access != "write_only" && entry.access != "read_write")
+                throw std::runtime_error("Unsupported buffer access mode: " + entry.access);
+            long long rawSize = [sizeNs longLongValue];
+            if (rawSize <= 0)
+                throw std::runtime_error("Buffer byte size must be positive: " + entry.name);
+            entry.size = static_cast<size_t>(rawSize);
+            entry.alignedSize = std::max<size_t>(4, (entry.size + 3) & ~static_cast<size_t>(3));
+            entry.isUAV = (entry.access != "read_only");
+            if ([dict[@"set"] isKindOfClass:[NSNumber class]])
+                entry.set = static_cast<uint32_t>([dict[@"set"] unsignedIntValue]);
+            if ([dict[@"binding"] isKindOfClass:[NSNumber class]])
+                entry.binding = static_cast<uint32_t>([dict[@"binding"] unsignedIntValue]);
+            if ([dict[@"output_path"] isKindOfClass:[NSString class]])
+                entry.outputPath = [dict[@"output_path"] UTF8String];
+
+            entry.buffer = [device newBufferWithLength:entry.alignedSize options:MTLResourceStorageModeShared];
+            if (!entry.buffer) throw failure(@"Cannot allocate Metal storage buffer");
+            std::memset(entry.buffer.contents, 0, entry.alignedSize);
+
+            id inputPathObj = dict[@"input_path"];
+            if ([inputPathObj isKindOfClass:[NSString class]] && [inputPathObj length] > 0) {
+                NSData* inData = [NSData dataWithContentsOfFile:inputPathObj options:0 error:&error];
+                if (!inData) throw failure(@"Cannot read input buffer file", error);
+                if (inData.length != entry.size)
+                    throw std::runtime_error("Input buffer file size does not match spec size: " + entry.name);
+                std::memcpy(entry.buffer.contents, inData.bytes, entry.size);
+            }
+            stage.buffers.push_back(std::move(entry));
+        }
+    }
+
+    id rawTextures = spec[@"textures"];
+    if (rawTextures != nil) {
+        if (![rawTextures isKindOfClass:[NSArray class]])
+            throw failure(@"Resource spec 'textures' must be an array");
+        NSArray* textureSpecs = rawTextures;
+        stage.textures.reserve(textureSpecs.count);
+
+        id<MTLCommandBuffer> uploadCmd = nil;
+        id<MTLBlitCommandEncoder> blit = nil;
+        std::vector<id<MTLBuffer>> stagingBuffers;
+
+        for (id item in textureSpecs) {
+            if (![item isKindOfClass:[NSDictionary class]])
+                throw failure(@"Invalid texture entry in resource spec");
+            NSDictionary* dict = item;
+            NSString* nameNs = dict[@"name"];
+            NSString* fmtNs = dict[@"format"];
+            NSString* pathNs = dict[@"path"];
+            NSNumber* widthNs = dict[@"width"];
+            NSNumber* heightNs = dict[@"height"];
+            if (![nameNs isKindOfClass:[NSString class]] || ![fmtNs isKindOfClass:[NSString class]] ||
+                ![pathNs isKindOfClass:[NSString class]] || ![widthNs isKindOfClass:[NSNumber class]] ||
+                ![heightNs isKindOfClass:[NSNumber class]])
+                throw failure(@"Texture entry is missing required fields");
+
+            MetalTextureResource entry;
+            entry.name = nameNs.UTF8String;
+            long long rawW = [widthNs longLongValue];
+            long long rawH = [heightNs longLongValue];
+            if (rawW <= 0 || rawH <= 0)
+                throw std::runtime_error("Texture dimensions must be positive: " + entry.name);
+            entry.width = static_cast<NSUInteger>(rawW);
+            entry.height = static_cast<NSUInteger>(rawH);
+            if ([dict[@"set"] isKindOfClass:[NSNumber class]])
+                entry.set = static_cast<uint32_t>([dict[@"set"] unsignedIntValue]);
+            if ([dict[@"binding"] isKindOfClass:[NSNumber class]])
+                entry.binding = static_cast<uint32_t>([dict[@"binding"] unsignedIntValue]);
+
+            std::string fmtStr = fmtNs.UTF8String;
+            MTLPixelFormat pixelFmt = MTLPixelFormatRGBA8Unorm;
+            NSUInteger bytesPerPixel = 4;
+            if (fmtStr == "rgba8_unorm") {
+                pixelFmt = MTLPixelFormatRGBA8Unorm;
+                bytesPerPixel = 4;
+            } else if (fmtStr == "rgba32_sfloat") {
+                pixelFmt = MTLPixelFormatRGBA32Float;
+                bytesPerPixel = 16;
+            } else {
+                throw std::runtime_error("Unsupported texture format: " + fmtStr);
+            }
+
+            NSData* texData = [NSData dataWithContentsOfFile:pathNs options:0 error:&error];
+            if (!texData) throw failure(@"Cannot read texture payload file", error);
+            NSUInteger expectedBytes = entry.width * entry.height * bytesPerPixel;
+            if (texData.length != expectedBytes)
+                throw std::runtime_error("Texture payload byte size does not match dimensions: " + entry.name);
+
+            MTLTextureDescriptor* texDesc = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:pixelFmt width:entry.width height:entry.height mipmapped:NO];
+            texDesc.storageMode = MTLStorageModePrivate;
+            texDesc.usage = MTLTextureUsageShaderRead;
+            entry.texture = [device newTextureWithDescriptor:texDesc];
+            if (!entry.texture) throw failure(@"Cannot allocate Metal 2D texture");
+
+            id<MTLBuffer> staging = [device newBufferWithBytes:texData.bytes
+                                                        length:texData.length
+                                                       options:MTLResourceStorageModeShared];
+            if (!staging) throw failure(@"Cannot allocate Metal texture upload staging buffer");
+            stagingBuffers.push_back(staging);
+
+            if (!uploadCmd) {
+                uploadCmd = [queue commandBuffer];
+                if (!uploadCmd) throw failure(@"Cannot allocate texture upload command buffer");
+                blit = [uploadCmd blitCommandEncoder];
+                if (!blit) throw failure(@"Cannot allocate texture upload blit encoder");
+            }
+            NSUInteger rowBytes = entry.width * bytesPerPixel;
+            [blit copyFromBuffer:staging
+                    sourceOffset:0
+               sourceBytesPerRow:rowBytes
+             sourceBytesPerImage:expectedBytes
+                      sourceSize:MTLSizeMake(entry.width, entry.height, 1)
+                       toTexture:entry.texture
+                destinationSlice:0
+                destinationLevel:0
+               destinationOrigin:MTLOriginMake(0, 0, 0)];
+
+            stage.textures.push_back(std::move(entry));
+        }
+
+        if (uploadCmd) {
+            [blit endEncoding];
+            [uploadCmd commit];
+            [uploadCmd waitUntilCompleted];
+            if (uploadCmd.status == MTLCommandBufferStatusError)
+                throw failure(@"Metal texture upload failed", uploadCmd.error);
+        }
+    }
+
+    id rawSamplers = spec[@"samplers"];
+    if (rawSamplers != nil) {
+        if (![rawSamplers isKindOfClass:[NSArray class]])
+            throw failure(@"Resource spec 'samplers' must be an array");
+        NSArray* samplerSpecs = rawSamplers;
+        stage.samplers.reserve(samplerSpecs.count);
+        for (id item in samplerSpecs) {
+            if (![item isKindOfClass:[NSDictionary class]])
+                throw failure(@"Invalid sampler entry in resource spec");
+            NSDictionary* dict = item;
+            NSString* nameNs = dict[@"name"];
+            if (![nameNs isKindOfClass:[NSString class]])
+                throw failure(@"Sampler entry is missing name");
+
+            MetalSamplerResource entry;
+            entry.name = nameNs.UTF8String;
+            if ([dict[@"set"] isKindOfClass:[NSNumber class]])
+                entry.set = static_cast<uint32_t>([dict[@"set"] unsignedIntValue]);
+            if ([dict[@"binding"] isKindOfClass:[NSNumber class]])
+                entry.binding = static_cast<uint32_t>([dict[@"binding"] unsignedIntValue]);
+
+            std::string minF = [dict[@"min_filter"] isKindOfClass:[NSString class]] ? [dict[@"min_filter"] UTF8String] : "linear";
+            std::string magF = [dict[@"mag_filter"] isKindOfClass:[NSString class]] ? [dict[@"mag_filter"] UTF8String] : "linear";
+            std::string addrU = [dict[@"address_mode_u"] isKindOfClass:[NSString class]] ? [dict[@"address_mode_u"] UTF8String] : "repeat";
+            std::string addrV = [dict[@"address_mode_v"] isKindOfClass:[NSString class]] ? [dict[@"address_mode_v"] UTF8String] : "repeat";
+
+            MTLSamplerDescriptor* sampDesc = [MTLSamplerDescriptor new];
+            sampDesc.minFilter = parseMetalFilter(minF);
+            sampDesc.magFilter = parseMetalFilter(magF);
+            sampDesc.mipFilter = MTLSamplerMipFilterNotMipmapped;
+            sampDesc.sAddressMode = parseMetalAddressMode(addrU);
+            sampDesc.tAddressMode = parseMetalAddressMode(addrV);
+            sampDesc.lodMinClamp = 0.0f;
+            sampDesc.lodMaxClamp = 0.0f;
+            sampDesc.supportArgumentBuffers = YES;
+            entry.sampler = [device newSamplerStateWithDescriptor:sampDesc];
+            if (!entry.sampler) throw failure(@"Cannot create Metal sampler state");
+            stage.samplers.push_back(std::move(entry));
+        }
+    }
+
+    // Build SRV/UAV descriptor table matching GfxToLLVMPass register ordering:
+    // UAV buffers sorted by (set, binding), then read-only buffers + 2D textures sorted together by (set, binding).
+    struct OrderedSlot {
+        uint32_t set = 0;
+        uint32_t binding = 0;
+        bool isTexture = false;
+        size_t index = 0;
+    };
+    std::vector<OrderedSlot> uavSlots;
+    std::vector<OrderedSlot> srvSlots;
+    for (size_t i = 0; i < stage.buffers.size(); ++i) {
+        OrderedSlot slot{stage.buffers[i].set, stage.buffers[i].binding, false, i};
+        if (stage.buffers[i].isUAV) uavSlots.push_back(slot);
+        else srvSlots.push_back(slot);
+    }
+    for (size_t i = 0; i < stage.textures.size(); ++i) {
+        srvSlots.push_back(OrderedSlot{stage.textures[i].set, stage.textures[i].binding, true, i});
+    }
+    auto slotLess = [](const OrderedSlot& a, const OrderedSlot& b) {
+        if (a.set != b.set) return a.set < b.set;
+        return a.binding < b.binding;
+    };
+    std::stable_sort(uavSlots.begin(), uavSlots.end(), slotLess);
+    std::stable_sort(srvSlots.begin(), srvSlots.end(), slotLess);
+
+    size_t totalSrvUav = uavSlots.size() + srvSlots.size();
+    if (totalSrvUav > 0) {
+        size_t tableBytes = totalSrvUav * sizeof(IRDescriptorTableEntry);
+        stage.srvUavTable = [device newBufferWithLength:tableBytes options:MTLResourceStorageModeShared];
+        if (!stage.srvUavTable) throw failure(@"Cannot allocate Metal SRV/UAV descriptor table buffer");
+        auto* entries = static_cast<IRDescriptorTableEntry*>(stage.srvUavTable.contents);
+        std::memset(entries, 0, tableBytes);
+        size_t slotIdx = 0;
+        for (const auto& uav : uavSlots) {
+            IRDescriptorTableSetBuffer(&entries[slotIdx++], stage.buffers[uav.index].buffer.gpuAddress, 0);
+        }
+        for (const auto& srv : srvSlots) {
+            if (srv.isTexture) {
+                IRDescriptorTableSetTexture(&entries[slotIdx++], stage.textures[srv.index].texture, 0.0f, 0);
+            } else {
+                IRDescriptorTableSetBuffer(&entries[slotIdx++], stage.buffers[srv.index].buffer.gpuAddress, 0);
+            }
+        }
+    }
+
+    if (!stage.samplers.empty()) {
+        std::stable_sort(stage.samplers.begin(), stage.samplers.end(),
+                         [](const MetalSamplerResource& a, const MetalSamplerResource& b) {
+                             if (a.set != b.set) return a.set < b.set;
+                             return a.binding < b.binding;
+                         });
+        size_t sampBytes = stage.samplers.size() * sizeof(IRDescriptorTableEntry);
+        stage.samplerTable = [device newBufferWithLength:sampBytes options:MTLResourceStorageModeShared];
+        if (!stage.samplerTable) throw failure(@"Cannot allocate Metal sampler descriptor table buffer");
+        auto* entries = static_cast<IRDescriptorTableEntry*>(stage.samplerTable.contents);
+        std::memset(entries, 0, sampBytes);
+        for (size_t i = 0; i < stage.samplers.size(); ++i) {
+            IRDescriptorTableSetSampler(&entries[i], stage.samplers[i].sampler, 0.0f);
+        }
+    }
+
+    return stage;
+}
+
+struct ReflectedArgBufferLayout {
+    size_t bufferSize = 0;
+    std::vector<size_t> pointerOffsets;
+};
+
+static ReflectedArgBufferLayout extractReflectedArgBufferLayout(NSArray<id<MTLBinding>>* bindings) {
+    ReflectedArgBufferLayout info;
+    if (!bindings) return info;
+    for (id<MTLBinding> binding in bindings) {
+        if (binding.type == MTLBindingTypeBuffer && binding.index == kIRArgumentBufferBindPoint) {
+            id untyped = binding;
+            id<MTLBufferBinding> bufferBinding = untyped;
+            info.bufferSize = bufferBinding.bufferDataSize;
+            MTLStructType* structType = bufferBinding.bufferStructType;
+            if (structType != nil) {
+                for (MTLStructMember* member in structType.members) {
+                    if (member.dataType == MTLDataTypePointer) {
+                        info.pointerOffsets.push_back(member.offset);
+                    }
+                }
+                std::sort(info.pointerOffsets.begin(), info.pointerOffsets.end());
+            }
+            break;
+        }
+    }
+    return info;
+}
+
+static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantData, size_t rootConstantSize,
+                                                  const MetalStageResources& stage,
+                                                  const ReflectedArgBufferLayout& reflected) {
+    std::vector<uint64_t> tableAddresses;
+    if (stage.srvUavTable != nil) tableAddresses.push_back(stage.srvUavTable.gpuAddress);
+    if (stage.samplerTable != nil) tableAddresses.push_back(stage.samplerTable.gpuAddress);
+    if (rootConstantSize == 0 && tableAddresses.empty()) return {};
+
+    std::vector<size_t> offsets = reflected.pointerOffsets;
+    size_t nextFallbackOffset = (rootConstantSize + 7) & ~static_cast<size_t>(7);
+    if (!offsets.empty()) {
+        nextFallbackOffset = offsets.back() + sizeof(uint64_t);
+    }
+    while (offsets.size() < tableAddresses.size()) {
+        offsets.push_back(nextFallbackOffset);
+        nextFallbackOffset += sizeof(uint64_t);
+    }
+
+    size_t minSize = rootConstantSize;
+    for (size_t i = 0; i < tableAddresses.size(); ++i) {
+        minSize = std::max<size_t>(minSize, offsets[i] + sizeof(uint64_t));
+    }
+    size_t totalSize = std::max<size_t>(std::max<size_t>(reflected.bufferSize, minSize), 16);
+    std::vector<uint8_t> bytes(totalSize, 0);
+    if (rootConstantData != nullptr && rootConstantSize > 0) {
+        std::memcpy(bytes.data(), rootConstantData, rootConstantSize);
+    }
+    for (size_t i = 0; i < tableAddresses.size(); ++i) {
+        uint64_t addr = tableAddresses[i];
+        std::memcpy(bytes.data() + offsets[i], &addr, sizeof(addr));
+    }
+    return bytes;
+}
+
 @interface GraphicsRenderer : NSObject <MTKViewDelegate, NSWindowDelegate>
 {
     std::chrono::steady_clock::time_point _started;
+    ReflectedArgBufferLayout _vertexArgLayout;
+    ReflectedArgBufferLayout _fragmentArgLayout;
+    std::map<std::string, ReflectedArgBufferLayout> _pipelineVertexArgLayouts;
+    std::map<std::string, ReflectedArgBufferLayout> _pipelineFragmentArgLayouts;
+    MetalStageResources _vertexResources;
+    MetalStageResources _fragmentResources;
 }
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
@@ -159,6 +536,12 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
 - (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
                   depthSettings:(MetalDepthSettings)depthSettings;
+- (void)loadResourcesFromPath:(NSString*)path;
+- (ReflectedArgBufferLayout)vertexArgLayout;
+- (ReflectedArgBufferLayout)fragmentArgLayout;
+- (void)setArgLayoutsForPipeline:(NSString*)pipeId
+                          vertex:(ReflectedArgBufferLayout)vertexLayout
+                        fragment:(ReflectedArgBufferLayout)fragmentLayout;
 - (void)encode:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass;
 @end
 
@@ -266,8 +649,17 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
         }
         descriptor.vertexDescriptor = vd;
     }
-    _pipeline = [_device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+    MTLAutoreleasedRenderPipelineReflection renderReflection = nil;
+    MTLPipelineOption pipelineOptions = MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo;
+    _pipeline = [_device newRenderPipelineStateWithDescriptor:descriptor
+                                                      options:pipelineOptions
+                                                   reflection:&renderReflection
+                                                        error:&error];
     if (!_pipeline) throw failure(@"Cannot create the converted DXIL render pipeline", error);
+    if (renderReflection != nil) {
+        _vertexArgLayout = extractReflectedArgBufferLayout(renderReflection.vertexBindings);
+        _fragmentArgLayout = extractReflectedArgBufferLayout(renderReflection.fragmentBindings);
+    }
 
     if (depthSettings.enabled) {
         MTLDepthStencilDescriptor* depthDesc = [MTLDepthStencilDescriptor new];
@@ -284,6 +676,39 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
     return self;
 }
 
+- (void)loadResourcesFromPath:(NSString*)path {
+    NSError* error = nil;
+    NSData* data = [NSData dataWithContentsOfFile:path options:0 error:&error];
+    if (!data) throw failure(@"Cannot read graphics resources JSON", error);
+    id raw = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+    if (![raw isKindOfClass:[NSDictionary class]])
+        throw failure(@"Invalid graphics resources JSON", error);
+    NSDictionary* dict = raw;
+    if ([dict[@"vertex"] isKindOfClass:[NSDictionary class]]) {
+        _vertexResources = loadStageResources(_device, _queue, dict[@"vertex"]);
+    }
+    if ([dict[@"fragment"] isKindOfClass:[NSDictionary class]]) {
+        _fragmentResources = loadStageResources(_device, _queue, dict[@"fragment"]);
+    }
+}
+
+- (ReflectedArgBufferLayout)vertexArgLayout {
+    return _vertexArgLayout;
+}
+
+- (ReflectedArgBufferLayout)fragmentArgLayout {
+    return _fragmentArgLayout;
+}
+
+- (void)setArgLayoutsForPipeline:(NSString*)pipeId
+                          vertex:(ReflectedArgBufferLayout)vertexLayout
+                        fragment:(ReflectedArgBufferLayout)fragmentLayout {
+    if (!pipeId) return;
+    std::string key(pipeId.UTF8String);
+    _pipelineVertexArgLayouts[key] = std::move(vertexLayout);
+    _pipelineFragmentArgLayouts[key] = std::move(fragmentLayout);
+}
+
 - (void)encode:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass {
     id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
     if (!encoder) throw failure(@"Cannot create a Metal render encoder");
@@ -294,21 +719,69 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
     [encoder setDepthClipMode:MTLDepthClipModeClip];
     id<MTLTexture> texture = pass.colorAttachments[0].texture;
     if (!texture || !texture.width || !texture.height) throw failure(@"Framebuffer dimensions must be positive");
+    std::vector<uint8_t> frameBytes;
+    bool vertexHasFrame = false;
+    bool fragmentHasFrame = false;
+    NSUInteger argBufBindIndex = kIRArgumentBufferBindPoint;
     if (self.frameLayout) {
         double elapsed = self.hasFixedTime ? self.fixedTime :
             (self.live ? std::chrono::duration<double>(std::chrono::steady_clock::now() - _started).count() : 0);
         if (!std::isfinite(elapsed) || elapsed < 0 || elapsed > 3.4028234663852886e38)
             throw failure(@"Invalid elapsed frame time");
-        std::vector<uint8_t> bytes([self.frameLayout[@"size"] unsignedIntegerValue], 0);
+        frameBytes.assign([self.frameLayout[@"size"] unsignedIntegerValue], 0);
         NSArray* fields = self.frameLayout[@"fields"];
         float time = static_cast<float>(elapsed);
         float resolution[] = {static_cast<float>(texture.width), static_cast<float>(texture.height)};
-        std::memcpy(bytes.data() + [fields[0][@"offset"] unsignedIntegerValue], &time, sizeof(time));
-        std::memcpy(bytes.data() + [fields[1][@"offset"] unsignedIntegerValue], resolution, sizeof(resolution));
-        NSUInteger index = [self.frameLayout[@"bindings"][@"metal"][@"buffer_index"] unsignedIntegerValue];
+        std::memcpy(frameBytes.data() + [fields[0][@"offset"] unsignedIntegerValue], &time, sizeof(time));
+        std::memcpy(frameBytes.data() + [fields[1][@"offset"] unsignedIntegerValue], resolution, sizeof(resolution));
+        argBufBindIndex = [self.frameLayout[@"bindings"][@"metal"][@"buffer_index"] unsignedIntegerValue];
         NSArray* stages = self.frameLayout[@"stages"];
-        if ([stages containsObject:@"vertex"]) [encoder setVertexBytes:bytes.data() length:bytes.size() atIndex:index];
-        if ([stages containsObject:@"fragment"]) [encoder setFragmentBytes:bytes.data() length:bytes.size() atIndex:index];
+        vertexHasFrame = [stages containsObject:@"vertex"];
+        fragmentHasFrame = [stages containsObject:@"fragment"];
+    }
+
+    std::vector<uint8_t> vsArgBytes = packTopLevelArgBuffer(
+        vertexHasFrame ? frameBytes.data() : nullptr,
+        vertexHasFrame ? frameBytes.size() : 0,
+        _vertexResources,
+        _vertexArgLayout);
+    if (!vsArgBytes.empty()) {
+        [encoder setVertexBytes:vsArgBytes.data() length:vsArgBytes.size() atIndex:argBufBindIndex];
+    }
+    if (_vertexResources.srvUavTable != nil) {
+        [encoder useResource:_vertexResources.srvUavTable usage:MTLResourceUsageRead stage:MTLRenderStageVertex];
+    }
+    if (_vertexResources.samplerTable != nil) {
+        [encoder useResource:_vertexResources.samplerTable usage:MTLResourceUsageRead stage:MTLRenderStageVertex];
+    }
+    for (const auto& buf : _vertexResources.buffers) {
+        MTLResourceUsage usage = buf.isUAV ? (MTLResourceUsageRead | MTLResourceUsageWrite) : MTLResourceUsageRead;
+        [encoder useResource:buf.buffer usage:usage stage:MTLRenderStageVertex];
+    }
+    for (const auto& tex : _vertexResources.textures) {
+        [encoder useResource:tex.texture usage:MTLResourceUsageRead stage:MTLRenderStageVertex];
+    }
+
+    std::vector<uint8_t> fsArgBytes = packTopLevelArgBuffer(
+        fragmentHasFrame ? frameBytes.data() : nullptr,
+        fragmentHasFrame ? frameBytes.size() : 0,
+        _fragmentResources,
+        _fragmentArgLayout);
+    if (!fsArgBytes.empty()) {
+        [encoder setFragmentBytes:fsArgBytes.data() length:fsArgBytes.size() atIndex:argBufBindIndex];
+    }
+    if (_fragmentResources.srvUavTable != nil) {
+        [encoder useResource:_fragmentResources.srvUavTable usage:MTLResourceUsageRead stage:MTLRenderStageFragment];
+    }
+    if (_fragmentResources.samplerTable != nil) {
+        [encoder useResource:_fragmentResources.samplerTable usage:MTLResourceUsageRead stage:MTLRenderStageFragment];
+    }
+    for (const auto& buf : _fragmentResources.buffers) {
+        MTLResourceUsage usage = buf.isUAV ? (MTLResourceUsageRead | MTLResourceUsageWrite) : MTLResourceUsageRead;
+        [encoder useResource:buf.buffer usage:usage stage:MTLRenderStageFragment];
+    }
+    for (const auto& tex : _fragmentResources.textures) {
+        [encoder useResource:tex.texture usage:MTLResourceUsageRead stage:MTLRenderStageFragment];
     }
     [encoder setViewport:(MTLViewport){0, 0, static_cast<double>(texture.width),
         static_cast<double>(texture.height), 0, 1}];
@@ -365,10 +838,31 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
                 std::vector<uint8_t> fullConst(cOff + rawBytes.size(), 0);
                 std::memcpy(fullConst.data() + cOff, rawBytes.data(), rawBytes.size());
 
+                const ReflectedArgBufferLayout* activeVsLayout = &_vertexArgLayout;
+                const ReflectedArgBufferLayout* activeFsLayout = &_fragmentArgLayout;
+                if (pipeId) {
+                    std::string key(pipeId.UTF8String);
+                    auto vsIt = _pipelineVertexArgLayouts.find(key);
+                    if (vsIt != _pipelineVertexArgLayouts.end()) activeVsLayout = &vsIt->second;
+                    auto fsIt = _pipelineFragmentArgLayouts.find(key);
+                    if (fsIt != _pipelineFragmentArgLayouts.end()) activeFsLayout = &fsIt->second;
+                }
+                auto bindVsTopLevel = [&](const uint8_t* ptr, size_t len) {
+                    auto packed = packTopLevelArgBuffer(ptr, len, _vertexResources, *activeVsLayout);
+                    if (!packed.empty())
+                        [encoder setVertexBytes:packed.data() length:packed.size() atIndex:kIRArgumentBufferBindPoint];
+                };
+                auto bindFsTopLevel = [&](const uint8_t* ptr, size_t len) {
+                    auto packed = packTopLevelArgBuffer(ptr, len, _fragmentResources, *activeFsLayout);
+                    if (!packed.empty())
+                        [encoder setFragmentBytes:packed.data() length:packed.size() atIndex:kIRArgumentBufferBindPoint];
+                };
+
                 id pipeParams = (self.pipelineParameters && pipeId) ? self.pipelineParameters[pipeId] : nil;
                 if ([pipeParams isKindOfClass:[NSArray class]]) {
+                    NSArray* paramBlocks = pipeParams;
                     std::vector<uint8_t> vsArg, fsArg;
-                    for (NSDictionary* block in (NSArray*)pipeParams) {
+                    for (NSDictionary* block in paramBlocks) {
                         NSUInteger bOff = [block[@"bindings"][@"vulkan"][@"offset"] unsignedIntegerValue];
                         NSUInteger bSize = [block[@"size"] unsignedIntegerValue];
                         NSArray* stages = block[@"stages"];
@@ -383,8 +877,8 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
                         if ([stages containsObject:@"vertex"]) appendSlice(vsArg);
                         if ([stages containsObject:@"fragment"]) appendSlice(fsArg);
                     }
-                    if (!vsArg.empty()) [encoder setVertexBytes:vsArg.data() length:vsArg.size() atIndex:kIRArgumentBufferBindPoint];
-                    if (!fsArg.empty()) [encoder setFragmentBytes:fsArg.data() length:fsArg.size() atIndex:kIRArgumentBufferBindPoint];
+                    if (!vsArg.empty()) bindVsTopLevel(vsArg.data(), vsArg.size());
+                    if (!fsArg.empty()) bindFsTopLevel(fsArg.data(), fsArg.size());
                 } else if ([pipeParams isKindOfClass:[NSDictionary class]]) {
                     NSDictionary* block = pipeParams;
                     NSUInteger bOff = [block[@"bindings"][@"vulkan"][@"offset"] unsignedIntegerValue];
@@ -396,12 +890,12 @@ static MTLCompareFunction parseMetalCompareFunction(const std::string& op) {
                     }
                     NSArray* stages = block[@"stages"];
                     if (!stages || [stages containsObject:@"vertex"])
-                        [encoder setVertexBytes:slice.data() length:slice.size() atIndex:kIRArgumentBufferBindPoint];
+                        bindVsTopLevel(slice.data(), slice.size());
                     if (!stages || [stages containsObject:@"fragment"])
-                        [encoder setFragmentBytes:slice.data() length:slice.size() atIndex:kIRArgumentBufferBindPoint];
+                        bindFsTopLevel(slice.data(), slice.size());
                 } else {
-                    [encoder setVertexBytes:rawBytes.data() length:rawBytes.size() atIndex:kIRArgumentBufferBindPoint];
-                    [encoder setFragmentBytes:rawBytes.data() length:rawBytes.size() atIndex:kIRArgumentBufferBindPoint];
+                    bindVsTopLevel(rawBytes.data(), rawBytes.size());
+                    bindFsTopLevel(rawBytes.data(), rawBytes.size());
                 }
             }
             NSString* drawType = draw[@"type"] ?: @"standard";
@@ -611,149 +1105,31 @@ static void runComputeDispatch(const std::string& metallibPath, const std::strin
         rootConstants.assign(rcPtr, rcPtr + rcData.length);
     }
 
-    struct MetalComputeBuffer {
-        std::string name;
-        uint32_t set = 0;
-        uint32_t binding = 0;
-        std::string access;
-        size_t size = 0;
-        size_t alignedSize = 0;
-        bool isUAV = false;
-        std::string outputPath;
-        id<MTLBuffer> buffer = nil;
-    };
-
-    id rawBuffers = spec[@"buffers"];
-    if (![rawBuffers isKindOfClass:[NSArray class]])
-        throw failure(@"Compute dispatch spec 'buffers' must be an array");
-    NSArray* bufferSpecs = rawBuffers;
-
-    std::vector<MetalComputeBuffer> buffers;
-    buffers.reserve(bufferSpecs.count);
-
-    for (id item in bufferSpecs) {
-        if (![item isKindOfClass:[NSDictionary class]])
-            throw failure(@"Invalid buffer entry in compute dispatch spec");
-        NSDictionary* dict = item;
-        NSString* nameNs = dict[@"name"];
-        NSString* accessNs = dict[@"access"];
-        NSNumber* sizeNs = dict[@"size"];
-        if (![nameNs isKindOfClass:[NSString class]] || ![accessNs isKindOfClass:[NSString class]] ||
-            ![sizeNs isKindOfClass:[NSNumber class]])
-            throw failure(@"Compute buffer entry is missing required fields");
-
-        MetalComputeBuffer entry;
-        entry.name = nameNs.UTF8String;
-        entry.access = accessNs.UTF8String;
-        if (entry.access != "read_only" && entry.access != "write_only" && entry.access != "read_write")
-            throw std::runtime_error("Unsupported compute buffer access mode: " + entry.access);
-        long long rawSize = [sizeNs longLongValue];
-        if (rawSize <= 0)
-            throw std::runtime_error("Compute buffer byte size must be positive: " + entry.name);
-        entry.size = static_cast<size_t>(rawSize);
-        entry.alignedSize = std::max<size_t>(4, (entry.size + 3) & ~static_cast<size_t>(3));
-        entry.isUAV = (entry.access != "read_only");
-
-        if ([dict[@"set"] isKindOfClass:[NSNumber class]])
-            entry.set = static_cast<uint32_t>([dict[@"set"] unsignedIntValue]);
-        if ([dict[@"binding"] isKindOfClass:[NSNumber class]])
-            entry.binding = static_cast<uint32_t>([dict[@"binding"] unsignedIntValue]);
-        if ([dict[@"output_path"] isKindOfClass:[NSString class]])
-            entry.outputPath = [dict[@"output_path"] UTF8String];
-
-        entry.buffer = [device newBufferWithLength:entry.alignedSize options:MTLResourceStorageModeShared];
-        if (!entry.buffer)
-            throw failure(@"Cannot allocate Metal compute storage buffer");
-        std::memset(entry.buffer.contents, 0, entry.alignedSize);
-
-        id inputPathObj = dict[@"input_path"];
-        if ([inputPathObj isKindOfClass:[NSString class]] && [inputPathObj length] > 0) {
-            NSData* inData = [NSData dataWithContentsOfFile:inputPathObj options:0 error:&error];
-            if (!inData) throw failure(@"Cannot read compute input buffer file", error);
-            if (inData.length != entry.size)
-                throw std::runtime_error("Compute input buffer file size does not match spec size: " + entry.name);
-            std::memcpy(entry.buffer.contents, inData.bytes, entry.size);
-        }
-
-        buffers.push_back(std::move(entry));
-    }
-
-    std::stable_sort(buffers.begin(), buffers.end(),
-                     [](const MetalComputeBuffer& a, const MetalComputeBuffer& b) {
-                         if (a.set != b.set) return a.set < b.set;
-                         return a.binding < b.binding;
-                     });
-
-    std::vector<size_t> uavIndices;
-    std::vector<size_t> srvIndices;
-    for (size_t i = 0; i < buffers.size(); ++i) {
-        if (buffers[i].isUAV) uavIndices.push_back(i);
-        else srvIndices.push_back(i);
-    }
-
-    size_t totalDescriptors = uavIndices.size() + srvIndices.size();
-    id<MTLBuffer> descriptorTable = nil;
-    if (totalDescriptors > 0) {
-        size_t tableByteSize = totalDescriptors * sizeof(IRDescriptorTableEntry);
-        descriptorTable = [device newBufferWithLength:tableByteSize options:MTLResourceStorageModeShared];
-        if (!descriptorTable)
-            throw failure(@"Cannot allocate Metal IRDescriptorTableEntry buffer");
-        auto* entries = static_cast<IRDescriptorTableEntry*>(descriptorTable.contents);
-        std::memset(entries, 0, tableByteSize);
-        size_t slot = 0;
-        for (size_t idx : uavIndices) {
-            IRDescriptorTableSetBuffer(&entries[slot++], buffers[idx].buffer.gpuAddress, 0);
-        }
-        for (size_t idx : srvIndices) {
-            IRDescriptorTableSetBuffer(&entries[slot++], buffers[idx].buffer.gpuAddress, 0);
-        }
-    }
-
-    bool needsTopLevelArgBuffer = !rootConstants.empty() || totalDescriptors > 0;
-    size_t reflectedSize = 0;
-    size_t descriptorTableOffset = (rootConstants.size() + 7) & ~static_cast<size_t>(7);
-    if (reflection != nil) {
-        for (id<MTLBinding> binding in reflection.bindings) {
-            if (binding.type == MTLBindingTypeBuffer && binding.index == kIRArgumentBufferBindPoint) {
-                id untyped = binding;
-                id<MTLBufferBinding> bufferBinding = untyped;
-                reflectedSize = bufferBinding.bufferDataSize;
-                MTLStructType* structType = bufferBinding.bufferStructType;
-                if (structType != nil) {
-                    for (MTLStructMember* member in structType.members) {
-                        if (member.dataType == MTLDataTypePointer) {
-                            descriptorTableOffset = member.offset;
-                        }
-                    }
-                }
-                break;
-            }
-        }
-    }
-
-    id<MTLBuffer> topLevelArgBuffer = nil;
-    if (needsTopLevelArgBuffer) {
-        size_t minSize = rootConstants.size();
-        if (totalDescriptors > 0) {
-            minSize = std::max<size_t>(minSize, descriptorTableOffset + sizeof(uint64_t));
-        }
-        size_t argBufSize = std::max<size_t>(std::max<size_t>(reflectedSize, minSize), 16);
-        topLevelArgBuffer = [device newBufferWithLength:argBufSize options:MTLResourceStorageModeShared];
-        if (!topLevelArgBuffer)
-            throw failure(@"Cannot allocate Metal top-level argument buffer");
-        auto* argBytes = static_cast<uint8_t*>(topLevelArgBuffer.contents);
-        std::memset(argBytes, 0, argBufSize);
-        if (!rootConstants.empty()) {
-            std::memcpy(argBytes, rootConstants.data(), rootConstants.size());
-        }
-        if (totalDescriptors > 0 && descriptorTable != nil) {
-            uint64_t tableAddress = descriptorTable.gpuAddress;
-            std::memcpy(argBytes + descriptorTableOffset, &tableAddress, sizeof(tableAddress));
-        }
-    }
-
     id<MTLCommandQueue> queue = [device newCommandQueue];
     if (!queue) throw failure(@"Cannot create a Metal command queue");
+
+    if (![spec[@"buffers"] isKindOfClass:[NSArray class]])
+        throw failure(@"Compute dispatch spec 'buffers' must be an array");
+    MetalStageResources stageResources = loadStageResources(device, queue, spec);
+
+    ReflectedArgBufferLayout reflectedLayout;
+    if (reflection != nil) {
+        reflectedLayout = extractReflectedArgBufferLayout(reflection.bindings);
+    }
+    std::vector<uint8_t> topLevelArgBytes = packTopLevelArgBuffer(
+        rootConstants.empty() ? nullptr : rootConstants.data(),
+        rootConstants.size(),
+        stageResources,
+        reflectedLayout);
+    id<MTLBuffer> topLevelArgBuffer = nil;
+    if (!topLevelArgBytes.empty()) {
+        topLevelArgBuffer = [device newBufferWithBytes:topLevelArgBytes.data()
+                                                length:topLevelArgBytes.size()
+                                               options:MTLResourceStorageModeShared];
+        if (!topLevelArgBuffer)
+            throw failure(@"Cannot allocate Metal top-level argument buffer");
+    }
+
     id<MTLCommandBuffer> command = [queue commandBuffer];
     if (!command) throw failure(@"Cannot allocate a Metal compute command buffer");
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
@@ -763,13 +1139,19 @@ static void runComputeDispatch(const std::string& metallibPath, const std::strin
     if (topLevelArgBuffer != nil) {
         [encoder setBuffer:topLevelArgBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
     }
-    if (descriptorTable != nil) {
-        [encoder useResource:descriptorTable usage:MTLResourceUsageRead];
+    if (stageResources.srvUavTable != nil) {
+        [encoder useResource:stageResources.srvUavTable usage:MTLResourceUsageRead];
     }
-    for (const auto& buf : buffers) {
+    if (stageResources.samplerTable != nil) {
+        [encoder useResource:stageResources.samplerTable usage:MTLResourceUsageRead];
+    }
+    for (const auto& buf : stageResources.buffers) {
         MTLResourceUsage usage = buf.isUAV ? (MTLResourceUsageRead | MTLResourceUsageWrite)
                                            : MTLResourceUsageRead;
         [encoder useResource:buf.buffer usage:usage];
+    }
+    for (const auto& tex : stageResources.textures) {
+        [encoder useResource:tex.texture usage:MTLResourceUsageRead];
     }
 
     [encoder dispatchThreadgroups:MTLSizeMake(grid[0], grid[1], grid[2])
@@ -781,7 +1163,7 @@ static void runComputeDispatch(const std::string& metallibPath, const std::strin
     if (command.status == MTLCommandBufferStatusError)
         throw failure(@"Metal compute dispatch failed", command.error);
 
-    for (const auto& buf : buffers) {
+    for (const auto& buf : stageResources.buffers) {
         if (!buf.isUAV || buf.outputPath.empty()) continue;
         const auto* source = static_cast<const char*>(buf.buffer.contents);
         if (!source) throw failure(@"Metal compute buffer is not CPU accessible");
@@ -833,6 +1215,7 @@ int main(int argc, char** argv) {
                         pair.first != "--index-count" &&
                         pair.first != "--compute" && pair.first != "--compute-entry" &&
                         pair.first != "--compute-spec" && pair.first != "--multi-spec" &&
+                        pair.first != "--resources" &&
                         pair.first != "--depth-compare" && pair.first != "--depth-write" &&
                         pair.first != "--depth-format")
                         throw std::runtime_error("Unknown option: " + pair.first);
@@ -863,7 +1246,8 @@ int main(int argc, char** argv) {
                         arguments.count("--vertex-count") || arguments.count("--frame-layout") ||
                         arguments.count("--time") || arguments.count("--input-layout") ||
                         arguments.count("--vertex-buffer") || arguments.count("--index-buffer") ||
-                        arguments.count("--index-type") || arguments.count("--index-count"))
+                        arguments.count("--index-type") || arguments.count("--index-count") ||
+                        arguments.count("--multi-spec") || arguments.count("--resources"))
                         throw std::runtime_error("Compute dispatch options cannot be combined with graphics options");
                     runComputeDispatch(
                         required("--compute"),
@@ -921,6 +1305,9 @@ int main(int argc, char** argv) {
                                                                            options:MTLResourceStorageModeShared];
                     }
                 }
+                if (arguments.count("--resources")) {
+                    [renderer loadResourcesFromPath:@(arguments.at("--resources").c_str())];
+                }
                 renderer.limit = arguments.count("--frames") ? number(arguments.at("--frames"), NSUIntegerMax) : 0;
                 renderer.frameLayout = layout;
                 renderer.live = !arguments.count("--readback");
@@ -955,6 +1342,9 @@ int main(int argc, char** argv) {
                                    inputLayout:pLayout
                                  depthSettings:pDepth];
                             builtPipes[pId] = sub.pipeline;
+                            [renderer setArgLayoutsForPipeline:pId
+                                                        vertex:[sub vertexArgLayout]
+                                                      fragment:[sub fragmentArgLayout]];
                             if (sub.depthState) builtDepths[pId] = sub.depthState;
                             if (pCfg[@"parameters"] && pCfg[@"parameters"] != [NSNull null]) {
                                 builtParams[pId] = pCfg[@"parameters"];

@@ -370,6 +370,110 @@ struct AtomicCASPattern : OpConversionPattern<gfx::AtomicCASOp> {
   }
 };
 
+struct TextureBindingPattern : OpConversionPattern<gfx::TextureBindingOp> {
+  const DenseMap<std::pair<uint32_t, uint32_t>, spirv::GlobalVariableOp>
+      &globals;
+  TextureBindingPattern(
+      const TypeConverter &converter, MLIRContext *context,
+      const DenseMap<std::pair<uint32_t, uint32_t>, spirv::GlobalVariableOp>
+          &globals)
+      : OpConversionPattern(converter, context), globals(globals) {}
+
+  LogicalResult
+  matchAndRewrite(gfx::TextureBindingOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
+    auto it = globals.find({op.getSet(), op.getBinding()});
+    if (it == globals.end())
+      return failure();
+    Value addr = spirv::AddressOfOp::create(rewriter, op.getLoc(), it->second);
+    rewriter.replaceOpWithNewOp<spirv::LoadOp>(op, addr);
+    return success();
+  }
+};
+
+struct SamplerBindingPattern : OpConversionPattern<gfx::SamplerBindingOp> {
+  const DenseMap<std::pair<uint32_t, uint32_t>, spirv::GlobalVariableOp>
+      &globals;
+  SamplerBindingPattern(
+      const TypeConverter &converter, MLIRContext *context,
+      const DenseMap<std::pair<uint32_t, uint32_t>, spirv::GlobalVariableOp>
+          &globals)
+      : OpConversionPattern(converter, context), globals(globals) {}
+
+  LogicalResult
+  matchAndRewrite(gfx::SamplerBindingOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
+    auto it = globals.find({op.getSet(), op.getBinding()});
+    if (it == globals.end())
+      return failure();
+    Value addr = spirv::AddressOfOp::create(rewriter, op.getLoc(), it->second);
+    rewriter.replaceOpWithNewOp<spirv::LoadOp>(op, addr);
+    return success();
+  }
+};
+
+struct TextureSamplePattern : OpConversionPattern<gfx::TextureSampleOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(gfx::TextureSampleOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resType = getTypeConverter()->convertType(op.getType());
+    if (!resType)
+      return failure();
+    auto sampledType =
+        spirv::SampledImageType::get(adaptor.getTexture().getType());
+    Value sampled = spirv::SampledImageOp::create(
+        rewriter, op.getLoc(), sampledType, adaptor.getTexture(),
+        adaptor.getSampler());
+    rewriter.replaceOpWithNewOp<spirv::ImageSampleImplicitLodOp>(
+        op, resType, sampled, adaptor.getUv(), spirv::ImageOperandsAttr{},
+        ValueRange{});
+    return success();
+  }
+};
+
+struct TextureSampleLevelPattern
+    : OpConversionPattern<gfx::TextureSampleLevelOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(gfx::TextureSampleLevelOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resType = getTypeConverter()->convertType(op.getType());
+    if (!resType)
+      return failure();
+    auto sampledType =
+        spirv::SampledImageType::get(adaptor.getTexture().getType());
+    Value sampled = spirv::SampledImageOp::create(
+        rewriter, op.getLoc(), sampledType, adaptor.getTexture(),
+        adaptor.getSampler());
+    auto lodMask = spirv::ImageOperandsAttr::get(
+        rewriter.getContext(), spirv::ImageOperands::Lod);
+    rewriter.replaceOpWithNewOp<spirv::ImageSampleExplicitLodOp>(
+        op, resType, sampled, adaptor.getUv(), lodMask,
+        ValueRange{adaptor.getLod()});
+    return success();
+  }
+};
+
+struct TextureLoadPattern : OpConversionPattern<gfx::TextureLoadOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(gfx::TextureLoadOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resType = getTypeConverter()->convertType(op.getType());
+    if (!resType)
+      return failure();
+    auto lodMask = spirv::ImageOperandsAttr::get(
+        rewriter.getContext(), spirv::ImageOperands::Lod);
+    rewriter.replaceOpWithNewOp<spirv::ImageFetchOp>(
+        op, resType, adaptor.getTexture(), adaptor.getCoord(), lodMask,
+        ValueRange{adaptor.getLevel()});
+    return success();
+  }
+};
+
 static bool isBoundEntryPointerRoot(Value root, func::FuncOp entryFunction) {
   if (root.getDefiningOp<BufferBindingOp>() ||
       root.getDefiningOp<SharedAllocOp>())
@@ -544,9 +648,31 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       }
       return spirv::PointerType::get(elemType, sc);
     });
+    converter.addConversion(
+        [&](gfx::HandleType handleType) -> std::optional<Type> {
+          switch (handleType.getKind()) {
+          case ResourceKind::Texture2D:
+            return spirv::ImageType::get(
+                builder.getF32Type(), spirv::Dim::Dim2D,
+                spirv::ImageDepthInfo::NoDepth,
+                spirv::ImageArrayedInfo::NonArrayed,
+                spirv::ImageSamplingInfo::SingleSampled,
+                spirv::ImageSamplerUseInfo::NeedSampler,
+                spirv::ImageFormat::Unknown);
+          case ResourceKind::Sampler:
+            return spirv::SamplerType::get(context);
+          default:
+            break;
+          }
+          return std::nullopt;
+        });
 
     SmallVector<BufferBindingOp> bufferBindings;
     shader.walk([&](BufferBindingOp op) { bufferBindings.push_back(op); });
+    SmallVector<TextureBindingOp> textureBindings;
+    shader.walk([&](TextureBindingOp op) { textureBindings.push_back(op); });
+    SmallVector<SamplerBindingOp> samplerBindings;
+    shader.walk([&](SamplerBindingOp op) { samplerBindings.push_back(op); });
 
     auto allBlocks = getModuleParameterBlocks(module);
     spirv::GlobalVariableOp parameterVariable;
@@ -859,6 +985,39 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       }
     }
 
+    DenseMap<std::pair<uint32_t, uint32_t>, spirv::GlobalVariableOp>
+        uniformConstGlobals;
+    auto getOrCreateHandleGlobal = [&](Location loc, Type handleType,
+                                       StringRef symName, uint32_t set,
+                                       uint32_t binding) -> spirv::GlobalVariableOp {
+      auto key = std::make_pair(set, binding);
+      if (auto it = uniformConstGlobals.find(key);
+          it != uniformConstGlobals.end())
+        return it->second;
+      Type spvType = converter.convertType(handleType);
+      auto varPtrType =
+          spirv::PointerType::get(spvType, spirv::StorageClass::UniformConstant);
+      builder.setInsertionPoint(function);
+      auto var = spirv::GlobalVariableOp::create(builder, loc, varPtrType, symName);
+      var->setAttr("descriptor_set",
+                   builder.getI32IntegerAttr(static_cast<int32_t>(set)));
+      var->setAttr("binding",
+                   builder.getI32IntegerAttr(static_cast<int32_t>(binding)));
+      symbols.insert(var);
+      uniformConstGlobals[key] = var;
+      return var;
+    };
+
+    for (auto op : textureBindings) {
+      getOrCreateHandleGlobal(op.getLoc(), op.getResult().getType(),
+                              op.getName(), op.getSet(), op.getBinding());
+    }
+
+    for (auto op : samplerBindings) {
+      getOrCreateHandleGlobal(op.getLoc(), op.getResult().getType(),
+                              op.getName(), op.getSet(), op.getBinding());
+    }
+
     SmallVector<SharedAllocOp> sharedAllocs;
     shader.walk([&](SharedAllocOp op) { sharedAllocs.push_back(op); });
     for (size_t idx = 0; idx < sharedAllocs.size(); ++idx) {
@@ -899,7 +1058,11 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
     RewritePatternSet patterns(context);
     ScfToSPIRVContext scfContext;
     patterns.add<PtrOffsetPattern, LoadPattern, StorePattern, BarrierPattern,
-                 AtomicRMWPattern, AtomicCASPattern>(converter, context);
+                 AtomicRMWPattern, AtomicCASPattern, TextureSamplePattern,
+                 TextureSampleLevelPattern, TextureLoadPattern>(converter,
+                                                                context);
+    patterns.add<TextureBindingPattern, SamplerBindingPattern>(
+        converter, context, uniformConstGlobals);
     arith::populateArithToSPIRVPatterns(converter, patterns);
     populateMathToSPIRVPatterns(converter, patterns);
     populateVectorToSPIRVPatterns(converter, patterns);
@@ -977,18 +1140,19 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
         helper.setPrivate();
     OpBuilder builder(module.getContext());
 
-    struct BoundBufferSlot {
+    enum class DxSlotClass { UAVBuffer, SRVResource, Sampler };
+    struct BoundResourceSlot {
       int32_t set;
       int32_t binding;
-      AccessMode access;
+      DxSlotClass slotClass;
     };
-    SmallVector<BoundBufferSlot> allBufferSlots;
-    auto recordSlot = [&](int32_t set, int32_t binding, AccessMode access) {
-      for (const auto &existing : allBufferSlots) {
+    SmallVector<BoundResourceSlot> allResourceSlots;
+    auto recordSlot = [&](int32_t set, int32_t binding, DxSlotClass slotClass) {
+      for (const auto &existing : allResourceSlots) {
         if (existing.set == set && existing.binding == binding)
           return;
       }
-      allBufferSlots.push_back({set, binding, access});
+      allResourceSlots.push_back({set, binding, slotClass});
     };
 
     struct EntryArgBuffer {
@@ -999,25 +1163,86 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
     for (unsigned i = 0; i < function.getNumArguments(); ++i) {
       if (auto info = getArgumentBufferBinding(function, i)) {
         entryArgBuffers.push_back({i, *info});
-        recordSlot(info->set, info->binding, info->access);
+        recordSlot(static_cast<int32_t>(info->set),
+                   static_cast<int32_t>(info->binding),
+                   info->access == AccessMode::ReadOnly
+                       ? DxSlotClass::SRVResource
+                       : DxSlotClass::UAVBuffer);
       }
     }
-    module.walk([&](BufferBindingOp bindingOp) {
-      recordSlot(bindingOp.getSet(), bindingOp.getBinding(),
-                 bindingOp.getAccess());
+    module.walk([&](Operation *op) {
+      if (auto bindingOp = dyn_cast<BufferBindingOp>(op)) {
+        recordSlot(static_cast<int32_t>(bindingOp.getSet()),
+                   static_cast<int32_t>(bindingOp.getBinding()),
+                   bindingOp.getAccess() == AccessMode::ReadOnly
+                       ? DxSlotClass::SRVResource
+                       : DxSlotClass::UAVBuffer);
+      } else if (auto texOp = dyn_cast<TextureBindingOp>(op)) {
+        recordSlot(static_cast<int32_t>(texOp.getSet()),
+                   static_cast<int32_t>(texOp.getBinding()),
+                   DxSlotClass::SRVResource);
+      } else if (auto sampOp = dyn_cast<SamplerBindingOp>(op)) {
+        recordSlot(static_cast<int32_t>(sampOp.getSet()),
+                   static_cast<int32_t>(sampOp.getBinding()),
+                   DxSlotClass::Sampler);
+      }
     });
-    llvm::sort(allBufferSlots, [](const BoundBufferSlot &a,
-                                  const BoundBufferSlot &b) {
+    llvm::sort(allResourceSlots, [](const BoundResourceSlot &a,
+                                    const BoundResourceSlot &b) {
       return std::tie(a.set, a.binding) < std::tie(b.set, b.binding);
     });
     DenseMap<std::pair<int32_t, int32_t>, uint32_t> compactRegBySlot;
     uint32_t nextUAVReg = 0;
     uint32_t nextSRVReg = 0;
-    for (const auto &slot : allBufferSlots) {
-      uint32_t reg =
-          (slot.access == AccessMode::ReadOnly) ? nextSRVReg++ : nextUAVReg++;
+    uint32_t nextSamplerReg = 0;
+    for (const auto &slot : allResourceSlots) {
+      uint32_t reg = 0;
+      switch (slot.slotClass) {
+      case DxSlotClass::UAVBuffer:
+        reg = nextUAVReg++;
+        break;
+      case DxSlotClass::SRVResource:
+        reg = nextSRVReg++;
+        break;
+      case DxSlotClass::Sampler:
+        reg = nextSamplerReg++;
+        break;
+      }
       compactRegBySlot[{slot.set, slot.binding}] = reg;
     }
+
+    auto getDxHandleType = [&](ResourceKind kind) -> Type {
+      switch (kind) {
+      case ResourceKind::Texture2D:
+        return LLVM::LLVMTargetExtType::get(
+            module.getContext(), "dx.Texture",
+            ArrayRef<Type>{VectorType::get({4}, builder.getF32Type())},
+            ArrayRef<unsigned int>{0u, 0u, 0u, 2u});
+      case ResourceKind::Sampler:
+        return LLVM::LLVMTargetExtType::get(
+            module.getContext(), "dx.Sampler", ArrayRef<Type>{},
+            ArrayRef<unsigned int>{0u});
+      default:
+        break;
+      }
+      return Type{};
+    };
+
+    auto emitHandleFromBinding = [&](Location loc, Type handleType,
+                                     uint32_t compactReg) -> Value {
+      auto integer = [&](uint32_t value) -> Value {
+        return LLVM::ConstantOp::create(builder, loc, builder.getI32Type(),
+                                        builder.getI32IntegerAttr(value));
+      };
+      auto pointerType = LLVM::LLVMPointerType::get(module.getContext());
+      auto nullVal = LLVM::ZeroOp::create(builder, loc, pointerType);
+      return LLVM::CallIntrinsicOp::create(
+                 builder, loc, handleType,
+                 builder.getStringAttr("llvm.dx.resource.handlefrombinding"),
+                 ValueRange{integer(0), integer(compactReg), integer(1),
+                            integer(0), nullVal})
+          .getResult(0);
+    };
 
     auto emitRawBufferBasePtr = [&](Location loc, AccessMode access,
                                     uint32_t compactReg) -> Value {
@@ -1080,6 +1305,9 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
         case StorageClass::Workgroup: addrSpace = 3; break;
         }
         return LLVM::LLVMPointerType::get(module.getContext(), addrSpace);
+      }
+      if (auto handle = dyn_cast<gfx::HandleType>(t)) {
+        return getDxHandleType(handle.getKind());
       }
       if (auto intType = dyn_cast<IntegerType>(t)) {
         if (!intType.isSignless())
@@ -1313,18 +1541,90 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
 
     SmallVector<Operation *> bufferOps;
     module.walk([&](Operation *op) {
-      if (isa<BufferBindingOp, PtrOffsetOp, LoadOp, StoreOp, BarrierOp,
-              AtomicRMWOp, AtomicCASOp>(op))
+      if (isa<BufferBindingOp, TextureBindingOp, SamplerBindingOp,
+              TextureSampleOp, TextureSampleLevelOp, TextureLoadOp, PtrOffsetOp,
+              LoadOp, StoreOp, BarrierOp, AtomicRMWOp, AtomicCASOp>(op))
         bufferOps.push_back(op);
     });
+    auto ensureConvertedVal = [&](Location loc, Value val) -> Value {
+      Type expected = convertGfxPtr(val.getType());
+      if (val.getType() != expected) {
+        return UnrealizedConversionCastOp::create(
+                   builder, loc, TypeRange{expected}, ValueRange{val})
+            .getResult(0);
+      }
+      return val;
+    };
     for (Operation *op : bufferOps) {
       builder.setInsertionPoint(op);
       if (auto binding = dyn_cast<BufferBindingOp>(op)) {
         uint32_t compactReg =
-            compactRegBySlot[{binding.getSet(), binding.getBinding()}];
+            compactRegBySlot[{static_cast<int32_t>(binding.getSet()),
+                              static_cast<int32_t>(binding.getBinding())}];
         Value pointer =
             emitRawBufferBasePtr(op->getLoc(), binding.getAccess(), compactReg);
         op->getResult(0).replaceAllUsesWith(pointer);
+        op->erase();
+      } else if (auto texBinding = dyn_cast<TextureBindingOp>(op)) {
+        uint32_t compactReg =
+            compactRegBySlot[{static_cast<int32_t>(texBinding.getSet()),
+                              static_cast<int32_t>(texBinding.getBinding())}];
+        Type dxTexType = getDxHandleType(ResourceKind::Texture2D);
+        Value handle =
+            emitHandleFromBinding(op->getLoc(), dxTexType, compactReg);
+        op->getResult(0).replaceAllUsesWith(handle);
+        op->erase();
+      } else if (auto sampBinding = dyn_cast<SamplerBindingOp>(op)) {
+        uint32_t compactReg =
+            compactRegBySlot[{static_cast<int32_t>(sampBinding.getSet()),
+                              static_cast<int32_t>(sampBinding.getBinding())}];
+        Type dxSampType = getDxHandleType(ResourceKind::Sampler);
+        Value handle =
+            emitHandleFromBinding(op->getLoc(), dxSampType, compactReg);
+        op->getResult(0).replaceAllUsesWith(handle);
+        op->erase();
+      } else if (auto sampleOp = dyn_cast<TextureSampleOp>(op)) {
+        Value tex = ensureConvertedVal(op->getLoc(), op->getOperand(0));
+        Value samp = ensureConvertedVal(op->getLoc(), op->getOperand(1));
+        Value uv = ensureConvertedVal(op->getLoc(), op->getOperand(2));
+        Value zeroOffset = LLVM::ZeroOp::create(
+            builder, op->getLoc(), VectorType::get({2}, builder.getI32Type()));
+        Value sampled =
+            LLVM::CallIntrinsicOp::create(
+                builder, op->getLoc(), sampleOp.getResult().getType(),
+                builder.getStringAttr("llvm.dx.resource.sample"),
+                ValueRange{tex, samp, uv, zeroOffset})
+                .getResult(0);
+        sampleOp.getResult().replaceAllUsesWith(sampled);
+        op->erase();
+      } else if (auto sampleLvlOp = dyn_cast<TextureSampleLevelOp>(op)) {
+        Value tex = ensureConvertedVal(op->getLoc(), op->getOperand(0));
+        Value samp = ensureConvertedVal(op->getLoc(), op->getOperand(1));
+        Value uv = ensureConvertedVal(op->getLoc(), op->getOperand(2));
+        Value lod = ensureConvertedVal(op->getLoc(), op->getOperand(3));
+        Value zeroOffset = LLVM::ZeroOp::create(
+            builder, op->getLoc(), VectorType::get({2}, builder.getI32Type()));
+        Value sampled =
+            LLVM::CallIntrinsicOp::create(
+                builder, op->getLoc(), sampleLvlOp.getResult().getType(),
+                builder.getStringAttr("llvm.dx.resource.samplelevel"),
+                ValueRange{tex, samp, uv, lod, zeroOffset})
+                .getResult(0);
+        sampleLvlOp.getResult().replaceAllUsesWith(sampled);
+        op->erase();
+      } else if (auto loadTexOp = dyn_cast<TextureLoadOp>(op)) {
+        Value tex = ensureConvertedVal(op->getLoc(), op->getOperand(0));
+        Value coord = ensureConvertedVal(op->getLoc(), op->getOperand(1));
+        Value level = ensureConvertedVal(op->getLoc(), op->getOperand(2));
+        Value zeroOffset = LLVM::ZeroOp::create(
+            builder, op->getLoc(), VectorType::get({2}, builder.getI32Type()));
+        Value loaded =
+            LLVM::CallIntrinsicOp::create(
+                builder, op->getLoc(), loadTexOp.getResult().getType(),
+                builder.getStringAttr("llvm.dx.resource.load.level"),
+                ValueRange{tex, coord, level, zeroOffset})
+                .getResult(0);
+        loadTexOp.getResult().replaceAllUsesWith(loaded);
         op->erase();
       } else if (auto barrier = dyn_cast<BarrierOp>(op)) {
         StringRef intrinsicName = "llvm.dx.group.memory.barrier.with.group.sync";
@@ -1648,8 +1948,16 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
         {rootsig::RegisterType::BReg, 0}};
     elements.push_back(constants);
   }
-  if (!reflection.buffers.empty()) {
+  if (!reflection.buffers.empty() || !reflection.textures.empty() ||
+      !reflection.samplers.empty()) {
     namespace rootsig = llvm::hlsl::rootsig;
+    llvm::dxbc::ShaderVisibility tableVisibility =
+        llvm::dxbc::ShaderVisibility::All;
+    if (reflection.stage == Stage::Vertex)
+      tableVisibility = llvm::dxbc::ShaderVisibility::Vertex;
+    else if (reflection.stage == Stage::Fragment)
+      tableVisibility = llvm::dxbc::ShaderVisibility::Pixel;
+
     SmallVector<BufferInterfaceElement> uniqueBuffers;
     for (const auto &buf : reflection.buffers) {
       bool exists = llvm::any_of(uniqueBuffers, [&](const auto &existing) {
@@ -1658,8 +1966,25 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
       if (!exists)
         uniqueBuffers.push_back(buf);
     }
+    SmallVector<TextureInterfaceElement> uniqueTextures;
+    for (const auto &tex : reflection.textures) {
+      bool exists = llvm::any_of(uniqueTextures, [&](const auto &existing) {
+        return existing.set == tex.set && existing.binding == tex.binding;
+      });
+      if (!exists)
+        uniqueTextures.push_back(tex);
+    }
+    SmallVector<SamplerInterfaceElement> uniqueSamplers;
+    for (const auto &samp : reflection.samplers) {
+      bool exists = llvm::any_of(uniqueSamplers, [&](const auto &existing) {
+        return existing.set == samp.set && existing.binding == samp.binding;
+      });
+      if (!exists)
+        uniqueSamplers.push_back(samp);
+    }
+
     uint32_t uavCount = 0;
-    uint32_t srvCount = 0;
+    uint32_t srvCount = static_cast<uint32_t>(uniqueTextures.size());
     for (const auto &buf : uniqueBuffers) {
       if (buf.access == AccessMode::ReadOnly)
         ++srvCount;
@@ -1689,13 +2014,37 @@ std::unique_ptr<llvm::Module> exportDirectX(ModuleOp module,
     }
     if (numClauses > 0) {
       rootsig::DescriptorTable table;
-      table.Visibility = llvm::dxbc::ShaderVisibility::All;
+      table.Visibility = tableVisibility;
       table.NumClauses = numClauses;
       elements.push_back(table);
+    }
+    if (!uniqueSamplers.empty()) {
+      rootsig::DescriptorTableClause samplerClause;
+      samplerClause.Type = llvm::dxil::ResourceClass::Sampler;
+      samplerClause.Reg = rootsig::Register{rootsig::RegisterType::SReg, 0};
+      samplerClause.NumDescriptors =
+          static_cast<uint32_t>(uniqueSamplers.size());
+      samplerClause.Space = 0;
+      samplerClause.setDefaultFlags(llvm::dxbc::RootSignatureVersion::V1_1);
+      elements.push_back(samplerClause);
+
+      rootsig::DescriptorTable samplerTable;
+      samplerTable.Visibility = tableVisibility;
+      samplerTable.NumClauses = 1;
+      elements.push_back(samplerTable);
     }
   }
   if (!elements.empty()) {
     namespace rootsig = llvm::hlsl::rootsig;
+    bool hasVertexAttributes =
+        reflection.stage == Stage::Vertex &&
+        llvm::any_of(reflection.inputs, [](const InterfaceElement &io) {
+          return std::holds_alternative<int32_t>(io.binding);
+        });
+    if (hasVertexAttributes) {
+      elements.insert(elements.begin(),
+                      llvm::dxbc::RootFlags::AllowInputAssemblerInputLayout);
+    }
     auto signature =
         rootsig::MetadataBuilder(*translated, elements).BuildRootSignature();
     auto version = llvm::ConstantAsMetadata::get(

@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .frontend import ComputePipeline, DepthStencil, Dispatch, Draw, Pipeline, Stage
-from .interfaces import reflect_pipeline_parameters, verify_graphics_interface
+from .interfaces import (
+    reflect_pipeline_parameters,
+    reflect_pipeline_resources,
+    verify_graphics_interface,
+    verify_stage_resources,
+)
 from .parameters import verify_parameters
 
 
@@ -749,6 +754,7 @@ def compile_pipeline(
                 )
             if "parameters" in compute_refl:
                 verify_parameters(compute_refl["parameters"])
+            verify_stage_resources(compute_refl)
             if reflection_path is not None:
                 reflection_path = Path(reflection_path).absolute()
                 reflection_path.parent.mkdir(parents=True, exist_ok=True)
@@ -768,6 +774,10 @@ def compile_pipeline(
                 "runtime_verified": False,
                 "backend_status": "converted-binary" if target == Target.METAL else "validated-binary",
             }
+            if compute_refl.get("textures"):
+                manifest["textures"] = compute_refl["textures"]
+            if compute_refl.get("samplers"):
+                manifest["samplers"] = compute_refl["samplers"]
             if "parameters" in compute_refl:
                 manifest["parameters"] = compute_refl["parameters"]
             if compute_refl.get("shared_memory_bytes", 0) > 0:
@@ -778,6 +788,7 @@ def compile_pipeline(
 
         verify_graphics_interface(interface)
         parameters = reflect_pipeline_parameters(interface)
+        buffers, textures, samplers = reflect_pipeline_resources(interface)
         for stage in stages:
             if interface[stage.kind]["name"] != stage.name or interface[stage.kind]["stage"] != stage.kind:
                 raise CompileError(f"Reflected entry does not match the declared {stage.kind} stage {stage.name!r}.")
@@ -842,6 +853,12 @@ def compile_pipeline(
             manifest["input_layout"] = input_layout
         if parameters:
             manifest["parameters"] = parameters
+        if buffers:
+            manifest["buffers"] = buffers
+        if textures:
+            manifest["textures"] = textures
+        if samplers:
+            manifest["samplers"] = samplers
         if getattr(pipeline, "depth_stencil", None) is not None:
             manifest["depth_stencil"] = pipeline.depth_stencil.to_dict()
         (directory / "pipeline.json").write_text(json.dumps(manifest, indent=2) + "\n")

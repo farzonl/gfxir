@@ -15,8 +15,11 @@
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include <glaze/glaze.hpp>
@@ -240,11 +243,44 @@ struct ComputeBufferSpec {
     std::string output_path;
 };
 
+struct TextureResourceSpec {
+    std::string name;
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::string format;
+    std::string path;
+};
+
+struct SamplerResourceSpec {
+    std::string name;
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    std::string min_filter = "nearest";
+    std::string mag_filter = "nearest";
+    std::string address_mode_u = "repeat";
+    std::string address_mode_v = "repeat";
+};
+
+struct StageResourcesSpec {
+    std::vector<ComputeBufferSpec> buffers;
+    std::vector<TextureResourceSpec> textures;
+    std::vector<SamplerResourceSpec> samplers;
+};
+
+struct GraphicsResourcesSpec {
+    StageResourcesSpec vertex;
+    StageResourcesSpec fragment;
+};
+
 struct ComputeDispatchSpec {
     std::array<uint32_t, 3> workgroup_size = {1, 1, 1};
     std::array<uint32_t, 3> grid = {1, 1, 1};
     std::string root_constants_path;
     std::vector<ComputeBufferSpec> buffers;
+    std::vector<TextureResourceSpec> textures;
+    std::vector<SamplerResourceSpec> samplers;
 };
 
 struct ComputeReport {
@@ -257,6 +293,383 @@ static std::vector<char> binaryFile(const std::filesystem::path& path, const cha
     std::vector<char> bytes((std::istreambuf_iterator<char>(input)), {});
     if (input.bad()) throw std::runtime_error(std::string("Cannot read ") + description);
     return bytes;
+}
+
+static DXGI_FORMAT textureFormatToDXGI(std::string_view fmt) {
+    if (fmt == "rgba8_unorm") return DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (fmt == "rgba32_sfloat") return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    throw std::runtime_error("Unsupported texture format: " + std::string(fmt));
+}
+
+static size_t textureBytesPerPixel(DXGI_FORMAT fmt) {
+    if (fmt == DXGI_FORMAT_R8G8B8A8_UNORM) return 4;
+    if (fmt == DXGI_FORMAT_R32G32B32A32_FLOAT) return 16;
+    throw std::runtime_error("Unsupported DXGI texture format");
+}
+
+static D3D12_TEXTURE_ADDRESS_MODE parseTextureAddressMode(std::string_view mode) {
+    if (mode == "repeat") return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    if (mode == "clamp_to_edge") return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    if (mode == "mirror_repeat") return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+    throw std::runtime_error("Unsupported sampler address mode: " + std::string(mode));
+}
+
+static D3D12_SAMPLER_DESC createSamplerDesc(const SamplerResourceSpec& spec) {
+    D3D12_SAMPLER_DESC desc{};
+    if (spec.min_filter == "nearest" && spec.mag_filter == "nearest") {
+        desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    } else if (spec.min_filter == "nearest" && spec.mag_filter == "linear") {
+        desc.Filter = D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT;
+    } else if (spec.min_filter == "linear" && spec.mag_filter == "nearest") {
+        desc.Filter = D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT;
+    } else if (spec.min_filter == "linear" && spec.mag_filter == "linear") {
+        desc.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    } else {
+        throw std::runtime_error("Unsupported sampler filter combination: min=" +
+                                 spec.min_filter + ", mag=" + spec.mag_filter);
+    }
+    desc.AddressU = parseTextureAddressMode(spec.address_mode_u);
+    desc.AddressV = parseTextureAddressMode(spec.address_mode_v);
+    desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    desc.MipLODBias = 0.0f;
+    desc.MaxAnisotropy = 1;
+    desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    desc.MinLOD = 0.0f;
+    desc.MaxLOD = 0.0f;
+    return desc;
+}
+
+struct AllocatedStageBuffer {
+    ComputeBufferSpec spec;
+    bool isUAV = false;
+    uint64_t alignedSize = 0;
+    ComPtr<ID3D12Resource> defaultBuf;
+    ComPtr<ID3D12Resource> uploadBuf;
+    ComPtr<ID3D12Resource> readbackBuf;
+};
+
+struct UploadedTexture2D {
+    TextureResourceSpec spec;
+    DXGI_FORMAT dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    ComPtr<ID3D12Resource> texture;
+    ComPtr<ID3D12Resource> uploadBuf;
+};
+
+struct SrvSlotEntry {
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    bool isTexture = false;
+    size_t index = 0;
+};
+
+struct LoadedStageResources {
+    std::vector<AllocatedStageBuffer> buffers;
+    std::vector<UploadedTexture2D> textures;
+    std::vector<SamplerResourceSpec> samplers;
+    std::vector<size_t> uavBufferIndices;
+    std::vector<SrvSlotEntry> srvEntries;
+
+    size_t srvUavCount() const { return uavBufferIndices.size() + srvEntries.size(); }
+    size_t samplerCount() const { return samplers.size(); }
+    bool hasUploads() const { return !buffers.empty() || !textures.empty(); }
+};
+
+static LoadedStageResources allocateStageResources(
+    ID3D12Device* dev, const StageResourcesSpec& stageSpec, bool enableReadback) {
+    LoadedStageResources loaded;
+
+    std::vector<ComputeBufferSpec> sortedBuffers = stageSpec.buffers;
+    std::stable_sort(sortedBuffers.begin(), sortedBuffers.end(),
+                     [](const ComputeBufferSpec& a, const ComputeBufferSpec& b) {
+                         if (a.set != b.set) return a.set < b.set;
+                         return a.binding < b.binding;
+                     });
+
+    loaded.buffers.reserve(sortedBuffers.size());
+    for (const auto& bufSpec : sortedBuffers) {
+        if (bufSpec.access != "read_only" && bufSpec.access != "write_only" &&
+            bufSpec.access != "read_write") {
+            throw std::runtime_error("Unsupported buffer access mode: " + bufSpec.access);
+        }
+        if (bufSpec.size == 0) {
+            throw std::runtime_error("Buffer byte size must be positive: " + bufSpec.name);
+        }
+
+        AllocatedStageBuffer entry;
+        entry.spec = bufSpec;
+        entry.isUAV = (bufSpec.access != "read_only");
+        entry.alignedSize = std::max<uint64_t>(4, (bufSpec.size + 3ULL) & ~3ULL);
+
+        D3D12_HEAP_PROPERTIES defaultHeap{};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC defaultDesc{};
+        defaultDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        defaultDesc.Width = entry.alignedSize;
+        defaultDesc.Height = 1;
+        defaultDesc.DepthOrArraySize = 1;
+        defaultDesc.MipLevels = 1;
+        defaultDesc.SampleDesc.Count = 1;
+        defaultDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        defaultDesc.Flags = entry.isUAV ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                                        : D3D12_RESOURCE_FLAG_NONE;
+        check(dev->CreateCommittedResource(
+                  &defaultHeap, D3D12_HEAP_FLAG_NONE, &defaultDesc,
+                  D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&entry.defaultBuf)),
+              "Create stage default buffer");
+
+        D3D12_HEAP_PROPERTIES uploadHeap{};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC stagingDesc = defaultDesc;
+        stagingDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        check(dev->CreateCommittedResource(
+                  &uploadHeap, D3D12_HEAP_FLAG_NONE, &stagingDesc,
+                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&entry.uploadBuf)),
+              "Create stage upload buffer");
+
+        void* uploadMapped = nullptr;
+        D3D12_RANGE emptyReadRange{0, 0};
+        check(entry.uploadBuf->Map(0, &emptyReadRange, &uploadMapped), "Map stage upload buffer");
+        std::memset(uploadMapped, 0, static_cast<size_t>(entry.alignedSize));
+        if (!bufSpec.input_path.empty()) {
+            auto inputBytes = binaryFile(std::filesystem::path(bufSpec.input_path), "buffer input");
+            if (inputBytes.size() != bufSpec.size) {
+                entry.uploadBuf->Unmap(0, nullptr);
+                throw std::runtime_error("Buffer input file size does not match spec size: " + bufSpec.name);
+            }
+            std::memcpy(uploadMapped, inputBytes.data(), inputBytes.size());
+        }
+        entry.uploadBuf->Unmap(0, nullptr);
+
+        if (enableReadback && entry.isUAV && !bufSpec.output_path.empty()) {
+            D3D12_HEAP_PROPERTIES readbackHeap{};
+            readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
+            check(dev->CreateCommittedResource(
+                      &readbackHeap, D3D12_HEAP_FLAG_NONE, &stagingDesc,
+                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&entry.readbackBuf)),
+                  "Create stage readback buffer");
+        }
+
+        size_t idx = loaded.buffers.size();
+        if (entry.isUAV) {
+            loaded.uavBufferIndices.push_back(idx);
+        } else {
+            loaded.srvEntries.push_back(SrvSlotEntry{bufSpec.set, bufSpec.binding, false, idx});
+        }
+        loaded.buffers.push_back(std::move(entry));
+    }
+
+    loaded.textures.reserve(stageSpec.textures.size());
+    for (const auto& texSpec : stageSpec.textures) {
+        if (texSpec.width == 0 || texSpec.height == 0) {
+            throw std::runtime_error("Texture dimensions must be positive: " + texSpec.name);
+        }
+        DXGI_FORMAT dxgiFmt = textureFormatToDXGI(texSpec.format);
+        size_t bpp = textureBytesPerPixel(dxgiFmt);
+        size_t expectedBytes = static_cast<size_t>(texSpec.width) * texSpec.height * bpp;
+        auto texBytes = binaryFile(std::filesystem::path(texSpec.path), "texture data");
+        if (texBytes.size() != expectedBytes) {
+            throw std::runtime_error("Texture file size does not match dimensions and format: " + texSpec.name);
+        }
+
+        UploadedTexture2D texEntry;
+        texEntry.spec = texSpec;
+        texEntry.dxgiFormat = dxgiFmt;
+
+        D3D12_HEAP_PROPERTIES defaultHeap{};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC texDesc{};
+        texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texDesc.Width = texSpec.width;
+        texDesc.Height = texSpec.height;
+        texDesc.DepthOrArraySize = 1;
+        texDesc.MipLevels = 1;
+        texDesc.Format = dxgiFmt;
+        texDesc.SampleDesc.Count = 1;
+        texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        check(dev->CreateCommittedResource(
+                  &defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc,
+                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texEntry.texture)),
+              "Create 2D texture resource");
+
+        UINT numRows = 0;
+        UINT64 rowSizeInBytes = 0;
+        UINT64 totalBytes = 0;
+        dev->GetCopyableFootprints(&texDesc, 0, 1, 0, &texEntry.footprint, &numRows, &rowSizeInBytes, &totalBytes);
+
+        D3D12_HEAP_PROPERTIES uploadHeap{};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC uploadDesc{};
+        uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDesc.Width = totalBytes;
+        uploadDesc.Height = 1;
+        uploadDesc.DepthOrArraySize = 1;
+        uploadDesc.MipLevels = 1;
+        uploadDesc.SampleDesc.Count = 1;
+        uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        uploadDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        check(dev->CreateCommittedResource(
+                  &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&texEntry.uploadBuf)),
+              "Create texture upload buffer");
+
+        void* uploadMapped = nullptr;
+        D3D12_RANGE emptyReadRange{0, 0};
+        check(texEntry.uploadBuf->Map(0, &emptyReadRange, &uploadMapped), "Map texture upload buffer");
+        std::memset(uploadMapped, 0, static_cast<size_t>(totalBytes));
+        size_t srcRowBytes = static_cast<size_t>(texSpec.width) * bpp;
+        auto* dstBase = static_cast<uint8_t*>(uploadMapped) + texEntry.footprint.Offset;
+        for (uint32_t row = 0; row < texSpec.height; ++row) {
+            std::memcpy(dstBase + static_cast<size_t>(row) * texEntry.footprint.Footprint.RowPitch,
+                        texBytes.data() + static_cast<size_t>(row) * srcRowBytes,
+                        srcRowBytes);
+        }
+        texEntry.uploadBuf->Unmap(0, nullptr);
+
+        size_t texIdx = loaded.textures.size();
+        loaded.srvEntries.push_back(SrvSlotEntry{texSpec.set, texSpec.binding, true, texIdx});
+        loaded.textures.push_back(std::move(texEntry));
+    }
+
+    std::stable_sort(loaded.srvEntries.begin(), loaded.srvEntries.end(),
+                     [](const SrvSlotEntry& a, const SrvSlotEntry& b) {
+                         if (a.set != b.set) return a.set < b.set;
+                         return a.binding < b.binding;
+                     });
+
+    loaded.samplers = stageSpec.samplers;
+    std::stable_sort(loaded.samplers.begin(), loaded.samplers.end(),
+                     [](const SamplerResourceSpec& a, const SamplerResourceSpec& b) {
+                         if (a.set != b.set) return a.set < b.set;
+                         return a.binding < b.binding;
+                     });
+
+    return loaded;
+}
+
+static void recordStageUploads(ID3D12GraphicsCommandList* commands,
+                               const LoadedStageResources& loaded,
+                               D3D12_RESOURCE_STATES srvTargetState) {
+    if (!loaded.buffers.empty()) {
+        std::vector<D3D12_RESOURCE_BARRIER> toCopyDest;
+        toCopyDest.reserve(loaded.buffers.size());
+        for (const auto& buf : loaded.buffers) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = buf.defaultBuf.Get();
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            toCopyDest.push_back(b);
+        }
+        commands->ResourceBarrier(static_cast<UINT>(toCopyDest.size()), toCopyDest.data());
+
+        for (const auto& buf : loaded.buffers) {
+            commands->CopyBufferRegion(
+                buf.defaultBuf.Get(), 0, buf.uploadBuf.Get(), 0, buf.alignedSize);
+        }
+
+        std::vector<D3D12_RESOURCE_BARRIER> toShaderState;
+        toShaderState.reserve(loaded.buffers.size());
+        for (const auto& buf : loaded.buffers) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = buf.defaultBuf.Get();
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            b.Transition.StateAfter = buf.isUAV ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                                : srvTargetState;
+            toShaderState.push_back(b);
+        }
+        commands->ResourceBarrier(static_cast<UINT>(toShaderState.size()), toShaderState.data());
+    }
+
+    if (!loaded.textures.empty()) {
+        for (const auto& tex : loaded.textures) {
+            D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+            dstLoc.pResource = tex.texture.Get();
+            dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dstLoc.SubresourceIndex = 0;
+
+            D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+            srcLoc.pResource = tex.uploadBuf.Get();
+            srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            srcLoc.PlacedFootprint = tex.footprint;
+
+            commands->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+        }
+
+        std::vector<D3D12_RESOURCE_BARRIER> texBarriers;
+        texBarriers.reserve(loaded.textures.size());
+        for (const auto& tex : loaded.textures) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = tex.texture.Get();
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            b.Transition.StateAfter = srvTargetState;
+            texBarriers.push_back(b);
+        }
+        commands->ResourceBarrier(static_cast<UINT>(texBarriers.size()), texBarriers.data());
+    }
+}
+
+static void writeStageSrvUavDescriptors(ID3D12Device* dev,
+                                        const LoadedStageResources& loaded,
+                                        D3D12_CPU_DESCRIPTOR_HANDLE handle,
+                                        UINT increment) {
+    for (size_t idx : loaded.uavBufferIndices) {
+        const auto& buf = loaded.buffers[idx];
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+        uavDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uavDesc.Buffer.FirstElement = 0;
+        uavDesc.Buffer.NumElements = static_cast<UINT>(buf.alignedSize / 4);
+        uavDesc.Buffer.StructureByteStride = 0;
+        uavDesc.Buffer.CounterOffsetInBytes = 0;
+        uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        dev->CreateUnorderedAccessView(buf.defaultBuf.Get(), nullptr, &uavDesc, handle);
+        handle.ptr += increment;
+    }
+
+    for (const auto& item : loaded.srvEntries) {
+        if (item.isTexture) {
+            const auto& tex = loaded.textures[item.index];
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+            srvDesc.Format = tex.dxgiFormat;
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvDesc.Texture2D.MostDetailedMip = 0;
+            srvDesc.Texture2D.MipLevels = 1;
+            srvDesc.Texture2D.PlaneSlice = 0;
+            srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+            dev->CreateShaderResourceView(tex.texture.Get(), &srvDesc, handle);
+        } else {
+            const auto& buf = loaded.buffers[item.index];
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+            srvDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvDesc.Buffer.FirstElement = 0;
+            srvDesc.Buffer.NumElements = static_cast<UINT>(buf.alignedSize / 4);
+            srvDesc.Buffer.StructureByteStride = 0;
+            srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            dev->CreateShaderResourceView(buf.defaultBuf.Get(), &srvDesc, handle);
+        }
+        handle.ptr += increment;
+    }
+}
+
+static void writeStageSamplerDescriptors(ID3D12Device* dev,
+                                         const LoadedStageResources& loaded,
+                                         D3D12_CPU_DESCRIPTOR_HANDLE handle,
+                                         UINT increment) {
+    for (const auto& sampSpec : loaded.samplers) {
+        D3D12_SAMPLER_DESC sampDesc = createSamplerDesc(sampSpec);
+        dev->CreateSampler(&sampDesc, handle);
+        handle.ptr += increment;
+    }
 }
 
 static void checkValidationQueue(ID3D12InfoQueue* diagnostics) {
@@ -311,8 +724,10 @@ static void runComputeDispatch(const std::wstring& computePath, const std::wstri
     bool hasRootConstants = false;
     UINT rootConstantsParamIndex = 0;
     UINT rootConstantsNumWords = 0;
-    bool hasDescriptorTable = false;
-    UINT descriptorTableParamIndex = 0;
+    bool hasSrvUavTable = false;
+    UINT srvUavTableParamIndex = 0;
+    bool hasSamplerTable = false;
+    UINT samplerTableParamIndex = 0;
 
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12VersionedRootSignatureDeserializer> deserializer;
@@ -328,8 +743,16 @@ static void runComputeDispatch(const std::wstring& computePath, const std::wstri
                     rootConstantsParamIndex = i;
                     rootConstantsNumWords = param.Constants.Num32BitValues;
                 } else if (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
-                    hasDescriptorTable = true;
-                    descriptorTableParamIndex = i;
+                    bool isSampler = param.DescriptorTable.NumDescriptorRanges > 0 &&
+                                     param.DescriptorTable.pDescriptorRanges[0].RangeType ==
+                                         D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+                    if (isSampler) {
+                        hasSamplerTable = true;
+                        samplerTableParamIndex = i;
+                    } else {
+                        hasSrvUavTable = true;
+                        srvUavTableParamIndex = i;
+                    }
                 }
             }
         } else {
@@ -340,8 +763,16 @@ static void runComputeDispatch(const std::wstring& computePath, const std::wstri
                     rootConstantsParamIndex = i;
                     rootConstantsNumWords = param.Constants.Num32BitValues;
                 } else if (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
-                    hasDescriptorTable = true;
-                    descriptorTableParamIndex = i;
+                    bool isSampler = param.DescriptorTable.NumDescriptorRanges > 0 &&
+                                     param.DescriptorTable.pDescriptorRanges[0].RangeType ==
+                                         D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+                    if (isSampler) {
+                        hasSamplerTable = true;
+                        samplerTableParamIndex = i;
+                    } else {
+                        hasSrvUavTable = true;
+                        srvUavTableParamIndex = i;
+                    }
                 }
             }
         }
@@ -390,137 +821,33 @@ static void runComputeDispatch(const std::wstring& computePath, const std::wstri
         }
     }
 
-    std::stable_sort(spec.buffers.begin(), spec.buffers.end(),
-                     [](const ComputeBufferSpec& a, const ComputeBufferSpec& b) {
-                         if (a.set != b.set) return a.set < b.set;
-                         return a.binding < b.binding;
-                     });
+    StageResourcesSpec stageSpec{spec.buffers, spec.textures, spec.samplers};
+    LoadedStageResources loaded = allocateStageResources(dev.device.Get(), stageSpec, true);
 
-    struct AllocatedComputeBuffer {
-        ComputeBufferSpec spec;
-        bool isUAV = false;
-        uint64_t alignedSize = 0;
-        ComPtr<ID3D12Resource> defaultBuf;
-        ComPtr<ID3D12Resource> uploadBuf;
-        ComPtr<ID3D12Resource> readbackBuf;
-    };
-
-    std::vector<AllocatedComputeBuffer> buffers;
-    buffers.reserve(spec.buffers.size());
-    std::vector<size_t> uavIndices;
-    std::vector<size_t> srvIndices;
-
-    for (const auto& bufSpec : spec.buffers) {
-        if (bufSpec.access != "read_only" && bufSpec.access != "write_only" &&
-            bufSpec.access != "read_write") {
-            throw std::runtime_error("Unsupported compute buffer access mode: " + bufSpec.access);
-        }
-        if (bufSpec.size == 0) {
-            throw std::runtime_error("Compute buffer byte size must be positive: " + bufSpec.name);
-        }
-
-        AllocatedComputeBuffer entry;
-        entry.spec = bufSpec;
-        entry.isUAV = (bufSpec.access != "read_only");
-        entry.alignedSize = std::max<uint64_t>(4, (bufSpec.size + 3ULL) & ~3ULL);
-
-        D3D12_HEAP_PROPERTIES defaultHeap{};
-        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC defaultDesc{};
-        defaultDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        defaultDesc.Width = entry.alignedSize;
-        defaultDesc.Height = 1;
-        defaultDesc.DepthOrArraySize = 1;
-        defaultDesc.MipLevels = 1;
-        defaultDesc.SampleDesc.Count = 1;
-        defaultDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        defaultDesc.Flags = entry.isUAV ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
-                                        : D3D12_RESOURCE_FLAG_NONE;
-        check(dev.device->CreateCommittedResource(
-                  &defaultHeap, D3D12_HEAP_FLAG_NONE, &defaultDesc,
-                  D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&entry.defaultBuf)),
-              "Create compute default buffer");
-
-        D3D12_HEAP_PROPERTIES uploadHeap{};
-        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC stagingDesc = defaultDesc;
-        stagingDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-        check(dev.device->CreateCommittedResource(
-                  &uploadHeap, D3D12_HEAP_FLAG_NONE, &stagingDesc,
-                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&entry.uploadBuf)),
-              "Create compute upload buffer");
-
-        void* uploadMapped = nullptr;
-        D3D12_RANGE emptyReadRange{0, 0};
-        check(entry.uploadBuf->Map(0, &emptyReadRange, &uploadMapped), "Map compute upload buffer");
-        std::memset(uploadMapped, 0, static_cast<size_t>(entry.alignedSize));
-        if (!bufSpec.input_path.empty()) {
-            auto inputBytes = binaryFile(std::filesystem::path(bufSpec.input_path), "compute input buffer");
-            if (inputBytes.size() != bufSpec.size) {
-                entry.uploadBuf->Unmap(0, nullptr);
-                throw std::runtime_error("Compute input buffer file size does not match spec size: " + bufSpec.name);
-            }
-            std::memcpy(uploadMapped, inputBytes.data(), inputBytes.size());
-        }
-        entry.uploadBuf->Unmap(0, nullptr);
-
-        if (entry.isUAV && !bufSpec.output_path.empty()) {
-            D3D12_HEAP_PROPERTIES readbackHeap{};
-            readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
-            check(dev.device->CreateCommittedResource(
-                      &readbackHeap, D3D12_HEAP_FLAG_NONE, &stagingDesc,
-                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&entry.readbackBuf)),
-                  "Create compute readback buffer");
-        }
-
-        size_t idx = buffers.size();
-        if (entry.isUAV) {
-            uavIndices.push_back(idx);
-        } else {
-            srvIndices.push_back(idx);
-        }
-        buffers.push_back(std::move(entry));
-    }
-
-    ComPtr<ID3D12DescriptorHeap> descriptorHeap;
-    size_t totalDescriptors = uavIndices.size() + srvIndices.size();
-    if (hasDescriptorTable || totalDescriptors > 0) {
+    ComPtr<ID3D12DescriptorHeap> srvUavHeap;
+    if (hasSrvUavTable || loaded.srvUavCount() > 0) {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = static_cast<UINT>(std::max<size_t>(1, totalDescriptors));
+        heapDesc.NumDescriptors = static_cast<UINT>(std::max<size_t>(1, loaded.srvUavCount()));
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        check(dev.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&descriptorHeap)),
+        check(dev.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&srvUavHeap)),
               "Create compute CBV_SRV_UAV descriptor heap");
-
         UINT increment = dev.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        D3D12_CPU_DESCRIPTOR_HANDLE handle = descriptorHeap->GetCPUDescriptorHandleForHeapStart();
+        writeStageSrvUavDescriptors(
+            dev.device.Get(), loaded, srvUavHeap->GetCPUDescriptorHandleForHeapStart(), increment);
+    }
 
-        for (size_t idx : uavIndices) {
-            const auto& buf = buffers[idx];
-            D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-            uavDesc.Format = DXGI_FORMAT_R32_TYPELESS;
-            uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-            uavDesc.Buffer.FirstElement = 0;
-            uavDesc.Buffer.NumElements = static_cast<UINT>(buf.alignedSize / 4);
-            uavDesc.Buffer.StructureByteStride = 0;
-            uavDesc.Buffer.CounterOffsetInBytes = 0;
-            uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-            dev.device->CreateUnorderedAccessView(buf.defaultBuf.Get(), nullptr, &uavDesc, handle);
-            handle.ptr += increment;
-        }
-        for (size_t idx : srvIndices) {
-            const auto& buf = buffers[idx];
-            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-            srvDesc.Format = DXGI_FORMAT_R32_TYPELESS;
-            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srvDesc.Buffer.FirstElement = 0;
-            srvDesc.Buffer.NumElements = static_cast<UINT>(buf.alignedSize / 4);
-            srvDesc.Buffer.StructureByteStride = 0;
-            srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-            dev.device->CreateShaderResourceView(buf.defaultBuf.Get(), &srvDesc, handle);
-            handle.ptr += increment;
-        }
+    ComPtr<ID3D12DescriptorHeap> samplerHeap;
+    if (hasSamplerTable || loaded.samplerCount() > 0) {
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        heapDesc.NumDescriptors = static_cast<UINT>(std::max<size_t>(1, loaded.samplerCount()));
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        check(dev.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&samplerHeap)),
+              "Create compute SAMPLER descriptor heap");
+        UINT increment = dev.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        writeStageSamplerDescriptors(
+            dev.device.Get(), loaded, samplerHeap->GetCPUDescriptorHandleForHeapStart(), increment);
     }
 
     ComPtr<ID3D12GraphicsCommandList> commands;
@@ -529,58 +856,32 @@ static void runComputeDispatch(const std::wstring& computePath, const std::wstri
               IID_PPV_ARGS(&commands)),
           "Create compute command list");
 
-    if (!buffers.empty()) {
-        std::vector<D3D12_RESOURCE_BARRIER> toCopyDest;
-        toCopyDest.reserve(buffers.size());
-        for (const auto& buf : buffers) {
-            D3D12_RESOURCE_BARRIER b{};
-            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            b.Transition.pResource = buf.defaultBuf.Get();
-            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-            toCopyDest.push_back(b);
-        }
-        commands->ResourceBarrier(static_cast<UINT>(toCopyDest.size()), toCopyDest.data());
-
-        for (const auto& buf : buffers) {
-            commands->CopyBufferRegion(
-                buf.defaultBuf.Get(), 0, buf.uploadBuf.Get(), 0, buf.alignedSize);
-        }
-
-        std::vector<D3D12_RESOURCE_BARRIER> toShaderState;
-        toShaderState.reserve(buffers.size());
-        for (const auto& buf : buffers) {
-            D3D12_RESOURCE_BARRIER b{};
-            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            b.Transition.pResource = buf.defaultBuf.Get();
-            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-            b.Transition.StateAfter = buf.isUAV ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-                                                : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            toShaderState.push_back(b);
-        }
-        commands->ResourceBarrier(static_cast<UINT>(toShaderState.size()), toShaderState.data());
-    }
+    recordStageUploads(commands.Get(), loaded, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     commands->SetComputeRootSignature(root.Get());
-    if (descriptorHeap) {
-        ID3D12DescriptorHeap* heaps[] = {descriptorHeap.Get()};
-        commands->SetDescriptorHeaps(1, heaps);
+    std::vector<ID3D12DescriptorHeap*> activeHeaps;
+    if (srvUavHeap) activeHeaps.push_back(srvUavHeap.Get());
+    if (samplerHeap) activeHeaps.push_back(samplerHeap.Get());
+    if (!activeHeaps.empty()) {
+        commands->SetDescriptorHeaps(static_cast<UINT>(activeHeaps.size()), activeHeaps.data());
     }
     if (hasRootConstants) {
         commands->SetComputeRoot32BitConstants(
             rootConstantsParamIndex, rootConstantsNumWords, rootConstantWords.data(), 0);
     }
-    if (hasDescriptorTable && descriptorHeap) {
+    if (hasSrvUavTable && srvUavHeap) {
         commands->SetComputeRootDescriptorTable(
-            descriptorTableParamIndex, descriptorHeap->GetGPUDescriptorHandleForHeapStart());
+            srvUavTableParamIndex, srvUavHeap->GetGPUDescriptorHandleForHeapStart());
+    }
+    if (hasSamplerTable && samplerHeap) {
+        commands->SetComputeRootDescriptorTable(
+            samplerTableParamIndex, samplerHeap->GetGPUDescriptorHandleForHeapStart());
     }
 
     commands->Dispatch(spec.grid[0], spec.grid[1], spec.grid[2]);
 
     std::vector<D3D12_RESOURCE_BARRIER> postDispatchBarriers;
-    for (const auto& buf : buffers) {
+    for (const auto& buf : loaded.buffers) {
         if (buf.readbackBuf) {
             D3D12_RESOURCE_BARRIER uavBarrier{};
             uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -600,7 +901,7 @@ static void runComputeDispatch(const std::wstring& computePath, const std::wstri
         commands->ResourceBarrier(
             static_cast<UINT>(postDispatchBarriers.size()), postDispatchBarriers.data());
     }
-    for (const auto& buf : buffers) {
+    for (const auto& buf : loaded.buffers) {
         if (buf.readbackBuf) {
             commands->CopyBufferRegion(
                 buf.readbackBuf.Get(), 0, buf.defaultBuf.Get(), 0, buf.alignedSize);
@@ -624,7 +925,7 @@ static void runComputeDispatch(const std::wstring& computePath, const std::wstri
     check(dev.device->GetDeviceRemovedReason(), "GPU device removed");
     checkValidationQueue(diagnostics.Get());
 
-    for (const auto& buf : buffers) {
+    for (const auto& buf : loaded.buffers) {
         if (!buf.readbackBuf) continue;
         void* mapped = nullptr;
         D3D12_RANGE readRange{0, static_cast<SIZE_T>(buf.spec.size)};
@@ -839,6 +1140,26 @@ class Renderer {
     std::unordered_map<std::string, ComPtr<ID3D12PipelineState>> pipelines;
     std::vector<DirectXDrawCall> draws;
     bool hasFrameConstants = false;
+    UINT b0ParamIdx = 0;
+    UINT b1ParamIdx = 1;
+    bool hasVsSrvUavTable = false;
+    UINT vsSrvUavParamIdx = 0;
+    bool hasVsSamplerTable = false;
+    UINT vsSamplerParamIdx = 0;
+    bool hasPsSrvUavTable = false;
+    UINT psSrvUavParamIdx = 0;
+    bool hasPsSamplerTable = false;
+    UINT psSamplerParamIdx = 0;
+    LoadedStageResources vsLoadedResources;
+    LoadedStageResources psLoadedResources;
+    ComPtr<ID3D12DescriptorHeap> srvUavHeap;
+    ComPtr<ID3D12DescriptorHeap> samplerHeap;
+    UINT srvUavIncrement = 0;
+    UINT samplerIncrement = 0;
+    size_t vsSrvUavOffset = 0;
+    size_t psSrvUavOffset = 0;
+    size_t vsSamplerOffset = 0;
+    size_t psSamplerOffset = 0;
     bool hasFixedTime = false;
     double fixedTime = 0.0;
     bool isIndexed = false;
@@ -939,6 +1260,12 @@ class Renderer {
         auto handle = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         device->CreateRenderTargetView(target, nullptr, handle);
         commands->SetGraphicsRootSignature(root.Get());
+        std::vector<ID3D12DescriptorHeap*> activeHeaps;
+        if (srvUavHeap) activeHeaps.push_back(srvUavHeap.Get());
+        if (samplerHeap) activeHeaps.push_back(samplerHeap.Get());
+        if (!activeHeaps.empty()) {
+            commands->SetDescriptorHeaps(static_cast<UINT>(activeHeaps.size()), activeHeaps.data());
+        }
         if (hasFrameConstants) {
             if (!std::isfinite(elapsed) || elapsed < 0 || elapsed > 3.4028234663852886e38)
                 throw std::runtime_error("Invalid elapsed frame time");
@@ -948,7 +1275,27 @@ class Renderer {
                 static_cast<float>(width),
                 static_cast<float>(height),
             };
-            commands->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
+            commands->SetGraphicsRoot32BitConstants(b0ParamIdx, 4, constants, 0);
+        }
+        if (hasVsSrvUavTable && srvUavHeap) {
+            auto gpuHandle = srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+            gpuHandle.ptr += vsSrvUavOffset * srvUavIncrement;
+            commands->SetGraphicsRootDescriptorTable(vsSrvUavParamIdx, gpuHandle);
+        }
+        if (hasVsSamplerTable && samplerHeap) {
+            auto gpuHandle = samplerHeap->GetGPUDescriptorHandleForHeapStart();
+            gpuHandle.ptr += vsSamplerOffset * samplerIncrement;
+            commands->SetGraphicsRootDescriptorTable(vsSamplerParamIdx, gpuHandle);
+        }
+        if (hasPsSrvUavTable && srvUavHeap) {
+            auto gpuHandle = srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+            gpuHandle.ptr += psSrvUavOffset * srvUavIncrement;
+            commands->SetGraphicsRootDescriptorTable(psSrvUavParamIdx, gpuHandle);
+        }
+        if (hasPsSamplerTable && samplerHeap) {
+            auto gpuHandle = samplerHeap->GetGPUDescriptorHandleForHeapStart();
+            gpuHandle.ptr += psSamplerOffset * samplerIncrement;
+            commands->SetGraphicsRootDescriptorTable(psSamplerParamIdx, gpuHandle);
         }
         D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
         D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
@@ -994,7 +1341,7 @@ class Renderer {
                 }
                 if (!d.rootConstants.empty()) {
                     commands->SetGraphicsRoot32BitConstants(
-                        1, static_cast<UINT>(d.rootConstants.size()), d.rootConstants.data(), 0);
+                        b1ParamIdx, static_cast<UINT>(d.rootConstants.size()), d.rootConstants.data(), 0);
                 }
                 if (d.type == "indexed") {
                     commands->DrawIndexedInstanced(
@@ -1030,7 +1377,8 @@ public:
              const std::wstring& vertexBufferPath = L"",
              const std::wstring& indexBufferPath = L"",
              bool indexed = false, UINT idxCount = 0,
-             const std::wstring& idxType = L"uint16")
+             const std::wstring& idxType = L"uint16",
+             const std::wstring& resourcesPath = L"")
         : vertexCount(count), hasFixedTime(hasTime), fixedTime(time),
           depthSettings(depthSettings),
           isIndexed(indexed), indexCount(idxCount), indexType(idxType),
@@ -1048,39 +1396,153 @@ public:
 
         auto vs = shader(vertex), ps = shader(fragment);
 
-        for (const auto* bytecode : {&vs, &ps}) {
+        struct ExtractedTable {
+            D3D12_SHADER_VISIBILITY visibility = D3D12_SHADER_VISIBILITY_ALL;
+            bool isVertexStage = false;
+            bool isSampler = false;
+            std::vector<D3D12_DESCRIPTOR_RANGE1> ranges;
+        };
+
+        std::map<std::pair<UINT, UINT>, D3D12_ROOT_CONSTANTS> mergedConstants;
+        std::vector<ExtractedTable> extractedTables;
+
+        auto inspectStageBytecode = [&](const std::vector<char>& bytecode, bool isVertexStage) {
             ComPtr<ID3D12VersionedRootSignatureDeserializer> deserializer;
-            if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(
-                    bytecode->data(), bytecode->size(), IID_PPV_ARGS(&deserializer)))) {
-                const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc =
-                    deserializer->GetUnconvertedRootSignatureDesc();
-                UINT numParams = (desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_1)
-                                     ? desc->Desc_1_1.NumParameters
-                                     : desc->Desc_1_0.NumParameters;
-                HRESULT status = device->CreateRootSignature(
-                    0, bytecode->data(), bytecode->size(), IID_PPV_ARGS(&root));
-                if (SUCCEEDED(status)) {
-                    hasFrameConstants = numParams > 0;
-                    break;
-                }
+            if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(
+                    bytecode.data(), bytecode.size(), IID_PPV_ARGS(&deserializer)))) {
                 if (diagnostics) diagnostics->ClearStoredMessages();
+                return;
             }
+            const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc =
+                deserializer->GetUnconvertedRootSignatureDesc();
+            D3D12_SHADER_VISIBILITY stageVis =
+                isVertexStage ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
+
+            if (desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+                for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
+                    const auto& param = desc->Desc_1_1.pParameters[i];
+                    if (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+                        auto key = std::make_pair(param.Constants.RegisterSpace,
+                                                  param.Constants.ShaderRegister);
+                        auto it = mergedConstants.find(key);
+                        if (it == mergedConstants.end() ||
+                            param.Constants.Num32BitValues > it->second.Num32BitValues) {
+                            mergedConstants[key] = param.Constants;
+                        }
+                    } else if (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+                               param.DescriptorTable.NumDescriptorRanges > 0) {
+                        ExtractedTable tbl;
+                        tbl.visibility = stageVis;
+                        tbl.isVertexStage = isVertexStage;
+                        tbl.isSampler = (param.DescriptorTable.pDescriptorRanges[0].RangeType ==
+                                         D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER);
+                        tbl.ranges.assign(
+                            param.DescriptorTable.pDescriptorRanges,
+                            param.DescriptorTable.pDescriptorRanges +
+                                param.DescriptorTable.NumDescriptorRanges);
+                        extractedTables.push_back(std::move(tbl));
+                    }
+                }
+            } else {
+                for (UINT i = 0; i < desc->Desc_1_0.NumParameters; ++i) {
+                    const auto& param = desc->Desc_1_0.pParameters[i];
+                    if (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+                        auto key = std::make_pair(param.Constants.RegisterSpace,
+                                                  param.Constants.ShaderRegister);
+                        auto it = mergedConstants.find(key);
+                        if (it == mergedConstants.end() ||
+                            param.Constants.Num32BitValues > it->second.Num32BitValues) {
+                            mergedConstants[key] = param.Constants;
+                        }
+                    } else if (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+                               param.DescriptorTable.NumDescriptorRanges > 0) {
+                        ExtractedTable tbl;
+                        tbl.visibility = stageVis;
+                        tbl.isVertexStage = isVertexStage;
+                        tbl.isSampler = (param.DescriptorTable.pDescriptorRanges[0].RangeType ==
+                                         D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER);
+                        tbl.ranges.reserve(param.DescriptorTable.NumDescriptorRanges);
+                        for (UINT r = 0; r < param.DescriptorTable.NumDescriptorRanges; ++r) {
+                            const auto& r0 = param.DescriptorTable.pDescriptorRanges[r];
+                            D3D12_DESCRIPTOR_RANGE1 r1{};
+                            r1.RangeType = r0.RangeType;
+                            r1.NumDescriptors = r0.NumDescriptors;
+                            r1.BaseShaderRegister = r0.BaseShaderRegister;
+                            r1.RegisterSpace = r0.RegisterSpace;
+                            r1.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
+                            r1.OffsetInDescriptorsFromTableStart = r0.OffsetInDescriptorsFromTableStart;
+                            tbl.ranges.push_back(r1);
+                        }
+                        extractedTables.push_back(std::move(tbl));
+                    }
+                }
+            }
+        };
+
+        inspectStageBytecode(vs, true);
+        inspectStageBytecode(ps, false);
+
+        std::vector<D3D12_ROOT_PARAMETER1> mergedParams;
+        mergedParams.reserve(mergedConstants.size() + extractedTables.size());
+        for (const auto& [key, constants] : mergedConstants) {
+            UINT paramIndex = static_cast<UINT>(mergedParams.size());
+            if (constants.RegisterSpace == 0 && constants.ShaderRegister == 0 &&
+                constants.Num32BitValues == 4) {
+                hasFrameConstants = true;
+                b0ParamIdx = paramIndex;
+            } else if (constants.RegisterSpace == 0 && constants.ShaderRegister == 1) {
+                b1ParamIdx = paramIndex;
+            }
+            D3D12_ROOT_PARAMETER1 p{};
+            p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            p.Constants = constants;
+            p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            mergedParams.push_back(p);
         }
 
-        if (!root) {
-            D3D12_ROOT_SIGNATURE_DESC rootDescription{};
-            rootDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-
-            ComPtr<ID3DBlob> serialized, errors;
-            HRESULT status = D3D12SerializeRootSignature(
-                &rootDescription, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
-            if (FAILED(status) && errors)
-                throw std::runtime_error(std::string(static_cast<const char*>(errors->GetBufferPointer()),
-                                                    errors->GetBufferSize()));
-            check(status, "D3D12SerializeRootSignature");
-            check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
-                                              IID_PPV_ARGS(&root)), "CreateRootSignature");
+        for (const auto& tbl : extractedTables) {
+            UINT paramIndex = static_cast<UINT>(mergedParams.size());
+            if (tbl.isVertexStage) {
+                if (tbl.isSampler) {
+                    hasVsSamplerTable = true;
+                    vsSamplerParamIdx = paramIndex;
+                } else {
+                    hasVsSrvUavTable = true;
+                    vsSrvUavParamIdx = paramIndex;
+                }
+            } else {
+                if (tbl.isSampler) {
+                    hasPsSamplerTable = true;
+                    psSamplerParamIdx = paramIndex;
+                } else {
+                    hasPsSrvUavTable = true;
+                    psSrvUavParamIdx = paramIndex;
+                }
+            }
+            D3D12_ROOT_PARAMETER1 p{};
+            p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            p.DescriptorTable.NumDescriptorRanges = static_cast<UINT>(tbl.ranges.size());
+            p.DescriptorTable.pDescriptorRanges = tbl.ranges.data();
+            p.ShaderVisibility = tbl.visibility;
+            mergedParams.push_back(p);
         }
+
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC versionedRootDesc{};
+        versionedRootDesc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+        versionedRootDesc.Desc_1_1.NumParameters = static_cast<UINT>(mergedParams.size());
+        versionedRootDesc.Desc_1_1.pParameters = mergedParams.empty() ? nullptr : mergedParams.data();
+        versionedRootDesc.Desc_1_1.NumStaticSamplers = 0;
+        versionedRootDesc.Desc_1_1.pStaticSamplers = nullptr;
+        versionedRootDesc.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        ComPtr<ID3DBlob> serialized, errors;
+        HRESULT rsSerStatus = D3D12SerializeVersionedRootSignature(&versionedRootDesc, &serialized, &errors);
+        if (FAILED(rsSerStatus) && errors)
+            throw std::runtime_error(std::string(static_cast<const char*>(errors->GetBufferPointer()),
+                                                 errors->GetBufferSize()));
+        check(rsSerStatus, "D3D12SerializeVersionedRootSignature");
+        check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                          IID_PPV_ARGS(&root)), "CreateRootSignature");
 
         if (!inputLayoutPath.empty()) {
             auto layout = loadInputLayout(inputLayoutPath);
@@ -1206,6 +1668,77 @@ public:
                 indexBufferView.BufferLocation = indexBuffer->GetGPUVirtualAddress();
                 indexBufferView.SizeInBytes = static_cast<UINT>(data.size());
                 indexBufferView.Format = fmt;
+            }
+        }
+
+        if (!resourcesPath.empty()) {
+            auto resBytes = binaryFile(std::filesystem::path(resourcesPath), "graphics resources JSON");
+            std::string resJson(resBytes.begin(), resBytes.end());
+            GraphicsResourcesSpec gfxSpec{};
+            auto parseErr = glz::read<glz::opts{.error_on_unknown_keys = false}>(gfxSpec, resJson);
+            if (parseErr) {
+                throw std::runtime_error("Invalid graphics resources JSON");
+            }
+
+            vsLoadedResources = allocateStageResources(device.Get(), gfxSpec.vertex, false);
+            psLoadedResources = allocateStageResources(device.Get(), gfxSpec.fragment, false);
+
+            size_t totalSrvUav = vsLoadedResources.srvUavCount() + psLoadedResources.srvUavCount();
+            if (hasVsSrvUavTable || hasPsSrvUavTable || totalSrvUav > 0) {
+                D3D12_DESCRIPTOR_HEAP_DESC srvUavDesc{};
+                srvUavDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+                srvUavDesc.NumDescriptors = static_cast<UINT>(std::max<size_t>(1, totalSrvUav));
+                srvUavDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+                check(device->CreateDescriptorHeap(&srvUavDesc, IID_PPV_ARGS(&srvUavHeap)),
+                      "Create graphics CBV_SRV_UAV descriptor heap");
+
+                srvUavIncrement = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                vsSrvUavOffset = 0;
+                psSrvUavOffset = vsLoadedResources.srvUavCount();
+
+                auto cpuStart = srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+                if (vsLoadedResources.srvUavCount() > 0) {
+                    writeStageSrvUavDescriptors(device.Get(), vsLoadedResources, cpuStart, srvUavIncrement);
+                }
+                if (psLoadedResources.srvUavCount() > 0) {
+                    auto psCpu = cpuStart;
+                    psCpu.ptr += psSrvUavOffset * srvUavIncrement;
+                    writeStageSrvUavDescriptors(device.Get(), psLoadedResources, psCpu, srvUavIncrement);
+                }
+            }
+
+            size_t totalSamplers = vsLoadedResources.samplerCount() + psLoadedResources.samplerCount();
+            if (hasVsSamplerTable || hasPsSamplerTable || totalSamplers > 0) {
+                D3D12_DESCRIPTOR_HEAP_DESC sampDesc{};
+                sampDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+                sampDesc.NumDescriptors = static_cast<UINT>(std::max<size_t>(1, totalSamplers));
+                sampDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+                check(device->CreateDescriptorHeap(&sampDesc, IID_PPV_ARGS(&samplerHeap)),
+                      "Create graphics SAMPLER descriptor heap");
+
+                samplerIncrement = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+                vsSamplerOffset = 0;
+                psSamplerOffset = vsLoadedResources.samplerCount();
+
+                auto cpuStart = samplerHeap->GetCPUDescriptorHandleForHeapStart();
+                if (vsLoadedResources.samplerCount() > 0) {
+                    writeStageSamplerDescriptors(device.Get(), vsLoadedResources, cpuStart, samplerIncrement);
+                }
+                if (psLoadedResources.samplerCount() > 0) {
+                    auto psCpu = cpuStart;
+                    psCpu.ptr += psSamplerOffset * samplerIncrement;
+                    writeStageSamplerDescriptors(device.Get(), psLoadedResources, psCpu, samplerIncrement);
+                }
+            }
+
+            if (vsLoadedResources.hasUploads() || psLoadedResources.hasUploads()) {
+                begin();
+                D3D12_RESOURCE_STATES graphicsSrvState =
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                recordStageUploads(commands.Get(), vsLoadedResources, graphicsSrvState);
+                recordStageUploads(commands.Get(), psLoadedResources, graphicsSrvState);
+                submit();
             }
         }
     }
@@ -1391,7 +1924,8 @@ int wmain(int argc, wchar_t** argv) {
                 key != L"--readback" && key != L"--time" && key != L"--input-layout" &&
                 key != L"--vertex-buffer" && key != L"--index-buffer" && key != L"--index-type" &&
                 key != L"--index-count" && key != L"--compute" && key != L"--compute-spec" &&
-                key != L"--depth-compare" && key != L"--depth-write" && key != L"--depth-format")
+                key != L"--depth-compare" && key != L"--depth-write" && key != L"--depth-format" &&
+                key != L"--resources")
                 throw std::runtime_error("Unknown native DirectX viewer argument");
             if (++index == argc || !options.emplace(key, argv[index]).second)
                 throw std::runtime_error("Missing or duplicate native viewer argument");
@@ -1409,7 +1943,7 @@ int wmain(int argc, wchar_t** argv) {
                 options.count(L"--readback") || options.count(L"--time") ||
                 options.count(L"--input-layout") || options.count(L"--vertex-buffer") ||
                 options.count(L"--index-buffer") || options.count(L"--index-type") ||
-                options.count(L"--index-count"))
+                options.count(L"--index-count") || options.count(L"--resources"))
                 throw std::runtime_error("Compute dispatch arguments cannot be combined with graphics arguments");
             runComputeDispatch(options.at(L"--compute"), options.at(L"--compute-spec"), warp, validation);
             return 0;
@@ -1430,6 +1964,7 @@ int wmain(int argc, wchar_t** argv) {
         std::wstring inputLayout = options.count(L"--input-layout") ? options.at(L"--input-layout") : L"";
         std::wstring vertexBuffer = options.count(L"--vertex-buffer") ? options.at(L"--vertex-buffer") : L"";
         std::wstring indexBuffer = options.count(L"--index-buffer") ? options.at(L"--index-buffer") : L"";
+        std::wstring resourcesPath = options.count(L"--resources") ? options.at(L"--resources") : L"";
         bool isIndexed = options.count(L"--index-count") != 0;
         UINT indexCount = isIndexed ? number(options.at(L"--index-count"), UINT_MAX) : 0;
         std::wstring indexType = options.count(L"--index-type") ? options.at(L"--index-type") : L"uint16";
@@ -1449,7 +1984,7 @@ int wmain(int argc, wchar_t** argv) {
         Renderer renderer(options.at(L"--vertex"), options.at(L"--fragment"), count, validation,
                           warp, hasTime, fixedTime, depthSettings,
                           inputLayout, vertexBuffer, indexBuffer,
-                          isIndexed, indexCount, indexType);
+                          isIndexed, indexCount, indexType, resourcesPath);
         if (options.count(L"--readback")) {
             renderer.readback(width, height, options.at(L"--readback"));
         } else {

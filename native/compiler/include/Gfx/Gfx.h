@@ -47,6 +47,20 @@ struct BufferInterfaceElement {
   Type elementType;
 };
 
+struct TextureInterfaceElement {
+  std::string name;
+  uint32_t set;
+  uint32_t binding;
+  std::string dimension = "2d";
+  std::string sampleType = "f32x4";
+};
+
+struct SamplerInterfaceElement {
+  std::string name;
+  uint32_t set;
+  uint32_t binding;
+};
+
 struct ReflectedParameterBlock {
   ParameterBlockAttr block;
   uint32_t baseOffset = 0;
@@ -64,6 +78,8 @@ struct ShaderInterface {
   std::optional<std::array<int32_t, 3>> workgroupSize;
   uint32_t sharedMemoryBytes = 0;
   SmallVector<ReflectedParameterBlock> parameterBlocks;
+  SmallVector<TextureInterfaceElement> textures;
+  SmallVector<SamplerInterfaceElement> samplers;
 };
 
 std::optional<BufferInterfaceElement>
