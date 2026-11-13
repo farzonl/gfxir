@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -20,9 +21,17 @@ struct MgfxBufferEntry {
     size_t capacity = 0;
 };
 
+struct MgfxTextureSamplerEntry {
+    id<MTLTexture> texture = nil;
+    id<MTLSamplerState> sampler = nil;
+    id<MTLBuffer> srvTable = nil;
+    id<MTLBuffer> samplerTable = nil;
+};
+
 struct MgfxPipelineEntry {
     id<MTLRenderPipelineState> state = nil;
     bool depthEnabled = true;
+    std::vector<size_t> fragmentPointerOffsets;
 };
 
 struct MgfxMetalContext {
@@ -38,12 +47,19 @@ struct MgfxMetalContext {
 
     std::vector<MgfxPipelineEntry> pipelines;
     std::unordered_map<int, MgfxBufferEntry> buffers;
+    std::unordered_map<int, MgfxTextureSamplerEntry> textureSamplers;
 
     id<CAMetalDrawable> currentDrawable = nil;
     id<MTLCommandBuffer> currentCommandBuffer = nil;
     id<MTLRenderCommandEncoder> currentEncoder = nil;
     std::string lastError;
 };
+
+static MTLSamplerAddressMode toMetalAddressMode(int mode) {
+    if (mode == 1) return MTLSamplerAddressModeClampToEdge;
+    if (mode == 2) return MTLSamplerAddressModeMirrorRepeat;
+    return MTLSamplerAddressModeRepeat;
+}
 
 static void setError(MgfxMetalContext* ctx, NSString* msg, NSError* err = nil) {
     if (!ctx) return;
@@ -127,14 +143,14 @@ void* mgfx_metal_create(void* cocoa_nswindow, int fb_width, int fb_height, char*
             return nullptr;
         }
 
-        auto* ctx = new MgfxMetalContext();
+        auto ctx = std::make_unique<MgfxMetalContext>();
         ctx->window = window;
         ctx->layer = layer;
         ctx->device = device;
         ctx->queue = queue;
         ctx->depthEnabledState = depthOn;
         ctx->depthDisabledState = depthOff;
-        return ctx;
+        return ctx.release();
     }
 }
 
@@ -202,7 +218,12 @@ int mgfx_metal_create_pipeline(
             desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
         }
 
-        id<MTLRenderPipelineState> pso = [ctx->device newRenderPipelineStateWithDescriptor:desc error:&error];
+        MTLAutoreleasedRenderPipelineReflection reflection = nil;
+        MTLPipelineOption options = MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo;
+        id<MTLRenderPipelineState> pso = [ctx->device newRenderPipelineStateWithDescriptor:desc
+                                                                                   options:options
+                                                                                reflection:&reflection
+                                                                                     error:&error];
         if (!pso) {
             setError(ctx, @"Cannot create Metal render pipeline state", error);
             return -1;
@@ -211,6 +232,24 @@ int mgfx_metal_create_pipeline(
         MgfxPipelineEntry entry;
         entry.state = pso;
         entry.depthEnabled = (depth_enabled != 0);
+        if (reflection != nil) {
+            for (id<MTLBinding> binding in reflection.fragmentBindings) {
+                if (binding.type == MTLBindingTypeBuffer && binding.index == kIRArgumentBufferBindPoint) {
+                    id untyped = binding;
+                    id<MTLBufferBinding> bufBinding = untyped;
+                    MTLStructType* structType = bufBinding.bufferStructType;
+                    if (structType != nil) {
+                        for (MTLStructMember* member in structType.members) {
+                            if (member.dataType == MTLDataTypePointer) {
+                                entry.fragmentPointerOffsets.push_back(member.offset);
+                            }
+                        }
+                        std::sort(entry.fragmentPointerOffsets.begin(), entry.fragmentPointerOffsets.end());
+                    }
+                    break;
+                }
+            }
+        }
         int id_out = static_cast<int>(ctx->pipelines.size());
         ctx->pipelines.push_back(std::move(entry));
         return id_out;
@@ -324,16 +363,198 @@ int mgfx_metal_begin_frame(
 
         [enc setCullMode:MTLCullModeNone];
         [enc setDepthClipMode:MTLDepthClipModeClip];
-        [enc setViewport:(MTLViewport){
+        MTLViewport viewport{
             0.0, 0.0,
             static_cast<double>(drawable.texture.width),
             static_cast<double>(drawable.texture.height),
             0.0, 1.0
-        }];
+        };
+        [enc setViewport:viewport];
 
         ctx->currentDrawable = drawable;
         ctx->currentCommandBuffer = cmd;
         ctx->currentEncoder = enc;
+        return 0;
+    }
+}
+
+int mgfx_metal_upload_texture_sampler(
+    void* handle,
+    int tex_id,
+    int width,
+    int height,
+    int is_float32,
+    const void* pixels,
+    size_t byte_size,
+    int min_linear,
+    int mag_linear,
+    int addr_u,
+    int addr_v
+) {
+    @autoreleasepool {
+        if (!handle || !pixels || width <= 0 || height <= 0) return -1;
+        auto* ctx = static_cast<MgfxMetalContext*>(handle);
+        NSUInteger w = static_cast<NSUInteger>(width);
+        NSUInteger h = static_cast<NSUInteger>(height);
+        NSUInteger bpp = is_float32 ? 16 : 4;
+        NSUInteger expected = w * h * bpp;
+        if (byte_size != expected) {
+            setError(ctx, @"Texture payload byte size does not match dimensions");
+            return -1;
+        }
+
+        MTLPixelFormat fmt = is_float32 ? MTLPixelFormatRGBA32Float : MTLPixelFormatRGBA8Unorm;
+        MTLTextureDescriptor* texDesc = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:fmt width:w height:h mipmapped:NO];
+        texDesc.storageMode = MTLStorageModePrivate;
+        texDesc.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> tex = [ctx->device newTextureWithDescriptor:texDesc];
+        if (!tex) {
+            setError(ctx, @"Failed to allocate Metal 2D texture");
+            return -1;
+        }
+
+        id<MTLBuffer> staging = [ctx->device newBufferWithBytes:pixels
+                                                         length:byte_size
+                                                        options:MTLResourceStorageModeShared];
+        if (!staging) {
+            setError(ctx, @"Failed to allocate Metal texture staging buffer");
+            return -1;
+        }
+
+        id<MTLCommandBuffer> uploadCmd = [ctx->queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [uploadCmd blitCommandEncoder];
+        if (!uploadCmd || !blit) {
+            setError(ctx, @"Failed to create Metal texture upload blit encoder");
+            return -1;
+        }
+        [blit copyFromBuffer:staging
+                sourceOffset:0
+           sourceBytesPerRow:w * bpp
+         sourceBytesPerImage:expected
+                  sourceSize:MTLSizeMake(w, h, 1)
+                   toTexture:tex
+            destinationSlice:0
+            destinationLevel:0
+           destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        [uploadCmd commit];
+        [uploadCmd waitUntilCompleted];
+        if (uploadCmd.status == MTLCommandBufferStatusError) {
+            setError(ctx, @"Metal texture upload failed", uploadCmd.error);
+            return -1;
+        }
+
+        MTLSamplerDescriptor* sampDesc = [MTLSamplerDescriptor new];
+        sampDesc.minFilter = min_linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+        sampDesc.magFilter = mag_linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+        sampDesc.mipFilter = MTLSamplerMipFilterNotMipmapped;
+        sampDesc.sAddressMode = toMetalAddressMode(addr_u);
+        sampDesc.tAddressMode = toMetalAddressMode(addr_v);
+        sampDesc.lodMinClamp = 0.0f;
+        sampDesc.lodMaxClamp = 0.0f;
+        sampDesc.supportArgumentBuffers = YES;
+        id<MTLSamplerState> samp = [ctx->device newSamplerStateWithDescriptor:sampDesc];
+        if (!samp) {
+            setError(ctx, @"Failed to create Metal sampler state");
+            return -1;
+        }
+
+        id<MTLBuffer> srvTable = [ctx->device newBufferWithLength:sizeof(IRDescriptorTableEntry)
+                                                          options:MTLResourceStorageModeShared];
+        id<MTLBuffer> samplerTable = [ctx->device newBufferWithLength:sizeof(IRDescriptorTableEntry)
+                                                              options:MTLResourceStorageModeShared];
+        if (!srvTable || !samplerTable) {
+            setError(ctx, @"Failed to allocate Metal texture/sampler descriptor tables");
+            return -1;
+        }
+
+        auto* srvEntry = static_cast<IRDescriptorTableEntry*>(srvTable.contents);
+        std::memset(srvEntry, 0, sizeof(IRDescriptorTableEntry));
+        IRDescriptorTableSetTexture(srvEntry, tex, 0.0f, 0);
+
+        auto* sampEntry = static_cast<IRDescriptorTableEntry*>(samplerTable.contents);
+        std::memset(sampEntry, 0, sizeof(IRDescriptorTableEntry));
+        IRDescriptorTableSetSampler(sampEntry, samp, 0.0f);
+
+        MgfxTextureSamplerEntry slot;
+        slot.texture = tex;
+        slot.sampler = samp;
+        slot.srvTable = srvTable;
+        slot.samplerTable = samplerTable;
+        ctx->textureSamplers[tex_id] = std::move(slot);
+        return 0;
+    }
+}
+
+int mgfx_metal_draw_textured(
+    void* handle,
+    int pipeline_id,
+    int buf_id,
+    uint32_t vertex_count,
+    const void* vs_consts,
+    size_t vs_const_size,
+    const void* fs_consts,
+    size_t fs_const_size,
+    int tex_id
+) {
+    @autoreleasepool {
+        if (!handle || vertex_count == 0) return 0;
+        auto* ctx = static_cast<MgfxMetalContext*>(handle);
+        if (!ctx->currentEncoder) return -1;
+        if (pipeline_id < 0 || static_cast<size_t>(pipeline_id) >= ctx->pipelines.size()) return -1;
+        auto bufIt = ctx->buffers.find(buf_id);
+        if (bufIt == ctx->buffers.end() || !bufIt->second.dataBuffer || !bufIt->second.descriptorTable) return -1;
+        if (vs_const_size > 512 || fs_const_size > 512) return -1;
+
+        const auto& pipe = ctx->pipelines[static_cast<size_t>(pipeline_id)];
+        const auto& buf = bufIt->second;
+        id<MTLRenderCommandEncoder> enc = ctx->currentEncoder;
+
+        [enc setRenderPipelineState:pipe.state];
+        [enc setDepthStencilState:(pipe.depthEnabled ? ctx->depthEnabledState : ctx->depthDisabledState)];
+
+        uint8_t vsArgBuf[528];
+        std::memset(vsArgBuf, 0, sizeof(vsArgBuf));
+        if (vs_consts && vs_const_size > 0) {
+            std::memcpy(vsArgBuf, vs_consts, vs_const_size);
+        }
+        uint64_t tableGpuAddr = buf.descriptorTable.gpuAddress;
+        std::memcpy(vsArgBuf + vs_const_size, &tableGpuAddr, sizeof(uint64_t));
+        size_t totalVsArg = std::max<size_t>(vs_const_size + sizeof(uint64_t), 16);
+        [enc setVertexBytes:vsArgBuf length:totalVsArg atIndex:kIRArgumentBufferBindPoint];
+
+        if (tex_id >= 0) {
+            auto texIt = ctx->textureSamplers.find(tex_id);
+            if (texIt == ctx->textureSamplers.end()) return -1;
+            const auto& ts = texIt->second;
+            size_t srvOff = !pipe.fragmentPointerOffsets.empty()
+                ? pipe.fragmentPointerOffsets[0]
+                : ((fs_const_size + 7) & ~static_cast<size_t>(7));
+            size_t sampOff = pipe.fragmentPointerOffsets.size() >= 2
+                ? pipe.fragmentPointerOffsets[1]
+                : (srvOff + sizeof(uint64_t));
+            size_t totalFsArg = std::max<size_t>(sampOff + sizeof(uint64_t), 16);
+            std::vector<uint8_t> fsArgBuf(totalFsArg, 0);
+            if (fs_consts && fs_const_size > 0) {
+                std::memcpy(fsArgBuf.data(), fs_consts, fs_const_size);
+            }
+            uint64_t srvAddr = ts.srvTable.gpuAddress;
+            uint64_t sampAddr = ts.samplerTable.gpuAddress;
+            std::memcpy(fsArgBuf.data() + srvOff, &srvAddr, sizeof(uint64_t));
+            std::memcpy(fsArgBuf.data() + sampOff, &sampAddr, sizeof(uint64_t));
+            [enc setFragmentBytes:fsArgBuf.data() length:fsArgBuf.size() atIndex:kIRArgumentBufferBindPoint];
+            [enc useResource:ts.srvTable usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+            [enc useResource:ts.samplerTable usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+            [enc useResource:ts.texture usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+        } else if (fs_consts && fs_const_size > 0) {
+            [enc setFragmentBytes:fs_consts length:fs_const_size atIndex:kIRArgumentBufferBindPoint];
+        }
+
+        [enc useResource:buf.descriptorTable usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
+        [enc useResource:buf.dataBuffer usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
+
+        IRRuntimeDrawPrimitives(enc, MTLPrimitiveTypeTriangle, uint64_t{0}, static_cast<uint64_t>(vertex_count));
         return 0;
     }
 }
@@ -420,10 +641,11 @@ int mgfx_metal_end_frame(void* handle) {
 void mgfx_metal_destroy(void* handle) {
     @autoreleasepool {
         if (!handle) return;
-        auto* ctx = static_cast<MgfxMetalContext*>(handle);
+        std::unique_ptr<MgfxMetalContext> ctx(static_cast<MgfxMetalContext*>(handle));
         ctx->currentEncoder = nil;
         ctx->currentCommandBuffer = nil;
         ctx->currentDrawable = nil;
+        ctx->textureSamplers.clear();
         ctx->buffers.clear();
         ctx->pipelines.clear();
         ctx->depthTexture = nil;
@@ -432,7 +654,6 @@ void mgfx_metal_destroy(void* handle) {
         ctx->queue = nil;
         ctx->device = nil;
         ctx->layer = nil;
-        delete ctx;
     }
 }
 

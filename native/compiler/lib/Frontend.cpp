@@ -542,32 +542,95 @@ ShaderInterface mlir::gfx::reflectShader(ModuleOp module) {
   }
   if (!result.parameterBlocks.empty())
     result.parameters = result.parameterBlocks[0].block;
-  function.walk([&](Operation *op) {
-    if (auto builtin = dyn_cast<BuiltinOp>(op)) {
-      result.inputs.push_back({stringifyBuiltin(builtin.getKind()).str(),
-                               builtin.getValue().getType(), builtin.getKind(),
-                               Interpolation::Perspective});
-    } else if (auto input = dyn_cast<InputOp>(op)) {
-      result.inputs.push_back({input.getName().str(),
-                               input.getValue().getType(),
-                               static_cast<int32_t>(input.getLocation()),
-                               input.getInterpolation()});
-    } else if (auto output = dyn_cast<OutputOp>(op)) {
-      result.outputs.push_back({output.getName().str(),
-                                output.getValue().getType(),
-                                static_cast<int32_t>(output.getLocation()),
-                                output.getInterpolation()});
-    } else if (auto position = dyn_cast<PositionOp>(op)) {
-      result.outputs.push_back({"position", position.getValue().getType(),
-                                PositionBinding{}, Interpolation::Perspective});
-    } else if (auto binding = dyn_cast<BufferBindingOp>(op)) {
-      auto ptrType = cast<PtrType>(binding.getResult().getType());
-      result.buffers.push_back({binding.getName().str(),
-                                binding.getSet(),
-                                binding.getBinding(),
-                                binding.getAccess(),
-                                ptrType.getElementType()});
-    }
+
+  SmallVector<func::FuncOp, 8> reachable{function};
+  llvm::SmallPtrSet<Operation *, 8> visitedFuncs;
+  visitedFuncs.insert(function.getOperation());
+  for (size_t idx = 0; idx < reachable.size(); ++idx) {
+    reachable[idx].walk([&](func::CallOp call) {
+      if (auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee())) {
+        if (visitedFuncs.insert(callee.getOperation()).second)
+          reachable.push_back(callee);
+      }
+    });
+  }
+
+  for (func::FuncOp current : reachable) {
+    current.walk([&](Operation *op) {
+      if (current == function) {
+        if (auto builtin = dyn_cast<BuiltinOp>(op)) {
+          result.inputs.push_back({stringifyBuiltin(builtin.getKind()).str(),
+                                   builtin.getValue().getType(),
+                                   builtin.getKind(),
+                                   Interpolation::Perspective});
+          return;
+        }
+        if (auto input = dyn_cast<InputOp>(op)) {
+          result.inputs.push_back({input.getName().str(),
+                                   input.getValue().getType(),
+                                   static_cast<int32_t>(input.getLocation()),
+                                   input.getInterpolation()});
+          return;
+        }
+        if (auto output = dyn_cast<OutputOp>(op)) {
+          result.outputs.push_back({output.getName().str(),
+                                    output.getValue().getType(),
+                                    static_cast<int32_t>(output.getLocation()),
+                                    output.getInterpolation()});
+          return;
+        }
+        if (auto position = dyn_cast<PositionOp>(op)) {
+          result.outputs.push_back({"position", position.getValue().getType(),
+                                    PositionBinding{},
+                                    Interpolation::Perspective});
+          return;
+        }
+      }
+      if (auto binding = dyn_cast<BufferBindingOp>(op)) {
+        auto ptrType = cast<PtrType>(binding.getResult().getType());
+        bool exists = llvm::any_of(result.buffers, [&](const auto &existing) {
+          return existing.set == binding.getSet() &&
+                 existing.binding == binding.getBinding();
+        });
+        if (!exists) {
+          result.buffers.push_back({binding.getName().str(),
+                                    binding.getSet(),
+                                    binding.getBinding(),
+                                    binding.getAccess(),
+                                    ptrType.getElementType()});
+        }
+      } else if (auto texBinding = dyn_cast<TextureBindingOp>(op)) {
+        bool exists = llvm::any_of(result.textures, [&](const auto &existing) {
+          return existing.set == texBinding.getSet() &&
+                 existing.binding == texBinding.getBinding();
+        });
+        if (!exists) {
+          result.textures.push_back({texBinding.getName().str(),
+                                     texBinding.getSet(),
+                                     texBinding.getBinding(),
+                                     "2d",
+                                     "f32x4"});
+        }
+      } else if (auto sampBinding = dyn_cast<SamplerBindingOp>(op)) {
+        bool exists = llvm::any_of(result.samplers, [&](const auto &existing) {
+          return existing.set == sampBinding.getSet() &&
+                 existing.binding == sampBinding.getBinding();
+        });
+        if (!exists) {
+          result.samplers.push_back({sampBinding.getName().str(),
+                                     sampBinding.getSet(),
+                                     sampBinding.getBinding()});
+        }
+      }
+    });
+  }
+  llvm::sort(result.textures, [](const TextureInterfaceElement &a,
+                                 const TextureInterfaceElement &b) {
+    return std::tie(a.set, a.binding) < std::tie(b.set, b.binding);
+  });
+  llvm::sort(result.samplers, [](const SamplerInterfaceElement &a,
+                                 const SamplerInterfaceElement &b) {
+    return std::tie(a.set, a.binding) < std::tie(b.set, b.binding);
   });
   return result;
 }
@@ -635,6 +698,30 @@ mlir::gfx::serializeReflection(const ShaderInterface &reflection) {
       });
     }
     result["buffers"] = std::move(buffers);
+  }
+  if (!reflection.textures.empty()) {
+    llvm::json::Array textures;
+    for (const auto &tex : reflection.textures) {
+      textures.push_back(llvm::json::Object{
+          {"name", tex.name},
+          {"set", tex.set},
+          {"binding", tex.binding},
+          {"dimension", tex.dimension},
+          {"sample_type", tex.sampleType},
+      });
+    }
+    result["textures"] = std::move(textures);
+  }
+  if (!reflection.samplers.empty()) {
+    llvm::json::Array samplers;
+    for (const auto &samp : reflection.samplers) {
+      samplers.push_back(llvm::json::Object{
+          {"name", samp.name},
+          {"set", samp.set},
+          {"binding", samp.binding},
+      });
+    }
+    result["samplers"] = std::move(samplers);
   }
   return result;
 }

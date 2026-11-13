@@ -185,4 +185,101 @@ def Gfx_AtomicCASOp : Gfx_Op<"atomic_cas", [MemoryEffects<[MemRead, MemWrite]>]>
   }];
   let hasVerifier = 1;
 }
+
+def Gfx_TextureBindingOp : Gfx_Op<"texture_binding", [Pure]> {
+  let summary = "Bind an external 2D texture descriptor slot to a typed handle";
+  let description = [{
+    Binds a 2D sampled texture descriptor identified by descriptor set and
+    binding slot with a symbolic name to a !gfx.handle<texture_2d> token.
+  }];
+
+  let arguments = (ins
+    I32Attr:$set,
+    I32Attr:$binding,
+    StrAttr:$name
+  );
+  let results = (outs Gfx_HandleType:$result);
+  let assemblyFormat = [{
+    $set `,` $binding `,` $name attr-dict `:` qualified(type($result))
+  }];
+  let hasVerifier = 1;
+}
+
+def Gfx_SamplerBindingOp : Gfx_Op<"sampler_binding", [Pure]> {
+  let summary = "Bind an external sampler descriptor slot to a typed handle";
+  let description = [{
+    Binds a sampler descriptor identified by descriptor set and binding slot
+    with a symbolic name to a !gfx.handle<sampler> token.
+  }];
+
+  let arguments = (ins
+    I32Attr:$set,
+    I32Attr:$binding,
+    StrAttr:$name
+  );
+  let results = (outs Gfx_HandleType:$result);
+  let assemblyFormat = [{
+    $set `,` $binding `,` $name attr-dict `:` qualified(type($result))
+  }];
+  let hasVerifier = 1;
+}
+
+def Gfx_TextureSampleOp : Gfx_Op<"texture_sample", [MemoryEffects<[MemRead]>]> {
+  let summary = "Sample a 2D texture with implicit LOD in a fragment shader";
+  let description = [{
+    Samples a 2D texture using a sampler and normalized 2D UV coordinates with
+    implicit screen-space derivatives. Valid only in fragment shaders.
+  }];
+
+  let arguments = (ins
+    Gfx_HandleType:$texture,
+    Gfx_HandleType:$sampler,
+    AnyType:$uv
+  );
+  let results = (outs AnyType:$result);
+  let assemblyFormat = [{
+    $texture `,` $sampler `,` $uv attr-dict `:` functional-type(operands, results)
+  }];
+  let hasVerifier = 1;
+}
+
+def Gfx_TextureSampleLevelOp : Gfx_Op<"texture_sample_level", [MemoryEffects<[MemRead]>]> {
+  let summary = "Sample a 2D texture at an explicit mip LOD";
+  let description = [{
+    Samples a 2D texture using a sampler, normalized 2D UV coordinates, and an
+    explicit floating-point mip level. Valid in vertex, fragment, and compute
+    shaders.
+  }];
+
+  let arguments = (ins
+    Gfx_HandleType:$texture,
+    Gfx_HandleType:$sampler,
+    AnyType:$uv,
+    F32:$lod
+  );
+  let results = (outs AnyType:$result);
+  let assemblyFormat = [{
+    $texture `,` $sampler `,` $uv `,` $lod attr-dict `:` functional-type(operands, results)
+  }];
+  let hasVerifier = 1;
+}
+
+def Gfx_TextureLoadOp : Gfx_Op<"texture_load", [MemoryEffects<[MemRead]>]> {
+  let summary = "Fetch an unfiltered texel from a 2D texture at integer coordinates";
+  let description = [{
+    Loads an unfiltered RGBA texel from a 2D texture at integer 2D texel
+    coordinates and integer mip level without a sampler.
+  }];
+
+  let arguments = (ins
+    Gfx_HandleType:$texture,
+    AnyType:$coord,
+    AnyType:$level
+  );
+  let results = (outs AnyType:$result);
+  let assemblyFormat = [{
+    $texture `,` $coord `,` $level attr-dict `:` functional-type(operands, results)
+  }];
+  let hasVerifier = 1;
+}
 #endif

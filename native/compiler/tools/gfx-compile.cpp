@@ -205,6 +205,20 @@ int main(int argc, char **argv) {
       reflection.buffers.push_back(buf);
     }
   }
+  for (const auto &tex : initialReflection.textures) {
+    if (llvm::none_of(reflection.textures, [&](const auto &t) {
+          return t.set == tex.set && t.binding == tex.binding;
+        })) {
+      reflection.textures.push_back(tex);
+    }
+  }
+  for (const auto &samp : initialReflection.samplers) {
+    if (llvm::none_of(reflection.samplers, [&](const auto &s) {
+          return s.set == samp.set && s.binding == samp.binding;
+        })) {
+      reflection.samplers.push_back(samp);
+    }
+  }
   manager.clear();
   if (resolvedTarget == "vulkan")
     manager.addPass(gfx::createGfxToSPIRVPass(profile));
