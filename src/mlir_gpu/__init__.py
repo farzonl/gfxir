@@ -78,6 +78,16 @@ from .parameters import (
     pack_parameters,
     struct,
 )
+from .compute_runtime import (
+    ComputeContext,
+    PersistentBuffer,
+    PersistentComputeError,
+    PersistentPipeline,
+    VulkanBuffer,
+    VulkanComputeContext,
+    VulkanPipeline,
+    open_compute_context,
+)
 from .viewer import (
     ComputeDispatchResult,
     ComputeProgram,
@@ -97,20 +107,20 @@ mat4x2, mat4x3, mat4x4 = Type.MAT4X2, Type.MAT4X3, Type.MAT4X4
 mat4 = mat4x4
 
 __all__ = [
-    "AccessMode", "Buffer", "BufferBinding", "BufferType", "CompileError", "ComputeDispatchResult",
+    "AccessMode", "Buffer", "BufferBinding", "BufferType", "CompileError", "ComputeContext", "ComputeDispatchResult",
     "ComputePipeline", "ComputeProgram", "DIRECTX_SM60", "DIRECTX_SM66", "DepthStencil", "Dispatch",
     "Draw", "DrawCall", "FragmentCoord", "FrameParameters", "GlobalInvocationId",
     "HIGH_END_COMPUTE", "ImageDiffError", "ImageDiffResult", "LocalInvocationId", "MLIRPipeline",
-    "MULTI_DRAW_SCHEMA_VERSION", "MultiDrawManifest", "PRESETS", "ParameterBlock", "Pipeline",
+    "MULTI_DRAW_SCHEMA_VERSION", "MultiDrawManifest", "PRESETS", "ParameterBlock", "PersistentBuffer", "PersistentComputeError", "PersistentPipeline", "Pipeline",
     "PointerType", "ReflectedBufferBinding", "RenderedImage", "StorageClass", "StructField",
     "Target", "TargetProfile", "Toolchain", "Type", "VULKAN_PORTABLE_1_0", "Value", "Vertex",
-    "ViewerError", "WorkgroupId", "atomic_add", "atomic_and", "atomic_cas",
+    "ViewerError", "VulkanBuffer", "VulkanComputeContext", "VulkanPipeline", "WorkgroupId", "atomic_add", "atomic_and", "atomic_cas",
     "atomic_compare_exchange", "atomic_exchange", "atomic_max", "atomic_min", "atomic_or",
     "atomic_sub", "atomic_umax", "atomic_umin", "atomic_xor", "compile_pipeline", "compute",
     "compute_session", "dispatch_compute", "f32", "fragment", "full_barrier", "fullscreen_vertex",
     "global_invocation_id", "i32", "imgdiff", "is_struct", "load_compute_program",
     "local_invocation_id", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4", "mat4",
-    "mat4x2", "mat4x3", "mat4x4", "maximum", "minimum", "natural_alignment", "pack_parameters",
+    "mat4x2", "mat4x3", "mat4x4", "maximum", "minimum", "natural_alignment", "open_compute_context", "pack_parameters",
     "read_png", "render_compute_rgba", "sdf", "select", "shader_math", "shared_array",
     "storage_barrier", "struct", "u32", "vec2", "vec3", "vec4", "verify_multi_draw_manifest",
     "vertex", "workgroup_barrier", "workgroup_id", "write_png",
