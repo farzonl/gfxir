@@ -88,6 +88,11 @@ from .compute_runtime import (
     VulkanPipeline,
     open_compute_context,
 )
+from .directx_compute import (
+    DirectXBuffer,
+    DirectXComputeContext,
+    DirectXPipeline,
+)
 from .viewer import (
     ComputeDispatchResult,
     ComputeProgram,
@@ -108,7 +113,8 @@ mat4 = mat4x4
 
 __all__ = [
     "AccessMode", "Buffer", "BufferBinding", "BufferType", "CompileError", "ComputeContext", "ComputeDispatchResult",
-    "ComputePipeline", "ComputeProgram", "DIRECTX_SM60", "DIRECTX_SM66", "DepthStencil", "Dispatch",
+    "ComputePipeline", "ComputeProgram", "DIRECTX_SM60", "DIRECTX_SM66", "DepthStencil",
+    "DirectXBuffer", "DirectXComputeContext", "DirectXPipeline", "Dispatch",
     "Draw", "DrawCall", "FragmentCoord", "FrameParameters", "GlobalInvocationId",
     "HIGH_END_COMPUTE", "ImageDiffError", "ImageDiffResult", "LocalInvocationId", "MLIRPipeline",
     "MULTI_DRAW_SCHEMA_VERSION", "MultiDrawManifest", "PRESETS", "ParameterBlock", "PersistentBuffer", "PersistentComputeError", "PersistentPipeline", "Pipeline",

@@ -706,11 +706,16 @@ def open_compute_context(
 ):
     """Open a persistent ComputeContext for the specified GPU backend."""
     normalized = target.strip().lower() if isinstance(target, str) else ""
-    if normalized != "vulkan":
+    if normalized == "vulkan":
+        ctx: ComputeContext = VulkanComputeContext(validation=validation, provider=provider)
+    elif normalized == "directx":
+        from .directx_compute import DirectXComputeContext
+
+        ctx = DirectXComputeContext(validation=validation, provider=provider)
+    else:
         raise PersistentComputeError(
-            f"Persistent ComputeContext is currently implemented for 'vulkan', got {target!r}."
+            f"Persistent ComputeContext is currently implemented for 'vulkan' and 'directx', got {target!r}."
         )
-    ctx = VulkanComputeContext(validation=validation, provider=provider)
     try:
         yield ctx
     finally:
