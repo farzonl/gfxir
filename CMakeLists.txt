@@ -38,6 +38,12 @@ if(WIN32)
   target_link_libraries(mlir-gpu-directx-view PRIVATE d3d12 dxgi user32 glaze::glaze)
   install(TARGETS mlir-gpu-directx-view RUNTIME DESTINATION bin)
 
+  add_library(mlir-gpu-directx-compute SHARED native/directx_compute_bridge.cpp)
+  set_target_properties(mlir-gpu-directx-compute PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON PREFIX "")
+  target_compile_definitions(mlir-gpu-directx-compute PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+  target_link_libraries(mlir-gpu-directx-compute PRIVATE d3d12 dxgi)
+  install(TARGETS mlir-gpu-directx-compute RUNTIME DESTINATION bin)
+
   find_file(DXC_RUNTIME dxcompiler.dll HINTS
     "${DXC_LIBRARY_DIR}/../bin" "${DXC_LIBRARY_DIR}/../../bin/x64" REQUIRED)
   foreach(tool IN ITEMS dxv dxil-assemble)
