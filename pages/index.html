@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>GfxIR vs NumPy — GPU Compute Benchmarks</title>
+  <script>
+    (() => {
+      try {
+        const saved = localStorage.getItem("gfxir-bench-theme");
+        const theme = (saved === "light" || saved === "dark")
+          ? saved
+          : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+        document.documentElement.dataset.theme = theme;
+      } catch {
+        document.documentElement.dataset.theme = "light";
+      }
+    })();
+  </script>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg-light: #f8fafc;
+      --bg-dark: #0b0f17;
+      --surface-light: #ffffff;
+      --surface-dark: #111827;
+      --surface-alt-light: #f1f5f9;
+      --surface-alt-dark: #182235;
+      --border-light: #cbd5e1;
+      --border-dark: #293548;
+      --text-light: #0f172a;
+      --text-dark: #f1f5f9;
+      --muted-light: #475569;
+      --muted-dark: #94a3b8;
+      --accent-light: #0369a1;
+      --accent-dark: #38bdf8;
+      --gfx-light: #0284c7;
+      --gfx-dark: #38bdf8;
+      --np-light: #7c3aed;
+      --np-dark: #a78bfa;
+      --good-light: #15803d;
+      --good-dark: #4ade80;
+      --warn-light: #c2410c;
+      --warn-dark: #fb923c;
+
+      --bg: var(--bg-light);
+      --surface: var(--surface-light);
+      --surface-alt: var(--surface-alt-light);
+      --border: var(--border-light);
+      --text: var(--text-light);
+      --muted: var(--muted-light);
+      --accent: var(--accent-light);
+      --c-gfx: var(--gfx-light);
+      --c-np: var(--np-light);
+      --c-good: var(--good-light);
+      --c-warn: var(--warn-light);
+
+      --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --radius: 12px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        color-scheme: dark;
+        --bg: var(--bg-dark);
+        --surface: var(--surface-dark);
+        --surface-alt: var(--surface-alt-dark);
+        --border: var(--border-dark);
+        --text: var(--text-dark);
+        --muted: var(--muted-dark);
+        --accent: var(--accent-dark);
+        --c-gfx: var(--gfx-dark);
+        --c-np: var(--np-dark);
+        --c-good: var(--good-dark);
+        --c-warn: var(--warn-dark);
+      }
+    }
+
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: var(--bg-dark);
+      --surface: var(--surface-dark);
+      --surface-alt: var(--surface-alt-dark);
+      --border: var(--border-dark);
+      --text: var(--text-dark);
+      --muted: var(--muted-dark);
+      --accent: var(--accent-dark);
+      --c-gfx: var(--gfx-dark);
+      --c-np: var(--np-dark);
+      --c-good: var(--good-dark);
+      --c-warn: var(--warn-dark);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--font-sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px 20px 64px;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    h1 {
+      margin: 0;
+      font-size: 1.5rem;
+      letter-spacing: -0.02em;
+    }
+    .subtitle {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }
+    select, button {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 7px 12px;
+      font: inherit;
+      font-size: 0.88rem;
+      cursor: pointer;
+    }
+    button:hover, select:hover { border-color: var(--accent); }
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 18px;
+    }
+    .card-label {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .card-value {
+      font-size: 1.4rem;
+      font-weight: 700;
+      font-family: var(--font-mono);
+    }
+    .card-sub {
+      margin-top: 4px;
+      font-size: 0.84rem;
+      color: var(--muted);
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .panel-title {
+      margin: 0;
+      font-size: 1.02rem;
+      font-weight: 600;
+    }
+    .legend {
+      display: flex;
+      gap: 14px;
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+    .dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 5px;
+      vertical-align: middle;
+    }
+    svg.chart {
+      width: 100%;
+      height: auto;
+      display: block;
+      font-family: var(--font-mono);
+    }
+    .table-wrap {
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.87rem;
+    }
+    th, td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      white-space: nowrap;
+    }
+    th {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      background: var(--surface-alt);
+    }
+    td.num { font-family: var(--font-mono); text-align: right; }
+    th.num { text-align: right; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.76rem;
+      font-weight: 600;
+      font-family: var(--font-mono);
+    }
+    .badge-ok { background: color-mix(in srgb, var(--c-good) 15%, transparent); color: var(--c-good); }
+    .badge-skip { background: color-mix(in srgb, var(--c-warn) 15%, transparent); color: var(--c-warn); }
+    .speedup-win { color: var(--c-good); font-weight: 700; }
+    .speedup-lose { color: var(--c-warn); font-weight: 600; }
+    .empty-msg {
+      padding: 32px;
+      text-align: center;
+      color: var(--muted);
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>GfxIR vs NumPy (float32) Benchmarks</h1>
+        <p class="subtitle">Cross-platform GPU compute performance tracker for Epic #176 (Metal / Vulkan / DirectX 12)</p>
+      </div>
+      <div class="controls">
+        <select id="runSelect" aria-label="Select benchmark run"></select>
+        <select id="metricSelect" aria-label="Select latency metric">
+          <option value="medianMs">Warm Median (ms)</option>
+          <option value="meanMs">Warm Mean (ms)</option>
+          <option value="minMs">Warm Min (ms)</option>
+          <option value="p95Ms">Warm P95 (ms)</option>
+          <option value="coldMs">Cold / First Call (ms)</option>
+        </select>
+        <button id="themeToggle" type="button">Toggle Theme</button>
+      </div>
+    </header>
+
+    <section class="kpis" id="kpis"></section>
+
+    <section class="grid-2">
+      <div class="card">
+        <div class="panel-header">
+          <h2 class="panel-title">Suite Latency Comparison (lower is better)</h2>
+          <div class="legend">
+            <span><i class="dot" style="background: var(--c-np)"></i>NumPy CPU f32</span>
+            <span><i class="dot" style="background: var(--c-gfx)"></i>GfxIR GPU</span>
+          </div>
+        </div>
+        <div id="suiteChart"></div>
+      </div>
+
+      <div class="card">
+        <div class="panel-header">
+          <h2 class="panel-title">Commit History Geomean (ms)</h2>
+          <div class="legend">
+            <span><i class="dot" style="background: var(--c-np)"></i>NumPy</span>
+            <span><i class="dot" style="background: var(--c-gfx)"></i>GfxIR</span>
+          </div>
+        </div>
+        <div id="historyChart"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="panel-header">
+        <h2 class="panel-title">Detailed Suite Results</h2>
+        <span class="subtitle" id="runMeta"></span>
+      </div>
+      <div class="table-wrap" id="resultsTable"></div>
+    </section>
+  </div>
+
+  <script>
+    const themeBtn = document.getElementById("themeToggle");
+    themeBtn.addEventListener("click", () => {
+      const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+      document.documentElement.dataset.theme = next;
+      try { localStorage.setItem("gfxir-bench-theme", next); } catch {}
+    });
+
+    function esc(str) {
+      return String(str ?? "").replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[c]));
+    }
+
+    function fmtMs(v) {
+      if (v === null || v === undefined || Number.isNaN(v)) return "—";
+      if (v === 0) return "0.000";
+      return v < 1 ? v.toFixed(4) : v.toFixed(3);
+    }
+
+    function renderBarChart(container, suites, metric) {
+      if (!suites.length) {
+        container.innerHTML = '<div class="empty-msg">No suite data available.</div>';
+        return;
+      }
+      const W = 560, rowH = 44, padL = 140, padR = 70, padT = 10, padB = 20;
+      const H = padT + padB + suites.length * rowH;
+      const maxVal = Math.max(
+        1e-6,
+        ...suites.flatMap(s => [
+          s.np && s.np.ran ? Number(s.np[metric] || 0) : 0,
+          s.gfx && s.gfx.ran ? Number(s.gfx[metric] || 0) : 0
+        ])
+      );
+      const plotW = W - padL - padR;
+
+      let rows = "";
+      suites.forEach((s, i) => {
+        const y = padT + i * rowH;
+        const npVal = s.np && s.np.ran ? Number(s.np[metric] || 0) : null;
+        const gfxVal = s.gfx && s.gfx.ran ? Number(s.gfx[metric] || 0) : null;
+        const npW = npVal !== null ? Math.max(2, (npVal / maxVal) * plotW) : 0;
+        const gfxW = gfxVal !== null ? Math.max(2, (gfxVal / maxVal) * plotW) : 0;
+
+        rows += `<text x="${padL - 8}" y="${y + 18}" text-anchor="end" fill="currentColor" font-size="11">${esc(s.benchName)}</text>`;
+        if (npVal !== null) {
+          rows += `<rect x="${padL}" y="${y + 4}" width="${npW.toFixed(1)}" height="12" rx="3" fill="var(--c-np)"/>`;
+          rows += `<text x="${padL + npW + 6}" y="${y + 14}" fill="var(--muted)" font-size="10">${fmtMs(npVal)} ms</text>`;
+        }
+        if (gfxVal !== null) {
+          rows += `<rect x="${padL}" y="${y + 20}" width="${gfxW.toFixed(1)}" height="12" rx="3" fill="var(--c-gfx)"/>`;
+          rows += `<text x="${padL + gfxW + 6}" y="${y + 30}" fill="var(--muted)" font-size="10">${fmtMs(gfxVal)} ms</text>`;
+        } else {
+          rows += `<text x="${padL + 4}" y="${y + 30}" fill="var(--c-warn)" font-size="10">GPU unavailable</text>`;
+        }
+      });
+
+      container.innerHTML = `<svg class="chart" viewBox="0 0 ${W} ${H}">${rows}</svg>`;
+    }
+
+    function renderHistoryChart(container, history) {
+      if (!history.length) {
+        container.innerHTML = '<div class="empty-msg">No history recorded yet.</div>';
+        return;
+      }
+      const W = 560, H = 220, padL = 54, padR = 20, padT = 16, padB = 34;
+      const plotW = W - padL - padR;
+      const plotH = H - padT - padB;
+      const pts = history.slice(-20);
+
+      const vals = pts.flatMap(h => {
+        const g = h.overallGeomeanMs || {};
+        return Object.values(g).filter(v => typeof v === "number" && v > 0);
+      });
+      const maxVal = Math.max(1e-3, ...vals);
+
+      const xFor = i => pts.length === 1 ? padL + plotW / 2 : padL + (i / (pts.length - 1)) * plotW;
+      const yFor = v => padT + plotH - (v / maxVal) * plotH;
+
+      let npCoords = [], gfxCoords = [];
+      pts.forEach((h, i) => {
+        const g = h.overallGeomeanMs || {};
+        const npV = g["numpy-cpu-f32"] || 0;
+        const gfxKey = Object.keys(g).find(k => k.startsWith("gfxir-"));
+        const gfxV = gfxKey ? (g[gfxKey] || 0) : 0;
+        if (npV > 0) npCoords.push([xFor(i), yFor(npV), h.shortSha]);
+        if (gfxV > 0) gfxCoords.push([xFor(i), yFor(gfxV), h.shortSha]);
+      });
+
+      const line = coords => coords.map((p, i) => `${i === 0 ? "M" : "L"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ");
+      let svg = `<line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT + plotH}" stroke="var(--border)"/>`;
+      svg += `<line x1="${padL}" y1="${padT + plotH}" x2="${W - padR}" y2="${padT + plotH}" stroke="var(--border)"/>`;
+      svg += `<text x="${padL - 6}" y="${padT + 10}" text-anchor="end" fill="var(--muted)" font-size="10">${fmtMs(maxVal)} ms</text>`;
+      svg += `<text x="${padL - 6}" y="${padT + plotH}" text-anchor="end" fill="var(--muted)" font-size="10">0</text>`;
+
+      if (npCoords.length) {
+        svg += `<path d="${line(npCoords)}" fill="none" stroke="var(--c-np)" stroke-width="2.2"/>`;
+        npCoords.forEach(p => { svg += `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="3.5" fill="var(--c-np)"/>`; });
+      }
+      if (gfxCoords.length) {
+        svg += `<path d="${line(gfxCoords)}" fill="none" stroke="var(--c-gfx)" stroke-width="2.2"/>`;
+        gfxCoords.forEach(p => { svg += `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="3.5" fill="var(--c-gfx)"/>`; });
+      }
+      pts.forEach((h, i) => {
+        if (pts.length <= 8 || i === 0 || i === pts.length - 1 || i % Math.ceil(pts.length / 6) === 0) {
+          svg += `<text x="${xFor(i).toFixed(1)}" y="${H - 10}" text-anchor="middle" fill="var(--muted)" font-size="10">${esc(h.shortSha)}</text>`;
+        }
+      });
+      container.innerHTML = `<svg class="chart" viewBox="0 0 ${W} ${H}">${svg}</svg>`;
+    }
+
+    function groupSuites(results) {
+      const map = new Map();
+      for (const r of results || []) {
+        if (!map.has(r.benchId)) {
+          map.set(r.benchId, { benchId: r.benchId, benchName: r.benchName, category: r.category, np: null, gfx: null });
+        }
+        const entry = map.get(r.benchId);
+        if (r.backend === "numpy-cpu-f32") entry.np = r;
+        else entry.gfx = r;
+      }
+      return Array.from(map.values());
+    }
+
+    function renderRun(entry, history) {
+      const suites = groupSuites(entry.results);
+      const metric = document.getElementById("metricSelect").value;
+      const g = entry.overallGeomeanMs || {};
+      const npGeo = g["numpy-cpu-f32"] || 0;
+      const gfxKey = Object.keys(g).find(k => k.startsWith("gfxir-")) || "gfxir";
+      const gfxGeo = g[gfxKey] || 0;
+      const speedup = (npGeo > 0 && gfxGeo > 0) ? (npGeo / gfxGeo) : null;
+
+      let bestSuite = "—";
+      let bestRatio = 0;
+      for (const s of suites) {
+        if (s.np && s.np.ran && s.gfx && s.gfx.ran && s.gfx.medianMs > 0) {
+          const r = s.np.medianMs / s.gfx.medianMs;
+          if (r > bestRatio) {
+            bestRatio = r;
+            bestSuite = `${s.benchName} (${r.toFixed(2)}x)`;
+          }
+        }
+      }
+
+      document.getElementById("kpis").innerHTML = `
+        <div class="card">
+          <div class="card-label">Overall Winner</div>
+          <div class="card-value">${esc(entry.overallWinner || "—")}</div>
+          <div class="card-sub">Geomean: NumPy ${fmtMs(npGeo)} ms vs GfxIR ${fmtMs(gfxGeo)} ms</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Geomean Speedup vs NumPy</div>
+          <div class="card-value">${speedup ? speedup.toFixed(2) + "x" : "—"}</div>
+          <div class="card-sub">${speedup && speedup >= 1 ? "GfxIR faster overall" : "Transfer/dispatch bound on small/per-call"}</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Best GPU Suite</div>
+          <div class="card-value" style="font-size:1.1rem">${esc(bestSuite)}</div>
+          <div class="card-sub">Warm median latency ratio</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Environment</div>
+          <div class="card-value" style="font-size:1.1rem">${esc(entry.os || "")} / ${esc(entry.target || "")}</div>
+          <div class="card-sub">${esc(entry.arch || "")} · NumPy ${esc(entry.numpyVersion || "n/a")}</div>
+        </div>
+      `;
+
+      const shaLink = entry.runUrl
+        ? `<a href="${esc(entry.runUrl)}" target="_blank" rel="noopener">${esc(entry.shortSha)}</a>`
+        : esc(entry.shortSha);
+      document.getElementById("runMeta").innerHTML =
+        `Commit ${shaLink} · ${esc(entry.message || "")} · ${esc(entry.timestamp || "")}`;
+
+      renderBarChart(document.getElementById("suiteChart"), suites, metric);
+      renderHistoryChart(document.getElementById("historyChart"), history);
+
+      const rowsHtml = (entry.results || []).map(r => {
+        const pair = suites.find(s => s.benchId === r.benchId);
+        let speedupCell = "—";
+        if (r.backend !== "numpy-cpu-f32" && r.ran && pair && pair.np && pair.np.ran && r.medianMs > 0) {
+          const ratio = pair.np.medianMs / r.medianMs;
+          const cls = ratio >= 1 ? "speedup-win" : "speedup-lose";
+          speedupCell = `<span class="${cls}">${ratio.toFixed(2)}x</span>`;
+        }
+        const badge = r.ran
+          ? `<span class="badge badge-ok">ran</span>`
+          : `<span class="badge badge-skip">${esc(r.status || "skipped")}</span>`;
+        return `<tr>
+          <td>${esc(r.benchName)}</td>
+          <td>${esc(r.category)}</td>
+          <td><code>${esc(r.backend)}</code></td>
+          <td><code>${esc(r.runtimeMode || "—")}</code></td>
+          <td class="num">${fmtMs(r.compileMs)}</td>
+          <td class="num">${fmtMs(r.coldMs)}</td>
+          <td class="num">${fmtMs(r.medianMs)}</td>
+          <td class="num">${fmtMs(r.minMs)}</td>
+          <td class="num">${fmtMs(r.p95Ms)}</td>
+          <td class="num">${speedupCell}</td>
+          <td class="num">${r.ran ? esc(r.maxAbsError) : "—"}</td>
+          <td class="num">${r.peakRssMb ? r.peakRssMb.toFixed(1) : "—"}</td>
+          <td>${badge}</td>
+        </tr>`;
+      }).join("");
+
+      document.getElementById("resultsTable").innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>Suite</th>
+              <th>Category</th>
+              <th>Backend</th>
+              <th>Runtime</th>
+              <th class="num">Compile (ms)</th>
+              <th class="num">Cold (ms)</th>
+              <th class="num">Median (ms)</th>
+              <th class="num">Min (ms)</th>
+              <th class="num">P95 (ms)</th>
+              <th class="num">vs NumPy</th>
+              <th class="num">Max Err</th>
+              <th class="num">Peak RSS (MB)</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      `;
+    }
+
+    async function init() {
+      let history = [];
+      try {
+        const resp = await fetch("data/bench-history.json", { cache: "no-store" });
+        if (resp.ok) history = await resp.json();
+      } catch {}
+
+      if (!Array.isArray(history) || !history.length) {
+        document.getElementById("kpis").innerHTML =
+          '<div class="card"><div class="card-label">No Data</div><div class="card-sub">Run <code>scripts/run_numpy_benchmarks.py</code> and <code>scripts/build_benchmark_site.py</code> to generate <code>data/bench-history.json</code>.</div></div>';
+        return;
+      }
+
+      const runSelect = document.getElementById("runSelect");
+      const reversed = [...history].reverse();
+      runSelect.innerHTML = reversed
+        .map((h, idx) => `<option value="${idx}">${esc(h.shortSha)} — ${esc((h.timestamp || "").slice(0, 10))} (${esc(h.target || "")})</option>`)
+        .join("");
+
+      const update = () => renderRun(reversed[Number(runSelect.value) || 0], history);
+      runSelect.addEventListener("change", update);
+      document.getElementById("metricSelect").addEventListener("change", update);
+      update();
+    }
+
+    init();
+  </script>
+</body>
+</html>
