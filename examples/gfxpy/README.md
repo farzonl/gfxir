@@ -70,6 +70,25 @@ unknown target names raise `UnsupportedTargetError`.
 - **Supported operations**: Elementwise `+` and `*` (array/array and array/scalar,
   including reflected scalar ops `2.0 * a` and `10.0 + b`), and explicit host
   readback via `tolist()`.
+- **Explicit elementwise fusion (`@gp.fuse` / `gp.fuse(fn)`)**:
+  Ordinary `GfxArray` operators remain eager. Wrapping a function in `gp.fuse`
+  lowers a contiguous `float32` `+`/`*` expression tree into a single
+  bounds-checked GfxIR `@compute` dispatch with one output allocation and no
+  materialized intermediates or host readback.
+  - **Evaluation & caching**: Evaluated eagerly when the fused callable is
+    invoked. Compiled kernels are cached by expression structure, dtype/layout,
+    target, validation/provider, contraction policy, and toolchain; runtime
+    scalars are passed via `ParameterBlock` parameters without recompilation.
+  - **Restrictions & errors**: All array inputs must be open, `float32`,
+    identical in shape (`ShapeMismatchError`), and on the same `Device`
+    (`CrossDeviceError`). Unsupported operations inside `gp.fuse` (such as
+    `-`, `/`, `@`, `.sum()`, indexing, or Python control flow over proxies)
+    raise `UnsupportedFusionError`. Empty arrays return an empty `GfxArray`
+    with zero allocations or dispatches.
+  - **Contraction & reassociation policy**: `no_fast_math` — the generated
+    GfxIR kernel preserves the exact parenthesized Python expression order
+    without fast-math or algebraic reassociation (target shader compilers may
+    still perform hardware FMA contraction unless disabled by the driver).
 - **Empty arrays**: `gp.array([])` and `gp.empty(0)` are handled at the array
   layer without zero-byte GPU allocations or zero-grid dispatches.
 - **Explicit ownership & lifecycle**: `Device` and `GfxArray` support `close()`
