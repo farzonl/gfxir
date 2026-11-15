@@ -376,6 +376,7 @@ class MetalBuffer(PersistentBuffer):
         if self._closed:
             return
         self._closed = True
+        self._context._buffers.discard(self)
         handle = self._handle
         self._handle = 0
         if not handle:
@@ -387,6 +388,12 @@ class MetalBuffer(PersistentBuffer):
             self._context._defer_cleanup("pool_buffer", (self._size_bytes, handle))
         else:
             self._context._return_buffer_to_pool(self._size_bytes, handle)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class MetalPipeline(PersistentPipeline):
@@ -498,13 +505,19 @@ class MetalPipeline(PersistentPipeline):
         if self._closed:
             return
         self._closed = True
+        self._context._pipelines.discard(self)
         handle = self._handle
         self._handle = 0
-        if handle and not self._context.closed:
-            if self._context._pending_work:
-                self._context._defer_cleanup("pipeline", handle)
-            else:
-                self._context._lib.gfx_mtl_destroy_pipeline(handle)
+        if handle and not self._context.closed and self._context._pending_work:
+            self._context._defer_cleanup("pipeline", handle)
+        elif handle:
+            self._context._lib.gfx_mtl_destroy_pipeline(handle)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class MetalComputeContext(ComputeContext):
@@ -710,14 +723,24 @@ class MetalComputeContext(ComputeContext):
             return
         retired = self._retired_resources
         self._retired_resources = []
+        remaining: list[tuple[str, object]] = []
+        errors: list[BaseException] = []
         for kind, handle in retired:
-            if kind == "buffer":
-                self._lib.gfx_mtl_destroy_buffer(handle)
-            elif kind == "pool_buffer":
-                size_bytes, buf_handle = handle  # type: ignore[misc]
-                self._return_buffer_to_pool(size_bytes, buf_handle)
-            elif kind == "pipeline":
-                self._lib.gfx_mtl_destroy_pipeline(handle)
+            try:
+                if kind == "buffer":
+                    self._lib.gfx_mtl_destroy_buffer(handle)
+                elif kind == "pool_buffer":
+                    size_bytes, buf_handle = handle  # type: ignore[misc]
+                    self._return_buffer_to_pool(size_bytes, buf_handle)
+                elif kind == "pipeline":
+                    self._lib.gfx_mtl_destroy_pipeline(handle)
+            except BaseException as exc:
+                errors.append(exc)
+                remaining.append((kind, handle))
+        if remaining:
+            self._retired_resources = remaining + self._retired_resources
+        if errors:
+            raise errors[0]
 
     def synchronize(self) -> None:
         self._ensure_open()
@@ -734,19 +757,46 @@ class MetalComputeContext(ComputeContext):
     def close(self) -> None:
         if self._closed:
             return
-        try:
-            if self._ctx_handle:
+        errors: list[BaseException] = []
+        if self._ctx_handle:
+            try:
                 self.synchronize()
-        finally:
-            self._pending_work = False
+            except BaseException as exc:
+                errors.append(exc)
+        self._pending_work = False
+        try:
             self._flush_retired()
-            for buf in list(self._buffers):
+        except BaseException as exc:
+            errors.append(exc)
+        for buf in list(self._buffers):
+            try:
                 buf.close()
-            for pipe in list(self._pipelines):
+            except BaseException as exc:
+                errors.append(exc)
+        for pipe in list(self._pipelines):
+            try:
                 pipe.close()
+            except BaseException as exc:
+                errors.append(exc)
+        try:
             self._pool.clear(self._lib.gfx_mtl_destroy_buffer)
-            self._closed = True
-            ctx_handle = self._ctx_handle
-            self._ctx_handle = 0
-            if ctx_handle:
+        except BaseException as exc:
+            errors.append(exc)
+        self._buffers.clear()
+        self._pipelines.clear()
+        self._closed = True
+        ctx_handle = self._ctx_handle
+        self._ctx_handle = 0
+        if ctx_handle:
+            try:
                 self._lib.gfx_mtl_destroy_context(ctx_handle)
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass

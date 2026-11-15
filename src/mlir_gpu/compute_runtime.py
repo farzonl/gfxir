@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from contextlib import ExitStack, contextmanager
 import os
 from pathlib import Path
+import weakref
 
 from .parameters import pack_parameters
 from .viewer import (
@@ -144,15 +145,27 @@ class _BoundedBufferPool:
         return True
 
     def clear(self, destroy_fn: Callable[[object], None]) -> int:
-        freed_bytes = self._pooled_bytes
-        buckets = list(self._buckets.values())
+        freed_bytes = 0
+        items = list(self._buckets.items())
         self._buckets.clear()
         self._fifo.clear()
         self._pooled_bytes = 0
         self._pooled_buffers = 0
-        for bucket in buckets:
+        errors: list[BaseException] = []
+        for bucket_size, bucket in items:
             for handle in bucket:
-                destroy_fn(handle)
+                try:
+                    destroy_fn(handle)
+                except BaseException as exc:
+                    errors.append(exc)
+                    self._buckets.setdefault(bucket_size, []).append(handle)
+                    self._fifo.append(bucket_size)
+                    self._pooled_bytes += bucket_size
+                    self._pooled_buffers += 1
+                else:
+                    freed_bytes += bucket_size
+        if errors:
+            raise errors[0]
         return freed_bytes
 
     def reset_counters(self) -> None:
@@ -526,6 +539,7 @@ class VulkanBuffer(PersistentBuffer):
         if self._closed:
             return
         self._closed = True
+        self._context._buffers.discard(self)
         self._context._pool.on_live_free(self._alloc_size)
         handle = (self._vk_buffer, self._vk_memory, self._alloc_size, self._mapped)
         self._mapped = None
@@ -535,6 +549,12 @@ class VulkanBuffer(PersistentBuffer):
             self._context._defer_cleanup(lambda: self._context._return_buffer_to_pool(handle))
         else:
             self._context._return_buffer_to_pool(handle)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 _MAX_CACHED_BINDINGS = 32
@@ -757,11 +777,18 @@ class VulkanPipeline(PersistentPipeline):
         if self._closed:
             return
         self._closed = True
+        self._context._pipelines.discard(self)
         if not self._context.closed:
             if self._context._recording or self._context._submitted:
                 self._context._defer_cleanup(self._resources.close)
                 return
         self._resources.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class VulkanComputeContext(ComputeContext):
@@ -784,8 +811,8 @@ class VulkanComputeContext(ComputeContext):
         self._retired_resources: list[object] = []
         self._stats = {"dispatches": 0, "submissions": 0, "waits": 0, "deferred_cleanups": 0}
         self._pool = _BoundedBufferPool(max_bytes=_resolve_pool_max_bytes(pool_max_bytes))
-        self._buffers: list[VulkanBuffer] = []
-        self._pipelines: list[VulkanPipeline] = []
+        self._buffers: weakref.WeakSet[VulkanBuffer] = weakref.WeakSet()
+        self._pipelines: weakref.WeakSet[VulkanPipeline] = weakref.WeakSet()
 
         try:
             with _api_errors():
@@ -840,10 +867,22 @@ class VulkanComputeContext(ComputeContext):
         vk_buf, vk_mem, _alloc_size, mapped = handle  # type: ignore[misc]
         gpu = self._gpu
         vk = gpu.vk
+        errors: list[BaseException] = []
         if mapped is not None:
-            vk.vkUnmapMemory(gpu.device, vk_mem)
-        vk.vkDestroyBuffer(gpu.device, vk_buf, None)
-        vk.vkFreeMemory(gpu.device, vk_mem, None)
+            try:
+                vk.vkUnmapMemory(gpu.device, vk_mem)
+            except BaseException as exc:
+                errors.append(exc)
+        try:
+            vk.vkDestroyBuffer(gpu.device, vk_buf, None)
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            vk.vkFreeMemory(gpu.device, vk_mem, None)
+        except BaseException as exc:
+            errors.append(exc)
+        if errors:
+            raise errors[0]
 
     def _return_buffer_to_pool(self, handle: object) -> None:
         _vk_buf, _vk_mem, alloc_size, _mapped = handle  # type: ignore[misc]
@@ -893,7 +932,7 @@ class VulkanComputeContext(ComputeContext):
                 raise
             buf = VulkanBuffer(self, size_bytes, vk_buf, vk_mem, alloc_size, mapped=mapped)
             self._pool.on_live_alloc(alloc_size)
-            self._buffers.append(buf)
+            self._buffers.add(buf)
             return buf
 
         with _api_errors():
@@ -941,7 +980,7 @@ class VulkanComputeContext(ComputeContext):
         self._pool.record_allocation()
         self._pool.on_live_alloc(alloc_size)
         buf = VulkanBuffer(self, size_bytes, vk_buf, vk_mem, alloc_size, mapped=mapped)
-        self._buffers.append(buf)
+        self._buffers.add(buf)
         return buf
 
     def compile_pipeline(self, program: ComputeProgram | Path | str) -> VulkanPipeline:
@@ -1003,7 +1042,7 @@ class VulkanComputeContext(ComputeContext):
             descriptor_sets,
             pipe_resources,
         )
-        self._pipelines.append(pipe)
+        self._pipelines.add(pipe)
         return pipe
 
     @property
@@ -1032,8 +1071,18 @@ class VulkanComputeContext(ComputeContext):
             return
         pending = list(self._retired_resources)
         self._retired_resources.clear()
+        remaining: list[object] = []
+        errors: list[BaseException] = []
         for fn in pending:
-            fn()  # type: ignore[operator]
+            try:
+                fn()  # type: ignore[operator]
+            except BaseException as exc:
+                errors.append(exc)
+                remaining.append(fn)
+        if remaining:
+            self._retired_resources = remaining + self._retired_resources
+        if errors:
+            raise errors[0]
 
     def _submit_recording(self) -> None:
         if not self._recording:
@@ -1100,20 +1149,47 @@ class VulkanComputeContext(ComputeContext):
     def close(self) -> None:
         if self._closed:
             return
-        try:
-            if self._recording or self._submitted:
+        errors: list[BaseException] = []
+        if self._recording or self._submitted:
+            try:
                 self.synchronize()
-        finally:
+            except BaseException as exc:
+                errors.append(exc)
+        self._recording = False
+        self._submitted = False
+        try:
             self._flush_retired()
-            for buf in self._buffers:
+        except BaseException as exc:
+            errors.append(exc)
+        for buf in list(self._buffers):
+            try:
                 buf.close()
-            for pipe in self._pipelines:
+            except BaseException as exc:
+                errors.append(exc)
+        for pipe in list(self._pipelines):
+            try:
                 pipe.close()
-            self._buffers.clear()
-            self._pipelines.clear()
+            except BaseException as exc:
+                errors.append(exc)
+        try:
             self._pool.clear(self._destroy_vk_buffer)
-            self._closed = True
+        except BaseException as exc:
+            errors.append(exc)
+        self._buffers.clear()
+        self._pipelines.clear()
+        self._closed = True
+        try:
             self._resources.close()
+        except BaseException as exc:
+            errors.append(exc)
+        if errors:
+            raise errors[0]
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 @contextmanager

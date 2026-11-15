@@ -102,6 +102,8 @@ class _FakeComputeContext(ComputeContext):
         self.download_calls = 0
         self.dispatch_calls: list[tuple[str, tuple[int, int, int] | None]] = []
         self.compile_calls = 0
+        self.created_buffers: list[_FakePersistentBuffer] = []
+        self.created_pipelines: list[_FakeComputePipeline] = []
 
     @property
     def target(self) -> str:
@@ -117,6 +119,7 @@ class _FakeComputeContext(ComputeContext):
 
     def create_buffer(self, size_bytes: int, initial_data=None) -> PersistentBuffer:
         buf = _FakePersistentBuffer(self, size_bytes)
+        self.created_buffers.append(buf)
         if initial_data:
             buf.upload(initial_data)
         return buf
@@ -124,7 +127,9 @@ class _FakeComputeContext(ComputeContext):
     def compile_pipeline(self, program) -> PersistentPipeline:
         self.compile_calls += 1
         op_dir = Path(str(program)).parent.name
-        return _FakePersistentPipeline(self, program, op_dir)
+        pipe = _FakePersistentPipeline(self, program, op_dir)
+        self.created_pipelines.append(pipe)
+        return pipe
 
     def synchronize(self) -> None:
         pass
@@ -193,6 +198,41 @@ class TestGfxPyDeviceResidentHost(unittest.TestCase):
             self.assertIn("float32", k1)
             backend.close()
 
+    def test_repeated_arrays_temporaries_reductions_and_close_baseline(self) -> None:
+        import gc
+
+        fake_ctx = _FakeComputeContext("vulkan")
+
+        def fake_compile(pipeline, target, out_dir, toolchain):
+            out_dir.mkdir(parents=True, exist_ok=True)
+            manifest = out_dir / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            return manifest
+
+        with (
+            mock.patch("gfxpy.gpu_backend._open_context", return_value=fake_ctx),
+            mock.patch("gfxpy.gpu_backend.compile_pipeline", side_effect=fake_compile),
+        ):
+            backend = GfxIRComputeBackend("vulkan")
+            dev = gp.device("vulkan", backend=backend)
+            try:
+                with dev:
+                    for _ in range(25):
+                        a = gp.array([1.0, 2.0, 3.0, 4.0])
+                        b = gp.array([2.0, 3.0, 4.0, 5.0])
+                        res = (a * 2.0 + 1.0) + b
+                        self.assertEqual(res.tolist(), [5.0, 8.0, 11.0, 14.0])
+                        res.close()
+                        a.close()
+                        b.close()
+                    gc.collect()
+                    open_bufs = [buf for buf in fake_ctx.created_buffers if not buf.closed]
+                    self.assertEqual(len(open_bufs), 0)
+            finally:
+                dev.close()
+            self.assertTrue(all(buf.closed for buf in fake_ctx.created_buffers))
+            self.assertTrue(all(pipe.closed for pipe in fake_ctx.created_pipelines))
+
 
 class _LiveBackendMixin:
     target_name: str
@@ -217,6 +257,28 @@ class _LiveBackendMixin:
                     self.assertAlmostEqual(g, e, delta=1e-3)
                 for g, e in zip(got_w, exp_w):
                     self.assertAlmostEqual(g, e, delta=1e-3)
+
+    def test_repeated_arrays_temporaries_reductions_and_close_baseline(self) -> None:
+        import gc
+
+        with gp.device(self.target_name) as dev:
+            try:
+                for _ in range(20):
+                    a = gp.array([1.0, 2.0, 3.0, 4.0], device=dev)
+                    b = gp.array([0.5, 1.5, 2.5, 3.5], device=dev)
+                    s = ((a * 2.0 + 1.0) + b).sum()
+                    got = s.tolist()
+                    self.assertAlmostEqual(got[0], 32.0, delta=1e-3)
+                    s.close()
+                    a.close()
+                    b.close()
+                gc.collect()
+                stats = dev.memory_stats
+                self.assertEqual(stats.get("live_buffers", 0), 0)
+                dev.release_pool()
+                self.assertEqual(dev.memory_stats.get("pooled_buffers", 0), 0)
+            finally:
+                dev.close()
 
 
 @unittest.skipUnless(

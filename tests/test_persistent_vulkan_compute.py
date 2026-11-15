@@ -26,6 +26,8 @@ from mlir_gpu import (
     open_compute_context,
 )
 from mlir_gpu import compute_runtime
+from mlir_gpu.compute_runtime import VulkanComputeContext
+from mlir_gpu.viewer import ComputeProgram, Shader
 from test_support import TOOLS
 
 TestNoopParams = ParameterBlock("p", (("n", Type.I32),))
@@ -489,6 +491,80 @@ class TestPersistentComputeValidation(unittest.TestCase):
                             ctx_err.create_buffer(16)
                     self.assertEqual(ctx_err.stats["live_buffers"], 0)
                     self.assertEqual(ctx_err.stats["live_bytes"], 0)
+
+    def test_closed_and_dropped_vulkan_resources_leave_bounded_tracking(self) -> None:
+        import gc
+
+        fake_gpu = _FakeVulkan(None)
+        vk = fake_gpu.vk
+        prog = ComputeProgram(
+            compute=Shader(entry_point="main", code=b"\x03\x02\x23\x07"),
+            target="vulkan",
+            workgroup_size=(64, 1, 1),
+            buffers=[],
+        )
+        with (
+            mock.patch("mlir_gpu.compute_runtime._api_errors", side_effect=lambda: nullcontext()),
+            mock.patch("mlir_gpu.compute_runtime._Vulkan", return_value=fake_gpu),
+        ):
+            ctx = VulkanComputeContext(pool_max_bytes=0)
+            for _ in range(100):
+                b = ctx.create_buffer(16)
+                b.close()
+            self.assertEqual(len(ctx._buffers), 0)
+            self.assertEqual(ctx.stats["live_buffers"], 0)
+            self.assertEqual(len(vk.destroyed_buffers), 100)
+
+            dropped_buf = ctx.create_buffer(16)
+            dropped_pipe = ctx.compile_pipeline(prog)
+            del dropped_buf, dropped_pipe
+            gc.collect()
+            self.assertEqual(len(ctx._buffers), 0)
+            self.assertEqual(len(ctx._pipelines), 0)
+            self.assertEqual(len(vk.destroyed_buffers), 101)
+            ctx.close()
+
+    def test_vulkan_close_attempts_remaining_cleanup_on_sync_and_destroy_failures(self) -> None:
+        fake_gpu = _FakeVulkan(None)
+        vk = fake_gpu.vk
+        orig_destroy = vk.vkDestroyBuffer
+        fail_first = {"done": False}
+
+        def failing_destroy_buffer(device, buf, alloc) -> None:
+            if not fail_first["done"]:
+                fail_first["done"] = True
+                raise RuntimeError("injected vkDestroyBuffer failure")
+            orig_destroy(device, buf, alloc)
+
+        vk.vkDestroyBuffer = failing_destroy_buffer  # type: ignore[method-assign]
+        vk.vkWaitForFences = mock.Mock(side_effect=RuntimeError("injected sync failure"))  # type: ignore[method-assign]
+
+        prog = ComputeProgram(
+            compute=Shader(entry_point="main", code=b"\x03\x02\x23\x07"),
+            target="vulkan",
+            workgroup_size=(64, 1, 1),
+            buffers=[],
+        )
+        with (
+            mock.patch("mlir_gpu.compute_runtime._api_errors", side_effect=lambda: nullcontext()),
+            mock.patch("mlir_gpu.compute_runtime._Vulkan", return_value=fake_gpu),
+        ):
+            ctx = VulkanComputeContext(pool_max_bytes=0)
+            _b1 = ctx.create_buffer(16)
+            _b2 = ctx.create_buffer(16)
+            _pipe = ctx.compile_pipeline(prog)
+            ctx._submitted = True
+
+            with self.assertRaises(RuntimeError) as err_ctx:
+                ctx.close()
+            self.assertIn("injected sync failure", str(err_ctx.exception))
+            self.assertTrue(ctx.closed)
+            self.assertEqual(len(ctx._buffers), 0)
+            self.assertEqual(len(ctx._pipelines), 0)
+            # Second buffer still destroyed despite first buffer's vkDestroyBuffer failure.
+            self.assertEqual(len(vk.destroyed_buffers), 1)
+            # Second close is idempotent.
+            ctx.close()
 
 
 @unittest.skipUnless(
