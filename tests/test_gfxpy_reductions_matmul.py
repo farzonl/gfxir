@@ -66,8 +66,8 @@ class _SpyReductionMatmulBackend:
     def reduce_sum_pass(self, inp: _SpyBuffer, out: _SpyBuffer, length: int) -> None:
         self.reduce_passes.append(length)
         vals = struct.unpack(f"<{length}f", inp.data[: length * 4])
-        num_groups = (length + 255) // 256
-        partials = [sum(vals[g * 256 : (g + 1) * 256]) for g in range(num_groups)]
+        num_groups = (length + 63) // 64
+        partials = [sum(vals[g * 64 : (g + 1) * 64]) for g in range(num_groups)]
         out.data[: num_groups * 4] = struct.pack(f"<{num_groups}f", *partials)
 
     def matmul(self, a: _SpyBuffer, b: _SpyBuffer, out: _SpyBuffer, m: int, n: int, k: int) -> None:
@@ -121,7 +121,7 @@ class TestReductionsAndMatmulHost(unittest.TestCase):
                 dl_before = backend.downloads
                 total = x.sum()
                 self.assertEqual(total.shape, (1,))
-                self.assertEqual(backend.reduce_passes, [5000, 20])
+                self.assertEqual(backend.reduce_passes, [5000, 79, 2])
                 self.assertEqual(backend.downloads, dl_before)
                 got = total.tolist()[0]
                 self.assertEqual(backend.downloads, dl_before + 1)
