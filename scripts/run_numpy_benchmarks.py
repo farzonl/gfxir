@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from dataclasses import dataclass
 import json
 import math
@@ -333,16 +334,18 @@ def _benchmark_gfx_suite(
                     def run_once() -> bytes:
                         src_buf = buf_x
                         dst_buf = buf_a
-                        for step in range(spec.chain_depth):
-                            if step > 0:
-                                assert buf_b is not None
-                                src_buf = buf_a if (step % 2 == 1) else buf_b
-                                dst_buf = buf_b if (step % 2 == 1) else buf_a
-                            pipe.dispatch(
-                                {"x": src_buf, "y": buf_y, "out": dst_buf},
-                                parameters={"n": spec.n, "alpha": 1.25},
-                                grid=grid,
-                            )
+                        batch_ctx = ctx.batch() if hasattr(ctx, "batch") else contextlib.nullcontext()
+                        with batch_ctx:
+                            for step in range(spec.chain_depth):
+                                if step > 0:
+                                    assert buf_b is not None
+                                    src_buf = buf_a if (step % 2 == 1) else buf_b
+                                    dst_buf = buf_b if (step % 2 == 1) else buf_a
+                                pipe.dispatch(
+                                    {"x": src_buf, "y": buf_y, "out": dst_buf},
+                                    parameters={"n": spec.n, "alpha": 1.25},
+                                    grid=grid,
+                                )
                         return dst_buf.download()
 
                     t_cold0 = time.perf_counter()

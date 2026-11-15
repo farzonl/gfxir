@@ -171,7 +171,26 @@ class PersistentPipeline(ABC):
 
 
 class ComputeContext(ABC):
-    """Owns a GPU compute device/queue and creates persistent buffers and pipelines."""
+    """Owns a GPU compute device/queue and creates persistent buffers and pipelines.
+
+    Threading policy: a ComputeContext and its child buffers/pipelines have
+    single-thread affinity (callers must not concurrently dispatch or close
+    resources on the same context from multiple threads without external locking).
+    """
+
+    @property
+    def stats(self) -> dict[str, int]:
+        """Return instrumentation counters for dispatches, submissions, host waits, and deferred cleanups."""
+        return {"dispatches": 0, "submissions": 0, "waits": 0, "deferred_cleanups": 0}
+
+    def reset_stats(self) -> None:
+        """Reset instrumentation counters to zero."""
+
+    @contextmanager
+    def batch(self):
+        """Group dependent dispatches without intermediate host waits."""
+        yield
+        self.synchronize()
 
     @property
     @abstractmethod
@@ -331,19 +350,27 @@ class VulkanBuffer(PersistentBuffer):
             mapped = self._ensure_mapped()
             return bytes(mapped[offset : offset + read_size])
 
+    def _destroy_vk_resources(self) -> None:
+        gpu = self._context._gpu
+        vk = gpu.vk
+        if self._mapped is not None:
+            vk.vkUnmapMemory(gpu.device, self._vk_memory)
+            self._mapped = None
+        vk.vkDestroyBuffer(gpu.device, self._vk_buffer, None)
+        vk.vkFreeMemory(gpu.device, self._vk_memory, None)
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         if not self._context.closed:
-            self._context.synchronize()
-            gpu = self._context._gpu
-            vk = gpu.vk
-            if self._mapped is not None:
-                vk.vkUnmapMemory(gpu.device, self._vk_memory)
-                self._mapped = None
-            vk.vkDestroyBuffer(gpu.device, self._vk_buffer, None)
-            vk.vkFreeMemory(gpu.device, self._vk_memory, None)
+            if self._context._recording or self._context._submitted:
+                self._context._defer_cleanup(self._destroy_vk_resources)
+            else:
+                self._destroy_vk_resources()
+
+
+_MAX_CACHED_BINDINGS = 32
 
 
 class VulkanPipeline(PersistentPipeline):
@@ -370,6 +397,8 @@ class VulkanPipeline(PersistentPipeline):
         self._resources = resources
         self._closed = False
         self._last_bindings: tuple[tuple[str, int, int], ...] | None = None
+        self._binding_cache: dict[tuple[tuple[str, int, int], ...], list[object]] = {}
+        self._unused_initial_sets = bool(descriptor_sets)
 
     @property
     def program(self) -> ComputeProgram:
@@ -442,60 +471,105 @@ class VulkanPipeline(PersistentPipeline):
 
         vk = gpu.vk
         with _api_errors():
-            # Wait on prior submission before rewriting descriptor sets or reusing command buffer.
-            self._context.synchronize()
+            if self._context._submitted:
+                # Wait on prior submitted batch before resetting/re-recording the command buffer.
+                self._context.synchronize()
 
-            key_tuple = tuple(binding_key)
-            if self._descriptor_sets and key_tuple != self._last_bindings:
-                writes = []
-                for buf_meta, buf in bound_buffers:
-                    info = vk.VkDescriptorBufferInfo(
-                        buffer=buf._vk_buffer,
-                        offset=0,
-                        range=buf._alloc_size,
-                    )
-                    writes.append(
-                        vk.VkWriteDescriptorSet(
-                            dstSet=self._descriptor_sets[buf_meta["set"]],
-                            dstBinding=buf_meta["binding"],
-                            dstArrayElement=0,
-                            descriptorCount=1,
-                            descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                            pBufferInfo=[info],
+            active_sets = self._descriptor_sets
+            if self._descriptor_sets:
+                key_tuple = tuple(binding_key)
+                cached_sets = self._binding_cache.get(key_tuple)
+                if cached_sets is not None:
+                    active_sets = cached_sets
+                else:
+                    if self._unused_initial_sets:
+                        active_sets = self._descriptor_sets
+                        self._unused_initial_sets = False
+                    else:
+                        if len(self._binding_cache) >= _MAX_CACHED_BINDINGS:
+                            self._context.synchronize()
+                            vk.vkResetDescriptorPool(gpu.device, self._desc_pool, 0)
+                            self._binding_cache.clear()
+                        active_sets = list(
+                            vk.vkAllocateDescriptorSets(
+                                gpu.device,
+                                vk.VkDescriptorSetAllocateInfo(
+                                    descriptorPool=self._desc_pool,
+                                    descriptorSetCount=len(self._set_layouts),
+                                    pSetLayouts=self._set_layouts,
+                                ),
+                            )
                         )
-                    )
-                vk.vkUpdateDescriptorSets(gpu.device, len(writes), writes, 0, None)
+                    writes = []
+                    for buf_meta, buf in bound_buffers:
+                        info = vk.VkDescriptorBufferInfo(
+                            buffer=buf._vk_buffer,
+                            offset=0,
+                            range=buf._alloc_size,
+                        )
+                        writes.append(
+                            vk.VkWriteDescriptorSet(
+                                dstSet=active_sets[buf_meta["set"]],
+                                dstBinding=buf_meta["binding"],
+                                dstArrayElement=0,
+                                descriptorCount=1,
+                                descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                pBufferInfo=[info],
+                            )
+                        )
+                    vk.vkUpdateDescriptorSets(gpu.device, len(writes), writes, 0, None)
+                    self._binding_cache[key_tuple] = active_sets
                 self._last_bindings = key_tuple
 
             cmd = self._context._command_buffer
-            vk.vkResetCommandBuffer(cmd, 0)
-            vk.vkBeginCommandBuffer(cmd, vk.VkCommandBufferBeginInfo())
-            if bound_buffers:
-                pre_barrier = vk.VkMemoryBarrier(
-                    srcAccessMask=vk.VK_ACCESS_HOST_WRITE_BIT | vk.VK_ACCESS_SHADER_WRITE_BIT,
+            if not self._context._recording:
+                vk.vkResetCommandBuffer(cmd, 0)
+                vk.vkBeginCommandBuffer(cmd, vk.VkCommandBufferBeginInfo())
+                self._context._recording = True
+                if bound_buffers:
+                    pre_barrier = vk.VkMemoryBarrier(
+                        srcAccessMask=vk.VK_ACCESS_HOST_WRITE_BIT | vk.VK_ACCESS_SHADER_WRITE_BIT,
+                        dstAccessMask=vk.VK_ACCESS_SHADER_READ_BIT | vk.VK_ACCESS_SHADER_WRITE_BIT,
+                    )
+                    vk.vkCmdPipelineBarrier(
+                        cmd,
+                        vk.VK_PIPELINE_STAGE_HOST_BIT | vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0,
+                        1,
+                        [pre_barrier],
+                        0,
+                        None,
+                        0,
+                        None,
+                    )
+            elif bound_buffers:
+                chain_barrier = vk.VkMemoryBarrier(
+                    srcAccessMask=vk.VK_ACCESS_SHADER_WRITE_BIT,
                     dstAccessMask=vk.VK_ACCESS_SHADER_READ_BIT | vk.VK_ACCESS_SHADER_WRITE_BIT,
                 )
                 vk.vkCmdPipelineBarrier(
                     cmd,
-                    vk.VK_PIPELINE_STAGE_HOST_BIT | vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     0,
                     1,
-                    [pre_barrier],
+                    [chain_barrier],
                     0,
                     None,
                     0,
                     None,
                 )
+
             vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self._pipeline)
-            if self._descriptor_sets:
+            if active_sets:
                 vk.vkCmdBindDescriptorSets(
                     cmd,
                     vk.VK_PIPELINE_BIND_POINT_COMPUTE,
                     self._layout,
                     0,
-                    len(self._descriptor_sets),
-                    self._descriptor_sets,
+                    len(active_sets),
+                    active_sets,
                     0,
                     None,
                 )
@@ -509,36 +583,17 @@ class VulkanPipeline(PersistentPipeline):
                     vk.ffi.from_buffer(packed_params),
                 )
             vk.vkCmdDispatch(cmd, gx, gy, gz)
-            if bound_buffers:
-                post_barrier = vk.VkMemoryBarrier(
-                    srcAccessMask=vk.VK_ACCESS_SHADER_WRITE_BIT,
-                    dstAccessMask=vk.VK_ACCESS_HOST_READ_BIT | vk.VK_ACCESS_SHADER_READ_BIT | vk.VK_ACCESS_SHADER_WRITE_BIT,
-                )
-                vk.vkCmdPipelineBarrier(
-                    cmd,
-                    vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    vk.VK_PIPELINE_STAGE_HOST_BIT | vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    0,
-                    1,
-                    [post_barrier],
-                    0,
-                    None,
-                    0,
-                    None,
-                )
-            vk.vkEndCommandBuffer(cmd)
-
-            vk.vkResetFences(gpu.device, 1, [self._context._fence])
-            submit_info = vk.VkSubmitInfo(pCommandBuffers=[cmd])
-            vk.vkQueueSubmit(gpu.queue, 1, [submit_info], self._context._fence)
-            self._context._submitted = True
+            self._context._stats["dispatches"] += 1
+            self._context._has_buffer_writes = self._context._has_buffer_writes or bool(bound_buffers)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         if not self._context.closed:
-            self._context.synchronize()
+            if self._context._recording or self._context._submitted:
+                self._context._defer_cleanup(self._resources.close)
+                return
         self._resources.close()
 
 
@@ -549,7 +604,12 @@ class VulkanComputeContext(ComputeContext):
         _validate_provider(provider, "vulkan")
         self._resources = ExitStack()
         self._closed = False
+        self._recording = False
         self._submitted = False
+        self._has_buffer_writes = False
+        self._batch_depth = 0
+        self._retired_resources: list[object] = []
+        self._stats = {"dispatches": 0, "submissions": 0, "waits": 0, "deferred_cleanups": 0}
         self._buffers: list[VulkanBuffer] = []
         self._pipelines: list[VulkanPipeline] = []
 
@@ -685,7 +745,7 @@ class VulkanComputeContext(ComputeContext):
                 descriptor_sets: list[object] = []
                 if set_layouts:
                     vk = self._gpu.vk
-                    buf_count = max(1, len(loaded.buffers))
+                    buf_count = max(1, len(loaded.buffers)) * _MAX_CACHED_BINDINGS
                     pool_sizes = [
                         vk.VkDescriptorPoolSize(
                             type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -695,8 +755,9 @@ class VulkanComputeContext(ComputeContext):
                     desc_pool = vk.vkCreateDescriptorPool(
                         self._gpu.device,
                         vk.VkDescriptorPoolCreateInfo(
-                            maxSets=len(set_layouts),
+                            maxSets=len(set_layouts) * _MAX_CACHED_BINDINGS,
                             pPoolSizes=pool_sizes,
+                            flags=vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
                         ),
                         None,
                     )
@@ -728,23 +789,96 @@ class VulkanComputeContext(ComputeContext):
         self._pipelines.append(pipe)
         return pipe
 
+    @property
+    def stats(self) -> dict[str, int]:
+        return dict(self._stats)
+
+    def reset_stats(self) -> None:
+        for k in self._stats:
+            self._stats[k] = 0
+
+    def _defer_cleanup(self, cleanup_fn: object) -> None:
+        self._retired_resources.append(cleanup_fn)
+        self._stats["deferred_cleanups"] += 1
+
+    def _flush_retired(self) -> None:
+        if not self._retired_resources:
+            return
+        pending = list(self._retired_resources)
+        self._retired_resources.clear()
+        for fn in pending:
+            fn()  # type: ignore[operator]
+
+    def _submit_recording(self) -> None:
+        if not self._recording:
+            return
+        vk = self._gpu.vk
+        cmd = self._command_buffer
+        with _api_errors():
+            if self._has_buffer_writes:
+                post_barrier = vk.VkMemoryBarrier(
+                    srcAccessMask=vk.VK_ACCESS_SHADER_WRITE_BIT,
+                    dstAccessMask=(
+                        vk.VK_ACCESS_HOST_READ_BIT
+                        | vk.VK_ACCESS_SHADER_READ_BIT
+                        | vk.VK_ACCESS_SHADER_WRITE_BIT
+                    ),
+                )
+                vk.vkCmdPipelineBarrier(
+                    cmd,
+                    vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    vk.VK_PIPELINE_STAGE_HOST_BIT | vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0,
+                    1,
+                    [post_barrier],
+                    0,
+                    None,
+                    0,
+                    None,
+                )
+            vk.vkEndCommandBuffer(cmd)
+            vk.vkResetFences(self._gpu.device, 1, [self._fence])
+            submit_info = vk.VkSubmitInfo(pCommandBuffers=[cmd])
+            vk.vkQueueSubmit(self._gpu.queue, 1, [submit_info], self._fence)
+            self._recording = False
+            self._has_buffer_writes = False
+            self._submitted = True
+            self._stats["submissions"] += 1
+
+    @contextmanager
+    def batch(self):
+        self._ensure_open()
+        self._batch_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+            if self._batch_depth == 0 and not self._closed:
+                self._submit_recording()
+
     def synchronize(self) -> None:
         self._ensure_open()
+        if self._recording:
+            self._submit_recording()
         if not self._submitted:
+            self._flush_retired()
             return
         vk = self._gpu.vk
         with _api_errors():
             vk.vkWaitForFences(self._gpu.device, 1, [self._fence], vk.VK_TRUE, 30_000_000_000)
             self._submitted = False
+            self._stats["waits"] += 1
+            self._flush_retired()
             self._gpu.check_validation()
 
     def close(self) -> None:
         if self._closed:
             return
         try:
-            if self._submitted:
+            if self._recording or self._submitted:
                 self.synchronize()
         finally:
+            self._flush_retired()
             for buf in self._buffers:
                 buf.close()
             for pipe in self._pipelines:

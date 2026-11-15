@@ -84,7 +84,7 @@ class _FakeMetalBridge:
         return self._alloc_id()
 
     def gfx_mtl_destroy_pipeline(self, handle):
-        pass
+        self.destroyed_pipelines = getattr(self, "destroyed_pipelines", 0) + 1
 
     def gfx_mtl_dispatch(self, ctx, pipe, bindings, num_bindings, rc_ptr, rc_size, gx, gy, gz, err_buf, err_cap):
         self.dispatches.append((pipe, num_bindings, (gx, gy, gz)))
@@ -192,6 +192,60 @@ class TestMetalComputeContract(unittest.TestCase):
                 self.assertTrue(ctx1.closed)
                 with self.assertRaises(PersistentComputeError):
                     ctx1.create_buffer(16)
+
+    def test_deferred_cleanup_and_stats_without_intermediate_waits(self) -> None:
+        fake = _FakeMetalBridge()
+
+        @compute(workgroup_size=(64, 1, 1))
+        def copy_kernel(
+            src: Buffer[Type.F32, "read_only"],
+            dst: Buffer[Type.F32, "write_only"],
+            params: MetalNoopParams,
+        ):
+            idx = i32(global_invocation_id().x)
+            if idx < params.n:
+                dst[idx] = src[idx]
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = compile_pipeline(
+                ComputePipeline(copy_kernel, Dispatch(grid=(1, 1, 1))),
+                Target.VULKAN,
+                Path(td) / "copy_vk",
+                TOOLS,
+            )
+            vk_prog = load_compute_program(manifest)
+            mtl_prog = replace(
+                vk_prog,
+                target="metal",
+                compute=replace(vk_prog.compute, code=b"MTLB"),
+            )
+            with (
+                mock.patch("mlir_gpu.metal_compute.sys.platform", "darwin"),
+                mock.patch("mlir_gpu.metal_compute._load_bridge", return_value=fake),
+            ):
+                with open_compute_context("metal") as ctx:
+                    b1 = ctx.create_buffer(16, b"abcd" * 4)
+                    b_tmp = ctx.create_buffer(16)
+                    b2 = ctx.create_buffer(16)
+                    pipe = ctx.compile_pipeline(mtl_prog)
+
+                    ctx.reset_stats()
+                    sync_before = fake.sync_calls
+                    with ctx.batch():
+                        pipe.dispatch({"src": b1, "dst": b_tmp}, parameters={"n": 4}, grid=(1, 1, 1))
+                        pipe.dispatch({"src": b_tmp, "dst": b2}, parameters={"n": 4}, grid=(1, 1, 1))
+                        b_tmp.close()
+                        pipe.close()
+                        self.assertEqual(fake.sync_calls, sync_before)
+                        self.assertEqual(ctx.stats["waits"], 0)
+                        self.assertEqual(ctx.stats["deferred_cleanups"], 2)
+                        self.assertGreater(len(fake.buffers), 0)
+
+                    _ = b2.download()
+                    self.assertEqual(ctx.stats["dispatches"], 2)
+                    self.assertEqual(ctx.stats["waits"], 1)
+                    self.assertEqual(fake.sync_calls, sync_before + 1)
+                    self.assertEqual(getattr(fake, "destroyed_pipelines", 0), 1)
 
 
 @unittest.skipUnless(

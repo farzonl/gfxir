@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import struct
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -51,13 +52,17 @@ class _FakeVk:
     VK_ACCESS_SHADER_WRITE_BIT = 8
     VK_PIPELINE_STAGE_HOST_BIT = 1
     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = 2
+    VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT = 1
     VK_TRUE = 1
 
     def __init__(self) -> None:
         self.mem_store: dict[int, bytearray] = {}
         self._next_id = 1
         self.wait_fences_calls = 0
+        self.queue_submit_calls = 0
+        self.dispatch_calls = 0
         self.destroyed_buffers: list[int] = []
+        self.destroyed_descriptor_pools: list[int] = []
 
     def _alloc_id(self) -> int:
         val = self._next_id
@@ -176,7 +181,7 @@ class _FakeVk:
         pass
 
     def vkCmdDispatch(self, *args):
-        pass
+        self.dispatch_calls += 1
 
     def vkEndCommandBuffer(self, cmd):
         pass
@@ -185,7 +190,13 @@ class _FakeVk:
         pass
 
     def vkQueueSubmit(self, queue, count, submits, fence):
+        self.queue_submit_calls += 1
+
+    def vkFreeDescriptorSets(self, device, pool, count, sets):
         pass
+
+    def vkDestroyDescriptorPool(self, device, pool, alloc):
+        self.destroyed_descriptor_pools.append(pool)
 
     def vkWaitForFences(self, device, count, fences, wait_all, timeout):
         self.wait_fences_calls += 1
@@ -290,6 +301,114 @@ class TestPersistentComputeValidation(unittest.TestCase):
             self.assertTrue(ctx1.closed)
             with self.assertRaises(PersistentComputeError):
                 ctx1.create_buffer(16)
+
+    def test_batched_dispatches_defer_waits_and_cleanup(self) -> None:
+        @compute(workgroup_size=(64, 1, 1))
+        def noop_kernel(
+            src: Buffer[Type.F32, "read_only"],
+            dst: Buffer[Type.F32, "write_only"],
+            params: TestNoopParams,
+        ):
+            idx = i32(global_invocation_id().x)
+            if idx < params.n:
+                dst[idx] = src[idx]
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = compile_pipeline(
+                ComputePipeline(noop_kernel, Dispatch(grid=(1, 1, 1))),
+                Target.VULKAN,
+                Path(td) / "noop_batch",
+                TOOLS,
+            )
+            with (
+                mock.patch.object(compute_runtime, "_Vulkan", _FakeVulkan),
+                mock.patch.object(compute_runtime, "_api_errors", nullcontext),
+            ):
+                with open_compute_context("vulkan") as ctx:
+                    vk = ctx._gpu.vk
+                    buf_a = ctx.create_buffer(16, initial_data=b"\x01" * 16)
+                    buf_b = ctx.create_buffer(16)
+                    buf_tmp = ctx.create_buffer(16)
+                    pipe = ctx.compile_pipeline(manifest)
+
+                    ctx.reset_stats()
+                    with ctx.batch():
+                        pipe.dispatch({"src": buf_a, "dst": buf_tmp}, parameters={"n": 4}, grid=(1, 1, 1))
+                        pipe.dispatch({"src": buf_tmp, "dst": buf_b}, parameters={"n": 4}, grid=(1, 1, 1))
+                        pipe.dispatch({"src": buf_b, "dst": buf_a}, parameters={"n": 4}, grid=(1, 1, 1))
+                        # Closing an intermediate buffer and pipeline mid-batch must defer destruction
+                        # without forcing a host wait.
+                        buf_tmp.close()
+                        pipe.close()
+                        self.assertEqual(ctx.stats["waits"], 0)
+                        self.assertEqual(vk.wait_fences_calls, 0)
+                        self.assertEqual(len(vk.destroyed_buffers), 0)
+                        self.assertEqual(ctx.stats["deferred_cleanups"], 2)
+
+                    # Batch exit submits once without waiting.
+                    self.assertEqual(ctx.stats["dispatches"], 3)
+                    self.assertEqual(ctx.stats["submissions"], 1)
+                    self.assertEqual(ctx.stats["waits"], 0)
+                    self.assertEqual(vk.queue_submit_calls, 1)
+                    self.assertEqual(vk.wait_fences_calls, 0)
+                    self.assertEqual(vk.dispatch_calls, 3)
+
+                    # Readback establishes completion and flushes deferred cleanups.
+                    _ = buf_a.download()
+                    self.assertEqual(ctx.stats["waits"], 1)
+                    self.assertEqual(vk.wait_fences_calls, 1)
+                    self.assertEqual(len(vk.destroyed_buffers), 1)
+                    self.assertEqual(len(vk.destroyed_descriptor_pools), 1)
+
+    def test_repeated_batches_and_partial_failure_recovery(self) -> None:
+        @compute(workgroup_size=(64, 1, 1))
+        def noop_kernel(
+            src: Buffer[Type.F32, "read_only"],
+            dst: Buffer[Type.F32, "write_only"],
+            params: TestNoopParams,
+        ):
+            idx = i32(global_invocation_id().x)
+            if idx < params.n:
+                dst[idx] = src[idx]
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = compile_pipeline(
+                ComputePipeline(noop_kernel, Dispatch(grid=(1, 1, 1))),
+                Target.VULKAN,
+                Path(td) / "noop_repeat",
+                TOOLS,
+            )
+            with (
+                mock.patch.object(compute_runtime, "_Vulkan", _FakeVulkan),
+                mock.patch.object(compute_runtime, "_api_errors", nullcontext),
+            ):
+                with open_compute_context("vulkan") as ctx:
+                    buf_a = ctx.create_buffer(16, initial_data=b"\x01" * 16)
+                    buf_b = ctx.create_buffer(16)
+                    pipe = ctx.compile_pipeline(manifest)
+
+                    # Repeated execution across multiple batches (exceeding descriptor cache size).
+                    for i in range(40):
+                        with ctx.batch():
+                            src, dst = (buf_a, buf_b) if i % 2 == 0 else (buf_b, buf_a)
+                            pipe.dispatch({"src": src, "dst": dst}, parameters={"n": 4}, grid=(1, 1, 1))
+                    ctx.synchronize()
+                    self.assertEqual(ctx.stats["dispatches"], 40)
+
+                    # Partial failure mid-batch leaves context usable for subsequent dispatches.
+                    with self.assertRaises(PersistentComputeError):
+                        with ctx.batch():
+                            pipe.dispatch({"src": buf_a, "dst": buf_b}, parameters={"n": 4}, grid=(1, 1, 1))
+                            pipe.dispatch({"src": buf_a}, parameters={"n": 4}, grid=(1, 1, 1))
+
+                    ctx.synchronize()
+                    ctx.reset_stats()
+                    with ctx.batch():
+                        pipe.dispatch({"src": buf_a, "dst": buf_b}, parameters={"n": 4}, grid=(1, 1, 1))
+                    _ = buf_b.download()
+                    self.assertEqual(ctx.stats["dispatches"], 1)
+                    self.assertEqual(ctx.stats["submissions"], 1)
+                    self.assertEqual(ctx.stats["waits"], 1)
 
 
 @unittest.skipUnless(
