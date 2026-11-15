@@ -248,26 +248,89 @@ class MetalBuffer(PersistentBuffer):
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise PersistentComputeError("upload data must be bytes, bytearray, or memoryview.")
         _validate_non_negative_int(offset, "upload offset")
-        payload = bytes(data)
-        if offset + len(payload) > self._size_bytes:
+        view = memoryview(data).cast("B")
+        nbytes = len(view)
+        if offset + nbytes > self._size_bytes:
             raise PersistentComputeError(
-                f"Upload range [{offset}, {offset + len(payload)}) exceeds buffer size {self._size_bytes}."
+                f"Upload range [{offset}, {offset + nbytes}) exceeds buffer size {self._size_bytes}."
             )
-        if not payload:
+        if nbytes == 0:
             return
         err_buf = ctypes.create_string_buffer(1024)
-        src = (ctypes.c_uint8 * len(payload)).from_buffer_copy(payload)
+        if not view.readonly and view.c_contiguous:
+            src = (ctypes.c_uint8 * nbytes).from_buffer(view)
+        else:
+            src = (ctypes.c_uint8 * nbytes).from_buffer_copy(view)
         rc = self._context._lib.gfx_mtl_upload_buffer(
             self._context._ctx_handle,
             self._handle,
             offset,
             ctypes.cast(src, ctypes.c_void_p),
-            len(payload),
+            nbytes,
             err_buf,
             len(err_buf),
         )
         if rc != 0:
             raise PersistentComputeError(_decode_err(err_buf))
+
+    def download_into(
+        self,
+        dst: bytearray | memoryview,
+        size_bytes: int | None = None,
+        offset: int = 0,
+    ) -> int:
+        self._ensure_open()
+        _validate_non_negative_int(offset, "download offset")
+        if offset > self._size_bytes:
+            raise PersistentComputeError(
+                f"Download offset {offset} exceeds buffer size {self._size_bytes}."
+            )
+        read_size = (self._size_bytes - offset) if size_bytes is None else _validate_non_negative_int(
+            size_bytes, "download size_bytes"
+        )
+        if offset + read_size > self._size_bytes:
+            raise PersistentComputeError(
+                f"Download range [{offset}, {offset + read_size}) exceeds buffer size {self._size_bytes}."
+            )
+        dst_view = memoryview(dst).cast("B")
+        if dst_view.readonly:
+            raise PersistentComputeError("download_into destination buffer must be writable.")
+        if len(dst_view) < read_size:
+            raise PersistentComputeError(
+                f"download_into destination buffer ({len(dst_view)} bytes) is smaller than {read_size} bytes."
+            )
+        if read_size == 0:
+            self._context.synchronize()
+            return 0
+        err_buf = ctypes.create_string_buffer(1024)
+        if dst_view.c_contiguous:
+            c_dst = (ctypes.c_uint8 * read_size).from_buffer(dst_view[:read_size])
+            rc = self._context._lib.gfx_mtl_download_buffer(
+                self._context._ctx_handle,
+                self._handle,
+                offset,
+                ctypes.cast(c_dst, ctypes.c_void_p),
+                read_size,
+                err_buf,
+                len(err_buf),
+            )
+            if rc != 0:
+                raise PersistentComputeError(_decode_err(err_buf))
+            return read_size
+        tmp = (ctypes.c_uint8 * read_size)()
+        rc = self._context._lib.gfx_mtl_download_buffer(
+            self._context._ctx_handle,
+            self._handle,
+            offset,
+            ctypes.cast(tmp, ctypes.c_void_p),
+            read_size,
+            err_buf,
+            len(err_buf),
+        )
+        if rc != 0:
+            raise PersistentComputeError(_decode_err(err_buf))
+        dst_view[:read_size] = tmp
+        return read_size
 
     def download(self, size_bytes: int | None = None, offset: int = 0) -> bytes:
         self._ensure_open()
@@ -287,7 +350,7 @@ class MetalBuffer(PersistentBuffer):
             self._context.synchronize()
             return b""
         err_buf = ctypes.create_string_buffer(1024)
-        dst = (ctypes.c_uint8 * read_size)()
+        dst = ctypes.create_string_buffer(read_size)
         rc = self._context._lib.gfx_mtl_download_buffer(
             self._context._ctx_handle,
             self._handle,
@@ -299,7 +362,7 @@ class MetalBuffer(PersistentBuffer):
         )
         if rc != 0:
             raise PersistentComputeError(_decode_err(err_buf))
-        return bytes(dst)
+        return dst.raw
 
     def close(self) -> None:
         if self._closed:

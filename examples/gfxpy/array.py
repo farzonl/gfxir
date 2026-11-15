@@ -171,6 +171,36 @@ class GfxArray:
         except Exception:
             pass
 
+    def download_into(self, dst: bytearray | memoryview | _stdlib_array.array) -> int:
+        """Synchronize and copy device bytes directly into a pre-allocated writable buffer."""
+        self._ensure_open()
+        if self._size == 0:
+            return 0
+        expected_bytes = self._size * self._dtype.itemsize
+        dst_view = memoryview(dst).cast("B")
+        if dst_view.readonly:
+            raise TypeError("download_into destination buffer must be writable.")
+        if len(dst_view) < expected_bytes:
+            raise ValueError(
+                f"Destination buffer ({len(dst_view)} bytes) is smaller than {expected_bytes} bytes."
+            )
+        assert self._buffer is not None
+        backend = self._device.backend
+        if hasattr(backend, "download_into"):
+            read_bytes = backend.download_into(self._buffer, dst_view[:expected_bytes])
+            if read_bytes != expected_bytes:
+                raise RuntimeError(
+                    f"Backend '{self._device.target}' returned {read_bytes} bytes, expected {expected_bytes}."
+                )
+            return read_bytes
+        raw = backend.download(self._buffer)
+        if len(raw) != expected_bytes:
+            raise RuntimeError(
+                f"Backend '{self._device.target}' returned {len(raw)} bytes, expected {expected_bytes}."
+            )
+        dst_view[:expected_bytes] = raw
+        return expected_bytes
+
     def tobytes(self) -> bytes:
         """Synchronize and download the raw little-endian device buffer bytes."""
         self._ensure_open()
@@ -187,13 +217,24 @@ class GfxArray:
 
     def toarray(self) -> _stdlib_array.array:
         """Synchronize and download the array into a stdlib array.array without float boxing."""
+        self._ensure_open()
         out = _stdlib_array.array(self._dtype.struct_code)
-        raw = self.tobytes()
-        if raw:
-            out.frombytes(raw)
-            if sys.byteorder != "little":
-                out.byteswap()
+        if self._size == 0:
+            return out
+        expected_bytes = self._size * self._dtype.itemsize
+        out.frombytes(b"\x00" * expected_bytes)
+        self.download_into(out)
+        if sys.byteorder != "little":
+            out.byteswap()
         return out
+
+    def tomemoryview(self) -> memoryview:
+        """Synchronize and return a typed memoryview over the downloaded array without float boxing."""
+        arr = self.toarray()
+        mv = memoryview(arr)
+        if self.ndim == 2:
+            return mv.cast("B").cast(self._dtype.struct_code, shape=self._shape)
+        return mv
 
     def tolist(self) -> list[Any]:
         """Synchronize and download the array contents to a Python list (or nested 2D list)."""

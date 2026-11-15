@@ -144,6 +144,10 @@ class GfxIRComputeBackend(ComputeBackend):
         assert isinstance(buf, PersistentBuffer)
         buf.upload(data)
 
+    def download_into(self, buf: ComputeBuffer, dst: bytearray | memoryview) -> int:
+        assert isinstance(buf, PersistentBuffer)
+        return buf.download_into(dst)
+
     def download(self, buf: ComputeBuffer) -> bytes:
         assert isinstance(buf, PersistentBuffer)
         return buf.download()

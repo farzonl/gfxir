@@ -267,6 +267,23 @@ class TestArrayContract(unittest.TestCase):
             self.assertEqual(empty_2d.toarray().tolist(), [])
             self.assertEqual(empty_2d.tolist(), [[], []])
 
+            mv1 = a1.tomemoryview()
+            self.assertEqual(mv1.shape, (3,))
+            self.assertEqual(mv1.tolist(), [1.5, -2.0, 3.25])
+
+            mv2 = a2.tomemoryview()
+            self.assertEqual(mv2.shape, (2, 3))
+            self.assertEqual(mv2.tolist(), [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+            dst = bytearray(24)
+            self.assertEqual(a2.download_into(dst), 24)
+            self.assertEqual(bytes(dst), struct.pack("<6f", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
+
+            with self.assertRaises(TypeError):
+                a1.download_into(memoryview(b"0" * 12))
+            with self.assertRaises(ValueError):
+                a1.download_into(bytearray(4))
+
 
 if __name__ == "__main__":
     unittest.main()
