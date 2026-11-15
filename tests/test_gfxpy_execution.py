@@ -146,6 +146,35 @@ class TestGfxPyBackendHost(unittest.TestCase):
             self.assertIn("No GPU device available", str(ctx.exception))
             self.assertIn("No fallback", str(ctx.exception))
 
+    def test_implicit_operations_reuse_context_and_compiled_pipelines(self) -> None:
+        ctx = _StubContext("vulkan")
+        gp.close_default_device()
+        try:
+            with (
+                mock.patch.object(sys, "platform", "linux"),
+                mock.patch("gfxpy.gpu_backend._open_context", return_value=ctx) as open_ctx,
+                mock.patch(
+                    "gfxpy.gpu_backend.compile_pipeline",
+                    return_value="dummy_manifest.json",
+                ) as compile_mock,
+            ):
+                a = gp.array([1.0, 2.0, 3.0])
+                b = gp.array([4.0, 5.0, 6.0])
+                c = gp.empty(3)
+                self.assertIs(a.device, b.device)
+                self.assertIs(a.device, c.device)
+
+                _ = ((a + b) * 2.0 + (a + b)).tolist()
+                d = gp.array([7.0, 8.0, 9.0])
+                _ = (d + a).tolist()
+
+                self.assertEqual(open_ctx.call_count, 1)
+                self.assertEqual(compile_mock.call_count, 2)
+                self.assertEqual(ctx.compiled_count, 2)
+                self.assertEqual(gp.current_device().backend.compiled_pipeline_count, 2)
+        finally:
+            gp.close_default_device()
+
 
 def _run_live_chain_check(
     test_case: unittest.TestCase,
@@ -236,3 +265,22 @@ class TestGfxPyLiveExecution(unittest.TestCase):
     def test_metal_chained_execution(self) -> None:
         validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
         _run_live_chain_check(self, target="metal", provider=None, validation=validation)
+
+    @unittest.skipUnless(
+        (sys.platform == "darwin" and os.environ.get("MLIR_GPU_TEST_METAL") == "1")
+        or (sys.platform == "win32" and os.environ.get("MLIR_GPU_TEST_DIRECTX") == "1")
+        or (sys.platform.startswith("linux") and os.environ.get("MLIR_GPU_TEST_VULKAN") == "1"),
+        "Opt-in live platform-default check (set MLIR_GPU_TEST_METAL=1, MLIR_GPU_TEST_DIRECTX=1, or MLIR_GPU_TEST_VULKAN=1)",
+    )
+    def test_implicit_default_device_execution(self) -> None:
+        gp.close_default_device()
+        try:
+            a = gp.array([1.0, 2.0, 3.0], dtype=gp.float32)
+            b = gp.array([4.0, 5.0, 6.0], dtype=gp.float32)
+            e = gp.empty(3, dtype=gp.float32)
+            self.assertIs(a.device, b.device)
+            self.assertIs(a.device, e.device)
+            self.assertEqual((a + b).tolist(), [5.0, 7.0, 9.0])
+            self.assertEqual((a * b).tolist(), [4.0, 10.0, 18.0])
+        finally:
+            gp.close_default_device()
