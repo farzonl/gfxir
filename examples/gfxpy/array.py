@@ -13,7 +13,7 @@ from .dtypes import DType, float32, resolve_dtype
 from .runtime import ComputeBuffer, Device, current_device
 from .targets import ArrayClosedError, CrossDeviceError, ShapeMismatchError
 
-_REDUCE_WORKGROUP_SIZE = 64
+_REDUCE_WORKGROUP_SIZE = 256
 
 
 def _is_scalar_number(value: object) -> bool:

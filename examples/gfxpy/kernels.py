@@ -13,12 +13,19 @@ from mlir_gpu import (
     global_invocation_id,
     i32,
     shared_array,
+    vec4,
     workgroup_barrier,
 )
 
-WORKGROUP_SIZE_1D = (64, 1, 1)
+WORKGROUP_SIZE_1D = (256, 1, 1)
 TILE_DIM = 16
-UNROLLED_TILE_STEPS = tuple(range(TILE_DIM))
+TILE_M = 64
+TILE_N = 64
+TILE_K = 16
+MATMUL_WG_X = 16
+MATMUL_WG_Y = 16
+UNROLLED_TILE_STEPS = tuple(range(TILE_K))
+UNROLLED_4 = (0, 1, 2, 3)
 
 BinaryElementwiseParams = ParameterBlock(
     "gfxpy_binary_params",
@@ -96,7 +103,7 @@ def reduce_sum_f32_kernel(
     out: Buffer[Type.F32, "write_only"],
     params: BinaryElementwiseParams,
 ):
-    shared_sum = shared_array(Type.F32, 64, name="reduce_sum")
+    shared_sum = shared_array(Type.F32, 256, name="reduce_sum")
     lx = i32(lid.x)
     gx = i32(gid.x)
     wx = i32(wid.x)
@@ -107,7 +114,7 @@ def reduce_sum_f32_kernel(
     shared_sum[lx] = val
     workgroup_barrier()
 
-    stride = 32
+    stride = 128
     while stride > 0:
         if lx < stride:
             shared_sum[lx] = shared_sum[lx] + shared_sum[lx + stride]
@@ -118,7 +125,7 @@ def reduce_sum_f32_kernel(
         out[wx] = shared_sum[0]
 
 
-@compute(workgroup_size=(TILE_DIM, TILE_DIM, 1))
+@compute(workgroup_size=(MATMUL_WG_X, MATMUL_WG_Y, 1))
 def tiled_matmul_f32_kernel(
     lid: LocalInvocationId,
     wid: WorkgroupId,
@@ -127,37 +134,97 @@ def tiled_matmul_f32_kernel(
     mat_c: Buffer[Type.F32, "write_only"],
     params: MatMulParams,
 ):
-    tile_a = shared_array(Type.F32, (TILE_DIM, TILE_DIM), name="tile_a")
-    tile_b = shared_array(Type.F32, (TILE_DIM, TILE_DIM), name="tile_b")
+    tile_a = shared_array(Type.F32, (TILE_M, TILE_K + 4), name="tile_a")
+    tile_b = shared_array(Type.F32, (TILE_K, TILE_N + 4), name="tile_b")
 
     lx = i32(lid.x)
     ly = i32(lid.y)
-    row = i32(wid.y) * TILE_DIM + ly
-    col = i32(wid.x) * TILE_DIM + lx
+    tid = ly * MATMUL_WG_X + lx
 
-    acc = 0.0
+    a_tile_row = tid // 4
+    a_tile_col_base = (tid % 4) * 4
+    a_global_row = i32(wid.y) * TILE_M + a_tile_row
+
+    b_tile_row = tid // 16
+    b_tile_col_base = (tid % 16) * 4
+    b_global_col_base = i32(wid.x) * TILE_N + b_tile_col_base
+
+    row_base = i32(wid.y) * TILE_M + ly * 4
+    col_base = i32(wid.x) * TILE_N + lx * 4
+
+    acc0 = vec4(0.0, 0.0, 0.0, 0.0)
+    acc1 = vec4(0.0, 0.0, 0.0, 0.0)
+    acc2 = vec4(0.0, 0.0, 0.0, 0.0)
+    acc3 = vec4(0.0, 0.0, 0.0, 0.0)
+
     for t in range(params.num_tiles):
-        a_col = t * TILE_DIM + lx
-        a_val = 0.0
-        if (row < params.m) and (a_col < params.k):
-            a_val = mat_a[row * params.k + a_col]
-        tile_a[ly, lx] = a_val
+        k_base = t * TILE_K
+        for u in UNROLLED_4:
+            ac = k_base + a_tile_col_base + u
+            av = 0.0
+            if (a_global_row < params.m) and (ac < params.k):
+                av = mat_a[a_global_row * params.k + ac]
+            tile_a[a_tile_row, a_tile_col_base + u] = av
 
-        b_row = t * TILE_DIM + ly
-        b_val = 0.0
-        if (b_row < params.k) and (col < params.n):
-            b_val = mat_b[b_row * params.n + col]
-        tile_b[ly, lx] = b_val
+            br = k_base + b_tile_row
+            bc = b_global_col_base + u
+            bv = 0.0
+            if (br < params.k) and (bc < params.n):
+                bv = mat_b[br * params.n + bc]
+            tile_b[b_tile_row, b_tile_col_base + u] = bv
 
         workgroup_barrier()
 
         for p in UNROLLED_TILE_STEPS:
-            acc = acc + tile_a[ly, p] * tile_b[p, lx]
+            a0 = tile_a[ly * 4 + 0, p]
+            a1 = tile_a[ly * 4 + 1, p]
+            a2 = tile_a[ly * 4 + 2, p]
+            a3 = tile_a[ly * 4 + 3, p]
+            b_vec = vec4(
+                tile_b[p, lx * 4 + 0],
+                tile_b[p, lx * 4 + 1],
+                tile_b[p, lx * 4 + 2],
+                tile_b[p, lx * 4 + 3],
+            )
+            acc0 = acc0 + vec4(a0, a0, a0, a0) * b_vec
+            acc1 = acc1 + vec4(a1, a1, a1, a1) * b_vec
+            acc2 = acc2 + vec4(a2, a2, a2, a2) * b_vec
+            acc3 = acc3 + vec4(a3, a3, a3, a3) * b_vec
 
         workgroup_barrier()
 
-    if (row < params.m) and (col < params.n):
-        mat_c[row * params.n + col] = acc
+    if ((row_base + 0) < params.m) and ((col_base + 0) < params.n):
+        mat_c[(row_base + 0) * params.n + col_base + 0] = acc0.x
+    if ((row_base + 0) < params.m) and ((col_base + 1) < params.n):
+        mat_c[(row_base + 0) * params.n + col_base + 1] = acc0.y
+    if ((row_base + 0) < params.m) and ((col_base + 2) < params.n):
+        mat_c[(row_base + 0) * params.n + col_base + 2] = acc0.z
+    if ((row_base + 0) < params.m) and ((col_base + 3) < params.n):
+        mat_c[(row_base + 0) * params.n + col_base + 3] = acc0.w
+    if ((row_base + 1) < params.m) and ((col_base + 0) < params.n):
+        mat_c[(row_base + 1) * params.n + col_base + 0] = acc1.x
+    if ((row_base + 1) < params.m) and ((col_base + 1) < params.n):
+        mat_c[(row_base + 1) * params.n + col_base + 1] = acc1.y
+    if ((row_base + 1) < params.m) and ((col_base + 2) < params.n):
+        mat_c[(row_base + 1) * params.n + col_base + 2] = acc1.z
+    if ((row_base + 1) < params.m) and ((col_base + 3) < params.n):
+        mat_c[(row_base + 1) * params.n + col_base + 3] = acc1.w
+    if ((row_base + 2) < params.m) and ((col_base + 0) < params.n):
+        mat_c[(row_base + 2) * params.n + col_base + 0] = acc2.x
+    if ((row_base + 2) < params.m) and ((col_base + 1) < params.n):
+        mat_c[(row_base + 2) * params.n + col_base + 1] = acc2.y
+    if ((row_base + 2) < params.m) and ((col_base + 2) < params.n):
+        mat_c[(row_base + 2) * params.n + col_base + 2] = acc2.z
+    if ((row_base + 2) < params.m) and ((col_base + 3) < params.n):
+        mat_c[(row_base + 2) * params.n + col_base + 3] = acc2.w
+    if ((row_base + 3) < params.m) and ((col_base + 0) < params.n):
+        mat_c[(row_base + 3) * params.n + col_base + 0] = acc3.x
+    if ((row_base + 3) < params.m) and ((col_base + 1) < params.n):
+        mat_c[(row_base + 3) * params.n + col_base + 1] = acc3.y
+    if ((row_base + 3) < params.m) and ((col_base + 2) < params.n):
+        mat_c[(row_base + 3) * params.n + col_base + 2] = acc3.z
+    if ((row_base + 3) < params.m) and ((col_base + 3) < params.n):
+        mat_c[(row_base + 3) * params.n + col_base + 3] = acc3.w
 
 
 def compute_grid_1d(length: int) -> tuple[int, int, int]:
@@ -172,7 +239,7 @@ def compute_matmul_grid(m: int, n: int) -> tuple[int, int, int]:
     """Compute 2D workgroup dispatch grid for tiled matrix multiplication."""
     if m <= 0 or n <= 0:
         raise ValueError(f"compute_matmul_grid requires positive dimensions, got ({m}, {n}).")
-    return ((n + TILE_DIM - 1) // TILE_DIM, (m + TILE_DIM - 1) // TILE_DIM, 1)
+    return ((n + TILE_N - 1) // TILE_N, (m + TILE_M - 1) // TILE_M, 1)
 
 
 BINARY_KERNELS = {

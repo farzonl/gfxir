@@ -25,8 +25,10 @@ from mlir_gpu.viewer import _preview_toolchain
 
 from .kernels import (
     BINARY_KERNELS,
+    MATMUL_WG_X,
+    MATMUL_WG_Y,
     SCALAR_KERNELS,
-    TILE_DIM,
+    TILE_K,
     WORKGROUP_SIZE_1D,
     compute_grid_1d,
     compute_matmul_grid,
@@ -300,8 +302,8 @@ class GfxIRComputeBackend(ComputeBackend):
         assert isinstance(a, PersistentBuffer)
         assert isinstance(b, PersistentBuffer)
         assert isinstance(out, PersistentBuffer)
-        pipe = self._get_or_compile("tiled_matmul", tiled_matmul_f32_kernel, (TILE_DIM, TILE_DIM, 1))
-        num_tiles = (k + TILE_DIM - 1) // TILE_DIM
+        pipe = self._get_or_compile("tiled_matmul", tiled_matmul_f32_kernel, (MATMUL_WG_X, MATMUL_WG_Y, 1))
+        num_tiles = (k + TILE_K - 1) // TILE_K
         pipe.dispatch(
             {"mat_a": a, "mat_b": b, "mat_c": out},
             parameters={"m": m, "n": n, "k": k, "num_tiles": num_tiles},
