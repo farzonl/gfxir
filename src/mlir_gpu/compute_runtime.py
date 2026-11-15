@@ -387,6 +387,15 @@ class ComputeContext(ABC):
         """Whether execution uses a software/CPU adapter, or None if unknown."""
         return None
 
+    def supports_capability(self, capability: str) -> bool:
+        """Return whether the runtime device supports the given named capability."""
+        return False
+
+    @property
+    def cooperative_matrix_configs(self) -> tuple[tuple[int, int, int], ...]:
+        """Supported (M, N, K) f32 subgroup cooperative matrix shapes, if any."""
+        return ()
+
     @property
     @abstractmethod
     def closed(self) -> bool:
@@ -888,6 +897,15 @@ class VulkanComputeContext(ComputeContext):
     @property
     def is_software(self) -> bool:
         return self._gpu.is_software
+
+    def supports_capability(self, capability: str) -> bool:
+        if capability == "cooperative_matrix":
+            return bool(self._gpu.cooperative_matrix_configs)
+        return False
+
+    @property
+    def cooperative_matrix_configs(self) -> tuple[tuple[int, int, int], ...]:
+        return self._gpu.cooperative_matrix_configs
 
     @property
     def closed(self) -> bool:

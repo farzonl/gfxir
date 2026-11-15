@@ -17,7 +17,8 @@ from .frontend import (
     _normalize_resource_annotation,
     atomic_add, atomic_and, atomic_compare_exchange, atomic_exchange,
     atomic_max, atomic_min, atomic_or, atomic_sub, atomic_umax, atomic_umin,
-    atomic_xor, full_barrier, global_invocation_id, load_texture,
+    atomic_xor, coop_matrix_load, coop_matrix_mul_add, coop_matrix_store,
+    coop_matrix_zero, full_barrier, global_invocation_id, load_texture,
     local_invocation_id, maximum, minimum, sample_texture, sample_texture_level,
     select, shared_array, storage_barrier, workgroup_barrier, workgroup_id,
 )
@@ -140,6 +141,18 @@ for _module in (shader_math, sdf):
         if not name.startswith("_") and isinstance(value, FunctionType)
         and value.__module__ == _module.__name__
     )
+
+
+@dataclass(frozen=True)
+class _CoopMatrixType:
+    rows: int
+    cols: int
+    element_type: Type
+    use: str
+
+    @property
+    def schema_name(self) -> str:
+        return f"!gfx.coop_matrix<{self.rows} x {self.cols} x {self.element_type.schema_name}, {self.use}>"
 
 
 @dataclass(frozen=True)
@@ -737,6 +750,14 @@ class ASTLowering:
             return self._call_atomic_rmw(function, args, kwargs)
         if function is atomic_compare_exchange:
             return self._call_atomic_cas(args, kwargs)
+        if function is coop_matrix_zero:
+            return self._call_coop_matrix_zero(args, kwargs)
+        if function is coop_matrix_load:
+            return self._call_coop_matrix_load(args, kwargs)
+        if function is coop_matrix_mul_add:
+            return self._call_coop_matrix_mul_add(args, kwargs)
+        if function is coop_matrix_store:
+            return self._call_coop_matrix_store(args, kwargs)
         if function is sample_texture:
             return self._call_sample_texture(args, kwargs)
         if function is sample_texture_level:
@@ -1160,6 +1181,102 @@ class ASTLowering:
         )
         self.structured = True
         return self.builder.bind(res_ref, target.element_type)
+
+    def _validate_coop_matrix_args(self, rows: Any, cols: Any, element_type: Any, use: Any) -> _CoopMatrixType:
+        if type(rows) is not int or rows <= 0 or type(cols) is not int or cols <= 0:
+            self.fail(f"Cooperative matrix dimensions must be positive integers, got ({rows!r}, {cols!r}).")
+        elem = _normalize_buffer_element_type(element_type)
+        if elem is None:
+            self.fail(f"Unsupported cooperative matrix element type: {element_type!r}.")
+        if use not in ("a", "b", "acc"):
+            self.fail(f"Cooperative matrix use must be 'a', 'b', or 'acc', got {use!r}.")
+        return _CoopMatrixType(rows, cols, elem, use)
+
+    def _coerce_i32_ref(self, value: Any, label: str) -> _Ref:
+        if isinstance(value, Value):
+            val = value if value.node.type == Type.I32 else i32(value)
+        elif type(value) is int and not isinstance(value, bool):
+            val = self.lift(value, Type.I32)
+        else:
+            self.fail(f"{label} must be an integer or i32 Value, got {type(value).__name__}.")
+        return self.builder.emit(val.node)
+
+    def _call_coop_matrix_zero(self, args, kwargs) -> Value:
+        if self.workgroup_size is None:
+            self.fail("coop_matrix_zero() is only allowed inside a @compute kernel.")
+        use = kwargs.pop("use", "acc")
+        if kwargs or len(args) != 3:
+            self.fail("coop_matrix_zero() expects (rows, cols, element_type, *, use='acc').")
+        coop_type = self._validate_coop_matrix_args(args[0], args[1], args[2], use)
+        res_ref, = self.builder.raw("gfx.coop_matrix_zero", [], types=[coop_type.schema_name])
+        self.structured = True
+        return self.builder.bind(res_ref, coop_type)
+
+    def _call_coop_matrix_load(self, args, kwargs) -> Value:
+        if self.workgroup_size is None:
+            self.fail("coop_matrix_load() is only allowed inside a @compute kernel.")
+        use = kwargs.pop("use", "a")
+        row_major = kwargs.pop("row_major", True)
+        if kwargs or len(args) not in (5, 6):
+            self.fail("coop_matrix_load() expects (target, index, stride, rows, cols, [use], *, row_major=True).")
+        target, index, stride, rows, cols = args[:5]
+        if len(args) == 6:
+            use = args[5]
+        if not isinstance(target, (_BufferProxy, _SharedArrayProxy)):
+            self.fail("coop_matrix_load() target must be a Buffer or shared_array.")
+        if type(row_major) is not bool:
+            self.fail("coop_matrix_load() row_major must be a bool.")
+        coop_type = self._validate_coop_matrix_args(rows, cols, target.element_type, use)
+        off_ref = self._element_ptr_ref(target, index)
+        stride_ref = self._coerce_i32_ref(stride, "coop_matrix_load() stride")
+        res_ref, = self.builder.raw(
+            "gfx.coop_matrix_load",
+            [off_ref, stride_ref],
+            types=[coop_type.schema_name],
+            attributes={"row_major": {"kind": "literal", "type": "i1", "value": row_major}},
+        )
+        self.structured = True
+        return self.builder.bind(res_ref, coop_type)
+
+    def _call_coop_matrix_mul_add(self, args, kwargs) -> Value:
+        if self.workgroup_size is None:
+            self.fail("coop_matrix_mul_add() is only allowed inside a @compute kernel.")
+        if kwargs or len(args) != 3:
+            self.fail("coop_matrix_mul_add() expects (a, b, c).")
+        a, b, c = args
+        for operand in (a, b, c):
+            if not isinstance(operand, Value) or not isinstance(operand.node.type, _CoopMatrixType):
+                self.fail("coop_matrix_mul_add() operands must be cooperative matrix values.")
+        res_ref, = self.builder.raw(
+            "gfx.coop_matrix_mul_add",
+            [self.builder.emit(a.node), self.builder.emit(b.node), self.builder.emit(c.node)],
+            types=[c.node.type.schema_name],
+        )
+        self.structured = True
+        return self.builder.bind(res_ref, c.node.type)
+
+    def _call_coop_matrix_store(self, args, kwargs) -> None:
+        if self.workgroup_size is None:
+            self.fail("coop_matrix_store() is only allowed inside a @compute kernel.")
+        row_major = kwargs.pop("row_major", True)
+        if kwargs or len(args) != 4:
+            self.fail("coop_matrix_store() expects (target, index, matrix, stride, *, row_major=True).")
+        target, index, matrix, stride = args
+        if not isinstance(target, (_BufferProxy, _SharedArrayProxy)):
+            self.fail("coop_matrix_store() target must be a Buffer or shared_array.")
+        if not isinstance(matrix, Value) or not isinstance(matrix.node.type, _CoopMatrixType):
+            self.fail("coop_matrix_store() matrix must be a cooperative matrix value.")
+        if type(row_major) is not bool:
+            self.fail("coop_matrix_store() row_major must be a bool.")
+        off_ref = self._element_ptr_ref(target, index)
+        stride_ref = self._coerce_i32_ref(stride, "coop_matrix_store() stride")
+        self.builder.raw(
+            "gfx.coop_matrix_store",
+            [off_ref, self.builder.emit(matrix.node), stride_ref],
+            attributes={"row_major": {"kind": "literal", "type": "i1", "value": row_major}},
+        )
+        self.structured = True
+        return None
 
     def _coerce_uv_operand(self, uv: Any, fn_name: str) -> _Ref:
         if isinstance(uv, (tuple, list)) and len(uv) == 2:

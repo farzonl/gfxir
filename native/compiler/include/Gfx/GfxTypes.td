@@ -43,4 +43,14 @@ def Gfx_StructType : TypeDef<Gfx_Dialect, "Struct"> {
   let parameters = (ins StringRefParameter<>:$name, "::mlir::ArrayAttr":$fields);
   let assemblyFormat = "`<` $name `,` $fields `>`";
 }
+
+def Gfx_CoopMatrixType : TypeDef<Gfx_Dialect, "CoopMatrix"> {
+  let mnemonic = "coop_matrix";
+  let summary = "Subgroup cooperative matrix tile";
+  let parameters = (ins "uint32_t":$rows,
+                        "uint32_t":$cols,
+                        "::mlir::Type":$elementType,
+                        EnumParameter<Gfx_CoopMatrixUse>:$use);
+  let assemblyFormat = "`<` $rows `x` $cols `x` $elementType `,` $use `>`";
+}
 #endif

@@ -282,4 +282,49 @@ def Gfx_TextureLoadOp : Gfx_Op<"texture_load", [MemoryEffects<[MemRead]>]> {
   }];
   let hasVerifier = 1;
 }
+
+def Gfx_CoopMatrixZeroOp : Gfx_Op<"coop_matrix_zero", [Pure]> {
+  let summary = "Create a zero-initialized cooperative matrix tile";
+  let results = (outs Gfx_CoopMatrixType:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
+def Gfx_CoopMatrixLoadOp : Gfx_Op<"coop_matrix_load", [MemoryEffects<[MemRead]>]> {
+  let summary = "Load a cooperative matrix tile from a device pointer";
+  let arguments = (ins
+    Gfx_PtrType:$ptr,
+    Gfx_IntegerOrIndex:$stride,
+    BoolAttr:$row_major
+  );
+  let results = (outs Gfx_CoopMatrixType:$result);
+  let assemblyFormat = [{
+    $ptr `,` $stride `,` $row_major attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def Gfx_CoopMatrixMulAddOp : Gfx_Op<"coop_matrix_mul_add", [Pure, AllTypesMatch<["c", "result"]>]> {
+  let summary = "Compute (A * B) + C on cooperative matrix tiles";
+  let arguments = (ins
+    Gfx_CoopMatrixType:$a,
+    Gfx_CoopMatrixType:$b,
+    Gfx_CoopMatrixType:$c
+  );
+  let results = (outs Gfx_CoopMatrixType:$result);
+  let assemblyFormat = [{
+    $a `,` $b `,` $c attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def Gfx_CoopMatrixStoreOp : Gfx_Op<"coop_matrix_store", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Store a cooperative matrix tile to a device pointer";
+  let arguments = (ins
+    Gfx_PtrType:$ptr,
+    Gfx_CoopMatrixType:$matrix,
+    Gfx_IntegerOrIndex:$stride,
+    BoolAttr:$row_major
+  );
+  let assemblyFormat = [{
+    $ptr `,` $matrix `,` $stride `,` $row_major attr-dict `:` type($ptr) `,` type($matrix) `,` type($stride)
+  }];
+}
 #endif

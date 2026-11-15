@@ -558,15 +558,15 @@ def _compile_stage(
     ])
     if target == Target.VULKAN:
         _check_binary(output, b"\x03\x02\x23\x07", 20)
-        spirv_env = (
-            "vulkan1.2"
-            if target_profile is not None
-            and (
-                target_profile.supports_capability("buffer_device_address")
-                or target_profile.supports_capability("PhysicalStorageBuffer64")
-            )
-            else "vulkan1.0"
-        )
+        if target_profile is not None and target_profile.supports_capability("cooperative_matrix"):
+            spirv_env = "vulkan1.3"
+        elif target_profile is not None and (
+            target_profile.supports_capability("buffer_device_address")
+            or target_profile.supports_capability("PhysicalStorageBuffer64")
+        ):
+            spirv_env = "vulkan1.2"
+        else:
+            spirv_env = "vulkan1.0"
         _run([tools["spirv-val"], "--target-env", spirv_env, str(output)])
         return output.name
     unsigned = directory / f"{stem}.unsigned.dxil"

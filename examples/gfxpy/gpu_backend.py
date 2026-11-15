@@ -12,6 +12,7 @@ from mlir_gpu import (
     ComputePipeline,
     Dispatch,
     Target,
+    TargetProfile,
     Toolchain,
     compile_pipeline,
 )
@@ -30,6 +31,7 @@ from .kernels import (
     WORKGROUP_SIZE_1D,
     compute_grid_1d,
     compute_matmul_grid,
+    make_coop_matmul_f32_kernel,
     reduce_sum_f32_kernel,
     tiled_matmul_f32_kernel,
 )
@@ -144,6 +146,7 @@ class GfxIRComputeBackend(ComputeBackend):
         *,
         cache_key: tuple[object, ...] | None = None,
         artifact_subdir: str | None = None,
+        target_profile: TargetProfile | None = None,
     ) -> PersistentPipeline:
         resolved_key = cache_key or self._pipeline_cache_key(op_key, workgroup_size)
         cached = self._pipelines.get(resolved_key)
@@ -151,11 +154,15 @@ class GfxIRComputeBackend(ComputeBackend):
             return cached
 
         out_dir = Path(self._artifact_dir.name) / (artifact_subdir or op_key)
+        compile_kwargs: dict[str, Any] = {}
+        if target_profile is not None:
+            compile_kwargs["target_profile"] = target_profile
         manifest = compile_pipeline(
             ComputePipeline(kernel, Dispatch(grid=(1, 1, 1))),
             _TARGET_MAP[self._target],
             out_dir,
             self._toolchain,
+            **compile_kwargs,
         )
         pipe = self._ctx.compile_pipeline(manifest)
         self._pipelines[resolved_key] = pipe
@@ -288,6 +295,19 @@ class GfxIRComputeBackend(ComputeBackend):
             grid=compute_grid_1d(length),
         )
 
+    def _select_coop_matmul_shape(self, m: int, n: int, k: int) -> tuple[int, int, int] | None:
+        if not self._ctx.supports_capability("cooperative_matrix"):
+            return None
+        configs = sorted(
+            self._ctx.cooperative_matrix_configs,
+            key=lambda cfg: cfg[0] * cfg[1] * cfg[2],
+            reverse=True,
+        )
+        for tile_m, tile_n, tile_k in configs:
+            if m % tile_m == 0 and n % tile_n == 0 and k % tile_k == 0:
+                return (tile_m, tile_n, tile_k)
+        return None
+
     def matmul(
         self,
         a: ComputeBuffer,
@@ -300,6 +320,26 @@ class GfxIRComputeBackend(ComputeBackend):
         assert isinstance(a, PersistentBuffer)
         assert isinstance(b, PersistentBuffer)
         assert isinstance(out, PersistentBuffer)
+        coop_shape = self._select_coop_matmul_shape(m, n, k)
+        if coop_shape is not None:
+            tile_m, tile_n, tile_k = coop_shape
+            op_key = f"coop_matmul_{tile_m}x{tile_n}x{tile_k}"
+            pipe = self._get_or_compile(
+                op_key,
+                make_coop_matmul_f32_kernel(tile_m, tile_n, tile_k),
+                (32, 1, 1),
+                target_profile=TargetProfile(
+                    spirv_version="1.6",
+                    required_capabilities=("cooperative_matrix",),
+                ),
+            )
+            pipe.dispatch(
+                {"mat_a": a, "mat_b": b, "mat_c": out},
+                parameters={"m": m, "n": n, "k": k, "num_tiles": k // tile_k},
+                grid=(n // tile_n, m // tile_m, 1),
+            )
+            return
+
         pipe = self._get_or_compile("tiled_matmul", tiled_matmul_f32_kernel, (TILE_DIM, TILE_DIM, 1))
         num_tiles = (k + TILE_DIM - 1) // TILE_DIM
         pipe.dispatch(

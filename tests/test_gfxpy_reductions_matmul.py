@@ -104,6 +104,53 @@ class TestReductionsAndMatmulHost(unittest.TestCase):
             self.assertTrue(Path(m_red).is_file())
             self.assertTrue(Path(m_mm).is_file())
 
+    def test_cooperative_matrix_matmul_compiles_and_selects_with_fallback(self) -> None:
+        from mlir_gpu import CompileError, TargetProfile
+        from examples.gfxpy.gpu_backend import GfxIRComputeBackend
+        from examples.gfxpy.kernels import make_coop_matmul_f32_kernel
+
+        coop_kernel = make_coop_matmul_f32_kernel(16, 16, 16)
+        profile = TargetProfile(spirv_version="1.6", required_capabilities=("cooperative_matrix",))
+        with tempfile.TemporaryDirectory() as td:
+            manifest = compile_pipeline(
+                ComputePipeline(coop_kernel, Dispatch(grid=(1, 1, 1))),
+                Target.VULKAN,
+                Path(td) / "coop_matmul",
+                TOOLS,
+                target_profile=profile,
+            )
+            self.assertTrue(Path(manifest).is_file())
+            self.assertTrue((Path(td) / "coop_matmul" / "compute.spv").is_file())
+
+            with self.assertRaises(CompileError):
+                compile_pipeline(
+                    ComputePipeline(coop_kernel, Dispatch(grid=(1, 1, 1))),
+                    Target.DIRECTX,
+                    Path(td) / "coop_matmul_dx",
+                    TOOLS,
+                )
+
+        class _FakeCtx:
+            def __init__(self, configs):
+                self._configs = configs
+
+            def supports_capability(self, cap: str) -> bool:
+                return cap == "cooperative_matrix" and bool(self._configs)
+
+            @property
+            def cooperative_matrix_configs(self):
+                return self._configs
+
+        backend_supported = object.__new__(GfxIRComputeBackend)
+        backend_supported._ctx = _FakeCtx(((8, 8, 8), (16, 16, 16)))
+        self.assertEqual(backend_supported._select_coop_matmul_shape(64, 64, 64), (16, 16, 16))
+        self.assertEqual(backend_supported._select_coop_matmul_shape(24, 24, 24), (8, 8, 8))
+        self.assertIsNone(backend_supported._select_coop_matmul_shape(37, 53, 29))
+
+        backend_unsupported = object.__new__(GfxIRComputeBackend)
+        backend_unsupported._ctx = _FakeCtx(())
+        self.assertIsNone(backend_unsupported._select_coop_matmul_shape(64, 64, 64))
+
     def test_multi_dispatch_sum_stays_device_resident_and_cleans_intermediates(self) -> None:
         backend = _SpyReductionMatmulBackend("vulkan")
         with mock.patch.dict(sys.modules, {"numpy": None}):
