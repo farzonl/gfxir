@@ -84,6 +84,15 @@ class _FakeMetalBridge:
         ctypes.memmove(out_ptr, raw, read_size)
         return 0
 
+    def gfx_mtl_buffer_contents(self, ctx, handle, out_size_ptr, err_buf, err_cap):
+        buf = self.buffers[handle]
+        if not hasattr(self, "_backing"):
+            self._backing = {}
+        c_arr = (ctypes.c_uint8 * len(buf)).from_buffer(buf)
+        self._backing[handle] = c_arr
+        ctypes.cast(out_size_ptr, ctypes.POINTER(ctypes.c_uint64))[0] = len(buf)
+        return ctypes.addressof(c_arr)
+
     def gfx_mtl_create_pipeline(self, ctx, path, entry, wg_x, wg_y, wg_z, err_buf, err_cap):
         handle = self._alloc_id()
         self.pipelines.add(handle)
@@ -321,6 +330,10 @@ class TestMetalComputeContract(unittest.TestCase):
                     self.assertEqual(ctx.stats["waits"], 1)
                     self.assertEqual(fake.sync_calls, sync_before + 1)
                     self.assertEqual(getattr(fake, "destroyed_pipelines", 0), 1)
+                    with b2.map_view() as view:
+                        self.assertEqual(len(view), 16)
+                        view[:4] = b"WXYZ"
+                    self.assertEqual(b2.download()[:4], b"WXYZ")
 
     def test_dropped_buffers_and_pipelines_release_native_allocations_and_keep_tracking_bounded(self) -> None:
         import gc

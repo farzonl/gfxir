@@ -538,6 +538,19 @@ class VulkanBuffer(PersistentBuffer):
             mapped = self._ensure_mapped()
             return bytes(mapped[offset : offset + read_size])
 
+    @contextmanager
+    def map_view(self):
+        """Synchronize pending GPU work and yield a zero-copy byte memoryview over mapped memory."""
+        self._ensure_open()
+        self._context.synchronize()
+        with _api_errors():
+            mapped = self._ensure_mapped()
+            view = memoryview(mapped).cast("B")[: self._size_bytes]
+        try:
+            yield view
+        finally:
+            view.release()
+
     def _destroy_vk_resources(self) -> None:
         gpu = self._context._gpu
         vk = gpu.vk

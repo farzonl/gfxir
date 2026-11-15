@@ -181,6 +181,15 @@ def _load_bridge() -> ctypes.CDLL:
     ]
     lib.gfx_mtl_download_buffer.restype = ctypes.c_int
 
+    lib.gfx_mtl_buffer_contents.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.gfx_mtl_buffer_contents.restype = ctypes.c_void_p
+
     lib.gfx_mtl_create_pipeline.argtypes = [
         ctypes.c_void_p,
         ctypes.c_char_p,
@@ -378,6 +387,30 @@ class MetalBuffer(PersistentBuffer):
         if rc != 0:
             raise PersistentComputeError(_decode_err(err_buf))
         return dst.raw
+
+    @contextmanager
+    def map_view(self):
+        """Synchronize pending GPU work and yield a zero-copy byte memoryview over the shared buffer."""
+        self._ensure_open()
+        self._context.synchronize()
+        err_buf = ctypes.create_string_buffer(1024)
+        out_size = ctypes.c_uint64(0)
+        ptr = self._context._lib.gfx_mtl_buffer_contents(
+            self._context._ctx_handle,
+            self._handle,
+            ctypes.byref(out_size),
+            err_buf,
+            len(err_buf),
+        )
+        if not ptr:
+            raise PersistentComputeError(_decode_err(err_buf))
+        size = int(out_size.value) or self._size_bytes
+        c_arr = (ctypes.c_uint8 * size).from_address(int(ptr))
+        view = memoryview(c_arr).cast("B")
+        try:
+            yield view
+        finally:
+            view.release()
 
     def close(self) -> None:
         if self._closed:
