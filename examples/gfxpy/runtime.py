@@ -61,6 +61,23 @@ class ComputeBackend(Protocol):
         length: int,
     ) -> None: ...
 
+    def reduce_sum_pass(
+        self,
+        inp: ComputeBuffer,
+        out: ComputeBuffer,
+        length: int,
+    ) -> None: ...
+
+    def matmul(
+        self,
+        a: ComputeBuffer,
+        b: ComputeBuffer,
+        out: ComputeBuffer,
+        m: int,
+        n: int,
+        k: int,
+    ) -> None: ...
+
     def close(self) -> None: ...
 
 
@@ -107,6 +124,25 @@ class UninitializedBackend:
         length: int,
     ) -> None:
         raise BackendNotImplementedError(self._target, f"scalar_op:{op}")
+
+    def reduce_sum_pass(
+        self,
+        inp: ComputeBuffer,
+        out: ComputeBuffer,
+        length: int,
+    ) -> None:
+        raise BackendNotImplementedError(self._target, "reduce_sum_pass")
+
+    def matmul(
+        self,
+        a: ComputeBuffer,
+        b: ComputeBuffer,
+        out: ComputeBuffer,
+        m: int,
+        n: int,
+        k: int,
+    ) -> None:
+        raise BackendNotImplementedError(self._target, "matmul")
 
     def close(self) -> None:
         self._closed = True

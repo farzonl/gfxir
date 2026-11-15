@@ -21,7 +21,16 @@ from mlir_gpu.compute_runtime import (
 )
 from mlir_gpu.viewer import _preview_toolchain
 
-from .kernels import BINARY_KERNELS, SCALAR_KERNELS, WORKGROUP_SIZE_1D, compute_grid_1d
+from .kernels import (
+    BINARY_KERNELS,
+    SCALAR_KERNELS,
+    TILE_DIM,
+    WORKGROUP_SIZE_1D,
+    compute_grid_1d,
+    compute_matmul_grid,
+    reduce_sum_f32_kernel,
+    tiled_matmul_f32_kernel,
+)
 from .runtime import ComputeBackend, ComputeBuffer
 from .targets import BackendInitializationError
 
@@ -93,17 +102,26 @@ class GfxIRComputeBackend(ComputeBackend):
     def compiled_pipeline_count(self) -> int:
         return len(self._pipelines)
 
-    def _pipeline_cache_key(self, op_key: str) -> tuple[object, ...]:
+    def _pipeline_cache_key(
+        self,
+        op_key: str,
+        workgroup_size: tuple[int, int, int] = WORKGROUP_SIZE_1D,
+    ) -> tuple[object, ...]:
         return (
             self._target,
             op_key,
             "float32",
-            WORKGROUP_SIZE_1D,
+            workgroup_size,
             id(self._toolchain),
         )
 
-    def _get_or_compile(self, op_key: str, kernel: Any) -> PersistentPipeline:
-        cache_key = self._pipeline_cache_key(op_key)
+    def _get_or_compile(
+        self,
+        op_key: str,
+        kernel: Any,
+        workgroup_size: tuple[int, int, int] = WORKGROUP_SIZE_1D,
+    ) -> PersistentPipeline:
+        cache_key = self._pipeline_cache_key(op_key, workgroup_size)
         cached = self._pipelines.get(cache_key)
         if cached is not None and not cached.closed:
             return cached
@@ -167,6 +185,41 @@ class GfxIRComputeBackend(ComputeBackend):
             {"lhs": lhs, "out": out},
             parameters={"n": length, "scalar": float(scalar)},
             grid=compute_grid_1d(length),
+        )
+
+    def reduce_sum_pass(
+        self,
+        inp: ComputeBuffer,
+        out: ComputeBuffer,
+        length: int,
+    ) -> None:
+        assert isinstance(inp, PersistentBuffer)
+        assert isinstance(out, PersistentBuffer)
+        pipe = self._get_or_compile("reduce_sum", reduce_sum_f32_kernel, WORKGROUP_SIZE_1D)
+        pipe.dispatch(
+            {"inp": inp, "out": out},
+            parameters={"n": length},
+            grid=compute_grid_1d(length),
+        )
+
+    def matmul(
+        self,
+        a: ComputeBuffer,
+        b: ComputeBuffer,
+        out: ComputeBuffer,
+        m: int,
+        n: int,
+        k: int,
+    ) -> None:
+        assert isinstance(a, PersistentBuffer)
+        assert isinstance(b, PersistentBuffer)
+        assert isinstance(out, PersistentBuffer)
+        pipe = self._get_or_compile("tiled_matmul", tiled_matmul_f32_kernel, (TILE_DIM, TILE_DIM, 1))
+        num_tiles = (k + TILE_DIM - 1) // TILE_DIM
+        pipe.dispatch(
+            {"mat_a": a, "mat_b": b, "mat_c": out},
+            parameters={"m": m, "n": n, "k": k, "num_tiles": num_tiles},
+            grid=compute_matmul_grid(m, n),
         )
 
     def synchronize(self) -> None:
