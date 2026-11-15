@@ -74,4 +74,12 @@ if(APPLE)
   target_link_libraries(mlir-gpu-metal-view PRIVATE
     "-framework Cocoa" "-framework Metal" "-framework MetalKit")
   install(TARGETS mlir-gpu-metal-view RUNTIME DESTINATION bin)
+
+  add_library(mlir-gpu-metal-compute SHARED native/metal_compute_bridge.mm)
+  set_target_properties(mlir-gpu-metal-compute PROPERTIES PREFIX "")
+  target_include_directories(mlir-gpu-metal-compute PRIVATE ${METAL_CONVERTER_RUNTIME_INCLUDE_DIR})
+  target_compile_options(mlir-gpu-metal-compute PRIVATE -fobjc-arc)
+  target_link_libraries(mlir-gpu-metal-compute PRIVATE
+    "-framework Foundation" "-framework Metal")
+  install(TARGETS mlir-gpu-metal-compute LIBRARY DESTINATION bin RUNTIME DESTINATION bin)
 endif()

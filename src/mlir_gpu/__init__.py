@@ -93,6 +93,11 @@ from .directx_compute import (
     DirectXComputeContext,
     DirectXPipeline,
 )
+from .metal_compute import (
+    MetalBuffer,
+    MetalComputeContext,
+    MetalPipeline,
+)
 from .viewer import (
     ComputeDispatchResult,
     ComputeProgram,
@@ -117,7 +122,7 @@ __all__ = [
     "DirectXBuffer", "DirectXComputeContext", "DirectXPipeline", "Dispatch",
     "Draw", "DrawCall", "FragmentCoord", "FrameParameters", "GlobalInvocationId",
     "HIGH_END_COMPUTE", "ImageDiffError", "ImageDiffResult", "LocalInvocationId", "MLIRPipeline",
-    "MULTI_DRAW_SCHEMA_VERSION", "MultiDrawManifest", "PRESETS", "ParameterBlock", "PersistentBuffer", "PersistentComputeError", "PersistentPipeline", "Pipeline",
+    "MULTI_DRAW_SCHEMA_VERSION", "MetalBuffer", "MetalComputeContext", "MetalPipeline", "MultiDrawManifest", "PRESETS", "ParameterBlock", "PersistentBuffer", "PersistentComputeError", "PersistentPipeline", "Pipeline",
     "PointerType", "ReflectedBufferBinding", "RenderedImage", "StorageClass", "StructField",
     "Target", "TargetProfile", "Toolchain", "Type", "VULKAN_PORTABLE_1_0", "Value", "Vertex",
     "ViewerError", "VulkanBuffer", "VulkanComputeContext", "VulkanPipeline", "WorkgroupId", "atomic_add", "atomic_and", "atomic_cas",

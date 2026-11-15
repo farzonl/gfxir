@@ -712,9 +712,13 @@ def open_compute_context(
         from .directx_compute import DirectXComputeContext
 
         ctx = DirectXComputeContext(validation=validation, provider=provider)
+    elif normalized == "metal":
+        from .metal_compute import MetalComputeContext
+
+        ctx = MetalComputeContext(validation=validation, provider=provider)
     else:
         raise PersistentComputeError(
-            f"Persistent ComputeContext is currently implemented for 'vulkan' and 'directx', got {target!r}."
+            f"Persistent ComputeContext is currently implemented for 'vulkan', 'directx', and 'metal', got {target!r}."
         )
     try:
         yield ctx
