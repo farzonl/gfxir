@@ -131,7 +131,9 @@ class TestTargetSelection(unittest.TestCase):
         self.assertIn("No fallback", str(ctx.exception))
 
     def test_uninitialized_backend_does_not_fall_back_to_cpu(self) -> None:
-        with gp.device("vulkan") as dev:
+        from gfxpy.runtime import UninitializedBackend
+
+        with gp.device("vulkan", backend=UninitializedBackend("vulkan")) as dev:
             self.assertEqual(dev.target, "vulkan")
             with self.assertRaises(gp.BackendNotImplementedError) as ctx:
                 gp.array([1.0, 2.0])
