@@ -50,7 +50,7 @@ class DirectXRenderingTests(unittest.TestCase):
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
         cls.programs = {}
         pipelines = {
-            name: runpy.run_path(str(ROOT / "examples" / f"{name}.py"))["pipeline"]
+            name: runpy.run_path(str(ROOT / "examples" / "basics" / f"{name}.py"))["pipeline"]
             for name in ("triangle", "quad")
         }
         for name, depth in (("before-near", -0.1), ("after-far", 1.1)):
