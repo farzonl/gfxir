@@ -152,9 +152,13 @@ def build_suites(preset: str) -> list[SuiteSpec]:
         SuiteSpec("saxpy_1m_k1", "SAXPY 1M (1x)", "Elementwise 1D", "saxpy_chain", "1M x 1", n=1_048_576, chain_depth=1),
         SuiteSpec("saxpy_1m_k10", "SAXPY 1M (10x)", "Elementwise 1D", "saxpy_chain", "1M x 10", n=1_048_576, chain_depth=10),
         SuiteSpec("saxpy_4m_k10", "SAXPY 4M (10x)", "Elementwise 1D", "saxpy_chain", "4M x 10", n=4_194_304, chain_depth=10),
+        SuiteSpec("saxpy_4m_k10_fused", "SAXPY 4M (10x Fused)", "Elementwise 1D", "saxpy_fused", "4M x 10", n=4_194_304, chain_depth=10),
         SuiteSpec("matmul_64", "MatMul 64x64", "Matrix Multiply", "matmul", "64x64", n=64, m=64, k=64),
         SuiteSpec("matmul_256", "MatMul 256x256", "Matrix Multiply", "matmul", "256x256", n=256, m=256, k=256),
         SuiteSpec("matmul_512", "MatMul 512x512", "Matrix Multiply", "matmul", "512x512", n=512, m=512, k=512),
+        SuiteSpec("matmul_1024", "MatMul 1024x1024", "Matrix Multiply", "matmul", "1024x1024", n=1024, m=1024, k=1024),
+        SuiteSpec("matmul_2048", "MatMul 2048x2048", "Matrix Multiply", "matmul", "2048x2048", n=2048, m=2048, k=2048),
+        SuiteSpec("matmul_4096", "MatMul 4096x4096", "Matrix Multiply", "matmul", "4096x4096", n=4096, m=4096, k=4096),
     ]
 
 
@@ -200,7 +204,7 @@ def _benchmark_numpy_suite(spec: SuiteSpec, np: Any, warmup: int, iters: int) ->
     rss_before = _get_rss_mb()
     rng = np.random.default_rng(42)
 
-    if spec.kind == "saxpy_chain":
+    if spec.kind in ("saxpy_chain", "saxpy_fused"):
         x = rng.standard_normal(spec.n, dtype=np.float32)
         y = rng.standard_normal(spec.n, dtype=np.float32)
         alpha = np.float32(1.25)
@@ -297,19 +301,36 @@ def _benchmark_gfx_suite(
     try:
         with tempfile.TemporaryDirectory() as td:
             t_compile0 = time.perf_counter()
-            if spec.kind == "saxpy_chain":
+            if spec.kind in ("saxpy_chain", "saxpy_fused"):
                 saxpy_wg_size = 256
+                fused_steps = tuple(range(spec.chain_depth))
 
-                @compute(workgroup_size=(saxpy_wg_size, 1, 1))
-                def saxpy_kernel(
-                    x: Buffer[Type.F32, "read_only"],
-                    y: Buffer[Type.F32, "read_only"],
-                    out: Buffer[Type.F32, "write_only"],
-                    params: SaxpyParams,
-                ):
-                    idx = i32(global_invocation_id().x)
-                    if idx < params.n:
-                        out[idx] = x[idx] * params.alpha + y[idx]
+                if spec.kind == "saxpy_fused":
+                    @compute(workgroup_size=(saxpy_wg_size, 1, 1))
+                    def saxpy_kernel(
+                        x: Buffer[Type.F32, "read_only"],
+                        y: Buffer[Type.F32, "read_only"],
+                        out: Buffer[Type.F32, "write_only"],
+                        params: SaxpyParams,
+                    ):
+                        idx = i32(global_invocation_id().x)
+                        if idx < params.n:
+                            val = x[idx]
+                            y_val = y[idx]
+                            for _ in fused_steps:
+                                val = val * params.alpha + y_val
+                            out[idx] = val
+                else:
+                    @compute(workgroup_size=(saxpy_wg_size, 1, 1))
+                    def saxpy_kernel(
+                        x: Buffer[Type.F32, "read_only"],
+                        y: Buffer[Type.F32, "read_only"],
+                        out: Buffer[Type.F32, "write_only"],
+                        params: SaxpyParams,
+                    ):
+                        idx = i32(global_invocation_id().x)
+                        if idx < params.n:
+                            out[idx] = x[idx] * params.alpha + y[idx]
 
                 pipeline = ComputePipeline(saxpy_kernel, Dispatch(grid=(1, 1, 1)))
                 manifest = compile_pipeline(pipeline, target, Path(td) / "saxpy", toolchain)
@@ -324,30 +345,42 @@ def _benchmark_gfx_suite(
                     y_bytes = struct.pack(f"<{spec.n}f", *([2.0] * spec.n))
                 nbytes = spec.n * 4
                 grid = ((spec.n + saxpy_wg_size - 1) // saxpy_wg_size, 1, 1)
+                out_host = bytearray(nbytes)
 
                 with open_compute_context(target_name, validation=False, provider=provider) as ctx:
                     pipe = ctx.compile_pipeline(manifest)
                     buf_x = ctx.create_buffer(nbytes, initial_data=x_bytes)
                     buf_y = ctx.create_buffer(nbytes, initial_data=y_bytes)
                     buf_a = ctx.create_buffer(nbytes)
-                    buf_b = ctx.create_buffer(nbytes) if spec.chain_depth > 1 else None
+                    buf_b = ctx.create_buffer(nbytes) if (spec.kind == "saxpy_chain" and spec.chain_depth > 1) else None
                     runtime_mode = f"persistent:{ctx.device_name}"
 
-                    def run_once() -> bytes:
-                        src_buf = buf_x
-                        dst_buf = buf_a
-                        batch_ctx = ctx.batch() if hasattr(ctx, "batch") else contextlib.nullcontext()
-                        with batch_ctx:
-                            for step in range(spec.chain_depth):
-                                if step > 0:
-                                    assert buf_b is not None
-                                    src_buf = buf_a if (step % 2 == 1) else buf_b
-                                    dst_buf = buf_b if (step % 2 == 1) else buf_a
-                                pipe.dispatch(
-                                    {"x": src_buf, "y": buf_y, "out": dst_buf},
-                                    parameters={"n": spec.n, "alpha": 1.25},
-                                    grid=grid,
-                                )
+                    def run_once() -> bytearray | bytes:
+                        if spec.kind == "saxpy_fused":
+                            pipe.dispatch(
+                                {"x": buf_x, "y": buf_y, "out": buf_a},
+                                parameters={"n": spec.n, "alpha": 1.25},
+                                grid=grid,
+                            )
+                            dst_buf = buf_a
+                        else:
+                            src_buf = buf_x
+                            dst_buf = buf_a
+                            batch_ctx = ctx.batch() if hasattr(ctx, "batch") else contextlib.nullcontext()
+                            with batch_ctx:
+                                for step in range(spec.chain_depth):
+                                    if step > 0:
+                                        assert buf_b is not None
+                                        src_buf = buf_a if (step % 2 == 1) else buf_b
+                                        dst_buf = buf_b if (step % 2 == 1) else buf_a
+                                    pipe.dispatch(
+                                        {"x": src_buf, "y": buf_y, "out": dst_buf},
+                                        parameters={"n": spec.n, "alpha": 1.25},
+                                        grid=grid,
+                                    )
+                        if hasattr(dst_buf, "download_into"):
+                            dst_buf.download_into(out_host)
+                            return out_host
                         return dst_buf.download()
 
                     t_cold0 = time.perf_counter()
@@ -413,6 +446,7 @@ def _benchmark_gfx_suite(
                     b_bytes = struct.pack(f"<{spec.k * spec.n}f", *([1.0] * (spec.k * spec.n)))
                 grid = ((spec.n + tile_dim - 1) // tile_dim, (spec.m + tile_dim - 1) // tile_dim, 1)
                 num_tiles = (spec.k + tile_dim - 1) // tile_dim
+                out_host = bytearray(spec.m * spec.n * 4)
 
                 with open_compute_context(target_name, validation=False, provider=provider) as ctx:
                     pipe = ctx.compile_pipeline(manifest)
@@ -421,12 +455,15 @@ def _benchmark_gfx_suite(
                     buf_c = ctx.create_buffer(spec.m * spec.n * 4)
                     runtime_mode = f"persistent:{ctx.device_name}"
 
-                    def run_once() -> bytes:
+                    def run_once() -> bytearray | bytes:
                         pipe.dispatch(
                             {"mat_a": buf_a, "mat_b": buf_b, "mat_c": buf_c},
                             parameters={"m": spec.m, "n": spec.n, "k": spec.k, "num_tiles": num_tiles},
                             grid=grid,
                         )
+                        if hasattr(buf_c, "download_into"):
+                            buf_c.download_into(out_host)
+                            return out_host
                         return buf_c.download()
 
                     t_cold0 = time.perf_counter()
