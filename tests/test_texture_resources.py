@@ -282,7 +282,8 @@ class TextureGpuExecutionTests(unittest.TestCase):
         if self.has_vulkan:
             backends.append(("vulkan", Target.VULKAN, None))
         if self.has_directx:
-            backends.append(("directx-hw", Target.DIRECTX, "hardware"))
+            if os.environ.get("MLIR_GPU_TEST_WARP") != "1":
+                backends.append(("directx-hw", Target.DIRECTX, "hardware"))
             backends.append(("directx-warp", Target.DIRECTX, "warp"))
         return backends
 
@@ -500,7 +501,11 @@ class TextureGpuExecutionTests(unittest.TestCase):
                 *([("vulkan", Target.VULKAN, None, self.vk_validation)] if self.has_vulkan else []),
                 *(
                     [
-                        ("directx-hw", Target.DIRECTX, "hardware", True),
+                        *(
+                            [("directx-hw", Target.DIRECTX, "hardware", True)]
+                            if os.environ.get("MLIR_GPU_TEST_WARP") != "1"
+                            else []
+                        ),
                         ("directx-warp", Target.DIRECTX, "warp", True),
                     ]
                     if self.has_directx

@@ -749,17 +749,17 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
         [encoder setVertexBytes:vsArgBytes.data() length:vsArgBytes.size() atIndex:argBufBindIndex];
     }
     if (_vertexResources.srvUavTable != nil) {
-        [encoder useResource:_vertexResources.srvUavTable usage:MTLResourceUsageRead stage:MTLRenderStageVertex];
+        [encoder useResource:_vertexResources.srvUavTable usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
     }
     if (_vertexResources.samplerTable != nil) {
-        [encoder useResource:_vertexResources.samplerTable usage:MTLResourceUsageRead stage:MTLRenderStageVertex];
+        [encoder useResource:_vertexResources.samplerTable usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
     }
     for (const auto& buf : _vertexResources.buffers) {
         MTLResourceUsage usage = buf.isUAV ? (MTLResourceUsageRead | MTLResourceUsageWrite) : MTLResourceUsageRead;
-        [encoder useResource:buf.buffer usage:usage stage:MTLRenderStageVertex];
+        [encoder useResource:buf.buffer usage:usage stages:MTLRenderStageVertex];
     }
     for (const auto& tex : _vertexResources.textures) {
-        [encoder useResource:tex.texture usage:MTLResourceUsageRead stage:MTLRenderStageVertex];
+        [encoder useResource:tex.texture usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
     }
 
     std::vector<uint8_t> fsArgBytes = packTopLevelArgBuffer(
@@ -771,17 +771,17 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
         [encoder setFragmentBytes:fsArgBytes.data() length:fsArgBytes.size() atIndex:argBufBindIndex];
     }
     if (_fragmentResources.srvUavTable != nil) {
-        [encoder useResource:_fragmentResources.srvUavTable usage:MTLResourceUsageRead stage:MTLRenderStageFragment];
+        [encoder useResource:_fragmentResources.srvUavTable usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
     }
     if (_fragmentResources.samplerTable != nil) {
-        [encoder useResource:_fragmentResources.samplerTable usage:MTLResourceUsageRead stage:MTLRenderStageFragment];
+        [encoder useResource:_fragmentResources.samplerTable usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
     }
     for (const auto& buf : _fragmentResources.buffers) {
         MTLResourceUsage usage = buf.isUAV ? (MTLResourceUsageRead | MTLResourceUsageWrite) : MTLResourceUsageRead;
-        [encoder useResource:buf.buffer usage:usage stage:MTLRenderStageFragment];
+        [encoder useResource:buf.buffer usage:usage stages:MTLRenderStageFragment];
     }
     for (const auto& tex : _fragmentResources.textures) {
-        [encoder useResource:tex.texture usage:MTLResourceUsageRead stage:MTLRenderStageFragment];
+        [encoder useResource:tex.texture usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
     }
     [encoder setViewport:(MTLViewport){0, 0, static_cast<double>(texture.width),
         static_cast<double>(texture.height), 0, 1}];
