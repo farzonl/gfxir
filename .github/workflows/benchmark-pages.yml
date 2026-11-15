@@ -126,25 +126,62 @@ jobs:
           export LLVM_BIN="$GITHUB_WORKSPACE/.toolchains/llvm-build/bin"
           export PATH="$GITHUB_WORKSPACE/.tools/bin:$GITHUB_WORKSPACE/.sdk/bin:$PATH"
           export DYLD_LIBRARY_PATH="$GITHUB_WORKSPACE/.sdk/lib:${DYLD_LIBRARY_PATH:-}"
-          export VK_ICD_FILENAMES="$GITHUB_WORKSPACE/.sdk/share/vulkan/icd.d/MoltenVK_icd.json"
-          export VK_DRIVER_FILES="$GITHUB_WORKSPACE/.sdk/share/vulkan/icd.d/MoltenVK_icd.json"
           export VK_ADD_LAYER_PATH="$GITHUB_WORKSPACE/.sdk/share/vulkan/explicit_layer.d"
 
-          TARGET="vulkan"
-          if swift -e 'import Metal; guard let d = MTLCreateSystemDefaultDevice(), d.argumentBuffersSupport == .tier2 else { exit(1) }' 2>/dev/null; then
-            echo "Metal Argument Buffers Tier 2 device detected; benchmarking Metal target."
-            TARGET="metal"
-          else
-            echo "Metal Argument Buffers Tier 2 unavailable; benchmarking Vulkan (MoltenVK) target."
+          BENCH_FILES=()
+
+          MOLTENVK_ICD="$GITHUB_WORKSPACE/.sdk/share/vulkan/icd.d/MoltenVK_icd.json"
+          if [ -f "$MOLTENVK_ICD" ]; then
+            echo "Benchmarking Vulkan (MoltenVK)..."
+            VK_ICD_FILENAMES="$MOLTENVK_ICD" VK_DRIVER_FILES="$MOLTENVK_ICD" \
+              python3 scripts/run_numpy_benchmarks.py \
+                --target vulkan \
+                --backend-label gfxir-vulkan-moltenvk \
+                --preset full \
+                --warmup 2 \
+                --iters 5 \
+                --require-gpu \
+                --out "$GITHUB_WORKSPACE/bench-moltenvk.json"
+            BENCH_FILES+=("$GITHUB_WORKSPACE/bench-moltenvk.json")
           fi
 
-          python3 scripts/run_numpy_benchmarks.py \
-            --target "$TARGET" \
-            --preset full \
-            --warmup 2 \
-            --iters 5 \
-            --require-gpu \
-            --out "$GITHUB_WORKSPACE/bench-results.json"
+          KOSMIC_ICD="$GITHUB_WORKSPACE/.sdk/share/vulkan/icd.d/libkosmickrisp_icd.json"
+          if [ -f "$KOSMIC_ICD" ]; then
+            echo "Benchmarking Vulkan (KosmicKrisp)..."
+            VK_ICD_FILENAMES="$KOSMIC_ICD" VK_DRIVER_FILES="$KOSMIC_ICD" \
+              python3 scripts/run_numpy_benchmarks.py \
+                --target vulkan \
+                --backend-label gfxir-vulkan-kosmickrisp \
+                --preset full \
+                --warmup 2 \
+                --iters 5 \
+                --require-gpu \
+                --out "$GITHUB_WORKSPACE/bench-kosmickrisp.json"
+            BENCH_FILES+=("$GITHUB_WORKSPACE/bench-kosmickrisp.json")
+          else
+            echo "Notice: KosmicKrisp ICD not found at $KOSMIC_ICD; skipping KosmicKrisp benchmark."
+          fi
+
+          if swift -e 'import Metal; guard let d = MTLCreateSystemDefaultDevice(), d.argumentBuffersSupport == .tier2 else { exit(1) }' 2>/dev/null; then
+            echo "Metal Argument Buffers Tier 2 device detected; benchmarking Metal target."
+            python3 scripts/run_numpy_benchmarks.py \
+              --target metal \
+              --backend-label gfxir-metal \
+              --preset full \
+              --warmup 2 \
+              --iters 5 \
+              --require-gpu \
+              --out "$GITHUB_WORKSPACE/bench-metal.json"
+            BENCH_FILES+=("$GITHUB_WORKSPACE/bench-metal.json")
+          else
+            echo "Notice: Metal Argument Buffers Tier 2 unavailable on this runner; skipping Metal benchmark."
+          fi
+
+          if [ ${#BENCH_FILES[@]} -eq 0 ]; then
+            echo "Error: no GPU benchmark reports were generated."
+            exit 1
+          fi
+          echo "BENCH_ARGS=${BENCH_FILES[*]}" >> "$GITHUB_ENV"
 
       - name: Restore historical benchmark data cache
         uses: actions/cache/restore@v4
@@ -160,8 +197,9 @@ jobs:
           MSG="$(git log -1 --pretty=%s)"
           AUTHOR="$(git log -1 --pretty=%an)"
           TS="$(git log -1 --pretty=%cI)"
+          read -r -a BENCH_FILES <<< "$BENCH_ARGS"
           python3 scripts/build_benchmark_site.py \
-            --bench-json "$GITHUB_WORKSPACE/bench-results.json" \
+            --bench-json "${BENCH_FILES[@]}" \
             --site-src "$GITHUB_WORKSPACE/pages" \
             --out-dir "$GITHUB_WORKSPACE/_site" \
             --sha "$TARGET_SHA" \

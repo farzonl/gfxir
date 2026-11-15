@@ -254,9 +254,10 @@ def _benchmark_gfx_suite(
     iters: int,
     np: Any | None,
     ref_output: Any | None,
+    backend_label: str | None = None,
 ) -> dict[str, Any]:
     """Run a suite on GfxIR GPU compute and return its result record."""
-    backend_label = f"gfxir-{target_name}"
+    backend_label = backend_label or f"gfxir-{target_name}"
     rss_before = _get_rss_mb()
 
     try:
@@ -442,9 +443,11 @@ def run_benchmarks(
     iters: int,
     provider: str | None = None,
     skip_gpu: bool = False,
+    backend_label: str | None = None,
 ) -> dict[str, Any]:
     """Run all benchmark suites and return the structured JSON report."""
     target_name = resolve_target(target_arg)
+    gfx_label = backend_label or f"gfxir-{target_name}"
     suites = build_suites(preset)
 
     try:
@@ -467,9 +470,18 @@ def run_benchmarks(
             results.append(_make_record(spec, "numpy-cpu-f32", ran=False, status="unavailable: numpy not installed"))
 
         if skip_gpu:
-            results.append(_make_record(spec, f"gfxir-{target_name}", ran=False, status="skipped: --skip-gpu"))
+            results.append(_make_record(spec, gfx_label, ran=False, status="skipped: --skip-gpu"))
         else:
-            gfx_rec = _benchmark_gfx_suite(spec, target_name, provider, warmup, iters, np, ref_output)
+            gfx_rec = _benchmark_gfx_suite(
+                spec,
+                target_name,
+                provider,
+                warmup,
+                iters,
+                np,
+                ref_output,
+                backend_label=gfx_label,
+            )
             results.append(gfx_rec)
             if gfx_rec["ran"] and gfx_rec["medianMs"] > 0:
                 gfx_medians.append(gfx_rec["medianMs"])
@@ -478,11 +490,11 @@ def run_benchmarks(
     gfx_geo = round(_geomean(gfx_medians), 4)
     overall_winner = ""
     if np_geo > 0 and gfx_geo > 0:
-        overall_winner = f"gfxir-{target_name}" if gfx_geo < np_geo else "numpy-cpu-f32"
+        overall_winner = gfx_label if gfx_geo < np_geo else "numpy-cpu-f32"
     elif np_geo > 0:
         overall_winner = "numpy-cpu-f32"
     elif gfx_geo > 0:
-        overall_winner = f"gfxir-{target_name}"
+        overall_winner = gfx_label
 
     return {
         "version": 1,
@@ -496,7 +508,7 @@ def run_benchmarks(
         "overallWinner": overall_winner,
         "overallGeomeanMs": {
             "numpy-cpu-f32": np_geo,
-            f"gfxir-{target_name}": gfx_geo,
+            gfx_label: gfx_geo,
         },
         "results": results,
     }
@@ -509,6 +521,7 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--provider", default=None)
+    parser.add_argument("--backend-label", default=None, help="Optional backend label (e.g. gfxir-vulkan-moltenvk).")
     parser.add_argument("--skip-gpu", action="store_true", help="Run only the NumPy baseline (for host-only testing).")
     parser.add_argument("--require-gpu", action="store_true", help="Exit non-zero if no GPU benchmark executed.")
     parser.add_argument("--list-suites", action="store_true", help="Print suite IDs for the chosen preset and exit.")
@@ -527,6 +540,7 @@ def main() -> int:
         iters=args.iters,
         provider=args.provider,
         skip_gpu=args.skip_gpu,
+        backend_label=args.backend_label,
     )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -280,7 +280,7 @@
       <div class="card">
         <div class="panel-header">
           <h2 class="panel-title">Suite Latency Comparison (lower is better)</h2>
-          <div class="legend">
+          <div class="legend" id="suiteLegend">
             <span><i class="dot" style="background: var(--c-np)"></i>NumPy CPU f32</span>
             <span><i class="dot" style="background: var(--c-gfx)"></i>GfxIR GPU</span>
           </div>
@@ -291,7 +291,7 @@
       <div class="card">
         <div class="panel-header">
           <h2 class="panel-title">Commit History Geomean (ms)</h2>
-          <div class="legend">
+          <div class="legend" id="historyLegend">
             <span><i class="dot" style="background: var(--c-np)"></i>NumPy</span>
             <span><i class="dot" style="background: var(--c-gfx)"></i>GfxIR</span>
           </div>
@@ -329,18 +329,42 @@
       return v < 1 ? v.toFixed(4) : v.toFixed(3);
     }
 
-    function renderBarChart(container, suites, metric) {
+    const BACKEND_COLORS = {
+      "numpy-cpu-f32": "var(--c-np)",
+      "gfxir-metal": "var(--c-gfx)",
+      "gfxir-vulkan-moltenvk": "#0ea5e9",
+      "gfxir-vulkan-kosmickrisp": "#10b981",
+      "gfxir-vulkan": "#0ea5e9",
+      "gfxir-directx": "#f59e0b",
+    };
+    const FALLBACK_COLORS = ["#0ea5e9", "#10b981", "#f59e0b", "#ec4899"];
+
+    function colorForBackend(name, idx = 0) {
+      return BACKEND_COLORS[name] || FALLBACK_COLORS[idx % FALLBACK_COLORS.length];
+    }
+
+    function renderLegend(el, backends) {
+      if (!el) return;
+      el.innerHTML = backends.map((b, i) =>
+        `<span><i class="dot" style="background: ${colorForBackend(b, i)}"></i>${esc(b)}</span>`
+      ).join("");
+    }
+
+    function renderBarChart(container, suites, metric, gpuBackends) {
       if (!suites.length) {
         container.innerHTML = '<div class="empty-msg">No suite data available.</div>';
         return;
       }
-      const W = 560, rowH = 44, padL = 140, padR = 70, padT = 10, padB = 20;
+      const barsPerSuite = 1 + Math.max(1, gpuBackends.length);
+      const barH = 11, barGap = 3;
+      const rowH = Math.max(44, 16 + barsPerSuite * (barH + barGap));
+      const W = 560, padL = 140, padR = 76, padT = 10, padB = 20;
       const H = padT + padB + suites.length * rowH;
       const maxVal = Math.max(
         1e-6,
         ...suites.flatMap(s => [
           s.np && s.np.ran ? Number(s.np[metric] || 0) : 0,
-          s.gfx && s.gfx.ran ? Number(s.gfx[metric] || 0) : 0
+          ...s.gfxs.map(g => (g && g.ran ? Number(g[metric] || 0) : 0))
         ])
       );
       const plotW = W - padL - padR;
@@ -349,21 +373,27 @@
       suites.forEach((s, i) => {
         const y = padT + i * rowH;
         const npVal = s.np && s.np.ran ? Number(s.np[metric] || 0) : null;
-        const gfxVal = s.gfx && s.gfx.ran ? Number(s.gfx[metric] || 0) : null;
         const npW = npVal !== null ? Math.max(2, (npVal / maxVal) * plotW) : 0;
-        const gfxW = gfxVal !== null ? Math.max(2, (gfxVal / maxVal) * plotW) : 0;
 
         rows += `<text x="${padL - 8}" y="${y + 18}" text-anchor="end" fill="currentColor" font-size="11">${esc(s.benchName)}</text>`;
+        let offsetY = y + 4;
         if (npVal !== null) {
-          rows += `<rect x="${padL}" y="${y + 4}" width="${npW.toFixed(1)}" height="12" rx="3" fill="var(--c-np)"/>`;
-          rows += `<text x="${padL + npW + 6}" y="${y + 14}" fill="var(--muted)" font-size="10">${fmtMs(npVal)} ms</text>`;
+          rows += `<rect x="${padL}" y="${offsetY}" width="${npW.toFixed(1)}" height="${barH}" rx="3" fill="${colorForBackend("numpy-cpu-f32")}"/>`;
+          rows += `<text x="${padL + npW + 6}" y="${offsetY + 9}" fill="var(--muted)" font-size="10">${fmtMs(npVal)} ms</text>`;
+          offsetY += barH + barGap;
         }
-        if (gfxVal !== null) {
-          rows += `<rect x="${padL}" y="${y + 20}" width="${gfxW.toFixed(1)}" height="12" rx="3" fill="var(--c-gfx)"/>`;
-          rows += `<text x="${padL + gfxW + 6}" y="${y + 30}" fill="var(--muted)" font-size="10">${fmtMs(gfxVal)} ms</text>`;
-        } else {
-          rows += `<text x="${padL + 4}" y="${y + 30}" fill="var(--c-warn)" font-size="10">GPU unavailable</text>`;
-        }
+        gpuBackends.forEach((bName, bIdx) => {
+          const g = s.gfxs.find(x => x.backend === bName);
+          const gfxVal = g && g.ran ? Number(g[metric] || 0) : null;
+          if (gfxVal !== null) {
+            const gfxW = Math.max(2, (gfxVal / maxVal) * plotW);
+            rows += `<rect x="${padL}" y="${offsetY}" width="${gfxW.toFixed(1)}" height="${barH}" rx="3" fill="${colorForBackend(bName, bIdx)}"/>`;
+            rows += `<text x="${padL + gfxW + 6}" y="${offsetY + 9}" fill="var(--muted)" font-size="10">${fmtMs(gfxVal)} ms</text>`;
+          } else {
+            rows += `<text x="${padL + 4}" y="${offsetY + 9}" fill="var(--c-warn)" font-size="10">${esc(bName)} unavailable</text>`;
+          }
+          offsetY += barH + barGap;
+        });
       });
 
       container.innerHTML = `<svg class="chart" viewBox="0 0 ${W} ${H}">${rows}</svg>`;
@@ -388,15 +418,13 @@
       const xFor = i => pts.length === 1 ? padL + plotW / 2 : padL + (i / (pts.length - 1)) * plotW;
       const yFor = v => padT + plotH - (v / maxVal) * plotH;
 
-      let npCoords = [], gfxCoords = [];
-      pts.forEach((h, i) => {
-        const g = h.overallGeomeanMs || {};
-        const npV = g["numpy-cpu-f32"] || 0;
-        const gfxKey = Object.keys(g).find(k => k.startsWith("gfxir-"));
-        const gfxV = gfxKey ? (g[gfxKey] || 0) : 0;
-        if (npV > 0) npCoords.push([xFor(i), yFor(npV), h.shortSha]);
-        if (gfxV > 0) gfxCoords.push([xFor(i), yFor(gfxV), h.shortSha]);
+      const backendKeys = [];
+      pts.forEach(h => {
+        for (const k of Object.keys(h.overallGeomeanMs || {})) {
+          if (!backendKeys.includes(k)) backendKeys.push(k);
+        }
       });
+      renderLegend(document.getElementById("historyLegend"), backendKeys);
 
       const line = coords => coords.map((p, i) => `${i === 0 ? "M" : "L"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ");
       let svg = `<line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT + plotH}" stroke="var(--border)"/>`;
@@ -404,14 +432,18 @@
       svg += `<text x="${padL - 6}" y="${padT + 10}" text-anchor="end" fill="var(--muted)" font-size="10">${fmtMs(maxVal)} ms</text>`;
       svg += `<text x="${padL - 6}" y="${padT + plotH}" text-anchor="end" fill="var(--muted)" font-size="10">0</text>`;
 
-      if (npCoords.length) {
-        svg += `<path d="${line(npCoords)}" fill="none" stroke="var(--c-np)" stroke-width="2.2"/>`;
-        npCoords.forEach(p => { svg += `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="3.5" fill="var(--c-np)"/>`; });
-      }
-      if (gfxCoords.length) {
-        svg += `<path d="${line(gfxCoords)}" fill="none" stroke="var(--c-gfx)" stroke-width="2.2"/>`;
-        gfxCoords.forEach(p => { svg += `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="3.5" fill="var(--c-gfx)"/>`; });
-      }
+      backendKeys.forEach((key, bIdx) => {
+        const coords = [];
+        pts.forEach((h, i) => {
+          const v = (h.overallGeomeanMs || {})[key] || 0;
+          if (v > 0) coords.push([xFor(i), yFor(v), h.shortSha]);
+        });
+        if (coords.length) {
+          const color = colorForBackend(key, bIdx);
+          svg += `<path d="${line(coords)}" fill="none" stroke="${color}" stroke-width="2.2"/>`;
+          coords.forEach(p => { svg += `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="3.5" fill="${color}"/>`; });
+        }
+      });
       pts.forEach((h, i) => {
         if (pts.length <= 8 || i === 0 || i === pts.length - 1 || i % Math.ceil(pts.length / 6) === 0) {
           svg += `<text x="${xFor(i).toFixed(1)}" y="${H - 10}" text-anchor="middle" fill="var(--muted)" font-size="10">${esc(h.shortSha)}</text>`;
@@ -422,48 +454,63 @@
 
     function groupSuites(results) {
       const map = new Map();
+      const gpuBackends = [];
       for (const r of results || []) {
         if (!map.has(r.benchId)) {
-          map.set(r.benchId, { benchId: r.benchId, benchName: r.benchName, category: r.category, np: null, gfx: null });
+          map.set(r.benchId, { benchId: r.benchId, benchName: r.benchName, category: r.category, np: null, gfxs: [] });
         }
         const entry = map.get(r.benchId);
         if (r.backend === "numpy-cpu-f32") entry.np = r;
-        else entry.gfx = r;
+        else {
+          entry.gfxs.push(r);
+          if (!gpuBackends.includes(r.backend)) gpuBackends.push(r.backend);
+        }
       }
-      return Array.from(map.values());
+      return { suites: Array.from(map.values()), gpuBackends };
     }
 
     function renderRun(entry, history) {
-      const suites = groupSuites(entry.results);
+      const { suites, gpuBackends } = groupSuites(entry.results);
+      renderLegend(document.getElementById("suiteLegend"), ["numpy-cpu-f32", ...gpuBackends]);
       const metric = document.getElementById("metricSelect").value;
       const g = entry.overallGeomeanMs || {};
       const npGeo = g["numpy-cpu-f32"] || 0;
-      const gfxKey = Object.keys(g).find(k => k.startsWith("gfxir-")) || "gfxir";
-      const gfxGeo = g[gfxKey] || 0;
+      const gfxEntries = Object.entries(g).filter(([k, v]) => k.startsWith("gfxir-") && v > 0);
+      gfxEntries.sort((a, b) => a[1] - b[1]);
+      const fastestGfx = gfxEntries[0] || ["gfxir", 0];
+      const gfxGeo = fastestGfx[1];
       const speedup = (npGeo > 0 && gfxGeo > 0) ? (npGeo / gfxGeo) : null;
 
       let bestSuite = "—";
       let bestRatio = 0;
       for (const s of suites) {
-        if (s.np && s.np.ran && s.gfx && s.gfx.ran && s.gfx.medianMs > 0) {
-          const r = s.np.medianMs / s.gfx.medianMs;
-          if (r > bestRatio) {
-            bestRatio = r;
-            bestSuite = `${s.benchName} (${r.toFixed(2)}x)`;
+        if (s.np && s.np.ran) {
+          for (const gx of s.gfxs) {
+            if (gx && gx.ran && gx.medianMs > 0) {
+              const r = s.np.medianMs / gx.medianMs;
+              if (r > bestRatio) {
+                bestRatio = r;
+                bestSuite = `${s.benchName} (${gx.backend}: ${r.toFixed(2)}x)`;
+              }
+            }
           }
         }
       }
+
+      const geoSummary = gfxEntries.length
+        ? gfxEntries.map(([k, v]) => `${k}: ${fmtMs(v)} ms`).join(" · ")
+        : "No GPU geomean";
 
       document.getElementById("kpis").innerHTML = `
         <div class="card">
           <div class="card-label">Overall Winner</div>
           <div class="card-value">${esc(entry.overallWinner || "—")}</div>
-          <div class="card-sub">Geomean: NumPy ${fmtMs(npGeo)} ms vs GfxIR ${fmtMs(gfxGeo)} ms</div>
+          <div class="card-sub">NumPy ${fmtMs(npGeo)} ms · ${esc(geoSummary)}</div>
         </div>
         <div class="card">
-          <div class="card-label">Geomean Speedup vs NumPy</div>
+          <div class="card-label">Fastest GPU vs NumPy</div>
           <div class="card-value">${speedup ? speedup.toFixed(2) + "x" : "—"}</div>
-          <div class="card-sub">${speedup && speedup >= 1 ? "GfxIR faster overall" : "Transfer/dispatch bound on small/per-call"}</div>
+          <div class="card-sub">${esc(fastestGfx[0])} (${speedup && speedup >= 1 ? "faster overall" : "transfer/dispatch bound"})</div>
         </div>
         <div class="card">
           <div class="card-label">Best GPU Suite</div>
@@ -483,7 +530,7 @@
       document.getElementById("runMeta").innerHTML =
         `Commit ${shaLink} · ${esc(entry.message || "")} · ${esc(entry.timestamp || "")}`;
 
-      renderBarChart(document.getElementById("suiteChart"), suites, metric);
+      renderBarChart(document.getElementById("suiteChart"), suites, metric, gpuBackends);
       renderHistoryChart(document.getElementById("historyChart"), history);
 
       const rowsHtml = (entry.results || []).map(r => {
