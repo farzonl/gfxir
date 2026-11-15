@@ -65,7 +65,7 @@ def short_circuit_output():
 
 
 def gallery_output():
-    shader = runpy.run_path(str(ROOT / "examples/beacon_gallery.py"))["pipeline"].trace()[1].to_dict()
+    shader = runpy.run_path(str(ROOT / "examples/raymarching/beacon_gallery.py"))["pipeline"].trace()[1].to_dict()
     print("parameters:", shader["parameters"]["name"])
     for function in shader["functions"]:
         for op in function["body"]["blocks"][0]["operations"]:

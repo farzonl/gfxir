@@ -654,7 +654,7 @@ class TestComputeE2EIntegration(unittest.TestCase):
             assert_valid_dxil(self, dx_out, self.dxv)
 
     def test_mandelbrot_python_example_compiles_and_validates_across_backends(self):
-        example_ns = runpy.run_path(str(ROOT / "examples/mandelbrot_compute.py"))
+        example_ns = runpy.run_path(str(ROOT / "examples/compute/mandelbrot_compute.py"))
         mandelbrot_pipeline: ComputePipeline = example_ns["pipeline"]
         mandelbrot_kernel = example_ns["mandelbrot_kernel"]
 
@@ -714,7 +714,7 @@ class TestComputeE2EIntegration(unittest.TestCase):
                 assert_valid_metallib(self, mtl_dir / "compute.metallib")
 
     def test_particle_life_python_example_compiles_and_validates_across_backends(self):
-        example_ns = runpy.run_path(str(ROOT / "examples/particle_life_compute.py"))
+        example_ns = runpy.run_path(str(ROOT / "examples/compute/particle_life_compute.py"))
         particle_pipeline: ComputePipeline = example_ns["pipeline"]
         particle_kernel = example_ns["particle_life_step"]
 

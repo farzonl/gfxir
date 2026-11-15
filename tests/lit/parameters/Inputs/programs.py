@@ -47,7 +47,7 @@ def limit256_fragment(parameters: Limit256):
 
 def pipeline(name):
     if name == "frame":
-        return runpy.run_path(str(ROOT / "examples/frame_bands.py"))["pipeline"]
+        return runpy.run_path(str(ROOT / "examples/basics/frame_bands.py"))["pipeline"]
     if name == "material":
         return Pipeline(fullscreen_vertex, material_fragment)
     if name == "limit":

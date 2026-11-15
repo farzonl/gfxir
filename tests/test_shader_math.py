@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class ShaderMathRenderingTests(unittest.TestCase):
     def test_math_example_matches_cpu_reference_and_other_targets(self):
         tools = Toolchain(Path(os.environ["LLVM_BIN"]) if "LLVM_BIN" in os.environ else None)
-        pipeline = runpy.run_path(str(ROOT / "examples/math.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples/basics/math.py"))["pipeline"]
         fragment = pipeline.trace()[1]
         width, height = 63, 47
         images = {}

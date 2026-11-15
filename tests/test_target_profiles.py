@@ -483,7 +483,7 @@ class TestTargetProfileCompilerIntegration(unittest.TestCase):
 
     def test_compile_pipeline_with_target_profile_e2e(self):
         """Compile a complete graphics pipeline end-to-end with TargetProfile without mocks."""
-        tri = runpy.run_path(str(ROOT / "examples" / "triangle.py"))["pipeline"]
+        tri = runpy.run_path(str(ROOT / "examples" / "basics" / "triangle.py"))["pipeline"]
         profile = TargetProfile.preset("HIGH_END_COMPUTE")
 
         with tempfile.TemporaryDirectory() as tmp_dir:

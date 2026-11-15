@@ -38,7 +38,7 @@ class TestParticleLifeGoldenReference(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.example = runpy.run_path(str(ROOT / "examples" / "particle_life_compute.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "particle_life_compute.py"))
 
     def test_cpu_simulation_matches_golden_reference_png(self):
         self.assertTrue(GOLDEN_PARTICLE_LIFE_PNG.is_file(), f"Missing golden PNG: {GOLDEN_PARTICLE_LIFE_PNG}")
@@ -68,7 +68,7 @@ class TestParticleLifeVulkanExecution(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.example = runpy.run_path(str(ROOT / "examples" / "particle_life_compute.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "particle_life_compute.py"))
 
     def test_vulkan_read_write_storage_buffer_in_place_update(self):
         @compute(workgroup_size=(32, 1, 1))
@@ -172,7 +172,7 @@ class TestParticleLifeDirectXExecution(unittest.TestCase):
         if not (available("llc") and available("dxv") and available("mlir-gpu-directx-view")):
             raise unittest.SkipTest("DirectX 12 compute execution tools are unavailable")
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.example = runpy.run_path(str(ROOT / "examples" / "particle_life_compute.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "particle_life_compute.py"))
 
     def test_directx_read_write_storage_buffer_in_place_update(self):
         @compute(workgroup_size=(32, 1, 1))
@@ -280,7 +280,7 @@ class TestParticleLifeMetalExecution(unittest.TestCase):
         if not all(available(tool) for tool in required):
             raise unittest.SkipTest("Metal compute execution tools are unavailable")
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.example = runpy.run_path(str(ROOT / "examples" / "particle_life_compute.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "particle_life_compute.py"))
 
     def test_metal_read_write_storage_buffer_in_place_update(self):
         @compute(workgroup_size=(32, 1, 1))

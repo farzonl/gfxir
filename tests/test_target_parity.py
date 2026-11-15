@@ -56,7 +56,7 @@ class TargetParityTests(unittest.TestCase):
         cls.programs = {}
         for name, positions in cls.positions.items():
             pipeline = (
-                runpy.run_path(str(ROOT / f"examples/{name}.py"))["pipeline"]
+                runpy.run_path(str(ROOT / f"examples/basics/{name}.py"))["pipeline"]
                 if name in ("triangle", "quad") else positioned_triangle(positions)
             )
             cls.programs[name] = {}

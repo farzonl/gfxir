@@ -54,7 +54,7 @@ class RayMarchAcceptanceTests(unittest.TestCase):
         for target in Target:
             for name, pipeline in (
                 ("gallery", gallery_pipeline()),
-                ("budget", runpy.run_path(str(ROOT / "examples/march_budget.py"))["pipeline"]),
+                ("budget", runpy.run_path(str(ROOT / "examples/raymarching/march_budget.py"))["pipeline"]),
                 ("frame", Pipeline(frame_vertex, both_stages)),
             ):
                 start = time.perf_counter()

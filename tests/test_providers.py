@@ -104,7 +104,7 @@ class TestDirectXCliProviders(unittest.TestCase):
         cls.viewer_bin = cls.tools.find("mlir-gpu-directx-view")
 
         # Compile minimal triangle DXIL program
-        pipeline = runpy.run_path(str(ROOT / "examples" / "triangle.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples" / "basics" / "triangle.py"))["pipeline"]
         manifest = compile_pipeline(pipeline, Target.DIRECTX, Path(cls.work.name) / "triangle", cls.tools)
         cls.triangle_prog = load_program(manifest)
         cls.vertex_path = Path(cls.work.name) / "triangle" / "vertex.dxil"
@@ -235,7 +235,7 @@ class TestDirectXPythonProviders(unittest.TestCase):
         cls.work = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.work.cleanup)
         cls.tools = get_test_toolchain()
-        pipeline = runpy.run_path(str(ROOT / "examples" / "triangle.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples" / "basics" / "triangle.py"))["pipeline"]
         manifest = compile_pipeline(pipeline, Target.DIRECTX, Path(cls.work.name) / "triangle", cls.tools)
         cls.program = load_program(manifest)
         viewer_bin = cls.tools.find("mlir-gpu-directx-view")
@@ -367,7 +367,7 @@ class TestVulkanPythonProviders(unittest.TestCase):
         cls.work = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.work.cleanup)
         cls.tools = get_test_toolchain()
-        pipeline = runpy.run_path(str(ROOT / "examples" / "triangle.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples" / "basics" / "triangle.py"))["pipeline"]
         try:
             manifest = compile_pipeline(pipeline, Target.VULKAN, Path(cls.work.name) / "triangle", cls.tools)
             cls.program = load_program(manifest)
@@ -458,7 +458,7 @@ class TestProviderRejectionAndSafety(unittest.TestCase):
         cls.work = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.work.cleanup)
         cls.tools = get_test_toolchain()
-        pipeline = runpy.run_path(str(ROOT / "examples" / "triangle.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples" / "basics" / "triangle.py"))["pipeline"]
         cls.triangle_pipe = pipeline
         try:
             manifest_vk = compile_pipeline(pipeline, Target.VULKAN, Path(cls.work.name) / "triangle_vk", cls.tools)
@@ -607,7 +607,7 @@ class TestVideoExportProviders(unittest.TestCase):
         cls.addClassCleanup(cls.work.cleanup)
         cls.tools = get_test_toolchain()
         if sys.platform == "win32":
-            pipeline = runpy.run_path(str(ROOT / "examples" / "triangle.py"))["pipeline"]
+            pipeline = runpy.run_path(str(ROOT / "examples" / "basics" / "triangle.py"))["pipeline"]
             manifest = compile_pipeline(pipeline, Target.DIRECTX, Path(cls.work.name) / "triangle", cls.tools)
             cls.program = load_program(manifest)
         else:
@@ -649,7 +649,7 @@ class TestViewerCli(unittest.TestCase):
         cls.addClassCleanup(cls.work.cleanup)
         cls.tools = get_test_toolchain()
         if sys.platform == "win32":
-            pipeline = runpy.run_path(str(ROOT / "examples" / "triangle.py"))["pipeline"]
+            pipeline = runpy.run_path(str(ROOT / "examples" / "basics" / "triangle.py"))["pipeline"]
             cls.manifest = compile_pipeline(pipeline, Target.DIRECTX, Path(cls.work.name) / "triangle", cls.tools)
             viewer_bin = cls.tools.find("mlir-gpu-directx-view")
             cls.has_hardware_gpu = _has_directx_hardware_gpu(viewer_bin)

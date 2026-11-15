@@ -78,7 +78,7 @@ class FragmentCoordinateFrontendTests(unittest.TestCase):
 class FragmentCoordinateRenderingTests(unittest.TestCase):
     def test_fullscreen_pixel_centers_origin_and_coverage_match_all_targets(self):
         tools = Toolchain(Path(os.environ["LLVM_BIN"]) if "LLVM_BIN" in os.environ else None)
-        pipeline = runpy.run_path(str(ROOT / "examples/coordinates.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples/basics/coordinates.py"))["pipeline"]
         programs = {}
         validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
         with tempfile.TemporaryDirectory() as work:

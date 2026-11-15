@@ -20,7 +20,7 @@ class TestPrefixScanCompilation(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.example = runpy.run_path(str(ROOT / "examples" / "prefix_scan.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "prefix_scan.py"))
 
     def test_cpu_prefix_scan_inclusive_and_exclusive(self):
         data = [3, -1, 4, 0, -2, 7]
@@ -88,7 +88,7 @@ class TestPrefixScanVulkanExecution(_PrefixScanExecutionMixin, unittest.TestCase
     @classmethod
     def setUpClass(cls):
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.example = runpy.run_path(str(ROOT / "examples" / "prefix_scan.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "prefix_scan.py"))
 
 
 @unittest.skipUnless(
@@ -104,7 +104,7 @@ class TestPrefixScanDirectXExecution(_PrefixScanExecutionMixin, unittest.TestCas
         if not (available("llc") and available("dxv") and available("mlir-gpu-directx-view")):
             raise unittest.SkipTest("DirectX 12 compute execution tools are unavailable")
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.example = runpy.run_path(str(ROOT / "examples" / "prefix_scan.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "prefix_scan.py"))
 
 
 @unittest.skipUnless(
@@ -120,7 +120,7 @@ class TestPrefixScanMetalExecution(_PrefixScanExecutionMixin, unittest.TestCase)
         if not all(available(tool) for tool in required):
             raise unittest.SkipTest("Metal compute execution tools are unavailable")
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.example = runpy.run_path(str(ROOT / "examples" / "prefix_scan.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "prefix_scan.py"))
 
 
 if __name__ == "__main__":

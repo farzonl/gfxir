@@ -480,7 +480,7 @@ class VulkanRenderingTests(unittest.TestCase):
         cls.addClassCleanup(work.cleanup)
         llvm = Path(os.environ["LLVM_BIN"]) if "LLVM_BIN" in os.environ else None
         tools = Path(os.environ["GPU_TOOLS_BIN"]) if "GPU_TOOLS_BIN" in os.environ else None
-        pipeline = runpy.run_path(str(ROOT / "examples/triangle.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples/basics/triangle.py"))["pipeline"]
         manifest = compile_pipeline(pipeline, Target.VULKAN, Path(work.name) / "pipeline", Toolchain(llvm, tools))
         cls.program = load_program(manifest)
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
@@ -563,7 +563,7 @@ class MetalRenderingTests(unittest.TestCase):
         tools = Path(os.environ["GPU_TOOLS_BIN"]) if "GPU_TOOLS_BIN" in os.environ else None
         cls.tools = Toolchain(llvm, tools)
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        pipeline = runpy.run_path(str(ROOT / "examples/triangle.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples/basics/triangle.py"))["pipeline"]
         cls.programs = {}
         for target in (Target.DIRECTX, Target.METAL):
             manifest = compile_pipeline(pipeline, target, Path(work.name) / target.value, cls.tools)
