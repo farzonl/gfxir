@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import atexit
 from collections.abc import Callable
 from contextvars import ContextVar, Token
+import threading
 from typing import Protocol, runtime_checkable
 
 from .targets import (
@@ -149,6 +151,8 @@ class UninitializedBackend:
 
 
 _ACTIVE_DEVICE: ContextVar[Device | None] = ContextVar("gfxpy_active_device", default=None)
+_DEFAULT_DEVICE_LOCK = threading.RLock()
+_DEFAULT_DEVICE: Device | None = None
 
 
 class Device:
@@ -234,6 +238,10 @@ class Device:
         return 0
 
     def close(self) -> None:
+        global _DEFAULT_DEVICE
+        with _DEFAULT_DEVICE_LOCK:
+            if _DEFAULT_DEVICE is self:
+                _DEFAULT_DEVICE = None
         if not self._closed:
             self._closed = True
             self._backend.close()
@@ -274,10 +282,35 @@ def device(
     )
 
 
+def close_default_device() -> None:
+    """Close and clear the process-wide default Device, if one is currently open."""
+    global _DEFAULT_DEVICE
+    with _DEFAULT_DEVICE_LOCK:
+        dev = _DEFAULT_DEVICE
+        _DEFAULT_DEVICE = None
+    if dev is not None:
+        dev.close()
+
+
+atexit.register(close_default_device)
+
+
 def current_device() -> Device:
-    """Return the active Device in the current context, or create a default one."""
+    """Return the active Device in the current context, or the shared default Device.
+
+    Inside an active ``with gp.device(...) as dev:`` block, returns ``dev`` and
+    raises ``DeviceClosedError`` if ``dev`` has been closed. Outside any explicit
+    scope, lazily creates and reuses a process-wide default ``Device`` for the
+    platform-default target; if that default device was closed (via
+    ``close_default_device()`` or ``dev.close()``), a fresh default ``Device``
+    is created on the next implicit call.
+    """
+    global _DEFAULT_DEVICE
     active = _ACTIVE_DEVICE.get()
     if active is not None:
         active.ensure_open()
         return active
-    return Device()
+    with _DEFAULT_DEVICE_LOCK:
+        if _DEFAULT_DEVICE is None or _DEFAULT_DEVICE.closed or _DEFAULT_DEVICE._backend.closed:
+            _DEFAULT_DEVICE = Device()
+        return _DEFAULT_DEVICE

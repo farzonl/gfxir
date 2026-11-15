@@ -285,5 +285,138 @@ class TestArrayContract(unittest.TestCase):
                 a1.download_into(bytearray(4))
 
 
+class TestDefaultDevicePolicy(unittest.TestCase):
+    def setUp(self) -> None:
+        gp.close_default_device()
+
+    def tearDown(self) -> None:
+        gp.close_default_device()
+
+    def test_implicit_array_and_empty_share_default_device_on_simulated_platforms(self) -> None:
+        for plat, expected_target in (
+            ("darwin", "metal"),
+            ("win32", "directx"),
+            ("linux", "vulkan"),
+        ):
+            with self.subTest(platform=plat):
+                gp.close_default_device()
+                created: list[_SpyBackend] = []
+
+                def make_backend(target: str, **_kwargs: object) -> _SpyBackend:
+                    backend = _SpyBackend(target)
+                    created.append(backend)
+                    return backend
+
+                with mock.patch.object(sys, "platform", plat), mock.patch(
+                    "gfxpy.gpu_backend.GfxIRComputeBackend",
+                    side_effect=make_backend,
+                ) as backend_cls:
+                    a = gp.array([1.0, 2.0], dtype=gp.float32)
+                    b = gp.array([3.0, 4.0], dtype=gp.float32)
+                    e = gp.empty(2, dtype=gp.float32)
+
+                    self.assertIs(a.device, b.device)
+                    self.assertIs(a.device, e.device)
+                    self.assertIs(a.device, gp.current_device())
+                    self.assertEqual(a.device.target, expected_target)
+                    self.assertEqual(backend_cls.call_count, 1)
+                    self.assertEqual(len(created), 1)
+                    self.assertEqual((a + b).tolist(), [4.0, 6.0])
+                    self.assertEqual((a * b).tolist(), [3.0, 8.0])
+                gp.close_default_device()
+
+    def test_nested_explicit_scopes_restore_and_isolate_devices(self) -> None:
+        with mock.patch.object(sys, "platform", "linux"), mock.patch(
+            "gfxpy.gpu_backend.GfxIRComputeBackend",
+            side_effect=lambda target, **_kw: _SpyBackend(target),
+        ):
+            d_default = gp.current_device()
+            a_default = gp.array([1.0, 2.0])
+
+            with gp.device("vulkan", backend=_SpyBackend("vulkan")) as d1:
+                self.assertIs(gp.current_device(), d1)
+                a1 = gp.array([3.0, 4.0])
+                self.assertIs(a1.device, d1)
+                with self.assertRaises(gp.CrossDeviceError):
+                    _ = a_default + a1
+
+                with gp.device("metal", backend=_SpyBackend("metal")) as d2:
+                    self.assertIs(gp.current_device(), d2)
+                    a2 = gp.array([5.0, 6.0])
+                    self.assertIs(a2.device, d2)
+                    with self.assertRaises(gp.CrossDeviceError):
+                        _ = a1 + a2
+
+                self.assertIs(gp.current_device(), d1)
+                a1_b = gp.array([7.0, 8.0])
+                self.assertEqual((a1 + a1_b).tolist(), [10.0, 12.0])
+
+            self.assertIs(gp.current_device(), d_default)
+            a_default_2 = gp.array([9.0, 10.0])
+            self.assertEqual((a_default + a_default_2).tolist(), [10.0, 12.0])
+
+    def test_explicit_separate_device_isolated_from_default(self) -> None:
+        with mock.patch.object(sys, "platform", "linux"), mock.patch(
+            "gfxpy.gpu_backend.GfxIRComputeBackend",
+            side_effect=lambda target, **_kw: _SpyBackend(target),
+        ):
+            d_sep = gp.device("vulkan", backend=_SpyBackend("vulkan"))
+            try:
+                a_def = gp.array([1.0, 2.0])
+                a_sep = gp.array([3.0, 4.0], device=d_sep)
+                with self.assertRaises(gp.CrossDeviceError):
+                    _ = a_def + a_sep
+            finally:
+                d_sep.close()
+
+    def test_closed_default_device_cleanup_and_recreation(self) -> None:
+        with mock.patch.object(sys, "platform", "linux"), mock.patch(
+            "gfxpy.gpu_backend.GfxIRComputeBackend",
+            side_effect=lambda target, **_kw: _SpyBackend(target),
+        ):
+            d1 = gp.current_device()
+            b1 = d1.backend
+            a1 = gp.array([1.0, 2.0])
+
+            gp.close_default_device()
+            self.assertTrue(d1.closed)
+            self.assertTrue(b1.closed)
+            with self.assertRaises(gp.DeviceClosedError):
+                gp.array([1.0], device=d1)
+            with self.assertRaises(gp.DeviceClosedError):
+                a1.tolist()
+
+            gp.close_default_device()  # idempotent
+
+            d2 = gp.current_device()
+            self.assertIsNot(d2, d1)
+            self.assertFalse(d2.closed)
+            a2 = gp.array([3.0, 4.0])
+            self.assertIs(a2.device, d2)
+            self.assertEqual((a2 + gp.array([1.0, 2.0])).tolist(), [4.0, 6.0])
+
+            d2.close()
+            self.assertTrue(d2.closed)
+            d3 = gp.current_device()
+            self.assertIsNot(d3, d2)
+            self.assertFalse(d3.closed)
+
+    def test_closed_explicit_scope_does_not_reopen_or_fall_back(self) -> None:
+        with mock.patch.object(sys, "platform", "linux"), mock.patch(
+            "gfxpy.gpu_backend.GfxIRComputeBackend",
+            side_effect=lambda target, **_kw: _SpyBackend(target),
+        ):
+            d_default = gp.current_device()
+            with gp.device("vulkan", backend=_SpyBackend("vulkan")) as d_scope:
+                d_scope.close()
+                with self.assertRaises(gp.DeviceClosedError):
+                    gp.current_device()
+                with self.assertRaises(gp.DeviceClosedError):
+                    gp.array([1.0])
+                with self.assertRaises(gp.DeviceClosedError):
+                    gp.empty(1)
+            self.assertIs(gp.current_device(), d_default)
+
+
 if __name__ == "__main__":
     unittest.main()

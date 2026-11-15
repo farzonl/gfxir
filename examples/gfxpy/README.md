@@ -77,6 +77,19 @@ unknown target names raise `UnsupportedTargetError`.
   context; call `dev.close()` to release GPU resources). Use-after-close raises
   `DeviceClosedError` or `ArrayClosedError`; combining arrays from different
   devices raises `CrossDeviceError`.
+- **Implicit default-device ownership, shutdown, and recreation**:
+  Calling `gp.array(...)` or `gp.empty(...)` without `device=` and outside a
+  `with gp.device(...)` block lazily creates and reuses a process-wide default
+  `Device` for the platform-default target (`"auto"`), so implicit arrays share
+  the same compute context and compiled pipeline cache. Nested `with gp.device(...)`
+  scopes override `current_device()` and restore the previous scope on exit, while
+  explicit `Device` instances remain isolated (`CrossDeviceError`). Call
+  `gp.close_default_device()` (also registered with `atexit`) or
+  `gp.current_device().close()` to deterministically shut down the default
+  context. Closing a `Device` never silently reopens it (using that `Device`,
+  its arrays, or an active `with dev:` scope after `dev.close()` raises
+  `DeviceClosedError`); subsequent implicit calls outside a closed scope create
+  a fresh default `Device`.
 - **No CPU or cross-backend fallback**: Missing tools, missing adapters, or
   backend initialization failures raise `BackendInitializationError`,
   `PersistentComputeError`, or `BackendNotImplementedError` with the target and
