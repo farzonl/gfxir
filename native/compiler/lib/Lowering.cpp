@@ -1883,6 +1883,9 @@ void buildDirectXPipeline(OpPassManager &manager, const TargetProfile &profile) 
   // Legalize vector-valued helper boundaries without unrolling shader loops.
   manager.addPass(createInlinerPass());
   manager.addPass(createSymbolDCEPass());
+  manager.addPass(createCanonicalizerPass());
+  manager.addPass(createCSEPass());
+  manager.addPass(createLoopInvariantCodeMotionPass());
   manager.addPass(createSCFToControlFlowPass());
   manager.addPass(createConvertVectorToLLVMPass());
   manager.addPass(createConvertMathToLLVMPass());
@@ -1891,6 +1894,8 @@ void buildDirectXPipeline(OpPassManager &manager, const TargetProfile &profile) 
   manager.addPass(createConvertFuncToLLVMPass());
   manager.addPass(createUBToLLVMConversionPass());
   manager.addPass(createReconcileUnrealizedCastsPass());
+  manager.addPass(createCanonicalizerPass());
+  manager.addPass(createCSEPass());
 }
 
 void registerGfxPipelines() {
