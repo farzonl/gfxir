@@ -298,7 +298,9 @@ def _benchmark_gfx_suite(
         with tempfile.TemporaryDirectory() as td:
             t_compile0 = time.perf_counter()
             if spec.kind == "saxpy_chain":
-                @compute(workgroup_size=(64, 1, 1))
+                saxpy_wg_size = 256
+
+                @compute(workgroup_size=(saxpy_wg_size, 1, 1))
                 def saxpy_kernel(
                     x: Buffer[Type.F32, "read_only"],
                     y: Buffer[Type.F32, "read_only"],
@@ -321,7 +323,7 @@ def _benchmark_gfx_suite(
                     x_bytes = struct.pack(f"<{spec.n}f", *([1.0] * spec.n))
                     y_bytes = struct.pack(f"<{spec.n}f", *([2.0] * spec.n))
                 nbytes = spec.n * 4
-                grid = ((spec.n + 63) // 64, 1, 1)
+                grid = ((spec.n + saxpy_wg_size - 1) // saxpy_wg_size, 1, 1)
 
                 with open_compute_context(target_name, validation=False, provider=provider) as ctx:
                     pipe = ctx.compile_pipeline(manifest)
