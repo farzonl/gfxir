@@ -335,6 +335,7 @@ class DirectXBuffer(PersistentBuffer):
     def close(self) -> None:
         if not self._closed:
             self._closed = True
+            self._context._buffers.discard(self)
             handle = self._handle
             self._handle = None
             if handle is not None and self._context._lib is not None:
@@ -490,6 +491,7 @@ class DirectXPipeline(PersistentPipeline):
     def close(self) -> None:
         if not self._closed:
             self._closed = True
+            self._context._pipelines.discard(self)
             handle = self._handle
             self._handle = None
             if handle is not None and self._context._lib is not None:
@@ -656,16 +658,31 @@ class DirectXComputeContext(ComputeContext):
         self._ensure_open()
 
     def close(self) -> None:
-        if not self._closed:
-            for buf in list(self._buffers):
+        if self._closed:
+            return
+        errors: list[BaseException] = []
+        for buf in list(self._buffers):
+            try:
                 buf.close()
-            for pipe in list(self._pipelines):
+            except BaseException as exc:
+                errors.append(exc)
+        for pipe in list(self._pipelines):
+            try:
                 pipe.close()
-            self._closed = True
-            handle = self._handle
-            self._handle = None
-            if handle is not None and self._lib is not None:
+            except BaseException as exc:
+                errors.append(exc)
+        self._buffers.clear()
+        self._pipelines.clear()
+        self._closed = True
+        handle = self._handle
+        self._handle = None
+        if handle is not None and self._lib is not None:
+            try:
                 self._lib.gfx_dx12_destroy_device(ctypes.c_void_p(handle))
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
 
     def __del__(self) -> None:
         try:

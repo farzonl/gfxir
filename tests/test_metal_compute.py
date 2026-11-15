@@ -27,6 +27,8 @@ from mlir_gpu import (
     load_compute_program,
     open_compute_context,
 )
+from mlir_gpu.metal_compute import MetalComputeContext
+from mlir_gpu.viewer import ComputeProgram, Shader
 from test_support import TOOLS
 
 MetalNoopParams = ParameterBlock("mtl_noop_p", (("n", Type.I32),))
@@ -38,8 +40,10 @@ class _FakeMetalBridge:
         self.fail_create = fail_create
         self.next_id = 1
         self.buffers: dict[int, bytearray] = {}
+        self.pipelines: set[int] = set()
         self.dispatches: list[tuple[int, int, tuple[int, int, int]]] = []
         self.sync_calls = 0
+        self.destroyed_contexts = 0
 
     def _alloc_id(self) -> int:
         val = self.next_id
@@ -53,7 +57,7 @@ class _FakeMetalBridge:
         return self._alloc_id()
 
     def gfx_mtl_destroy_context(self, ctx):
-        pass
+        self.destroyed_contexts += 1
 
     def gfx_mtl_context_device_name(self, ctx):
         return b"FakeAppleMetalGPU"
@@ -81,9 +85,12 @@ class _FakeMetalBridge:
         return 0
 
     def gfx_mtl_create_pipeline(self, ctx, path, entry, wg_x, wg_y, wg_z, err_buf, err_cap):
-        return self._alloc_id()
+        handle = self._alloc_id()
+        self.pipelines.add(handle)
+        return handle
 
     def gfx_mtl_destroy_pipeline(self, handle):
+        self.pipelines.discard(handle)
         self.destroyed_pipelines = getattr(self, "destroyed_pipelines", 0) + 1
 
     def gfx_mtl_dispatch(self, ctx, pipe, bindings, num_bindings, rc_ptr, rc_size, gx, gy, gz, err_buf, err_cap):
@@ -303,6 +310,96 @@ class TestMetalComputeContract(unittest.TestCase):
                     self.assertEqual(ctx.stats["waits"], 1)
                     self.assertEqual(fake.sync_calls, sync_before + 1)
                     self.assertEqual(getattr(fake, "destroyed_pipelines", 0), 1)
+
+    def test_dropped_buffers_and_pipelines_release_native_allocations_and_keep_tracking_bounded(self) -> None:
+        import gc
+
+        fake = _FakeMetalBridge()
+        prog = ComputeProgram(
+            compute=Shader(entry_point="main", code=b"metallib"),
+            target="metal",
+            workgroup_size=(64, 1, 1),
+            buffers=[],
+        )
+        with mock.patch("sys.platform", "darwin"), mock.patch(
+            "mlir_gpu.metal_compute._load_bridge", return_value=fake
+        ):
+            ctx = MetalComputeContext(pool_max_bytes=0)
+            for _ in range(50):
+                b = ctx.create_buffer(16)
+                b.close()
+            self.assertEqual(len(ctx._buffers), 0)
+            self.assertEqual(len(fake.buffers), 0)
+            self.assertEqual(ctx.stats["live_buffers"], 0)
+
+            dropped_buf = ctx.create_buffer(32)
+            dropped_pipe = ctx.compile_pipeline(prog)
+            self.assertEqual(len(fake.buffers), 1)
+            self.assertEqual(len(fake.pipelines), 1)
+            del dropped_buf, dropped_pipe
+            gc.collect()
+
+            self.assertEqual(len(ctx._buffers), 0)
+            self.assertEqual(len(ctx._pipelines), 0)
+            self.assertEqual(len(fake.buffers), 0)
+            self.assertEqual(len(fake.pipelines), 0)
+
+            # Dropping a buffer while work is pending defers cleanup and still frees on close().
+            pending_buf = ctx.create_buffer(16)
+            ctx._pending_work = True
+            del pending_buf
+            gc.collect()
+            self.assertEqual(len(fake.buffers), 1)
+            ctx.close()
+            self.assertEqual(len(fake.buffers), 0)
+            self.assertEqual(fake.destroyed_contexts, 1)
+
+    def test_close_attempts_remaining_resources_on_sync_and_destroy_failures(self) -> None:
+        fake = _FakeMetalBridge()
+        fail_first_destroy = {"done": False}
+        orig_destroy_buf = fake.gfx_mtl_destroy_buffer
+
+        def failing_destroy_buffer(handle: int) -> None:
+            if not fail_first_destroy["done"]:
+                fail_first_destroy["done"] = True
+                raise RuntimeError("injected destroy_buffer failure")
+            orig_destroy_buf(handle)
+
+        def failing_sync(ctx, err_buf, err_cap) -> int:
+            err_buf.value = b"injected sync failure"
+            return 1
+
+        fake.gfx_mtl_destroy_buffer = failing_destroy_buffer  # type: ignore[method-assign]
+        fake.gfx_mtl_synchronize = failing_sync  # type: ignore[method-assign]
+
+        prog = ComputeProgram(
+            compute=Shader(entry_point="main", code=b"metallib"),
+            target="metal",
+            workgroup_size=(64, 1, 1),
+            buffers=[],
+        )
+        with mock.patch("sys.platform", "darwin"), mock.patch(
+            "mlir_gpu.metal_compute._load_bridge", return_value=fake
+        ):
+            ctx = MetalComputeContext(pool_max_bytes=0)
+            _b1 = ctx.create_buffer(16)
+            _b2 = ctx.create_buffer(16)
+            _pipe = ctx.compile_pipeline(prog)
+            ctx._pending_work = True
+
+            with self.assertRaises(PersistentComputeError) as err_ctx:
+                ctx.close()
+            self.assertIn("injected sync failure", str(err_ctx.exception))
+            self.assertTrue(ctx.closed)
+            self.assertEqual(len(ctx._buffers), 0)
+            self.assertEqual(len(ctx._pipelines), 0)
+            self.assertEqual(len(fake.buffers), 1)  # Only the one whose destroy raised remains
+            self.assertEqual(len(fake.pipelines), 0)
+            self.assertEqual(fake.destroyed_contexts, 1)
+
+            # Second close is idempotent.
+            ctx.close()
+            self.assertEqual(fake.destroyed_contexts, 1)
 
 
 @unittest.skipUnless(

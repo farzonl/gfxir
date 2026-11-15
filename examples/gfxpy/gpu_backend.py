@@ -315,13 +315,23 @@ class GfxIRComputeBackend(ComputeBackend):
         if self._closed:
             return
         self._closed = True
-        try:
-            for pipe in self._pipelines.values():
+        errors: list[BaseException] = []
+        for pipe in list(self._pipelines.values()):
+            try:
                 pipe.close()
-            self._pipelines.clear()
+            except BaseException as exc:
+                errors.append(exc)
+        self._pipelines.clear()
+        try:
             self._ctx.close()
-        finally:
+        except BaseException as exc:
+            errors.append(exc)
+        try:
             self._artifact_dir.cleanup()
+        except BaseException as exc:
+            errors.append(exc)
+        if errors:
+            raise errors[0]
 
     def __del__(self) -> None:
         try:
