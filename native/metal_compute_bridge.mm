@@ -32,15 +32,44 @@ struct GfxMtlContext {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
     id<MTLCommandBuffer> last_command = nil;
+    id<MTLCommandBuffer> active_command = nil;
+    id<MTLComputeCommandEncoder> active_encoder = nil;
+    bool batch_active = false;
+    bool has_dispatches_in_encoder = false;
+    id<MTLBuffer> arg_ring_buf = nil;
+    size_t arg_ring_size = 4 * 1024 * 1024;
+    size_t arg_ring_offset = 0;
+    std::vector<id<MTLBuffer>> overflow_arg_buffers;
+    uint64_t next_buffer_id = 1;
     std::string device_name;
 };
 
 struct GfxMtlBuffer {
     GfxMtlContext* ctx = nullptr;
     id<MTLBuffer> buffer = nil;
+    uint64_t buffer_id = 0;
     uint64_t size_bytes = 0;
     uint64_t aligned_size = 0;
 };
+
+struct DescriptorKeyEntry {
+    uint64_t buffer_id;
+    int is_uav;
+    uint32_t set;
+    uint32_t binding;
+
+    bool operator==(const DescriptorKeyEntry& other) const {
+        return buffer_id == other.buffer_id && is_uav == other.is_uav && set == other.set &&
+               binding == other.binding;
+    }
+};
+
+struct DescriptorCacheEntry {
+    std::vector<DescriptorKeyEntry> key;
+    id<MTLBuffer> table = nil;
+};
+
+static constexpr size_t kMaxCachedDescriptorTables = 32;
 
 struct GfxMtlPipeline {
     GfxMtlContext* ctx = nullptr;
@@ -51,24 +80,45 @@ struct GfxMtlPipeline {
     size_t reflected_arg_size = 0;
     size_t descriptor_table_offset = 0;
     bool has_descriptor_table_offset = false;
+    std::vector<DescriptorCacheEntry> descriptor_cache;
 };
+
+int commit_active_command(GfxMtlContext* ctx) {
+    if (ctx->active_encoder != nil) {
+        [ctx->active_encoder endEncoding];
+        ctx->active_encoder = nil;
+    }
+    if (ctx->active_command != nil) {
+        [ctx->active_command commit];
+        ctx->last_command = ctx->active_command;
+        ctx->active_command = nil;
+    }
+    ctx->has_dispatches_in_encoder = false;
+    return 0;
+}
 
 int sync_context(GfxMtlContext* ctx, char* err_buf, size_t err_cap) {
     if (!ctx) {
         set_error(err_buf, err_cap, "Metal compute context is null");
         return -1;
     }
+    commit_active_command(ctx);
+    ctx->batch_active = false;
     if (ctx->last_command != nil) {
         [ctx->last_command waitUntilCompleted];
         if (ctx->last_command.status == MTLCommandBufferStatusError) {
             NSString* desc = ctx->last_command.error ? ctx->last_command.error.localizedDescription
                                                      : @"unknown Metal command buffer error";
             ctx->last_command = nil;
+            ctx->arg_ring_offset = 0;
+            ctx->overflow_arg_buffers.clear();
             set_error(err_buf, err_cap, std::string("Metal compute dispatch failed: ") + [desc UTF8String]);
             return -1;
         }
         ctx->last_command = nil;
     }
+    ctx->arg_ring_offset = 0;
+    ctx->overflow_arg_buffers.clear();
     return 0;
 }
 
@@ -110,10 +160,13 @@ void gfx_mtl_destroy_context(void* ctx_ptr) {
         if (!ctx) {
             return;
         }
+        commit_active_command(ctx);
         if (ctx->last_command != nil) {
             [ctx->last_command waitUntilCompleted];
             ctx->last_command = nil;
         }
+        ctx->overflow_arg_buffers.clear();
+        ctx->arg_ring_buf = nil;
         ctx->queue = nil;
         ctx->device = nil;
         delete ctx;
@@ -164,6 +217,7 @@ void* gfx_mtl_create_buffer(
         auto* buf = new GfxMtlBuffer();
         buf->ctx = ctx;
         buf->buffer = mtl_buf;
+        buf->buffer_id = ctx->next_buffer_id++;
         buf->size_bytes = size_bytes;
         buf->aligned_size = aligned_size;
         return buf;
@@ -337,6 +391,31 @@ void gfx_mtl_destroy_pipeline(void* pipe_ptr) {
     }
 }
 
+int gfx_mtl_begin_batch(void* ctx_ptr, char* err_buf, size_t err_cap) {
+    @autoreleasepool {
+        auto* ctx = static_cast<GfxMtlContext*>(ctx_ptr);
+        if (!ctx || !ctx->device) {
+            set_error(err_buf, err_cap, "Metal compute context is null");
+            return -1;
+        }
+        ctx->batch_active = true;
+        return 0;
+    }
+}
+
+int gfx_mtl_end_batch(void* ctx_ptr, char* err_buf, size_t err_cap) {
+    @autoreleasepool {
+        auto* ctx = static_cast<GfxMtlContext*>(ctx_ptr);
+        if (!ctx || !ctx->device) {
+            set_error(err_buf, err_cap, "Metal compute context is null");
+            return -1;
+        }
+        ctx->batch_active = false;
+        commit_active_command(ctx);
+        return 0;
+    }
+}
+
 int gfx_mtl_dispatch(
     void* ctx_ptr,
     void* pipe_ptr,
@@ -358,101 +437,152 @@ int gfx_mtl_dispatch(
             return -1;
         }
 
-        std::vector<const GfxMtlBufferBinding*> ordered;
-        ordered.reserve(num_bindings);
+        const GfxMtlBufferBinding* stack_ordered[16];
+        std::vector<const GfxMtlBufferBinding*> heap_ordered;
+        const GfxMtlBufferBinding** ordered_ptr = stack_ordered;
+        if (num_bindings > 16) {
+            heap_ordered.resize(num_bindings);
+            ordered_ptr = heap_ordered.data();
+        }
         for (uint32_t i = 0; i < num_bindings; ++i) {
             auto* buf = static_cast<GfxMtlBuffer*>(bindings[i].buffer);
             if (!buf || !buf->buffer || buf->ctx != ctx) {
                 set_error(err_buf, err_cap, "Invalid or cross-device Metal buffer binding");
                 return -1;
             }
-            ordered.push_back(&bindings[i]);
+            ordered_ptr[i] = &bindings[i];
         }
 
         std::stable_sort(
-            ordered.begin(),
-            ordered.end(),
+            ordered_ptr,
+            ordered_ptr + num_bindings,
             [](const GfxMtlBufferBinding* a, const GfxMtlBufferBinding* b) {
                 if (a->set != b->set) return a->set < b->set;
                 return a->binding < b->binding;
             }
         );
 
-        std::vector<const GfxMtlBufferBinding*> uavs;
-        std::vector<const GfxMtlBufferBinding*> srvs;
-        for (const auto* b : ordered) {
-            if (b->is_uav) uavs.push_back(b);
-            else srvs.push_back(b);
-        }
-
-        const size_t total_descriptors = uavs.size() + srvs.size();
         id<MTLBuffer> descriptor_table = nil;
-        if (total_descriptors > 0) {
-            const size_t table_bytes = total_descriptors * sizeof(IRDescriptorTableEntry);
-            descriptor_table = [ctx->device newBufferWithLength:table_bytes options:MTLResourceStorageModeShared];
-            if (!descriptor_table) {
-                set_error(err_buf, err_cap, "Cannot allocate Metal IRDescriptorTableEntry buffer");
-                return -1;
-            }
-            auto* entries = static_cast<IRDescriptorTableEntry*>(descriptor_table.contents);
-            std::memset(entries, 0, table_bytes);
-            size_t slot = 0;
-            for (const auto* b : uavs) {
+        if (num_bindings > 0) {
+            std::vector<DescriptorKeyEntry> cache_key;
+            cache_key.reserve(num_bindings);
+            for (uint32_t i = 0; i < num_bindings; ++i) {
+                const auto* b = ordered_ptr[i];
                 auto* buf = static_cast<GfxMtlBuffer*>(b->buffer);
-                IRDescriptorTableSetBuffer(&entries[slot++], buf->buffer.gpuAddress, 0);
+                cache_key.push_back(DescriptorKeyEntry{buf->buffer_id, b->is_uav, b->set, b->binding});
             }
-            for (const auto* b : srvs) {
-                auto* buf = static_cast<GfxMtlBuffer*>(b->buffer);
-                IRDescriptorTableSetBuffer(&entries[slot++], buf->buffer.gpuAddress, 0);
+
+            for (const auto& entry : pipe->descriptor_cache) {
+                if (entry.key == cache_key) {
+                    descriptor_table = entry.table;
+                    break;
+                }
+            }
+
+            if (descriptor_table == nil) {
+                const size_t table_bytes = static_cast<size_t>(num_bindings) * sizeof(IRDescriptorTableEntry);
+                descriptor_table = [ctx->device newBufferWithLength:table_bytes options:MTLResourceStorageModeShared];
+                if (!descriptor_table) {
+                    set_error(err_buf, err_cap, "Cannot allocate Metal IRDescriptorTableEntry buffer");
+                    return -1;
+                }
+                auto* entries = static_cast<IRDescriptorTableEntry*>(descriptor_table.contents);
+                std::memset(entries, 0, table_bytes);
+                size_t slot = 0;
+                for (uint32_t i = 0; i < num_bindings; ++i) {
+                    if (ordered_ptr[i]->is_uav) {
+                        auto* buf = static_cast<GfxMtlBuffer*>(ordered_ptr[i]->buffer);
+                        IRDescriptorTableSetBuffer(&entries[slot++], buf->buffer.gpuAddress, 0);
+                    }
+                }
+                for (uint32_t i = 0; i < num_bindings; ++i) {
+                    if (!ordered_ptr[i]->is_uav) {
+                        auto* buf = static_cast<GfxMtlBuffer*>(ordered_ptr[i]->buffer);
+                        IRDescriptorTableSetBuffer(&entries[slot++], buf->buffer.gpuAddress, 0);
+                    }
+                }
+                if (pipe->descriptor_cache.size() >= kMaxCachedDescriptorTables) {
+                    pipe->descriptor_cache.erase(pipe->descriptor_cache.begin());
+                }
+                pipe->descriptor_cache.push_back(DescriptorCacheEntry{std::move(cache_key), descriptor_table});
             }
         }
 
-        const bool needs_arg_buf = (root_constants_size > 0) || (total_descriptors > 0);
+        const bool needs_arg_buf = (root_constants_size > 0) || (num_bindings > 0);
         id<MTLBuffer> top_level_arg_buf = nil;
+        size_t top_level_arg_offset = 0;
         if (needs_arg_buf) {
             const size_t fallback_offset = (static_cast<size_t>(root_constants_size) + 7) & ~static_cast<size_t>(7);
             const size_t table_offset =
                 pipe->has_descriptor_table_offset ? pipe->descriptor_table_offset : fallback_offset;
             size_t min_size = root_constants_size;
-            if (total_descriptors > 0) {
+            if (num_bindings > 0) {
                 min_size = std::max<size_t>(min_size, table_offset + sizeof(uint64_t));
             }
             const size_t arg_buf_size = std::max<size_t>(std::max<size_t>(pipe->reflected_arg_size, min_size), 16);
-            top_level_arg_buf = [ctx->device newBufferWithLength:arg_buf_size options:MTLResourceStorageModeShared];
-            if (!top_level_arg_buf) {
-                set_error(err_buf, err_cap, "Cannot allocate Metal top-level argument buffer");
-                return -1;
+            const size_t aligned_arg_size = (arg_buf_size + 255) & ~static_cast<size_t>(255);
+
+            if (ctx->arg_ring_buf == nil && aligned_arg_size <= ctx->arg_ring_size) {
+                ctx->arg_ring_buf = [ctx->device newBufferWithLength:ctx->arg_ring_size
+                                                             options:MTLResourceStorageModeShared];
             }
-            auto* arg_bytes = static_cast<uint8_t*>(top_level_arg_buf.contents);
+
+            uint8_t* arg_bytes = nullptr;
+            if (ctx->arg_ring_buf != nil && ctx->arg_ring_offset + aligned_arg_size <= ctx->arg_ring_size) {
+                top_level_arg_buf = ctx->arg_ring_buf;
+                top_level_arg_offset = ctx->arg_ring_offset;
+                ctx->arg_ring_offset += aligned_arg_size;
+                arg_bytes = static_cast<uint8_t*>(top_level_arg_buf.contents) + top_level_arg_offset;
+            } else {
+                top_level_arg_buf = [ctx->device newBufferWithLength:arg_buf_size
+                                                             options:MTLResourceStorageModeShared];
+                if (!top_level_arg_buf) {
+                    set_error(err_buf, err_cap, "Cannot allocate Metal top-level argument buffer");
+                    return -1;
+                }
+                ctx->overflow_arg_buffers.push_back(top_level_arg_buf);
+                arg_bytes = static_cast<uint8_t*>(top_level_arg_buf.contents);
+            }
+
             std::memset(arg_bytes, 0, arg_buf_size);
             if (root_constants && root_constants_size > 0) {
                 std::memcpy(arg_bytes, root_constants, root_constants_size);
             }
-            if (total_descriptors > 0 && descriptor_table != nil) {
+            if (num_bindings > 0 && descriptor_table != nil) {
                 uint64_t table_addr = descriptor_table.gpuAddress;
                 std::memcpy(arg_bytes + table_offset, &table_addr, sizeof(table_addr));
             }
         }
 
-        id<MTLCommandBuffer> command = [ctx->queue commandBuffer];
-        if (!command) {
-            set_error(err_buf, err_cap, "Cannot allocate Metal compute command buffer");
-            return -1;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-        if (!encoder) {
-            set_error(err_buf, err_cap, "Cannot create Metal compute command encoder");
-            return -1;
+        if (ctx->active_command == nil) {
+            ctx->active_command = [ctx->queue commandBuffer];
+            if (!ctx->active_command) {
+                set_error(err_buf, err_cap, "Cannot allocate Metal compute command buffer");
+                return -1;
+            }
+            ctx->active_encoder = [ctx->active_command computeCommandEncoder];
+            if (!ctx->active_encoder) {
+                ctx->active_command = nil;
+                set_error(err_buf, err_cap, "Cannot create Metal compute command encoder");
+                return -1;
+            }
+            ctx->has_dispatches_in_encoder = false;
+        } else if (ctx->has_dispatches_in_encoder) {
+            [ctx->active_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         }
 
+        id<MTLComputeCommandEncoder> encoder = ctx->active_encoder;
         [encoder setComputePipelineState:pipe->pipeline];
         if (top_level_arg_buf != nil) {
-            [encoder setBuffer:top_level_arg_buf offset:0 atIndex:kIRArgumentBufferBindPoint];
+            [encoder setBuffer:top_level_arg_buf
+                        offset:top_level_arg_offset
+                       atIndex:kIRArgumentBufferBindPoint];
         }
         if (descriptor_table != nil) {
             [encoder useResource:descriptor_table usage:MTLResourceUsageRead];
         }
-        for (const auto* b : ordered) {
+        for (uint32_t i = 0; i < num_bindings; ++i) {
+            const auto* b = ordered_ptr[i];
             auto* buf = static_cast<GfxMtlBuffer*>(b->buffer);
             const MTLResourceUsage usage = b->is_uav ? (MTLResourceUsageRead | MTLResourceUsageWrite)
                                                      : MTLResourceUsageRead;
@@ -461,9 +591,11 @@ int gfx_mtl_dispatch(
 
         [encoder dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, grid_z)
                 threadsPerThreadgroup:MTLSizeMake(pipe->wg_x, pipe->wg_y, pipe->wg_z)];
-        [encoder endEncoding];
-        [command commit];
-        ctx->last_command = command;
+        ctx->has_dispatches_in_encoder = true;
+
+        if (!ctx->batch_active) {
+            commit_active_command(ctx);
+        }
         return 0;
     }
 }
