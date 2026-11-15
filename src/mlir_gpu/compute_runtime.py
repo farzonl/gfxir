@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack, contextmanager
+import os
 from pathlib import Path
 
 from .parameters import pack_parameters
@@ -20,6 +22,162 @@ from .viewer import (
 
 class PersistentComputeError(ViewerError):
     """Raised on invalid persistent compute resource usage, binding, or lifecycle."""
+
+
+_DEFAULT_POOL_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _resolve_pool_max_bytes(pool_max_bytes: int | None) -> int:
+    if pool_max_bytes is not None:
+        if type(pool_max_bytes) is not int or pool_max_bytes < 0:
+            raise PersistentComputeError(
+                f"pool_max_bytes must be a non-negative integer, got {pool_max_bytes!r}."
+            )
+        return pool_max_bytes
+    env_val = os.environ.get("MLIR_GPU_POOL_MAX_BYTES")
+    if env_val is not None:
+        try:
+            parsed = int(env_val)
+            if parsed >= 0:
+                return parsed
+        except ValueError:
+            pass
+    return _DEFAULT_POOL_MAX_BYTES
+
+
+class _BoundedBufferPool:
+    """Per-context bounded buffer pool with FIFO eviction and memory high-water stats."""
+
+    def __init__(
+        self,
+        *,
+        max_bytes: int = _DEFAULT_POOL_MAX_BYTES,
+        max_per_bucket: int = 32,
+        max_entries: int = 64,
+    ) -> None:
+        self._max_bytes = max_bytes
+        self._max_per_bucket = max_per_bucket
+        self._max_entries = max_entries
+        self._buckets: dict[int, list[object]] = {}
+        self._fifo: deque[int] = deque()
+        self._pooled_bytes = 0
+        self._pooled_buffers = 0
+        self._live_bytes = 0
+        self._live_buffers = 0
+        self._peak_live_bytes = 0
+        self._peak_total_bytes = 0
+        self._allocations = 0
+        self._pool_hits = 0
+        self._pool_misses = 0
+        self._pool_returns = 0
+        self._pool_evictions = 0
+
+    def acquire(self, bucket_size: int) -> object | None:
+        if self._max_bytes <= 0:
+            self._pool_misses += 1
+            return None
+        bucket = self._buckets.get(bucket_size)
+        if bucket:
+            handle = bucket.pop()
+            if not bucket:
+                del self._buckets[bucket_size]
+            self._pooled_bytes -= bucket_size
+            self._pooled_buffers -= 1
+            self._pool_hits += 1
+            return handle
+        self._pool_misses += 1
+        return None
+
+    def record_allocation(self) -> None:
+        self._allocations += 1
+
+    def on_live_alloc(self, size: int) -> None:
+        self._live_buffers += 1
+        self._live_bytes += size
+        if self._live_bytes > self._peak_live_bytes:
+            self._peak_live_bytes = self._live_bytes
+        total = self._live_bytes + self._pooled_bytes
+        if total > self._peak_total_bytes:
+            self._peak_total_bytes = total
+
+    def on_live_free(self, size: int) -> None:
+        self._live_buffers = max(0, self._live_buffers - 1)
+        self._live_bytes = max(0, self._live_bytes - size)
+
+    def release(self, bucket_size: int, handle: object, destroy_fn: Callable[[object], None]) -> bool:
+        if self._max_bytes <= 0 or bucket_size > self._max_bytes:
+            destroy_fn(handle)
+            self._pool_evictions += 1
+            return False
+        bucket = self._buckets.get(bucket_size)
+        if bucket is not None and len(bucket) >= self._max_per_bucket:
+            destroy_fn(handle)
+            self._pool_evictions += 1
+            return False
+        while self._fifo and (
+            self._pooled_bytes + bucket_size > self._max_bytes
+            or self._pooled_buffers >= self._max_entries
+        ):
+            evict_size = self._fifo.popleft()
+            evict_bucket = self._buckets.get(evict_size)
+            if not evict_bucket:
+                continue
+            evict_handle = evict_bucket.pop(0)
+            if not evict_bucket:
+                del self._buckets[evict_size]
+            self._pooled_bytes -= evict_size
+            self._pooled_buffers -= 1
+            self._pool_evictions += 1
+            destroy_fn(evict_handle)
+
+        if bucket is None:
+            bucket = []
+            self._buckets[bucket_size] = bucket
+        bucket.append(handle)
+        self._fifo.append(bucket_size)
+        self._pooled_bytes += bucket_size
+        self._pooled_buffers += 1
+        self._pool_returns += 1
+        total = self._live_bytes + self._pooled_bytes
+        if total > self._peak_total_bytes:
+            self._peak_total_bytes = total
+        return True
+
+    def clear(self, destroy_fn: Callable[[object], None]) -> int:
+        freed_bytes = self._pooled_bytes
+        buckets = list(self._buckets.values())
+        self._buckets.clear()
+        self._fifo.clear()
+        self._pooled_bytes = 0
+        self._pooled_buffers = 0
+        for bucket in buckets:
+            for handle in bucket:
+                destroy_fn(handle)
+        return freed_bytes
+
+    def reset_counters(self) -> None:
+        self._allocations = 0
+        self._pool_hits = 0
+        self._pool_misses = 0
+        self._pool_returns = 0
+        self._pool_evictions = 0
+        self._peak_live_bytes = self._live_bytes
+        self._peak_total_bytes = self._live_bytes + self._pooled_bytes
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "allocations": self._allocations,
+            "pool_hits": self._pool_hits,
+            "pool_misses": self._pool_misses,
+            "pool_returns": self._pool_returns,
+            "pool_evictions": self._pool_evictions,
+            "live_buffers": self._live_buffers,
+            "live_bytes": self._live_bytes,
+            "pooled_buffers": self._pooled_buffers,
+            "pooled_bytes": self._pooled_bytes,
+            "peak_live_bytes": self._peak_live_bytes,
+            "peak_total_bytes": self._peak_total_bytes,
+        }
 
 
 def _validate_positive_int(value: object, name: str) -> int:
@@ -186,6 +344,10 @@ class ComputeContext(ABC):
     def reset_stats(self) -> None:
         """Reset instrumentation counters to zero."""
 
+    def release_pool(self) -> int:
+        """Synchronize if needed and release all pooled idle buffers, returning bytes freed."""
+        return 0
+
     @contextmanager
     def batch(self):
         """Group dependent dispatches without intermediate host waits."""
@@ -246,13 +408,14 @@ class VulkanBuffer(PersistentBuffer):
         vk_buffer: object,
         vk_memory: object,
         alloc_size: int,
+        mapped: object | None = None,
     ) -> None:
         self._context = context
         self._size_bytes = size_bytes
         self._vk_buffer = vk_buffer
         self._vk_memory = vk_memory
         self._alloc_size = alloc_size
-        self._mapped: object | None = None
+        self._mapped: object | None = mapped
         self._closed = False
 
     @property
@@ -363,11 +526,15 @@ class VulkanBuffer(PersistentBuffer):
         if self._closed:
             return
         self._closed = True
-        if not self._context.closed:
-            if self._context._recording or self._context._submitted:
-                self._context._defer_cleanup(self._destroy_vk_resources)
-            else:
-                self._destroy_vk_resources()
+        self._context._pool.on_live_free(self._alloc_size)
+        handle = (self._vk_buffer, self._vk_memory, self._alloc_size, self._mapped)
+        self._mapped = None
+        if self._context.closed:
+            self._context._destroy_vk_buffer(handle)
+        elif self._context._recording or self._context._submitted:
+            self._context._defer_cleanup(lambda: self._context._return_buffer_to_pool(handle))
+        else:
+            self._context._return_buffer_to_pool(handle)
 
 
 _MAX_CACHED_BINDINGS = 32
@@ -600,7 +767,13 @@ class VulkanPipeline(PersistentPipeline):
 class VulkanComputeContext(ComputeContext):
     """Persistent Vulkan compute context owning device, queue, buffers, and pipelines."""
 
-    def __init__(self, *, validation: bool = False, provider: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        validation: bool = False,
+        provider: str | None = None,
+        pool_max_bytes: int | None = None,
+    ) -> None:
         _validate_provider(provider, "vulkan")
         self._resources = ExitStack()
         self._closed = False
@@ -610,6 +783,7 @@ class VulkanComputeContext(ComputeContext):
         self._batch_depth = 0
         self._retired_resources: list[object] = []
         self._stats = {"dispatches": 0, "submissions": 0, "waits": 0, "deferred_cleanups": 0}
+        self._pool = _BoundedBufferPool(max_bytes=_resolve_pool_max_bytes(pool_max_bytes))
         self._buffers: list[VulkanBuffer] = []
         self._pipelines: list[VulkanPipeline] = []
 
@@ -662,10 +836,28 @@ class VulkanComputeContext(ComputeContext):
         if self._closed:
             raise PersistentComputeError("ComputeContext has been closed.")
 
+    def _destroy_vk_buffer(self, handle: object) -> None:
+        vk_buf, vk_mem, _alloc_size, mapped = handle  # type: ignore[misc]
+        gpu = self._gpu
+        vk = gpu.vk
+        if mapped is not None:
+            vk.vkUnmapMemory(gpu.device, vk_mem)
+        vk.vkDestroyBuffer(gpu.device, vk_buf, None)
+        vk.vkFreeMemory(gpu.device, vk_mem, None)
+
+    def _return_buffer_to_pool(self, handle: object) -> None:
+        _vk_buf, _vk_mem, alloc_size, _mapped = handle  # type: ignore[misc]
+        if self._closed:
+            self._destroy_vk_buffer(handle)
+            return
+        self._pool.release(alloc_size, handle, self._destroy_vk_buffer)
+
     def create_buffer(
         self,
         size_bytes: int,
         initial_data: bytes | bytearray | memoryview | None = None,
+        *,
+        zero_init: bool = True,
     ) -> VulkanBuffer:
         self._ensure_open()
         _validate_positive_int(size_bytes, "buffer size_bytes")
@@ -682,6 +874,28 @@ class VulkanComputeContext(ComputeContext):
         gpu = self._gpu
         vk = gpu.vk
         alloc_size = max(4, (size_bytes + 3) & ~3)
+        pooled = self._pool.acquire(alloc_size)
+        if pooled is not None:
+            vk_buf, vk_mem, _pooled_alloc_size, mapped = pooled  # type: ignore[misc]
+            try:
+                if payload is not None or zero_init:
+                    with _api_errors():
+                        if mapped is None:
+                            mapped = vk.vkMapMemory(gpu.device, vk_mem, 0, alloc_size, 0)
+                        if payload:
+                            mapped[0 : len(payload)] = payload
+                            if zero_init and len(payload) < alloc_size:
+                                mapped[len(payload) : alloc_size] = b"\x00" * (alloc_size - len(payload))
+                        elif zero_init:
+                            mapped[0:alloc_size] = b"\x00" * alloc_size
+            except Exception:
+                self._destroy_vk_buffer((vk_buf, vk_mem, alloc_size, mapped))
+                raise
+            buf = VulkanBuffer(self, size_bytes, vk_buf, vk_mem, alloc_size, mapped=mapped)
+            self._pool.on_live_alloc(alloc_size)
+            self._buffers.append(buf)
+            return buf
+
         with _api_errors():
             vk_buf = vk.vkCreateBuffer(
                 gpu.device,
@@ -693,6 +907,7 @@ class VulkanComputeContext(ComputeContext):
                 None,
             )
             vk_mem = None
+            mapped = None
             try:
                 reqs = vk.vkGetBufferMemoryRequirements(gpu.device, vk_buf)
                 vk_mem = vk.vkAllocateMemory(
@@ -707,23 +922,25 @@ class VulkanComputeContext(ComputeContext):
                     None,
                 )
                 vk.vkBindBufferMemory(gpu.device, vk_buf, vk_mem, 0)
-                mapped = vk.vkMapMemory(gpu.device, vk_mem, 0, alloc_size, 0)
-                try:
+                if payload is not None or zero_init:
+                    mapped = vk.vkMapMemory(gpu.device, vk_mem, 0, alloc_size, 0)
                     if payload:
                         mapped[0 : len(payload)] = payload
-                        if len(payload) < alloc_size:
+                        if zero_init and len(payload) < alloc_size:
                             mapped[len(payload) : alloc_size] = b"\x00" * (alloc_size - len(payload))
-                    else:
+                    elif zero_init:
                         mapped[0:alloc_size] = b"\x00" * alloc_size
-                finally:
-                    vk.vkUnmapMemory(gpu.device, vk_mem)
             except Exception:
+                if mapped is not None:
+                    vk.vkUnmapMemory(gpu.device, vk_mem)
                 vk.vkDestroyBuffer(gpu.device, vk_buf, None)
                 if vk_mem is not None:
                     vk.vkFreeMemory(gpu.device, vk_mem, None)
                 raise
 
-        buf = VulkanBuffer(self, size_bytes, vk_buf, vk_mem, alloc_size)
+        self._pool.record_allocation()
+        self._pool.on_live_alloc(alloc_size)
+        buf = VulkanBuffer(self, size_bytes, vk_buf, vk_mem, alloc_size, mapped=mapped)
         self._buffers.append(buf)
         return buf
 
@@ -791,11 +1008,20 @@ class VulkanComputeContext(ComputeContext):
 
     @property
     def stats(self) -> dict[str, int]:
-        return dict(self._stats)
+        merged = dict(self._stats)
+        merged.update(self._pool.stats())
+        return merged
 
     def reset_stats(self) -> None:
         for k in self._stats:
             self._stats[k] = 0
+        self._pool.reset_counters()
+
+    def release_pool(self) -> int:
+        self._ensure_open()
+        if self._recording or self._submitted:
+            self.synchronize()
+        return self._pool.clear(self._destroy_vk_buffer)
 
     def _defer_cleanup(self, cleanup_fn: object) -> None:
         self._retired_resources.append(cleanup_fn)
@@ -883,6 +1109,9 @@ class VulkanComputeContext(ComputeContext):
                 buf.close()
             for pipe in self._pipelines:
                 pipe.close()
+            self._buffers.clear()
+            self._pipelines.clear()
+            self._pool.clear(self._destroy_vk_buffer)
             self._closed = True
             self._resources.close()
 

@@ -353,12 +353,15 @@ class TestPersistentComputeValidation(unittest.TestCase):
                     self.assertEqual(vk.wait_fences_calls, 0)
                     self.assertEqual(vk.dispatch_calls, 3)
 
-                    # Readback establishes completion and flushes deferred cleanups.
+                    # Readback establishes completion and flushes deferred cleanups (returning buffer to pool).
                     _ = buf_a.download()
                     self.assertEqual(ctx.stats["waits"], 1)
                     self.assertEqual(vk.wait_fences_calls, 1)
-                    self.assertEqual(len(vk.destroyed_buffers), 1)
+                    self.assertEqual(ctx.stats["pooled_buffers"], 1)
                     self.assertEqual(len(vk.destroyed_descriptor_pools), 1)
+                    freed = ctx.release_pool()
+                    self.assertEqual(freed, 16)
+                    self.assertEqual(len(vk.destroyed_buffers), 1)
 
     def test_repeated_batches_and_partial_failure_recovery(self) -> None:
         @compute(workgroup_size=(64, 1, 1))
@@ -409,6 +412,83 @@ class TestPersistentComputeValidation(unittest.TestCase):
                     self.assertEqual(ctx.stats["dispatches"], 1)
                     self.assertEqual(ctx.stats["submissions"], 1)
                     self.assertEqual(ctx.stats["waits"], 1)
+
+    def test_buffer_pool_reuse_in_flight_safety_and_bounded_release(self) -> None:
+        @compute(workgroup_size=(64, 1, 1))
+        def noop_kernel(
+            src: Buffer[Type.F32, "read_only"],
+            dst: Buffer[Type.F32, "write_only"],
+            params: TestNoopParams,
+        ):
+            idx = i32(global_invocation_id().x)
+            if idx < params.n:
+                dst[idx] = src[idx]
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = compile_pipeline(
+                ComputePipeline(noop_kernel, Dispatch(grid=(1, 1, 1))),
+                Target.VULKAN,
+                Path(td) / "noop_pool",
+                TOOLS,
+            )
+            with (
+                mock.patch.object(compute_runtime, "_Vulkan", _FakeVulkan),
+                mock.patch.object(compute_runtime, "_api_errors", nullcontext),
+            ):
+                with open_compute_context("vulkan") as ctx_default:
+                    ctx_default._pool = compute_runtime._BoundedBufferPool(max_bytes=32)
+                    vk = ctx_default._gpu.vk
+                    pipe = ctx_default.compile_pipeline(manifest)
+
+                    # 1. Reuse same-shape buffer when idle and verify zero_init=True vs False.
+                    b1 = ctx_default.create_buffer(16, initial_data=b"\xff" * 16)
+                    b1.close()
+                    b2 = ctx_default.create_buffer(16)  # default zero_init=True
+                    self.assertEqual(b2.download(), b"\x00" * 16)
+                    self.assertEqual(ctx_default.stats["allocations"], 1)
+                    self.assertEqual(ctx_default.stats["pool_hits"], 1)
+                    b2.close()
+
+                    b3 = ctx_default.create_buffer(16, zero_init=False)
+                    self.assertEqual(ctx_default.stats["allocations"], 1)
+                    self.assertEqual(ctx_default.stats["pool_hits"], 2)
+
+                    # 2. Never reuse an in-flight allocation closed mid-batch.
+                    ctx_default.reset_stats()
+                    b_out = ctx_default.create_buffer(16, zero_init=False)
+                    with ctx_default.batch():
+                        pipe.dispatch({"src": b3, "dst": b_out}, parameters={"n": 4}, grid=(1, 1, 1))
+                        b3.close()
+                        b_new = ctx_default.create_buffer(16, zero_init=False)
+                        self.assertEqual(ctx_default.stats["pool_hits"], 0)
+                        self.assertEqual(ctx_default.stats["allocations"], 2)
+                    ctx_default.synchronize()
+                    self.assertEqual(ctx_default.stats["pool_returns"], 1)
+                    b_out.close()
+                    b_new.close()
+
+                    # 3. Bounded pool (32 bytes): 3rd 16-byte buffer evicts oldest.
+                    self.assertEqual(ctx_default.stats["pooled_buffers"], 2)
+                    self.assertEqual(ctx_default.stats["pooled_bytes"], 32)
+                    self.assertEqual(ctx_default.stats["pool_evictions"], 1)
+                    self.assertEqual(len(vk.destroyed_buffers), 1)
+                    self.assertEqual(ctx_default.stats["peak_live_bytes"], 32)
+
+                    # 4. Deterministic release_pool() frees remaining pooled buffers.
+                    freed = ctx_default.release_pool()
+                    self.assertEqual(freed, 32)
+                    self.assertEqual(ctx_default.stats["pooled_buffers"], 0)
+                    self.assertEqual(len(vk.destroyed_buffers), 3)
+
+                # 5. Exception during allocation does not corrupt live stats.
+                with open_compute_context("vulkan") as ctx_err:
+                    with mock.patch.object(
+                        ctx_err._gpu.vk, "vkAllocateMemory", side_effect=RuntimeError("OOM")
+                    ):
+                        with self.assertRaises(RuntimeError):
+                            ctx_err.create_buffer(16)
+                    self.assertEqual(ctx_err.stats["live_buffers"], 0)
+                    self.assertEqual(ctx_err.stats["live_bytes"], 0)
 
 
 @unittest.skipUnless(

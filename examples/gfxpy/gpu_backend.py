@@ -140,6 +140,19 @@ class GfxIRComputeBackend(ComputeBackend):
     def allocate(self, size_bytes: int) -> ComputeBuffer:
         return self._ctx.create_buffer(size_bytes)
 
+    def allocate_uninitialized(self, size_bytes: int) -> ComputeBuffer:
+        try:
+            return self._ctx.create_buffer(size_bytes, zero_init=False)
+        except TypeError:
+            return self._ctx.create_buffer(size_bytes)
+
+    def release_pool(self) -> int:
+        return self._ctx.release_pool()
+
+    @property
+    def memory_stats(self) -> dict[str, int]:
+        return self._ctx.stats
+
     def upload(self, buf: ComputeBuffer, data: bytes) -> None:
         assert isinstance(buf, PersistentBuffer)
         buf.upload(data)

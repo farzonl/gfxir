@@ -272,7 +272,7 @@ class GfxArray:
                 return GfxArray(shape=self._shape, dtype=self._dtype, device=self._device, buffer=None)
             assert self._buffer is not None and other._buffer is not None
             backend = self._device.backend
-            out_buf = backend.allocate(self.nbytes)
+            out_buf = _allocate_output(backend, self.nbytes)
             try:
                 backend.binary_op(op, self._buffer, other._buffer, out_buf, self._size)
             except Exception:
@@ -285,7 +285,7 @@ class GfxArray:
                 return GfxArray(shape=self._shape, dtype=self._dtype, device=self._device, buffer=None)
             assert self._buffer is not None
             backend = self._device.backend
-            out_buf = backend.allocate(self.nbytes)
+            out_buf = _allocate_output(backend, self.nbytes)
             try:
                 backend.scalar_op(op, self._buffer, float(other), out_buf, self._size)
             except Exception:
@@ -350,6 +350,12 @@ def array(
     return GfxArray(shape=shape, dtype=resolved_dtype, device=target_device, buffer=buf)
 
 
+def _allocate_output(backend: ComputeBackend, size_bytes: int) -> ComputeBuffer:
+    if hasattr(backend, "allocate_uninitialized"):
+        return backend.allocate_uninitialized(size_bytes)
+    return backend.allocate(size_bytes)
+
+
 def empty(
     shape: int | tuple[int, ...],
     dtype: DType | str | None = float32,
@@ -366,7 +372,7 @@ def empty(
     if n == 0:
         return GfxArray(shape=resolved_shape, dtype=resolved_dtype, device=target_device, buffer=None)
 
-    buf = target_device.backend.allocate(n * resolved_dtype.itemsize)
+    buf = _allocate_output(target_device.backend, n * resolved_dtype.itemsize)
     return GfxArray(shape=resolved_shape, dtype=resolved_dtype, device=target_device, buffer=buf)
 
 
@@ -395,7 +401,7 @@ def sum(x: GfxArray) -> GfxArray:  # noqa: A001
     try:
         while cur_len > 1:
             num_groups = (cur_len + _REDUCE_WORKGROUP_SIZE - 1) // _REDUCE_WORKGROUP_SIZE
-            next_buf = backend.allocate(num_groups * x.dtype.itemsize)
+            next_buf = _allocate_output(backend, num_groups * x.dtype.itemsize)
             try:
                 backend.reduce_sum_pass(cur_buf, next_buf, cur_len)
             except Exception:
@@ -409,7 +415,7 @@ def sum(x: GfxArray) -> GfxArray:  # noqa: A001
 
         if not owns_cur:
             # Single-element input: copy via a 1-workgroup pass into an owned output buffer.
-            out_buf = backend.allocate(x.dtype.itemsize)
+            out_buf = _allocate_output(backend, x.dtype.itemsize)
             try:
                 backend.reduce_sum_pass(cur_buf, out_buf, 1)
             except Exception:
@@ -450,7 +456,7 @@ def matmul(a: GfxArray, b: GfxArray) -> GfxArray:
         return GfxArray(shape=out_shape, dtype=a.dtype, device=a.device, buffer=None)
 
     backend = a.device.backend
-    out_buf = backend.allocate(m * n * a.dtype.itemsize)
+    out_buf = _allocate_output(backend, m * n * a.dtype.itemsize)
     if k_a == 0:
         try:
             backend.upload(out_buf, b"\x00" * (m * n * a.dtype.itemsize))
