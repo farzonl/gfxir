@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+import hashlib
 from pathlib import Path
 import tempfile
 from typing import Any
@@ -72,6 +74,8 @@ class GfxIRComputeBackend(ComputeBackend):
         toolchain: Toolchain | None = None,
     ) -> None:
         self._target = target
+        self._validation = validation
+        self._provider = provider
         self._closed = False
         self._toolchain = toolchain or _preview_toolchain()
         self._artifact_dir = tempfile.TemporaryDirectory(prefix=f"gfxpy-{target}-")
@@ -102,17 +106,34 @@ class GfxIRComputeBackend(ComputeBackend):
     def compiled_pipeline_count(self) -> int:
         return len(self._pipelines)
 
+    def _toolchain_key(self) -> tuple[str | None, str | None]:
+        llvm_bin = getattr(self._toolchain, "llvm_bin", None)
+        tools_bin = getattr(self._toolchain, "tools_bin", None)
+        return (
+            str(llvm_bin) if llvm_bin is not None else None,
+            str(tools_bin) if tools_bin is not None else None,
+        )
+
     def _pipeline_cache_key(
         self,
         op_key: str,
         workgroup_size: tuple[int, int, int] = WORKGROUP_SIZE_1D,
+        *,
+        dtype: str = "float32",
+        layout: str = "contiguous",
+        contraction_policy: str = "no_fast_math",
     ) -> tuple[object, ...]:
         return (
             self._target,
             op_key,
-            "float32",
+            dtype,
+            layout,
             workgroup_size,
+            self._validation,
+            self._provider,
+            contraction_policy,
             id(self._toolchain),
+            self._toolchain_key(),
         )
 
     def _get_or_compile(
@@ -120,13 +141,16 @@ class GfxIRComputeBackend(ComputeBackend):
         op_key: str,
         kernel: Any,
         workgroup_size: tuple[int, int, int] = WORKGROUP_SIZE_1D,
+        *,
+        cache_key: tuple[object, ...] | None = None,
+        artifact_subdir: str | None = None,
     ) -> PersistentPipeline:
-        cache_key = self._pipeline_cache_key(op_key, workgroup_size)
-        cached = self._pipelines.get(cache_key)
+        resolved_key = cache_key or self._pipeline_cache_key(op_key, workgroup_size)
+        cached = self._pipelines.get(resolved_key)
         if cached is not None and not cached.closed:
             return cached
 
-        out_dir = Path(self._artifact_dir.name) / op_key
+        out_dir = Path(self._artifact_dir.name) / (artifact_subdir or op_key)
         manifest = compile_pipeline(
             ComputePipeline(kernel, Dispatch(grid=(1, 1, 1))),
             _TARGET_MAP[self._target],
@@ -134,7 +158,7 @@ class GfxIRComputeBackend(ComputeBackend):
             self._toolchain,
         )
         pipe = self._ctx.compile_pipeline(manifest)
-        self._pipelines[cache_key] = pipe
+        self._pipelines[resolved_key] = pipe
         return pipe
 
     def allocate(self, size_bytes: int) -> ComputeBuffer:
@@ -203,6 +227,51 @@ class GfxIRComputeBackend(ComputeBackend):
             parameters={"n": length, "scalar": float(scalar)},
             grid=compute_grid_1d(length),
         )
+
+    def fused_op(
+        self,
+        spec: Any,
+        inputs: Sequence[ComputeBuffer],
+        scalars: Sequence[float],
+        out: ComputeBuffer,
+        length: int,
+    ) -> None:
+        from .fusion import build_fused_compute_kernel
+
+        assert isinstance(out, PersistentBuffer)
+        bindings: dict[str, PersistentBuffer] = {"out": out}
+        for idx, buf in enumerate(inputs):
+            assert isinstance(buf, PersistentBuffer)
+            bindings[f"in{idx}"] = buf
+
+        op_key = f"fused:{spec.signature}"
+        cache_key = self._pipeline_cache_key(
+            op_key,
+            WORKGROUP_SIZE_1D,
+            dtype=spec.dtype,
+            layout=spec.layout,
+            contraction_policy=spec.contraction_policy,
+        )
+        pipe = self._pipelines.get(cache_key)
+        if pipe is None or pipe.closed:
+            digest = hashlib.sha256(spec.signature.encode("utf-8")).hexdigest()[:16]
+            subdir = f"fused_{digest}"
+            kernel = build_fused_compute_kernel(
+                spec,
+                Path(self._artifact_dir.name) / "_fused_sources",
+            )
+            pipe = self._get_or_compile(
+                op_key,
+                kernel,
+                WORKGROUP_SIZE_1D,
+                cache_key=cache_key,
+                artifact_subdir=subdir,
+            )
+
+        params: dict[str, object] = {"n": length}
+        for idx, val in enumerate(scalars):
+            params[f"s{idx}"] = float(val)
+        pipe.dispatch(bindings, parameters=params, grid=compute_grid_1d(length))
 
     def reduce_sum_pass(
         self,

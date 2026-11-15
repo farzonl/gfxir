@@ -17,6 +17,10 @@ class UnsupportedDTypeError(GfxPyError, TypeError):
     """Raised when an unsupported dtype is requested."""
 
 
+class UnsupportedFusionError(GfxPyError, TypeError):
+    """Raised when an unsupported operation or value is used inside gp.fuse()."""
+
+
 class ShapeMismatchError(GfxPyError, ValueError):
     """Raised when array shapes or lengths are incompatible."""
 

@@ -81,6 +81,10 @@ class _CountingBackend:
         self._inner.scalar_op(op, lhs, scalar, out, length)
         self.dispatches.append(f"scalar:{op}")
 
+    def fused_op(self, spec, inputs, scalars, out, length: int) -> None:
+        self._inner.fused_op(spec, inputs, scalars, out, length)
+        self.dispatches.append(f"fused:{spec.signature}")
+
     def close(self) -> None:
         self._inner.close()
 

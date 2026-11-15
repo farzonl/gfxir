@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .array import GfxArray, array, empty, matmul, sum  # noqa: A004
 from .dtypes import DType, float32, resolve_dtype
+from .fusion import fuse
 from .runtime import (
     ComputeBackend,
     ComputeBuffer,
@@ -21,6 +22,7 @@ from .targets import (
     GfxPyError,
     ShapeMismatchError,
     UnsupportedDTypeError,
+    UnsupportedFusionError,
     UnsupportedTargetError,
     default_target,
     normalize_target,
@@ -40,6 +42,7 @@ __all__ = [
     "GfxPyError",
     "ShapeMismatchError",
     "UnsupportedDTypeError",
+    "UnsupportedFusionError",
     "UnsupportedTargetError",
     "array",
     "close_default_device",
@@ -48,6 +51,7 @@ __all__ = [
     "device",
     "empty",
     "float32",
+    "fuse",
     "matmul",
     "normalize_target",
     "resolve_dtype",
