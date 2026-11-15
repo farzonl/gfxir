@@ -24,7 +24,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 _TILE_DIM = 16
-_UNROLLED = tuple(range(_TILE_DIM))
+_TILE_M = 64
+_TILE_N = 64
+_TILE_K = 16
+_MATMUL_WG = (16, 16, 1)
+_UNROLLED = tuple(range(_TILE_K))
+_UNROLLED_4 = (0, 1, 2, 3)
 try:
     from mlir_gpu import ParameterBlock as _ParameterBlock, Type as _Type
 
@@ -282,6 +287,7 @@ def _benchmark_gfx_suite(
             i32,
             open_compute_context,
             shared_array,
+            vec4,
             workgroup_barrier,
         )
     except Exception as exc:
@@ -399,9 +405,7 @@ def _benchmark_gfx_suite(
                         _ = run_once()
                         samples.append((time.perf_counter() - t0) * 1000.0)
             else:
-                tile_dim = _TILE_DIM
-
-                @compute(workgroup_size=(_TILE_DIM, _TILE_DIM, 1))
+                @compute(workgroup_size=_MATMUL_WG)
                 def tiled_matmul_kernel(
                     lid: LocalInvocationId,
                     wid: WorkgroupId,
@@ -410,31 +414,94 @@ def _benchmark_gfx_suite(
                     mat_c: Buffer[Type.F32, "write_only"],
                     params: MatMulParams,
                 ):
-                    tile_a = shared_array(Type.F32, (_TILE_DIM, _TILE_DIM), name="tile_a")
-                    tile_b = shared_array(Type.F32, (_TILE_DIM, _TILE_DIM), name="tile_b")
+                    tile_a = shared_array(Type.F32, (_TILE_M, _TILE_K + 4), name="tile_a")
+                    tile_b = shared_array(Type.F32, (_TILE_K, _TILE_N + 4), name="tile_b")
                     lx = i32(lid.x)
                     ly = i32(lid.y)
-                    row = i32(wid.y) * _TILE_DIM + ly
-                    col = i32(wid.x) * _TILE_DIM + lx
-                    acc = 0.0
-                    for t in range(params.num_tiles):
-                        a_col = t * _TILE_DIM + lx
-                        a_val = 0.0
-                        if (row < params.m) and (a_col < params.k):
-                            a_val = mat_a[row * params.k + a_col]
-                        tile_a[ly, lx] = a_val
+                    tid = ly * 16 + lx
 
-                        b_row = t * _TILE_DIM + ly
-                        b_val = 0.0
-                        if (b_row < params.k) and (col < params.n):
-                            b_val = mat_b[b_row * params.n + col]
-                        tile_b[ly, lx] = b_val
+                    a_tile_row = tid // 4
+                    a_tile_col_base = (tid % 4) * 4
+                    a_global_row = i32(wid.y) * _TILE_M + a_tile_row
+
+                    b_tile_row = tid // 16
+                    b_tile_col_base = (tid % 16) * 4
+                    b_global_col_base = i32(wid.x) * _TILE_N + b_tile_col_base
+
+                    row_base = i32(wid.y) * _TILE_M + ly * 4
+                    col_base = i32(wid.x) * _TILE_N + lx * 4
+
+                    acc0 = vec4(0.0, 0.0, 0.0, 0.0)
+                    acc1 = vec4(0.0, 0.0, 0.0, 0.0)
+                    acc2 = vec4(0.0, 0.0, 0.0, 0.0)
+                    acc3 = vec4(0.0, 0.0, 0.0, 0.0)
+
+                    for t in range(params.num_tiles):
+                        k_base = t * _TILE_K
+                        for u in _UNROLLED_4:
+                            ac = k_base + a_tile_col_base + u
+                            av = 0.0
+                            if (a_global_row < params.m) and (ac < params.k):
+                                av = mat_a[a_global_row * params.k + ac]
+                            tile_a[a_tile_row, a_tile_col_base + u] = av
+
+                            br = k_base + b_tile_row
+                            bc = b_global_col_base + u
+                            bv = 0.0
+                            if (br < params.k) and (bc < params.n):
+                                bv = mat_b[br * params.n + bc]
+                            tile_b[b_tile_row, b_tile_col_base + u] = bv
+
                         workgroup_barrier()
                         for p in _UNROLLED:
-                            acc = acc + tile_a[ly, p] * tile_b[p, lx]
+                            a0 = tile_a[ly * 4 + 0, p]
+                            a1 = tile_a[ly * 4 + 1, p]
+                            a2 = tile_a[ly * 4 + 2, p]
+                            a3 = tile_a[ly * 4 + 3, p]
+                            b_vec = vec4(
+                                tile_b[p, lx * 4 + 0],
+                                tile_b[p, lx * 4 + 1],
+                                tile_b[p, lx * 4 + 2],
+                                tile_b[p, lx * 4 + 3],
+                            )
+                            acc0 = acc0 + vec4(a0, a0, a0, a0) * b_vec
+                            acc1 = acc1 + vec4(a1, a1, a1, a1) * b_vec
+                            acc2 = acc2 + vec4(a2, a2, a2, a2) * b_vec
+                            acc3 = acc3 + vec4(a3, a3, a3, a3) * b_vec
                         workgroup_barrier()
-                    if (row < params.m) and (col < params.n):
-                        mat_c[row * params.n + col] = acc
+
+                    if ((row_base + 0) < params.m) and ((col_base + 0) < params.n):
+                        mat_c[(row_base + 0) * params.n + col_base + 0] = acc0.x
+                    if ((row_base + 0) < params.m) and ((col_base + 1) < params.n):
+                        mat_c[(row_base + 0) * params.n + col_base + 1] = acc0.y
+                    if ((row_base + 0) < params.m) and ((col_base + 2) < params.n):
+                        mat_c[(row_base + 0) * params.n + col_base + 2] = acc0.z
+                    if ((row_base + 0) < params.m) and ((col_base + 3) < params.n):
+                        mat_c[(row_base + 0) * params.n + col_base + 3] = acc0.w
+                    if ((row_base + 1) < params.m) and ((col_base + 0) < params.n):
+                        mat_c[(row_base + 1) * params.n + col_base + 0] = acc1.x
+                    if ((row_base + 1) < params.m) and ((col_base + 1) < params.n):
+                        mat_c[(row_base + 1) * params.n + col_base + 1] = acc1.y
+                    if ((row_base + 1) < params.m) and ((col_base + 2) < params.n):
+                        mat_c[(row_base + 1) * params.n + col_base + 2] = acc1.z
+                    if ((row_base + 1) < params.m) and ((col_base + 3) < params.n):
+                        mat_c[(row_base + 1) * params.n + col_base + 3] = acc1.w
+                    if ((row_base + 2) < params.m) and ((col_base + 0) < params.n):
+                        mat_c[(row_base + 2) * params.n + col_base + 0] = acc2.x
+                    if ((row_base + 2) < params.m) and ((col_base + 1) < params.n):
+                        mat_c[(row_base + 2) * params.n + col_base + 1] = acc2.y
+                    if ((row_base + 2) < params.m) and ((col_base + 2) < params.n):
+                        mat_c[(row_base + 2) * params.n + col_base + 2] = acc2.z
+                    if ((row_base + 2) < params.m) and ((col_base + 3) < params.n):
+                        mat_c[(row_base + 2) * params.n + col_base + 3] = acc2.w
+                    if ((row_base + 3) < params.m) and ((col_base + 0) < params.n):
+                        mat_c[(row_base + 3) * params.n + col_base + 0] = acc3.x
+                    if ((row_base + 3) < params.m) and ((col_base + 1) < params.n):
+                        mat_c[(row_base + 3) * params.n + col_base + 1] = acc3.y
+                    if ((row_base + 3) < params.m) and ((col_base + 2) < params.n):
+                        mat_c[(row_base + 3) * params.n + col_base + 2] = acc3.z
+                    if ((row_base + 3) < params.m) and ((col_base + 3) < params.n):
+                        mat_c[(row_base + 3) * params.n + col_base + 3] = acc3.w
 
                 pipeline = ComputePipeline(tiled_matmul_kernel, Dispatch(grid=(1, 1, 1)))
                 manifest = compile_pipeline(pipeline, target, Path(td) / "matmul", toolchain)
@@ -447,8 +514,8 @@ def _benchmark_gfx_suite(
                 else:
                     a_bytes = struct.pack(f"<{spec.m * spec.k}f", *([1.0] * (spec.m * spec.k)))
                     b_bytes = struct.pack(f"<{spec.k * spec.n}f", *([1.0] * (spec.k * spec.n)))
-                grid = ((spec.n + tile_dim - 1) // tile_dim, (spec.m + tile_dim - 1) // tile_dim, 1)
-                num_tiles = (spec.k + tile_dim - 1) // tile_dim
+                grid = ((spec.n + _TILE_N - 1) // _TILE_N, (spec.m + _TILE_M - 1) // _TILE_M, 1)
+                num_tiles = (spec.k + _TILE_K - 1) // _TILE_K
                 out_host = bytearray(spec.m * spec.n * 4)
 
                 with open_compute_context(target_name, validation=False, provider=provider) as ctx:
