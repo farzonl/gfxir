@@ -26,7 +26,10 @@ programs = {
 if args.program in programs:
     pipeline = programs[args.program]()
 else:
-    pipeline = runpy.run_path(str(ROOT / "examples" / f"{args.program}.py"))["pipeline"]
+    matches = [p for p in (ROOT / "examples").glob(f"**/{args.program}.py") if "__pycache__" not in p.parts]
+    if len(matches) != 1:
+        raise FileNotFoundError(f"Expected unique example for {args.program!r}, found {matches}")
+    pipeline = runpy.run_path(str(matches[0]))["pipeline"]
 if args.cap is not None:
     pipeline.fragment.function.__globals__["MAX_STEPS"] = args.cap
 manifest = compile_pipeline(pipeline, Target(args.target), args.output, TOOLS)

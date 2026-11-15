@@ -28,7 +28,7 @@ def main() -> None:
     except ValueError as error:
         parser.error(str(error))
 
-    pipeline = runpy.run_path(str(ROOT / "examples" / f"{args.example}.py"))["pipeline"]
+    pipeline = runpy.run_path(str(ROOT / "examples" / "basics" / f"{args.example}.py"))["pipeline"]
     llvm_bin = Path(os.environ["LLVM_BIN"]) if "LLVM_BIN" in os.environ else None
     toolchain = Toolchain(llvm_bin=llvm_bin)
     for target in targets:
