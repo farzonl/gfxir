@@ -297,6 +297,30 @@ int gfx_mtl_download_buffer(
     }
 }
 
+void* gfx_mtl_buffer_contents(
+    void* ctx_ptr,
+    void* buf_ptr,
+    uint64_t* out_size,
+    char* err_buf,
+    size_t err_cap
+) {
+    @autoreleasepool {
+        auto* ctx = static_cast<GfxMtlContext*>(ctx_ptr);
+        auto* buf = static_cast<GfxMtlBuffer*>(buf_ptr);
+        if (!ctx || !buf || !buf->buffer || buf->ctx != ctx) {
+            set_error(err_buf, err_cap, "Invalid Metal buffer or context");
+            return nullptr;
+        }
+        if (sync_context(ctx, err_buf, err_cap) != 0) {
+            return nullptr;
+        }
+        if (out_size) {
+            *out_size = buf->size_bytes;
+        }
+        return buf->buffer.contents;
+    }
+}
+
 void* gfx_mtl_create_pipeline(
     void* ctx_ptr,
     const char* metallib_path,

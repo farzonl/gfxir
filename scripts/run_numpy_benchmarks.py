@@ -355,7 +355,7 @@ def _benchmark_gfx_suite(
                     buf_b = ctx.create_buffer(nbytes) if (spec.kind == "saxpy_chain" and spec.chain_depth > 1) else None
                     runtime_mode = f"persistent:{ctx.device_name}"
 
-                    def run_once() -> bytearray | bytes:
+                    def run_once(*, copy_output: bool = False) -> bytearray | bytes | None:
                         if spec.kind == "saxpy_fused":
                             pipe.dispatch(
                                 {"x": buf_x, "y": buf_y, "out": buf_a},
@@ -378,13 +378,16 @@ def _benchmark_gfx_suite(
                                         parameters={"n": spec.n, "alpha": 1.25},
                                         grid=grid,
                                     )
+                        if hasattr(dst_buf, "map_view"):
+                            with dst_buf.map_view() as view:
+                                return bytes(view) if copy_output else None
                         if hasattr(dst_buf, "download_into"):
                             dst_buf.download_into(out_host)
                             return out_host
                         return dst_buf.download()
 
                     t_cold0 = time.perf_counter()
-                    out_bytes = run_once()
+                    out_bytes = run_once(copy_output=True)
                     cold_ms = compile_ms + (time.perf_counter() - t_cold0) * 1000.0
 
                     for _ in range(warmup):
@@ -455,19 +458,22 @@ def _benchmark_gfx_suite(
                     buf_c = ctx.create_buffer(spec.m * spec.n * 4)
                     runtime_mode = f"persistent:{ctx.device_name}"
 
-                    def run_once() -> bytearray | bytes:
+                    def run_once(*, copy_output: bool = False) -> bytearray | bytes | None:
                         pipe.dispatch(
                             {"mat_a": buf_a, "mat_b": buf_b, "mat_c": buf_c},
                             parameters={"m": spec.m, "n": spec.n, "k": spec.k, "num_tiles": num_tiles},
                             grid=grid,
                         )
+                        if hasattr(buf_c, "map_view"):
+                            with buf_c.map_view() as view:
+                                return bytes(view) if copy_output else None
                         if hasattr(buf_c, "download_into"):
                             buf_c.download_into(out_host)
                             return out_host
                         return buf_c.download()
 
                     t_cold0 = time.perf_counter()
-                    out_bytes = run_once()
+                    out_bytes = run_once(copy_output=True)
                     cold_ms = compile_ms + (time.perf_counter() - t_cold0) * 1000.0
 
                     for _ in range(warmup):
