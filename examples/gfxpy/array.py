@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import array as _stdlib_array
 from collections.abc import Sequence
 import math
 import struct
+import sys
 from typing import Any
 
 from .dtypes import DType, float32, resolve_dtype
@@ -169,13 +171,11 @@ class GfxArray:
         except Exception:
             pass
 
-    def tolist(self) -> list[Any]:
-        """Synchronize and download the array contents to a Python list (or nested 2D list)."""
+    def tobytes(self) -> bytes:
+        """Synchronize and download the raw little-endian device buffer bytes."""
         self._ensure_open()
         if self._size == 0:
-            if self.ndim == 2:
-                return [[] for _ in range(self._shape[0])]
-            return []
+            return b""
         assert self._buffer is not None
         raw = self._device.backend.download(self._buffer)
         expected_bytes = self._size * self._dtype.itemsize
@@ -183,6 +183,32 @@ class GfxArray:
             raise RuntimeError(
                 f"Backend '{self._device.target}' returned {len(raw)} bytes, expected {expected_bytes}."
             )
+        return raw
+
+    def toarray(self) -> _stdlib_array.array:
+        """Synchronize and download the array into a stdlib array.array without float boxing."""
+        out = _stdlib_array.array(self._dtype.struct_code)
+        raw = self.tobytes()
+        if raw:
+            out.frombytes(raw)
+            if sys.byteorder != "little":
+                out.byteswap()
+        return out
+
+    def tolist(self) -> list[Any]:
+        """Synchronize and download the array contents to a Python list (or nested 2D list)."""
+        self._ensure_open()
+        if self._size == 0:
+            if self.ndim == 2:
+                return [[] for _ in range(self._shape[0])]
+            return []
+        raw = self.tobytes()
+        if sys.byteorder == "little":
+            mv = memoryview(raw).cast(self._dtype.struct_code)
+            if self.ndim == 2:
+                rows, cols = self._shape
+                return [mv[r * cols : (r + 1) * cols].tolist() for r in range(rows)]
+            return mv.tolist()
         flat = list(struct.unpack(f"<{self._size}{self._dtype.struct_code}", raw))
         if self.ndim == 2:
             rows, cols = self._shape
