@@ -1010,10 +1010,12 @@
       const backends = getActiveBackends();
       renderLegend(document.getElementById("historyLegend"), backends);
 
-      const parsed = [];
+      const rawParsed = [];
       for (let i = startIdx; i < benchHistory.length; i++) {
-        parsed.push({ h: benchHistory[i], i, vals: extractCommitMetricMap(benchHistory[i], scope, metric) });
+        rawParsed.push({ h: benchHistory[i], i, vals: extractCommitMetricMap(benchHistory[i], scope, metric) });
       }
+      const firstDataIdx = rawParsed.findIndex(p => Object.values(p.vals).some(v => v > 0));
+      const parsed = firstDataIdx === -1 ? [] : rawParsed.slice(firstDataIdx);
 
       const dpr = window.devicePixelRatio || 1;
       canvas.width = Math.round(rect.width * dpr);
