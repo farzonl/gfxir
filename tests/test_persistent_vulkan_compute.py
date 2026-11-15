@@ -566,6 +566,46 @@ class TestPersistentComputeValidation(unittest.TestCase):
             # Second close is idempotent.
             ctx.close()
 
+    def test_vulkan_binding_cache_ignores_python_id_reuse(self) -> None:
+        import gc
+
+        fake_gpu = _FakeVulkan(None)
+        vk = fake_gpu.vk
+        updated_vk_buffers: list[object] = []
+
+        def recording_update(device, count, writes, copy_count, copies) -> None:
+            for write in writes:
+                updated_vk_buffers.append(write["pBufferInfo"][0]["buffer"])
+
+        vk.vkUpdateDescriptorSets = recording_update  # type: ignore[method-assign]
+
+        prog = ComputeProgram(
+            compute=Shader(entry_point="main", code=b"\x03\x02\x23\x07"),
+            target="vulkan",
+            workgroup_size=(64, 1, 1),
+            buffers=[{"name": "buf", "set": 0, "binding": 0}],
+        )
+        with (
+            mock.patch("mlir_gpu.compute_runtime._api_errors", side_effect=lambda: nullcontext()),
+            mock.patch("mlir_gpu.compute_runtime._Vulkan", return_value=fake_gpu),
+        ):
+            with VulkanComputeContext(pool_max_bytes=0) as ctx:
+                pipe = ctx.compile_pipeline(prog)
+                buf1 = ctx.create_buffer(16)
+                vk_buf1 = buf1._vk_buffer
+                pipe.dispatch({"buf": buf1}, grid=(1, 1, 1))
+                buf1.close()
+                del buf1
+                gc.collect()
+
+                buf2 = ctx.create_buffer(16)
+                vk_buf2 = buf2._vk_buffer
+                self.assertNotEqual(vk_buf1, vk_buf2)
+                pipe.dispatch({"buf": buf2}, grid=(1, 1, 1))
+
+                self.assertEqual(updated_vk_buffers, [vk_buf1, vk_buf2])
+                self.assertEqual(len(pipe._binding_cache), 2)
+
 
 @unittest.skipUnless(
     os.environ.get("MLIR_GPU_TEST_VULKAN") == "1",

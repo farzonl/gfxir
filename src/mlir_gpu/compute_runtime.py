@@ -429,6 +429,8 @@ class VulkanBuffer(PersistentBuffer):
         self._vk_memory = vk_memory
         self._alloc_size = alloc_size
         self._mapped: object | None = mapped
+        context._next_buffer_id += 1
+        self._buffer_id = context._next_buffer_id
         self._closed = False
 
     @property
@@ -654,7 +656,7 @@ class VulkanPipeline(PersistentPipeline):
             if buf.size_bytes <= 0:
                 raise PersistentComputeError(f"Buffer {name!r} must have positive size.")
             bound_buffers.append((buf_meta, buf))
-            binding_key.append((name, id(buf), buf._alloc_size))
+            binding_key.append((name, buf._buffer_id, buf._alloc_size))
 
         vk = gpu.vk
         with _api_errors():
@@ -811,6 +813,7 @@ class VulkanComputeContext(ComputeContext):
         self._retired_resources: list[object] = []
         self._stats = {"dispatches": 0, "submissions": 0, "waits": 0, "deferred_cleanups": 0}
         self._pool = _BoundedBufferPool(max_bytes=_resolve_pool_max_bytes(pool_max_bytes))
+        self._next_buffer_id = 0
         self._buffers: weakref.WeakSet[VulkanBuffer] = weakref.WeakSet()
         self._pipelines: weakref.WeakSet[VulkanPipeline] = weakref.WeakSet()
 
