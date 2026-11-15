@@ -317,6 +317,8 @@ class MetalBuffer(PersistentBuffer):
             if rc != 0:
                 raise PersistentComputeError(_decode_err(err_buf))
             return read_size
+        if self._context._pending_work:
+            self._context.synchronize()
         tmp = (ctypes.c_uint8 * read_size)()
         rc = self._context._lib.gfx_mtl_download_buffer(
             self._context._ctx_handle,
@@ -349,6 +351,8 @@ class MetalBuffer(PersistentBuffer):
         if read_size == 0:
             self._context.synchronize()
             return b""
+        if self._context._pending_work:
+            self._context.synchronize()
         err_buf = ctypes.create_string_buffer(1024)
         dst = ctypes.create_string_buffer(read_size)
         rc = self._context._lib.gfx_mtl_download_buffer(
@@ -371,8 +375,10 @@ class MetalBuffer(PersistentBuffer):
         handle = self._handle
         self._handle = 0
         if handle and not self._context.closed:
-            self._context.synchronize()
-            self._context._lib.gfx_mtl_destroy_buffer(handle)
+            if self._context._pending_work:
+                self._context._defer_cleanup("buffer", handle)
+            else:
+                self._context._lib.gfx_mtl_destroy_buffer(handle)
 
 
 class MetalPipeline(PersistentPipeline):
@@ -476,6 +482,9 @@ class MetalPipeline(PersistentPipeline):
         )
         if rc != 0:
             raise PersistentComputeError(_decode_err(err_buf))
+        self._context._pending_work = True
+        self._context._stats["dispatches"] += 1
+        self._context._stats["submissions"] += 1
 
     def close(self) -> None:
         if self._closed:
@@ -484,8 +493,10 @@ class MetalPipeline(PersistentPipeline):
         handle = self._handle
         self._handle = 0
         if handle and not self._context.closed:
-            self._context.synchronize()
-            self._context._lib.gfx_mtl_destroy_pipeline(handle)
+            if self._context._pending_work:
+                self._context._defer_cleanup("pipeline", handle)
+            else:
+                self._context._lib.gfx_mtl_destroy_pipeline(handle)
 
 
 class MetalComputeContext(ComputeContext):
@@ -501,6 +512,14 @@ class MetalComputeContext(ComputeContext):
         self._closed = False
         self._buffers: weakref.WeakSet[MetalBuffer] = weakref.WeakSet()
         self._pipelines: weakref.WeakSet[MetalPipeline] = weakref.WeakSet()
+        self._pending_work = False
+        self._retired_resources: list[tuple[str, int]] = []
+        self._stats = {
+            "dispatches": 0,
+            "submissions": 0,
+            "waits": 0,
+            "deferred_cleanups": 0,
+        }
 
         err_buf = ctypes.create_string_buffer(1024)
         ctx_handle = self._lib.gfx_mtl_create_context(err_buf, len(err_buf))
@@ -616,12 +635,40 @@ class MetalComputeContext(ComputeContext):
         self._pipelines.add(pipe)
         return pipe
 
+    @property
+    def stats(self) -> dict[str, int]:
+        return dict(self._stats)
+
+    def reset_stats(self) -> None:
+        for key in self._stats:
+            self._stats[key] = 0
+
+    def _defer_cleanup(self, kind: str, handle: int) -> None:
+        self._retired_resources.append((kind, handle))
+        self._stats["deferred_cleanups"] += 1
+
+    def _flush_retired(self) -> None:
+        if not self._retired_resources:
+            return
+        retired = self._retired_resources
+        self._retired_resources = []
+        for kind, handle in retired:
+            if kind == "buffer":
+                self._lib.gfx_mtl_destroy_buffer(handle)
+            elif kind == "pipeline":
+                self._lib.gfx_mtl_destroy_pipeline(handle)
+
     def synchronize(self) -> None:
         self._ensure_open()
+        had_pending = self._pending_work
         err_buf = ctypes.create_string_buffer(1024)
         rc = self._lib.gfx_mtl_synchronize(self._ctx_handle, err_buf, len(err_buf))
         if rc != 0:
             raise PersistentComputeError(_decode_err(err_buf))
+        self._pending_work = False
+        if had_pending:
+            self._stats["waits"] += 1
+        self._flush_retired()
 
     def close(self) -> None:
         if self._closed:
@@ -630,6 +677,8 @@ class MetalComputeContext(ComputeContext):
             if self._ctx_handle:
                 self.synchronize()
         finally:
+            self._pending_work = False
+            self._flush_retired()
             for buf in list(self._buffers):
                 buf.close()
             for pipe in list(self._pipelines):
