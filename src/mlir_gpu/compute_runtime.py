@@ -378,6 +378,16 @@ class ComputeContext(ABC):
         """Reported GPU or software provider device name."""
 
     @property
+    def provider(self) -> str | None:
+        """Resolved execution provider (e.g. 'hardware', 'warp', 'lavapipe', 'swiftshader'), or None if unknown."""
+        return None
+
+    @property
+    def is_software(self) -> bool | None:
+        """Whether execution uses a software/CPU adapter, or None if unknown."""
+        return None
+
+    @property
     @abstractmethod
     def closed(self) -> bool:
         """Whether this context has been closed."""
@@ -857,6 +867,14 @@ class VulkanComputeContext(ComputeContext):
     @property
     def device_name(self) -> str:
         return self._gpu.name
+
+    @property
+    def provider(self) -> str:
+        return self._gpu.provider
+
+    @property
+    def is_software(self) -> bool:
+        return self._gpu.is_software
 
     @property
     def closed(self) -> bool:

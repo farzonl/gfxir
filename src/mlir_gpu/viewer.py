@@ -1030,26 +1030,40 @@ def _validate_provider(provider: str | None, backend: str) -> None:
         raise ValueError(f"Provider '{provider}' is not supported by the Metal backend.")
 
 
-def _match_vulkan_device(properties, provider: str | None) -> bool:
-    if provider is None:
-        return True
+def _classify_vulkan_device(properties, *, cpu_device_type: int = 4) -> tuple[bool, str]:
+    """Return ``(is_software, provider_name)`` for a Vulkan physical device's properties."""
     raw_name = getattr(properties, "deviceName", b"")
-    name = raw_name.decode("utf-8", errors="replace") if isinstance(raw_name, bytes) else str(raw_name)
+    name = (raw_name.decode("utf-8", errors="replace") if isinstance(raw_name, bytes) else str(raw_name)).rstrip("\x00")
     name_lower = name.lower()
     vendor_id = getattr(properties, "vendorID", 0)
     device_id = getattr(properties, "deviceID", 0)
     device_type = getattr(properties, "deviceType", 0)
 
-    if provider == "lavapipe":
-        return vendor_id == 0x10005 or "llvmpipe" in name_lower or "lavapipe" in name_lower
-    elif provider == "swiftshader":
-        return vendor_id == 0x1AE0 or device_id == 0xC0DE or "swiftshader" in name_lower
-    elif provider == "hardware":
-        is_cpu = device_type == 4  # VK_PHYSICAL_DEVICE_TYPE_CPU
+    is_lavapipe = vendor_id == 0x10005 or "llvmpipe" in name_lower or "lavapipe" in name_lower
+    is_swiftshader = vendor_id == 0x1AE0 or device_id == 0xC0DE or "swiftshader" in name_lower
+    is_software = device_type == cpu_device_type or is_lavapipe or is_swiftshader
+
+    if is_lavapipe:
+        provider = "lavapipe"
+    elif is_swiftshader:
+        provider = "swiftshader"
+    elif is_software:
+        provider = "software"
+    else:
+        provider = "hardware"
+    return is_software, provider
+
+
+def _match_vulkan_device(properties, provider: str | None) -> bool:
+    if provider is None:
+        return True
+    is_software, detected_provider = _classify_vulkan_device(properties)
+    if provider in ("lavapipe", "swiftshader"):
+        return detected_provider == provider
+    if provider == "hardware":
+        device_type = getattr(properties, "deviceType", 0)
         is_gpu = device_type in (1, 2)  # INTEGRATED_GPU, DISCRETE_GPU
-        is_sw_vendor = vendor_id in (0x10005, 0x1AE0) or device_id == 0xC0DE
-        is_sw_name = "llvmpipe" in name_lower or "lavapipe" in name_lower or "swiftshader" in name_lower
-        return is_gpu and not is_cpu and not is_sw_vendor and not is_sw_name
+        return is_gpu and not is_software
     return False
 
 
@@ -1435,6 +1449,10 @@ class _Vulkan:
         _, _, self.physical, self.family, properties, device_extensions = selected
         raw_name = properties.deviceName
         self.name = (raw_name.decode("utf-8", errors="replace") if isinstance(raw_name, bytes) else str(raw_name)).rstrip("\x00")
+        self.is_software, self.provider = _classify_vulkan_device(
+            properties,
+            cpu_device_type=vk.VK_PHYSICAL_DEVICE_TYPE_CPU,
+        )
         self.max_width = properties.limits.maxFramebufferWidth
         self.max_height = properties.limits.maxFramebufferHeight
         self.max_push_constants = properties.limits.maxPushConstantsSize
@@ -3755,16 +3773,9 @@ def get_device_capabilities(
         device_id = getattr(properties, "deviceID", 0)
         vendor_id = getattr(properties, "vendorID", 0)
         device_type = getattr(properties, "deviceType", 0)
-        is_software = (
-            device_type == vk.VK_PHYSICAL_DEVICE_TYPE_CPU
-            or vendor_id in (0x10005, 0x1AE0)
-            or device_id == 0xC0DE
-            or "llvmpipe" in name.lower() or "lavapipe" in name.lower() or "swiftshader" in name.lower()
-        )
-        resolved_provider = (
-            "lavapipe" if (vendor_id == 0x10005 or "llvmpipe" in name.lower() or "lavapipe" in name.lower())
-            else "swiftshader" if (vendor_id == 0x1AE0 or device_id == 0xC0DE or "swiftshader" in name.lower())
-            else "hardware"
+        is_software, resolved_provider = _classify_vulkan_device(
+            properties,
+            cpu_device_type=vk.VK_PHYSICAL_DEVICE_TYPE_CPU,
         )
         vk_wg = getattr(properties.limits, "maxComputeWorkGroupSize", [1024, 1024, 64])
         max_workgroup_size = [int(vk_wg[0]), int(vk_wg[1]), int(vk_wg[2])]

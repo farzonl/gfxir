@@ -19,7 +19,7 @@ _EXAMPLES_DIR = _REPO_ROOT / "examples"
 _SRC_DIR = _REPO_ROOT / "src"
 for _p in (_EXAMPLES_DIR, _SRC_DIR):
     if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
+        sys.path.append(str(_p))
 
 import gfxpy as gp  # noqa: E402
 from gfxpy.gpu_backend import GfxIRComputeBackend  # noqa: E402
@@ -97,6 +97,19 @@ def _python_reference(
     return [((a * b + 1.5) * 2.0 + c) for a, b, c in zip(a_vals, b_vals, c_vals)]
 
 
+def format_provider_label(ctx: object) -> str:
+    """Return the context's provider label without assuming 'hardware' when metadata is absent."""
+    provider = getattr(ctx, "provider", None)
+    if provider:
+        return str(provider)
+    is_software = getattr(ctx, "is_software", None)
+    if is_software is True:
+        return "software"
+    if is_software is False:
+        return "hardware"
+    return "unknown"
+
+
 def run_example(
     *,
     target: str = "auto",
@@ -139,10 +152,7 @@ def run_example(
             empty_res = (gp.array([]) * 2.0 + 1.0).tolist()
 
             max_err = max((abs(g - e) for g, e in zip(actual, expected)), default=0.0)
-            ctx = raw_backend._ctx
-            provider_label = getattr(ctx, "provider", None) or (
-                "software" if getattr(ctx, "is_software", False) else "hardware"
-            )
+            provider_label = format_provider_label(raw_backend._ctx)
 
             print(f"Target:      {dev.target}")
             print(f"Device:      {raw_backend.device_name}")

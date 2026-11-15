@@ -566,6 +566,14 @@ class MetalComputeContext(ComputeContext):
         return self._device_name
 
     @property
+    def provider(self) -> str:
+        return "hardware"
+
+    @property
+    def is_software(self) -> bool:
+        return False
+
+    @property
     def closed(self) -> bool:
         return self._closed
 
