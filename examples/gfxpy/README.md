@@ -1,37 +1,130 @@
-# gfxpy (Example GPU Array API on GfxIR)
+# gfxpy (NumPy-Free Cross-Backend GPU Array Example)
 
-`gfxpy` is a NumPy-free, CuPy-inspired example array library built on GfxIR's `@compute` compiler and persistent GPU runtime (`open_compute_context`).
+`gfxpy` is a NumPy-free, CuPy-inspired example array library built on GfxIR.
+The same Python source executes on **Linux Vulkan**, **Windows DirectX 12**,
+and **macOS Metal** using persistent device-resident GPU buffers without
+generating GLSL, HLSL, or MSL source.
 
-## Supported Operations
-- **1D and 2D contiguous `float32` arrays**: `array(seq, dtype=float32)` and `empty(shape, dtype=float32)` supporting 1D `(n,)` and 2D `(rows, cols)` shapes
-- **Device-resident elementwise arithmetic**: `+` and `*` (array/array and array/scalar) executed via bounds-checked GfxIR `@compute` kernels without intermediate host transfers
-- **Bounded `sum` reduction**: `a.sum()` and `gfxpy.sum(a)` reduce all elements of a 1D or 2D array to a 1-element `GfxArray` of shape `(1,)` using a multi-dispatch shared-memory tree reduction (`workgroup_size=(64, 1, 1)`) where intermediate buffers stay on the device and are synchronized between passes. Empty inputs (`size == 0`) return a `(1,)` array with `[0.0]` without launching kernels.
-- **2D `float32` matrix multiplication**: `a @ b` and `gfxpy.matmul(a, b)` compute `(M, K) @ (K, N) -> (M, N)` using a 16x16 tiled shared-memory `@compute` kernel (`workgroup_size=(16, 16, 1)`). Handles non-tile-aligned dimensions with bounds checks; if `K == 0` with `M > 0, N > 0`, returns a zero-filled `(M, N)` array; if `M == 0` or `N == 0`, returns an empty `(M, N)` array without dispatching.
-- **Explicit readback**: `tolist()` synchronizes and downloads device data to a nested Python `list` (`list[float]` for 1D, `list[list[float]]` for 2D)
-- **Explicit ownership**: `Device` and `GfxArray` support `close()` and `with ...:` context managers
-- **Platform target selection**:
-  - macOS (`darwin`) -> `"metal"`
-  - Windows (`win32`) -> `"directx"`
-  - Linux (`linux`) -> `"vulkan"`
-  - Explicit override via `gfxpy.device("vulkan")` (or `"metal"`, `"directx"`)
+## Quick Example
 
-## Numerical Semantics & Failure Modes
-- **Accumulation & tolerances**: All device arithmetic, reductions, and matrix multiplications accumulate in IEEE-754 `float32`. Because parallel shared-memory tree reductions and tiled matmul reorder additions relative to sequential Python `float64` reference sums, results are verified within `float32` tolerances (for example `rel_tol=1e-4, abs_tol=1e-4` for bounded `sum` and `rel_tol=1e-4, abs_tol=1e-3` for `matmul`).
-- **Validation & failure modes**: 3D+ or ragged sequences, non-`float32` dtypes, shape mismatches (`ShapeMismatchError`), cross-device operations (`CrossDeviceError`), and use after `close()` (`ClosedResourceError`) raise explicit errors immediately.
+```python
+import gfxpy as gp
 
-## Unsupported Semantics & Non-Claims
-- No broadcasting beyond scalar operands
-- No 3D+ arrays, slicing, strides, or non-`float32` dtypes
-- No operator kernel fusion or arbitrary-axis reductions
-- No NumPy compatibility claims
-- No BLAS or CuPy performance claims (kernels are straightforward educational GfxIR `@compute` implementations)
+dev = gp.device("auto")  # macOS -> metal, Windows -> directx, Linux -> vulkan
+try:
+    with dev:
+        a = gp.array([1.0, 2.0, 3.0], dtype=gp.float32)
+        b = gp.array([4.0, 5.0, 6.0], dtype=gp.float32)
+        c = gp.array([0.5, 1.0, 1.5], dtype=gp.float32)
 
-## No NumPy Dependency & No CPU Fallback
-- Importing `gfxpy` and running host-side contract tests requires only the Python standard library (>= 3.11) and `mlir_gpu`.
-- NumPy is **not** required. If you want to compare against NumPy in benchmarks, install the optional `bench` extra (`pip install -e '.[bench]'`).
-- Backend initialization or compilation errors always surface the chosen target and cause; `gfxpy` never silently falls back to CPU execution or another GPU backend.
+        # Intermediate results stay device-resident; no host readback per operator.
+        y = (a * b + 1.5) * 2.0 + c
+        result = y.tolist()
+finally:
+    dev.close()
+```
 
-## Backend Prerequisites
-- **Linux (`vulkan`)**: Vulkan ICD/loader + `spirv-val` + GfxIR LLVM/MLIR toolchain
-- **macOS (`metal`)**: Metal Argument Buffers Tier 2 device + `metal-shaderconverter` + GfxIR toolchain
-- **Windows (`directx`)**: DirectX 12 device or WARP + `dxil` tools + GfxIR toolchain
+A complete runnable script comparing GPU output against a standard-library
+Python reference is provided in [chain_example.py](chain_example.py).
+
+## Supported Platforms & Target Selection
+
+| Platform (`sys.platform`) | Default Target | Explicit Override |
+| --- | --- | --- |
+| macOS (`darwin`) | `"metal"` | `gp.device("metal")` |
+| Windows (`win32`) | `"directx"` | `gp.device("directx")` |
+| Linux (`linux*`) | `"vulkan"` | `gp.device("vulkan")` |
+
+Pass `target="auto"` (or `None`) for platform-default selection, or pass
+`"vulkan"`, `"directx"`, or `"metal"` explicitly. Unsupported platforms or
+unknown target names raise `UnsupportedTargetError`.
+
+## Setup & Backend Prerequisites
+
+- **Python**: `>= 3.11` with only the standard library (NumPy is **not** required).
+  Install `mlir_gpu` in editable mode (`pip install -e .`) or run with
+  `PYTHONPATH=src:examples`.
+- **GfxIR Compiler Toolchain**: `gfx-compile` and `gfx-opt` (built via
+  `tools/build_toolchain.py` into `.toolchains/llvm-build/bin`, or set `LLVM_BIN`).
+- **Linux (`vulkan`)**:
+  - Vulkan loader (`libvulkan1`) and a hardware Vulkan ICD or SwiftShader ICD
+    (`VK_ICD_FILENAMES` / `VK_DRIVER_FILES` for software execution).
+  - `spirv-val` (optional validator in `PATH` or `GPU_TOOLS_BIN`).
+- **Windows (`directx`)**:
+  - Windows 10/11 with DirectX 12 hardware adapter or WARP software adapter
+    (`Microsoft Basic Render Driver`).
+  - Prebuilt `mlir-gpu-directx-compute.dll` in `.tools/bin` / `GPU_TOOLS_BIN`,
+    or MSVC `cl.exe` / `clang++` to build `native/directx_compute_bridge.cpp`
+    on demand, plus `dxv` / `dxcompiler.dll` / `dxil.dll`.
+- **macOS (`metal`)**:
+  - Metal device supporting Argument Buffers Tier 2.
+  - Apple Metal Shader Converter (`metal-shaderconverter` and
+    `libmetalirconverter`), plus `clang++` or prebuilt
+    `libmlir_gpu_metal_compute.dylib` for `native/metal_compute_bridge.mm`.
+
+## API Scope, Limits, and Error Semantics
+
+- **Supported types & shapes**: Contiguous 1D `float32` arrays (`gp.array(seq, dtype=gp.float32)`,
+  `gp.empty(length, dtype=gp.float32)`). Nested sequences raise `ShapeMismatchError`;
+  other dtypes raise `UnsupportedDTypeError`.
+- **Supported operations**: Elementwise `+` and `*` (array/array and array/scalar,
+  including reflected scalar ops `2.0 * a` and `10.0 + b`), and explicit host
+  readback via `tolist()`.
+- **Empty arrays**: `gp.array([])` and `gp.empty(0)` are handled at the array
+  layer without zero-byte GPU allocations or zero-grid dispatches.
+- **Explicit ownership & lifecycle**: `Device` and `GfxArray` support `close()`
+  and `with ...:` context managers (`Device.__exit__` restores the active
+  context; call `dev.close()` to release GPU resources). Use-after-close raises
+  `DeviceClosedError` or `ArrayClosedError`; combining arrays from different
+  devices raises `CrossDeviceError`.
+- **No CPU or cross-backend fallback**: Missing tools, missing adapters, or
+  backend initialization failures raise `BackendInitializationError`,
+  `PersistentComputeError`, or `BackendNotImplementedError` with the target and
+  cause. `gfxpy` never silently falls back to CPU execution.
+- **Out of scope**: Broadcasting beyond scalars, slicing/strides, reductions,
+  matmul, kernel fusion, or broad NumPy/CuPy compatibility.
+
+## Running the Example & Checks
+
+### 1. Host-only contract & caching checks (no GPU required)
+```bash
+python -m unittest discover -s tests -p "test_gfxpy_*.py" -v
+```
+
+### 2. Runnable chained example
+```bash
+# Platform default target
+python examples/gfxpy/chain_example.py --target auto
+
+# Software providers (CI-safe)
+python examples/gfxpy/chain_example.py --target directx --provider warp --validation
+python examples/gfxpy/chain_example.py --target vulkan --provider swiftshader --validation
+
+# Hardware providers
+python examples/gfxpy/chain_example.py --target directx --provider hardware --validation
+python examples/gfxpy/chain_example.py --target vulkan --provider hardware --validation
+python examples/gfxpy/chain_example.py --target metal --validation
+```
+
+If tools or a compatible GPU device are unavailable, `chain_example.py` prints
+`SKIPPED/UNAVAILABLE [...]` and exits with status `2` instead of falling back
+to CPU.
+
+### 3. Opt-in live execution tests (separates software vs hardware, skips when unavailable)
+```bash
+# Windows DirectX 12 (WARP software)
+MLIR_GPU_TEST_DIRECTX=1 MLIR_GPU_TEST_WARP=1 MLIR_GPU_TEST_VALIDATION=1 \
+  python -m unittest discover -s tests -p "test_gfxpy_execution.py" -v
+
+# Windows DirectX 12 (Hardware)
+MLIR_GPU_TEST_DIRECTX=1 MLIR_GPU_TEST_VALIDATION=1 \
+  python -m unittest discover -s tests -p "test_gfxpy_execution.py" -v
+
+# Linux Vulkan (SwiftShader software)
+MLIR_GPU_TEST_VULKAN=1 MLIR_GPU_TEST_SWIFTSHADER=1 MLIR_GPU_TEST_VALIDATION=1 \
+  python -m unittest discover -s tests -p "test_gfxpy_execution.py" -v
+
+# macOS Metal
+MLIR_GPU_TEST_METAL=1 MLIR_GPU_TEST_VALIDATION=1 \
+  python -m unittest discover -s tests -p "test_gfxpy_execution.py" -v
+```

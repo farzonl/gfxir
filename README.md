@@ -29,7 +29,7 @@ Vulkan and both Metal preview paths can export deterministic MP4 animation.
 | Python device control flow / SDF composition | Default AST frontend and upstream SCF | Real bounded GPU loops, branches, early exits, carried scalar/vector state, and finite-difference normals |
 | Read-only frame resources | Reflected f32 root ABI, Vulkan push constants, DXIL root constants, converted Metal argument buffer | Exact time/pixel dimensions in both stages; live clock, frozen snapshots, resize and Retina drawable readback |
 | Native DirectX 12 runtime rendering | Win32 window, D3D12 pipeline, DXGI swapchain, and offscreen RGBA readback | Readback/clipping tested on NVIDIA RTX 5060 with GPU validation; Vulkan pixel parity verified; live-window tests require an interactive desktop |
-| Compute entry points | IR foundation only | Typed stage, workgroup-size and invocation-ID verification; compute lowering/execution is explicitly rejected for now |
+| Compute entry points & persistent runtime | `@compute` lowering, reflection, and persistent device/buffer/pipeline execution | Lowering and validation for SPIR-V, DXIL, and Metal; persistent `ComputeContext` (`vulkan`, `directx`, `metal`) and NumPy-free [gfxpy](examples/gfxpy/README.md) example (live GPU tests are opt-in per platform/provider) |
 | Typed pointers / bindless handles | IR foundation only | ODS types parse and round-trip; general pointer/load-store lowering and resource heaps are not implemented yet |
 
 LLVM IR verification is **not** DXIL validation: the native DXC validator also
