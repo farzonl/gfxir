@@ -193,6 +193,60 @@ class TestMetalComputeContract(unittest.TestCase):
                 with self.assertRaises(PersistentComputeError):
                     ctx1.create_buffer(16)
 
+    def test_metal_buffer_pool_reuse_in_flight_safety_and_release(self) -> None:
+        fake = _FakeMetalBridge()
+
+        @compute(workgroup_size=(64, 1, 1))
+        def copy_kernel(
+            src: Buffer[Type.F32, "read_only"],
+            dst: Buffer[Type.F32, "write_only"],
+            params: MetalNoopParams,
+        ):
+            idx = i32(global_invocation_id().x)
+            if idx < params.n:
+                dst[idx] = src[idx]
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = compile_pipeline(
+                ComputePipeline(copy_kernel, Dispatch(grid=(1, 1, 1))),
+                Target.VULKAN,
+                Path(td) / "copy_pool_vk",
+                TOOLS,
+            )
+            vk_prog = load_compute_program(manifest)
+            mtl_prog = replace(
+                vk_prog,
+                target="metal",
+                compute=replace(vk_prog.compute, code=b"MTLB"),
+            )
+            with (
+                mock.patch("mlir_gpu.metal_compute.sys.platform", "darwin"),
+                mock.patch("mlir_gpu.metal_compute._load_bridge", return_value=fake),
+            ):
+                with open_compute_context("metal") as ctx:
+                    pipe = ctx.compile_pipeline(mtl_prog)
+                    b1 = ctx.create_buffer(16, b"abcd" * 4)
+                    b1.close()
+                    b2 = ctx.create_buffer(16, zero_init=False)
+                    self.assertEqual(ctx.stats["allocations"], 1)
+                    self.assertEqual(ctx.stats["pool_hits"], 1)
+
+                    b_out = ctx.create_buffer(16, zero_init=False)
+                    pipe.dispatch({"src": b2, "dst": b_out}, parameters={"n": 4}, grid=(1, 1, 1))
+                    b2.close()
+                    # In-flight buffer must not be reused before synchronize().
+                    b3 = ctx.create_buffer(16, zero_init=False)
+                    self.assertEqual(ctx.stats["allocations"], 3)
+                    ctx.synchronize()
+                    self.assertEqual(ctx.stats["pooled_buffers"], 1)
+                    b_out.close()
+                    b3.close()
+                    self.assertEqual(ctx.stats["pooled_buffers"], 3)
+                    freed = ctx.release_pool()
+                    self.assertEqual(freed, 48)
+                    self.assertEqual(ctx.stats["pooled_buffers"], 0)
+                    self.assertEqual(len(fake.buffers), 0)
+
     def test_deferred_cleanup_and_stats_without_intermediate_waits(self) -> None:
         fake = _FakeMetalBridge()
 

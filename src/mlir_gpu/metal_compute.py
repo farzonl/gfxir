@@ -19,7 +19,9 @@ from .compute_runtime import (
     PersistentBuffer,
     PersistentComputeError,
     PersistentPipeline,
+    _BoundedBufferPool,
     _pack_dispatch_parameters,
+    _resolve_pool_max_bytes,
     _validate_non_negative_int,
     _validate_positive_int,
 )
@@ -374,11 +376,15 @@ class MetalBuffer(PersistentBuffer):
         self._closed = True
         handle = self._handle
         self._handle = 0
-        if handle and not self._context.closed:
-            if self._context._pending_work:
-                self._context._defer_cleanup("buffer", handle)
-            else:
-                self._context._lib.gfx_mtl_destroy_buffer(handle)
+        if not handle:
+            return
+        self._context._pool.on_live_free(self._size_bytes)
+        if self._context.closed:
+            self._context._lib.gfx_mtl_destroy_buffer(handle)
+        elif self._context._pending_work:
+            self._context._defer_cleanup("pool_buffer", (self._size_bytes, handle))
+        else:
+            self._context._return_buffer_to_pool(self._size_bytes, handle)
 
 
 class MetalPipeline(PersistentPipeline):
@@ -502,7 +508,13 @@ class MetalPipeline(PersistentPipeline):
 class MetalComputeContext(ComputeContext):
     """Persistent macOS Metal compute context."""
 
-    def __init__(self, *, validation: bool = False, provider: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        validation: bool = False,
+        provider: str | None = None,
+        pool_max_bytes: int | None = None,
+    ) -> None:
         if sys.platform != "darwin":
             raise PersistentComputeError(
                 f"Persistent Metal compute is only supported on macOS (darwin), not {sys.platform!r}."
@@ -520,6 +532,7 @@ class MetalComputeContext(ComputeContext):
             "waits": 0,
             "deferred_cleanups": 0,
         }
+        self._pool = _BoundedBufferPool(max_bytes=_resolve_pool_max_bytes(pool_max_bytes))
 
         err_buf = ctypes.create_string_buffer(1024)
         ctx_handle = self._lib.gfx_mtl_create_context(err_buf, len(err_buf))
@@ -545,16 +558,22 @@ class MetalComputeContext(ComputeContext):
         if self._closed or not self._ctx_handle:
             raise PersistentComputeError("ComputeContext has been closed.")
 
+    def _return_buffer_to_pool(self, size_bytes: int, handle: int) -> None:
+        if self._closed:
+            self._lib.gfx_mtl_destroy_buffer(handle)
+            return
+        self._pool.release(size_bytes, handle, self._lib.gfx_mtl_destroy_buffer)
+
     def create_buffer(
         self,
         size_bytes: int,
         initial_data: bytes | bytearray | memoryview | None = None,
+        *,
+        zero_init: bool = True,
     ) -> MetalBuffer:
         self._ensure_open()
         _validate_positive_int(size_bytes, "buffer size_bytes")
-        data_ptr = None
-        data_len = 0
-        data_arr = None
+        payload: bytes | None = None
         if initial_data is not None:
             if not isinstance(initial_data, (bytes, bytearray, memoryview)):
                 raise PersistentComputeError("initial_data must be bytes, bytearray, or memoryview.")
@@ -563,6 +582,32 @@ class MetalComputeContext(ComputeContext):
                 raise PersistentComputeError(
                     f"initial_data length ({len(payload)}) exceeds buffer size ({size_bytes})."
                 )
+
+        pooled_handle = self._pool.acquire(size_bytes)
+        if pooled_handle is not None:
+            buf = MetalBuffer(self, size_bytes, int(pooled_handle))  # type: ignore[arg-type]
+            self._pool.on_live_alloc(size_bytes)
+            try:
+                if payload is not None:
+                    if len(payload) > 0:
+                        buf.upload(payload)
+                    if zero_init and len(payload) < size_bytes:
+                        buf.upload(b"\x00" * (size_bytes - len(payload)), offset=len(payload))
+                elif zero_init:
+                    buf.upload(b"\x00" * size_bytes)
+            except Exception:
+                buf._closed = True
+                buf._handle = 0
+                self._pool.on_live_free(size_bytes)
+                self._lib.gfx_mtl_destroy_buffer(int(pooled_handle))  # type: ignore[arg-type]
+                raise
+            self._buffers.add(buf)
+            return buf
+
+        data_ptr = None
+        data_len = 0
+        data_arr = None
+        if payload is not None:
             data_len = len(payload)
             if data_len > 0:
                 data_arr = (ctypes.c_uint8 * data_len).from_buffer_copy(payload)
@@ -579,6 +624,8 @@ class MetalComputeContext(ComputeContext):
         )
         if not handle:
             raise PersistentComputeError(_decode_err(err_buf))
+        self._pool.record_allocation()
+        self._pool.on_live_alloc(size_bytes)
         buf = MetalBuffer(self, size_bytes, handle)
         self._buffers.add(buf)
         return buf
@@ -637,13 +684,22 @@ class MetalComputeContext(ComputeContext):
 
     @property
     def stats(self) -> dict[str, int]:
-        return dict(self._stats)
+        merged = dict(self._stats)
+        merged.update(self._pool.stats())
+        return merged
 
     def reset_stats(self) -> None:
         for key in self._stats:
             self._stats[key] = 0
+        self._pool.reset_counters()
 
-    def _defer_cleanup(self, kind: str, handle: int) -> None:
+    def release_pool(self) -> int:
+        self._ensure_open()
+        if self._pending_work:
+            self.synchronize()
+        return self._pool.clear(self._lib.gfx_mtl_destroy_buffer)
+
+    def _defer_cleanup(self, kind: str, handle: object) -> None:
         self._retired_resources.append((kind, handle))
         self._stats["deferred_cleanups"] += 1
 
@@ -655,6 +711,9 @@ class MetalComputeContext(ComputeContext):
         for kind, handle in retired:
             if kind == "buffer":
                 self._lib.gfx_mtl_destroy_buffer(handle)
+            elif kind == "pool_buffer":
+                size_bytes, buf_handle = handle  # type: ignore[misc]
+                self._return_buffer_to_pool(size_bytes, buf_handle)
             elif kind == "pipeline":
                 self._lib.gfx_mtl_destroy_pipeline(handle)
 
@@ -683,6 +742,7 @@ class MetalComputeContext(ComputeContext):
                 buf.close()
             for pipe in list(self._pipelines):
                 pipe.close()
+            self._pool.clear(self._lib.gfx_mtl_destroy_buffer)
             self._closed = True
             ctx_handle = self._ctx_handle
             self._ctx_handle = 0

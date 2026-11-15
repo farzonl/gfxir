@@ -220,6 +220,19 @@ class Device:
         if self._closed or self._backend.closed:
             raise DeviceClosedError(f"Device '{self._target}' has been closed.")
 
+    @property
+    def memory_stats(self) -> dict[str, int]:
+        self.ensure_open()
+        if hasattr(self._backend, "memory_stats"):
+            return dict(self._backend.memory_stats)
+        return {}
+
+    def release_pool(self) -> int:
+        self.ensure_open()
+        if hasattr(self._backend, "release_pool"):
+            return int(self._backend.release_pool())
+        return 0
+
     def close(self) -> None:
         if not self._closed:
             self._closed = True
