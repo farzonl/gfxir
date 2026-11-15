@@ -97,6 +97,14 @@ class _FakeMetalBridge:
         self.dispatches.append((pipe, num_bindings, (gx, gy, gz)))
         return 0
 
+    def gfx_mtl_begin_batch(self, ctx, err_buf, err_cap):
+        self.begin_batch_calls = getattr(self, "begin_batch_calls", 0) + 1
+        return 0
+
+    def gfx_mtl_end_batch(self, ctx, err_buf, err_cap):
+        self.end_batch_calls = getattr(self, "end_batch_calls", 0) + 1
+        return 0
+
     def gfx_mtl_synchronize(self, ctx, err_buf, err_cap):
         self.sync_calls += 1
         return 0
@@ -307,6 +315,9 @@ class TestMetalComputeContract(unittest.TestCase):
 
                     _ = b2.download()
                     self.assertEqual(ctx.stats["dispatches"], 2)
+                    self.assertEqual(ctx.stats["submissions"], 1)
+                    self.assertEqual(getattr(fake, "begin_batch_calls", 0), 1)
+                    self.assertEqual(getattr(fake, "end_batch_calls", 0), 1)
                     self.assertEqual(ctx.stats["waits"], 1)
                     self.assertEqual(fake.sync_calls, sync_before + 1)
                     self.assertEqual(getattr(fake, "destroyed_pipelines", 0), 1)

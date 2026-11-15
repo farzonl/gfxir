@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 import ctypes
 import hashlib
 import os
@@ -210,6 +211,12 @@ def _load_bridge() -> ctypes.CDLL:
     ]
     lib.gfx_mtl_dispatch.restype = ctypes.c_int
 
+    lib.gfx_mtl_begin_batch.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+    lib.gfx_mtl_begin_batch.restype = ctypes.c_int
+
+    lib.gfx_mtl_end_batch.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+    lib.gfx_mtl_end_batch.restype = ctypes.c_int
+
     lib.gfx_mtl_synchronize.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
     lib.gfx_mtl_synchronize.restype = ctypes.c_int
 
@@ -404,6 +411,18 @@ class MetalPipeline(PersistentPipeline):
         self._program = program
         self._handle = handle
         self._closed = False
+        self._binding_arr = (_GfxMtlBufferBinding * len(program.buffers))()
+        self._binding_meta = tuple(
+            (
+                buf_meta["name"],
+                1 if buf_meta["access"] in ("write_only", "read_write") else 0,
+                int(buf_meta.get("set", 0)),
+                int(buf_meta.get("binding", 0)),
+            )
+            for buf_meta in program.buffers
+        )
+        self._reflected_names = frozenset(buf["name"] for buf in program.buffers)
+        self._err_buf = ctypes.create_string_buffer(1024)
 
     @property
     def program(self) -> ComputeProgram:
@@ -440,18 +459,17 @@ class MetalPipeline(PersistentPipeline):
 
         packed_params = _pack_dispatch_parameters(self._program, parameters)
 
-        provided = dict(buffers or {})
-        reflected_names = {buf["name"] for buf in self._program.buffers}
-        extra = sorted(set(provided) - reflected_names)
-        if extra:
-            raise PersistentComputeError(f"Unknown compute buffer name(s): {', '.join(extra)}.")
-        missing = sorted(reflected_names - set(provided))
-        if missing:
-            raise PersistentComputeError(f"Missing required compute buffer binding(s): {', '.join(missing)}.")
+        provided = buffers or {}
+        if len(provided) != len(self._reflected_names) or any(k not in self._reflected_names for k in provided):
+            extra = sorted(set(provided) - self._reflected_names)
+            if extra:
+                raise PersistentComputeError(f"Unknown compute buffer name(s): {', '.join(extra)}.")
+            missing = sorted(self._reflected_names - set(provided))
+            if missing:
+                raise PersistentComputeError(f"Missing required compute buffer binding(s): {', '.join(missing)}.")
 
-        binding_arr = (_GfxMtlBufferBinding * len(self._program.buffers))()
-        for idx, buf_meta in enumerate(self._program.buffers):
-            name = buf_meta["name"]
+        binding_arr = self._binding_arr
+        for idx, (name, is_uav, set_idx, binding_idx) in enumerate(self._binding_meta):
             buf = provided[name]
             if not isinstance(buf, MetalBuffer):
                 raise PersistentComputeError(
@@ -465,13 +483,10 @@ class MetalPipeline(PersistentPipeline):
             buf._ensure_open()
             if buf.size_bytes <= 0:
                 raise PersistentComputeError(f"Buffer {name!r} must have positive size.")
-            is_uav = 1 if buf_meta["access"] in ("write_only", "read_write") else 0
-            binding_arr[idx] = _GfxMtlBufferBinding(
-                buffer=buf._handle,
-                is_uav=is_uav,
-                set=int(buf_meta.get("set", 0)),
-                binding=int(buf_meta.get("binding", 0)),
-            )
+            binding_arr[idx].buffer = buf._handle
+            binding_arr[idx].is_uav = is_uav
+            binding_arr[idx].set = set_idx
+            binding_arr[idx].binding = binding_idx
 
         rc_ptr = None
         rc_size = 0
@@ -481,12 +496,12 @@ class MetalPipeline(PersistentPipeline):
             rc_buf = (ctypes.c_uint8 * rc_size).from_buffer_copy(packed_params)
             rc_ptr = ctypes.cast(rc_buf, ctypes.c_void_p)
 
-        err_buf = ctypes.create_string_buffer(1024)
+        err_buf = self._err_buf
         rc = self._context._lib.gfx_mtl_dispatch(
             self._context._ctx_handle,
             self._handle,
             binding_arr,
-            len(self._program.buffers),
+            len(self._binding_meta),
             rc_ptr,
             rc_size,
             gx,
@@ -499,7 +514,10 @@ class MetalPipeline(PersistentPipeline):
             raise PersistentComputeError(_decode_err(err_buf))
         self._context._pending_work = True
         self._context._stats["dispatches"] += 1
-        self._context._stats["submissions"] += 1
+        if self._context._batch_depth == 0:
+            self._context._stats["submissions"] += 1
+        else:
+            self._context._batch_dispatches += 1
 
     def close(self) -> None:
         if self._closed:
@@ -540,6 +558,8 @@ class MetalComputeContext(ComputeContext):
         self._buffers: weakref.WeakSet[MetalBuffer] = weakref.WeakSet()
         self._pipelines: weakref.WeakSet[MetalPipeline] = weakref.WeakSet()
         self._pending_work = False
+        self._batch_depth = 0
+        self._batch_dispatches = 0
         self._retired_resources: list[tuple[str, int]] = []
         self._stats = {
             "dispatches": 0,
@@ -749,6 +769,33 @@ class MetalComputeContext(ComputeContext):
             self._retired_resources = remaining + self._retired_resources
         if errors:
             raise errors[0]
+
+    @contextmanager
+    def batch(self):
+        self._ensure_open()
+        if self._batch_depth == 0:
+            self._batch_dispatches = 0
+            begin_fn = getattr(self._lib, "gfx_mtl_begin_batch", None)
+            if begin_fn is not None:
+                err_buf = ctypes.create_string_buffer(1024)
+                rc = begin_fn(self._ctx_handle, err_buf, len(err_buf))
+                if rc != 0:
+                    raise PersistentComputeError(_decode_err(err_buf))
+        self._batch_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+            if self._batch_depth == 0 and not self._closed:
+                end_fn = getattr(self._lib, "gfx_mtl_end_batch", None)
+                if end_fn is not None:
+                    err_buf = ctypes.create_string_buffer(1024)
+                    rc = end_fn(self._ctx_handle, err_buf, len(err_buf))
+                    if rc != 0:
+                        raise PersistentComputeError(_decode_err(err_buf))
+                if self._batch_dispatches > 0:
+                    self._stats["submissions"] += 1
+                    self._batch_dispatches = 0
 
     def synchronize(self) -> None:
         self._ensure_open()
