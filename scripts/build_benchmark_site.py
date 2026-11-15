@@ -86,9 +86,48 @@ def build_history_entry(
     }
 
 
+def merge_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge multiple benchmark JSON reports (e.g. Metal + MoltenVK + KosmicKrisp) into one."""
+    if not reports:
+        raise ValueError("At least one benchmark report is required.")
+    if len(reports) == 1:
+        return reports[0]
+
+    base = dict(reports[0])
+    seen_numpy_suites: set[str] = set()
+    merged_results: list[dict[str, Any]] = []
+    merged_geomeans: dict[str, float] = {}
+    targets: list[str] = []
+
+    for report in reports:
+        t = str(report.get("target", "")).strip()
+        if t and t not in targets:
+            targets.append(t)
+        for k, v in (report.get("overallGeomeanMs") or {}).items():
+            if isinstance(v, (int, float)) and (k not in merged_geomeans or (v > 0 and merged_geomeans[k] <= 0)):
+                merged_geomeans[k] = float(v)
+        for row in report.get("results") or []:
+            backend = row.get("backend")
+            bench_id = row.get("benchId")
+            if backend == "numpy-cpu-f32":
+                if bench_id in seen_numpy_suites:
+                    continue
+                seen_numpy_suites.add(str(bench_id))
+            merged_results.append(row)
+
+    positive = [(k, v) for k, v in merged_geomeans.items() if v > 0]
+    overall_winner = min(positive, key=lambda kv: kv[1])[0] if positive else base.get("overallWinner", "")
+
+    base["target"] = ", ".join(targets) if targets else base.get("target", "")
+    base["overallGeomeanMs"] = merged_geomeans
+    base["overallWinner"] = overall_winner
+    base["results"] = merged_results
+    return base
+
+
 def generate_site(
     *,
-    bench_json: Path,
+    bench_json: Path | list[Path],
     site_src: Path,
     out_dir: Path,
     sha: str,
@@ -100,7 +139,9 @@ def generate_site(
     history_cache: Path | None,
 ) -> list[dict[str, Any]]:
     """Update benchmark history and assemble the static website in out_dir."""
-    raw = json.loads(bench_json.read_text(encoding="utf-8"))
+    paths = [bench_json] if isinstance(bench_json, Path) else list(bench_json)
+    reports = [json.loads(p.read_text(encoding="utf-8")) for p in paths]
+    raw = merge_reports(reports)
     entry = build_history_entry(
         raw,
         sha=sha,
@@ -138,7 +179,7 @@ def generate_site(
 def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description="Build the GfxIR vs NumPy benchmark website.")
-    parser.add_argument("--bench-json", required=True, type=Path)
+    parser.add_argument("--bench-json", required=True, nargs="+", type=Path)
     parser.add_argument("--site-src", type=Path, default=repo_root / "pages")
     parser.add_argument("--out-dir", type=Path, default=repo_root / "_site")
     parser.add_argument("--sha", default="")

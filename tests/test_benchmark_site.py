@@ -153,6 +153,37 @@ class TestBenchmarkSiteBuilder(unittest.TestCase):
             self.assertTrue((out_dir / "index.html").is_file())
             self.assertTrue((out_dir / "data" / "bench-history.json").is_file())
 
+    def test_merge_reports_deduplicates_numpy_and_keeps_both_vulkan_runtimes(self) -> None:
+        r1 = {
+            "version": 1,
+            "os": "Darwin",
+            "arch": "arm64",
+            "target": "vulkan",
+            "overallWinner": "numpy-cpu-f32",
+            "overallGeomeanMs": {"numpy-cpu-f32": 0.01, "gfxir-vulkan-moltenvk": 1.2},
+            "results": [
+                {"benchId": "matmul_64", "benchName": "MatMul 64x64", "backend": "numpy-cpu-f32", "ran": True, "medianMs": 0.01},
+                {"benchId": "matmul_64", "benchName": "MatMul 64x64", "backend": "gfxir-vulkan-moltenvk", "ran": True, "medianMs": 1.2},
+            ],
+        }
+        r2 = {
+            "version": 1,
+            "os": "Darwin",
+            "arch": "arm64",
+            "target": "vulkan",
+            "overallWinner": "numpy-cpu-f32",
+            "overallGeomeanMs": {"numpy-cpu-f32": 0.01, "gfxir-vulkan-kosmickrisp": 2.1},
+            "results": [
+                {"benchId": "matmul_64", "benchName": "MatMul 64x64", "backend": "numpy-cpu-f32", "ran": True, "medianMs": 0.01},
+                {"benchId": "matmul_64", "benchName": "MatMul 64x64", "backend": "gfxir-vulkan-kosmickrisp", "ran": True, "medianMs": 2.1},
+            ],
+        }
+        merged = build_benchmark_site.merge_reports([r1, r2])
+        backends = [r["backend"] for r in merged["results"]]
+        self.assertEqual(backends, ["numpy-cpu-f32", "gfxir-vulkan-moltenvk", "gfxir-vulkan-kosmickrisp"])
+        self.assertIn("gfxir-vulkan-moltenvk", merged["overallGeomeanMs"])
+        self.assertIn("gfxir-vulkan-kosmickrisp", merged["overallGeomeanMs"])
+
 
 if __name__ == "__main__":
     unittest.main()
