@@ -22,7 +22,7 @@ class Pipeline:
 
 @dataclass
 class DrawCommand:
-    """Recorded graphics draw command with isolated push constants."""
+    """Recorded graphics draw command with isolated push constants and optional bound textures."""
 
     pipeline_id: str
     push_constants: bytes = b""
@@ -32,6 +32,8 @@ class DrawCommand:
     index_count: int = 0
     first_index: int = 0
     vertex_offset: int = 0
+    textures: Dict[str, Any] = field(default_factory=dict)
+    samplers: Dict[str, Any] = field(default_factory=dict)
 
 
 def sort_draw_items(items: Sequence[Any]) -> List[Any]:
@@ -161,6 +163,19 @@ class ForwardRenderer:
         elif index_count is None:
             index_count = 0
 
+        raw_textures = kwargs.get("textures")
+        raw_samplers = kwargs.get("samplers")
+        mat = kwargs.get("material")
+        if mat is None and node is not None:
+            mat = getattr(node, "material", None)
+        textures: Dict[str, Any] = dict(raw_textures) if raw_textures else {}
+        samplers: Dict[str, Any] = dict(raw_samplers) if raw_samplers else {}
+        if not textures and mat is not None and getattr(mat, "albedo_texture", None) is not None:
+            from .material import Sampler as MgfxSampler
+
+            textures["albedo_tex"] = mat.albedo_texture
+            samplers["albedo_sampler"] = getattr(mat, "sampler", None) or MgfxSampler()
+
         return DrawCommand(
             pipeline_id=str(pipeline_id),
             push_constants=pc_bytes,
@@ -170,6 +185,8 @@ class ForwardRenderer:
             index_count=int(index_count),
             first_index=int(kwargs.get("first_index", 0)),
             vertex_offset=int(kwargs.get("vertex_offset", 0)),
+            textures=textures,
+            samplers=samplers,
         )
 
     def record_commands(self, draw_list: Sequence[Any]) -> List[DrawCommand]:
@@ -182,9 +199,9 @@ class ForwardRenderer:
                 pipe_id = item.get("pipe") or item.get("pipeline") or item.get("pipeline_id") or "default"
                 mesh = item.get("mesh")
                 node = item.get("node")
+                mat = item.get("material") or (getattr(node, "material", None) if node is not None else None)
                 pc = item.get("push_constants")
                 if pc is None and node is not None:
-                    mat = item.get("material") or getattr(node, "material", None)
                     pc = self.upload_object_constants(node, mat)
                 elif pc is None:
                     pc = b""
@@ -193,6 +210,9 @@ class ForwardRenderer:
                     push_constants=pc,
                     mesh=mesh,
                     node=node,
+                    material=mat,
+                    textures=item.get("textures"),
+                    samplers=item.get("samplers"),
                     vertex_count=item.get("vertex_count"),
                     index_count=item.get("index_count"),
                     first_index=item.get("first_index", 0),
@@ -204,9 +224,9 @@ class ForwardRenderer:
                 pipe_id = getattr(item, "pipe", getattr(item, "pipeline", getattr(item, "pipeline_id", "default")))
                 mesh = getattr(item, "mesh", None)
                 node = getattr(item, "node", None)
+                mat = getattr(item, "material", getattr(node, "material", None) if node is not None else None)
                 pc = getattr(item, "push_constants", None)
                 if pc is None and node is not None:
-                    mat = getattr(item, "material", getattr(node, "material", None))
                     pc = self.upload_object_constants(node, mat)
                 elif pc is None:
                     pc = b""
@@ -215,6 +235,9 @@ class ForwardRenderer:
                     push_constants=pc,
                     mesh=mesh,
                     node=node,
+                    material=mat,
+                    textures=getattr(item, "textures", None),
+                    samplers=getattr(item, "samplers", None),
                     vertex_count=getattr(item, "vertex_count", None),
                     index_count=getattr(item, "index_count", None),
                     first_index=getattr(item, "first_index", 0),
@@ -249,14 +272,21 @@ class ForwardRenderer:
             if hasattr(node, "is_visible") and not node.is_visible(camera):
                 continue
 
-            pipe_key = (
-                getattr(node, "pipeline_id", None)
-                or getattr(node, "pipeline", None)
-                or getattr(node, "material", None)
-                or "default"
-            )
+            mat = getattr(node, "material", None)
+            pipe_key = getattr(node, "pipeline_id", None) or getattr(node, "pipeline", None)
+            if pipe_key is None:
+                if mat is not None:
+                    mat_name = getattr(mat, "name", "")
+                    if mat_name:
+                        pipe_key = mat_name
+                    elif getattr(mat, "albedo_texture", None) is not None:
+                        pipe_key = "textured_pbr"
+                    else:
+                        pipe_key = mat
+                else:
+                    pipe_key = "default"
             if not isinstance(pipe_key, str):
-                pipe_key = getattr(pipe_key, "name", str(pipe_key))
+                pipe_key = getattr(pipe_key, "name", None) or str(pipe_key)
 
             draw_items.append({
                 "pipe": pipe_key,

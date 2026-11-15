@@ -5,6 +5,7 @@ from .parameters import verify_parameters
 
 
 SUPPORTED_DEPTH_FORMATS = {"d32_sfloat"}
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 COMPARE_OPS = {
     "never", "less", "equal", "less_equal",
     "greater", "not_equal", "greater_equal", "always",
@@ -106,6 +107,73 @@ def verify_graphics_interface(interface: object, *, preview: bool = False) -> No
         outputs = ports["fragment", "outputs"]
         if set(outputs) != {0} or outputs[0]["type"] != "f32x4":
             raise ValueError("The preview currently supports one f32x4 render target at location 0.")
+    reflect_pipeline_resources(interface)
+
+
+def verify_stage_resources(stage_desc: dict) -> None:
+    for buf in stage_desc.get("buffers", []) or []:
+        if not isinstance(buf, dict):
+            raise ValueError("Reflected buffer entry must be an object.")
+        if not isinstance(buf.get("name"), str) or not _IDENTIFIER.fullmatch(buf["name"]):
+            raise ValueError(f"Invalid buffer binding name: {buf.get('name')!r}.")
+        if type(buf.get("set")) is not int or buf["set"] < 0 or type(buf.get("binding")) is not int or buf["binding"] < 0:
+            raise ValueError("Buffer set and binding must be nonnegative integers.")
+    for tex in stage_desc.get("textures", []) or []:
+        if not isinstance(tex, dict):
+            raise ValueError("Reflected texture entry must be an object.")
+        if not isinstance(tex.get("name"), str) or not _IDENTIFIER.fullmatch(tex["name"]):
+            raise ValueError(f"Invalid texture binding name: {tex.get('name')!r}.")
+        if type(tex.get("set")) is not int or tex["set"] < 0 or type(tex.get("binding")) is not int or tex["binding"] < 0:
+            raise ValueError("Texture set and binding must be nonnegative integers.")
+        if tex.get("dimension", "2d") != "2d":
+            raise ValueError(f"Unsupported texture dimension: {tex.get('dimension')!r}.")
+        if tex.get("sample_type", "f32x4") != "f32x4":
+            raise ValueError(f"Unsupported texture sample_type: {tex.get('sample_type')!r}.")
+    for samp in stage_desc.get("samplers", []) or []:
+        if not isinstance(samp, dict):
+            raise ValueError("Reflected sampler entry must be an object.")
+        if not isinstance(samp.get("name"), str) or not _IDENTIFIER.fullmatch(samp["name"]):
+            raise ValueError(f"Invalid sampler binding name: {samp.get('name')!r}.")
+        if type(samp.get("set")) is not int or samp["set"] < 0 or type(samp.get("binding")) is not int or samp["binding"] < 0:
+            raise ValueError("Sampler set and binding must be nonnegative integers.")
+
+
+def reflect_pipeline_resources(interface: dict) -> tuple[list[dict], list[dict], list[dict]]:
+    slots: dict[tuple[int, int], tuple[str, dict]] = {}
+    buffers: list[dict] = []
+    textures: list[dict] = []
+    samplers: list[dict] = []
+
+    for stage in ("vertex", "fragment"):
+        stage_desc = interface.get(stage, {})
+        verify_stage_resources(stage_desc)
+        for kind, key, out_list in (
+            ("buffer", "buffers", buffers),
+            ("texture", "textures", textures),
+            ("sampler", "samplers", samplers),
+        ):
+            for item in stage_desc.get(key, []) or []:
+                slot = (item["set"], item["binding"])
+                if slot not in slots:
+                    merged = {**item, "stages": [stage]}
+                    slots[slot] = (kind, merged)
+                    out_list.append(merged)
+                else:
+                    existing_kind, existing = slots[slot]
+                    compare_existing = {k: v for k, v in existing.items() if k != "stages"}
+                    compare_current = {k: v for k, v in item.items() if k != "stages"}
+                    if existing_kind != kind or compare_existing != compare_current:
+                        raise ValueError(
+                            f"Conflicting descriptor declarations at set {slot[0]}, binding {slot[1]} "
+                            f"between pipeline stages ({existing.get('name')!r} vs {item.get('name')!r})."
+                        )
+                    if stage not in existing["stages"]:
+                        existing["stages"].append(stage)
+
+    buffers.sort(key=lambda b: (b["set"], b["binding"]))
+    textures.sort(key=lambda t: (t["set"], t["binding"]))
+    samplers.sort(key=lambda s: (s["set"], s["binding"]))
+    return buffers, textures, samplers
 
 
 def reflect_pipeline_parameters(interface: dict) -> dict | list[dict] | None:

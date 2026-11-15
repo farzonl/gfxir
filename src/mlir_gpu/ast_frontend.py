@@ -7,17 +7,19 @@ import operator
 import textwrap
 from dataclasses import dataclass
 from types import FunctionType, ModuleType
-from typing import Callable
+from typing import Any, Callable, Sequence
 
 from . import sdf, shader_math
 from .frontend import (
     ComputePipeline, Entry, GlobalInvocationId, LocalInvocationId, Node, Pipeline,
+    Sampler, SamplerBinding, Texture2D, TextureBinding,
     Type, Value, Vertex, WorkgroupId, _node, _normalize_buffer_element_type,
+    _normalize_resource_annotation,
     atomic_add, atomic_and, atomic_compare_exchange, atomic_exchange,
     atomic_max, atomic_min, atomic_or, atomic_sub, atomic_umax, atomic_umin,
-    atomic_xor, full_barrier, global_invocation_id, local_invocation_id,
-    maximum, minimum, select, shared_array, storage_barrier,
-    workgroup_barrier, workgroup_id,
+    atomic_xor, full_barrier, global_invocation_id, load_texture,
+    local_invocation_id, maximum, minimum, sample_texture, sample_texture_level,
+    select, shared_array, storage_barrier, workgroup_barrier, workgroup_id,
 )
 from .frontend import i32, u32, vec2, vec3, vec4
 from .parameters import _ParameterValues
@@ -315,6 +317,35 @@ class _SharedArrayProxy:
         return None
 
 
+class _TextureProxy:
+    def __init__(self, engine: ASTLowering, name: str, ref: _Ref, set_index: int = 0, binding_index: int = 0):
+        self._engine = engine
+        self.name = name
+        self.ref = ref
+        self.set = set_index
+        self.binding = binding_index
+
+    def sample(self, sampler: Any, uv: Any) -> Value:
+        return self._engine._call_sample_texture([self, sampler, uv], {})
+
+    def sample_level(self, sampler: Any, uv: Any, lod: Any) -> Value:
+        return self._engine._call_sample_texture_level([self, sampler, uv, lod], {})
+
+    def load(self, coord: Any, level: Any = 0) -> Value:
+        return self._engine._call_load_texture([self, coord, level], {})
+
+    def __repr__(self) -> str:
+        return f"<Texture2DProxy {self.name!r} set={self.set} binding={self.binding}>"
+
+
+@dataclass(frozen=True)
+class _SamplerProxy:
+    name: str
+    ref: _Ref
+    set: int = 0
+    binding: int = 0
+
+
 def _has_nonlocal_jump(statements: Sequence[ast.stmt], in_loop: bool = False) -> bool:
     for stmt in statements:
         if isinstance(stmt, ast.Return):
@@ -332,7 +363,17 @@ def _has_nonlocal_jump(statements: Sequence[ast.stmt], in_loop: bool = False) ->
 
 
 class ASTLowering:
-    def __init__(self, function, inputs, interfaces, parameters=None, workgroup_size=None):
+    def __init__(
+        self,
+        function,
+        inputs,
+        interfaces,
+        parameters=None,
+        workgroup_size=None,
+        *,
+        stage_kind: str | None = None,
+        binding_offset: int = 0,
+    ):
         self.serial = 0
         self.owned = set()
         self.nodes = {id(node): node for node in inputs}
@@ -343,6 +384,7 @@ class ASTLowering:
         self.line = function.__code__.co_firstlineno
         self.column = 1
         self.workgroup_size = workgroup_size
+        self.stage_kind = stage_kind or ("compute" if workgroup_size is not None else None)
         self.builder = _Builder(self)
         self.root = self.builder
         for node, interface in zip(inputs, interfaces):
@@ -367,9 +409,12 @@ class ASTLowering:
 
         from .frontend import BufferBinding, BufferType, AccessMode, resolve_annotation
         self.buffer_bindings = {}
-        binding_counter = 0
+        self.texture_bindings = {}
+        self.sampler_bindings = {}
+        binding_counter = binding_offset
         for parameter in inspect.signature(function).parameters.values():
-            annotation = resolve_annotation(function, parameter.annotation)
+            raw_annotation = resolve_annotation(function, parameter.annotation)
+            annotation = _normalize_resource_annotation(raw_annotation)
             if isinstance(annotation, BufferType):
                 annotation = BufferBinding(
                     element_type=annotation.element_type,
@@ -382,7 +427,8 @@ class ASTLowering:
                 )
             if isinstance(annotation, BufferBinding):
                 b_idx = annotation.binding if annotation.binding is not None else binding_counter
-                binding_counter = max(binding_counter + 1, b_idx + 1)
+                if annotation.set == 0:
+                    binding_counter = max(binding_counter + 1, b_idx + 1)
                 self.buffer_bindings[parameter.name] = BufferBinding(
                     element_type=annotation.element_type,
                     access=annotation.access,
@@ -392,6 +438,26 @@ class ASTLowering:
                     name=parameter.name,
                     shape=annotation.shape,
                     alignment=annotation.alignment,
+                )
+            elif isinstance(annotation, TextureBinding):
+                b_idx = annotation.binding if annotation.binding is not None else binding_counter
+                if annotation.set == 0:
+                    binding_counter = max(binding_counter + 1, b_idx + 1)
+                self.texture_bindings[parameter.name] = TextureBinding(
+                    sample_type=annotation.sample_type,
+                    dimension=annotation.dimension,
+                    set=annotation.set,
+                    binding=b_idx,
+                    name=parameter.name,
+                )
+            elif isinstance(annotation, SamplerBinding):
+                b_idx = annotation.binding if annotation.binding is not None else binding_counter
+                if annotation.set == 0:
+                    binding_counter = max(binding_counter + 1, b_idx + 1)
+                self.sampler_bindings[parameter.name] = SamplerBinding(
+                    set=annotation.set,
+                    binding=b_idx,
+                    name=parameter.name,
                 )
 
         arguments = []
@@ -440,6 +506,51 @@ class ASTLowering:
                         binding=b_spec.binding,
                         shape=b_spec.shape,
                         alignment=b_spec.alignment,
+                    )
+                )
+                self.structured = True
+                continue
+            if parameter.name in self.texture_bindings:
+                t_spec = self.texture_bindings[parameter.name]
+                ref, = self.root.raw(
+                    "gfx.texture_binding",
+                    [],
+                    types=["!gfx.handle<texture_2d>"],
+                    attributes={
+                        "set": {"kind": "literal", "type": "i32", "value": t_spec.set},
+                        "binding": {"kind": "literal", "type": "i32", "value": t_spec.binding},
+                        "name": {"kind": "string", "value": parameter.name},
+                    },
+                )
+                arguments.append(
+                    _TextureProxy(
+                        engine=self,
+                        name=parameter.name,
+                        ref=ref,
+                        set_index=t_spec.set,
+                        binding_index=t_spec.binding,
+                    )
+                )
+                self.structured = True
+                continue
+            if parameter.name in self.sampler_bindings:
+                s_spec = self.sampler_bindings[parameter.name]
+                ref, = self.root.raw(
+                    "gfx.sampler_binding",
+                    [],
+                    types=["!gfx.handle<sampler>"],
+                    attributes={
+                        "set": {"kind": "literal", "type": "i32", "value": s_spec.set},
+                        "binding": {"kind": "literal", "type": "i32", "value": s_spec.binding},
+                        "name": {"kind": "string", "value": parameter.name},
+                    },
+                )
+                arguments.append(
+                    _SamplerProxy(
+                        name=parameter.name,
+                        ref=ref,
+                        set=s_spec.set,
+                        binding=s_spec.binding,
                     )
                 )
                 self.structured = True
@@ -626,6 +737,12 @@ class ASTLowering:
             return self._call_atomic_rmw(function, args, kwargs)
         if function is atomic_compare_exchange:
             return self._call_atomic_cas(args, kwargs)
+        if function is sample_texture:
+            return self._call_sample_texture(args, kwargs)
+        if function is sample_texture_level:
+            return self._call_sample_texture_level(args, kwargs)
+        if function is load_texture:
+            return self._call_load_texture(args, kwargs)
         if function in (builtins.abs, minimum, maximum, builtins.min, builtins.max):
             if function is builtins.abs and (len(args) != 1 or type(args[0]) not in (Value, int, float, bool)):
                 self.fail("abs requires a scalar or device numeric operand.")
@@ -654,6 +771,8 @@ class ASTLowering:
             return self.builder.value(op, [value], target)
         module = getattr(function, "__module__", "")
         bound = getattr(function, "__self__", None)
+        if isinstance(bound, _TextureProxy):
+            return function(*args, **kwargs)
         intrinsic = function in _INTRINSICS if isinstance(function, (FunctionType, type)) else False
         if intrinsic or isinstance(bound, Value) and getattr(function, "__func__", None) is Value.with_components:
             def callback(arg):
@@ -766,7 +885,7 @@ class ASTLowering:
             if node.attr.startswith("_"):
                 self.fail("Private attributes and Python introspection are unsupported in device source.")
             owner = self.expression(node.value, env)
-            if not isinstance(owner, (Value, Node, ModuleType, Type, Vertex, Entry, Pipeline, ComputePipeline, _ParameterValues, MatrixValue, _VertexProxy)) and owner is not Type:
+            if not isinstance(owner, (Value, Node, ModuleType, Type, Vertex, Entry, Pipeline, ComputePipeline, _ParameterValues, MatrixValue, _VertexProxy, _TextureProxy)) and owner is not Type:
                 self.fail("Dynamic attributes on arbitrary Python objects are unsupported.")
             return getattr(owner, node.attr)
         if isinstance(node, (ast.Tuple, ast.List)):
@@ -1042,6 +1161,96 @@ class ASTLowering:
         self.structured = True
         return self.builder.bind(res_ref, target.element_type)
 
+    def _coerce_uv_operand(self, uv: Any, fn_name: str) -> _Ref:
+        if isinstance(uv, (tuple, list)) and len(uv) == 2:
+            uv = vec2(uv[0], uv[1])
+        if not isinstance(uv, Value) or uv.node.type != Type.VEC2:
+            self.fail(f"{fn_name}() uv operand must be a vec2 (f32x2), got {type(uv).__name__}.")
+        return self.builder.emit(uv.node)
+
+    def _call_sample_texture(self, args, kwargs) -> Value:
+        if kwargs or len(args) != 3:
+            self.fail("sample_texture() expects (texture, sampler, uv).")
+        if self.stage_kind is not None and self.stage_kind != "fragment":
+            self.fail(
+                "sample_texture() with implicit LOD is only allowed in @fragment shaders; "
+                "use sample_texture_level(texture, sampler, uv, lod)."
+            )
+        texture, sampler, uv = args
+        if not isinstance(texture, _TextureProxy):
+            self.fail(f"sample_texture() expects a Texture2D handle, got {type(texture).__name__}.")
+        if not isinstance(sampler, _SamplerProxy):
+            self.fail(f"sample_texture() expects a Sampler handle, got {type(sampler).__name__}.")
+        uv_ref = self._coerce_uv_operand(uv, "sample_texture")
+        res_ref, = self.builder.raw(
+            "gfx.texture_sample",
+            [texture.ref, sampler.ref, uv_ref],
+            types=[Type.VEC4.schema_name],
+        )
+        self.structured = True
+        return self.builder.bind(res_ref, Type.VEC4)
+
+    def _call_sample_texture_level(self, args, kwargs) -> Value:
+        if kwargs or len(args) != 4:
+            self.fail("sample_texture_level() expects (texture, sampler, uv, lod).")
+        texture, sampler, uv, lod = args
+        if not isinstance(texture, _TextureProxy):
+            self.fail(f"sample_texture_level() expects a Texture2D handle, got {type(texture).__name__}.")
+        if not isinstance(sampler, _SamplerProxy):
+            self.fail(f"sample_texture_level() expects a Sampler handle, got {type(sampler).__name__}.")
+        uv_ref = self._coerce_uv_operand(uv, "sample_texture_level")
+        if isinstance(lod, (int, float)) and not isinstance(lod, bool):
+            lod_val = self.lift(float(lod), Type.F32)
+        elif isinstance(lod, Value) and lod.node.type == Type.F32:
+            lod_val = lod
+        else:
+            self.fail("sample_texture_level() lod operand must be an f32 scalar.")
+        lod_ref = self.builder.emit(lod_val.node)
+        res_ref, = self.builder.raw(
+            "gfx.texture_sample_level",
+            [texture.ref, sampler.ref, uv_ref, lod_ref],
+            types=[Type.VEC4.schema_name],
+        )
+        self.structured = True
+        return self.builder.bind(res_ref, Type.VEC4)
+
+    def _call_load_texture(self, args, kwargs) -> Value:
+        if set(kwargs) - {"level"} or not (2 <= len(args) <= 3):
+            self.fail("load_texture() expects (texture, coord, level=0).")
+        if len(args) == 3 and "level" in kwargs:
+            self.fail("load_texture() got multiple values for 'level'.")
+        texture = args[0]
+        coord = args[1]
+        level = args[2] if len(args) == 3 else kwargs.get("level", 0)
+        if not isinstance(texture, _TextureProxy):
+            self.fail(f"load_texture() expects a Texture2D handle, got {type(texture).__name__}.")
+
+        def _int_scalar_ref(item: Any, label: str) -> _Ref:
+            if type(item) is int and not isinstance(item, bool):
+                return self.builder.emit(self.lift(item, Type.I32).node)
+            if isinstance(item, Value) and item.node.type in (Type.I32, Type.U32):
+                norm = item if item.node.type == Type.I32 else i32(item)
+                return self.builder.emit(norm.node)
+            self.fail(f"load_texture() {label} must be a 32-bit integer, got {type(item).__name__}.")
+
+        if isinstance(coord, (tuple, list)) and len(coord) == 2:
+            cx = _int_scalar_ref(coord[0], "coord[0]")
+            cy = _int_scalar_ref(coord[1], "coord[1]")
+            coord_ref, = self.builder.raw("vector.from_elements", [cx, cy], types=["vector<2xi32>"])
+        elif isinstance(coord, Value) and coord.node.type == "vector<2xi32>":
+            coord_ref = self.builder.emit(coord.node)
+        else:
+            self.fail("load_texture() coord must be a 2-element integer tuple (x, y).")
+
+        level_ref = _int_scalar_ref(level, "level")
+        res_ref, = self.builder.raw(
+            "gfx.texture_load",
+            [texture.ref, coord_ref, level_ref],
+            types=[Type.VEC4.schema_name],
+        )
+        self.structured = True
+        return self.builder.bind(res_ref, Type.VEC4)
+
     def _linearize_index(self, owner: _BufferProxy | _SharedArrayProxy, index: Any) -> _Ref:
         if isinstance(index, tuple):
             if owner.shape is None or len(index) != len(owner.shape):
@@ -1200,7 +1409,7 @@ class ASTLowering:
                     )
                 finally:
                     self.builder = parent
-                unmergeable = (_Function, _Lambda, _BufferProxy, _SharedArrayProxy, _VertexProxy)
+                unmergeable = (_Function, _Lambda, _BufferProxy, _SharedArrayProxy, _VertexProxy, _TextureProxy, _SamplerProxy)
                 common_keys = [k for k in then_env if k in else_env]
                 changed_keys = [
                     k for k in common_keys

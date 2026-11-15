@@ -1231,7 +1231,7 @@ static LogicalResult verifyUniformBarrierPlacement(BarrierOp barrier,
     changed = false;
     func.walk([&](Operation *op) {
       if (isa<BuiltinOp, ParameterOp, SharedAllocOp, BufferBindingOp,
-              arith::ConstantOp>(op))
+              TextureBindingOp, SamplerBindingOp, arith::ConstantOp>(op))
         return;
 
       if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
@@ -1473,6 +1473,135 @@ LogicalResult AtomicCASOp::verify() {
   return success();
 }
 
+static bool isVecFloat32(Type type, int64_t expectedElements) {
+  auto vecType = dyn_cast<VectorType>(type);
+  return vecType && vecType.getRank() == 1 &&
+         vecType.getNumElements() == expectedElements &&
+         vecType.getElementType().isF32();
+}
+
+static bool isVecInt32(Type type, int64_t expectedElements) {
+  auto vecType = dyn_cast<VectorType>(type);
+  return vecType && vecType.getRank() == 1 &&
+         vecType.getNumElements() == expectedElements &&
+         vecType.getElementType().isInteger(32);
+}
+
+LogicalResult TextureBindingOp::verify() {
+  if (!(*this)->getParentOfType<func::FuncOp>())
+    return emitOpError("requires an enclosing function");
+  if (getSetAttr().getInt() < 0)
+    return emitOpError("texture binding set index must be non-negative, got ")
+           << getSetAttr().getInt();
+  if (getBindingAttr().getInt() < 0)
+    return emitOpError("texture binding slot index must be non-negative, got ")
+           << getBindingAttr().getInt();
+  if (getName().empty() || !isShaderSymbolName(getName()))
+    return emitOpError("texture binding requires a valid identifier name");
+
+  auto handleType = cast<HandleType>(getResult().getType());
+  if (handleType.getKind() != ResourceKind::Texture2D)
+    return emitOpError(
+               "texture_binding must produce !gfx.handle<texture_2d>, got ")
+           << handleType;
+  return success();
+}
+
+LogicalResult SamplerBindingOp::verify() {
+  if (!(*this)->getParentOfType<func::FuncOp>())
+    return emitOpError("requires an enclosing function");
+  if (getSetAttr().getInt() < 0)
+    return emitOpError("sampler binding set index must be non-negative, got ")
+           << getSetAttr().getInt();
+  if (getBindingAttr().getInt() < 0)
+    return emitOpError("sampler binding slot index must be non-negative, got ")
+           << getBindingAttr().getInt();
+  if (getName().empty() || !isShaderSymbolName(getName()))
+    return emitOpError("sampler binding requires a valid identifier name");
+
+  auto handleType = cast<HandleType>(getResult().getType());
+  if (handleType.getKind() != ResourceKind::Sampler)
+    return emitOpError("sampler_binding must produce !gfx.handle<sampler>, got ")
+           << handleType;
+  return success();
+}
+
+LogicalResult TextureSampleOp::verify() {
+  if (!(*this)->getParentOfType<func::FuncOp>())
+    return emitOpError("requires an enclosing function");
+  if (auto stage = stageOf(*this)) {
+    if (stage.getValue() != Stage::Fragment)
+      return emitOpError("implicit-LOD texture_sample is only allowed in "
+                         "fragment shaders; use texture_sample_level");
+  }
+  auto texType = cast<HandleType>(getTexture().getType());
+  if (texType.getKind() != ResourceKind::Texture2D)
+    return emitOpError(
+               "texture_sample texture operand must be !gfx.handle<texture_2d>, got ")
+           << texType;
+  auto sampType = cast<HandleType>(getSampler().getType());
+  if (sampType.getKind() != ResourceKind::Sampler)
+    return emitOpError(
+               "texture_sample sampler operand must be !gfx.handle<sampler>, got ")
+           << sampType;
+  if (!isVecFloat32(getUv().getType(), 2))
+    return emitOpError(
+               "texture_sample uv operand must be vector<2xf32>, got ")
+           << getUv().getType();
+  if (!isVecFloat32(getResult().getType(), 4))
+    return emitOpError("texture_sample result must be vector<4xf32>, got ")
+           << getResult().getType();
+  return success();
+}
+
+LogicalResult TextureSampleLevelOp::verify() {
+  if (!(*this)->getParentOfType<func::FuncOp>())
+    return emitOpError("requires an enclosing function");
+  auto texType = cast<HandleType>(getTexture().getType());
+  if (texType.getKind() != ResourceKind::Texture2D)
+    return emitOpError("texture_sample_level texture operand must be "
+                       "!gfx.handle<texture_2d>, got ")
+           << texType;
+  auto sampType = cast<HandleType>(getSampler().getType());
+  if (sampType.getKind() != ResourceKind::Sampler)
+    return emitOpError("texture_sample_level sampler operand must be "
+                       "!gfx.handle<sampler>, got ")
+           << sampType;
+  if (!isVecFloat32(getUv().getType(), 2))
+    return emitOpError(
+               "texture_sample_level uv operand must be vector<2xf32>, got ")
+           << getUv().getType();
+  if (!getLod().getType().isF32())
+    return emitOpError("texture_sample_level lod operand must be f32, got ")
+           << getLod().getType();
+  if (!isVecFloat32(getResult().getType(), 4))
+    return emitOpError(
+               "texture_sample_level result must be vector<4xf32>, got ")
+           << getResult().getType();
+  return success();
+}
+
+LogicalResult TextureLoadOp::verify() {
+  if (!(*this)->getParentOfType<func::FuncOp>())
+    return emitOpError("requires an enclosing function");
+  auto texType = cast<HandleType>(getTexture().getType());
+  if (texType.getKind() != ResourceKind::Texture2D)
+    return emitOpError(
+               "texture_load texture operand must be !gfx.handle<texture_2d>, got ")
+           << texType;
+  if (!isVecInt32(getCoord().getType(), 2))
+    return emitOpError(
+               "texture_load coordinate operand must be vector<2xi32>, got ")
+           << getCoord().getType();
+  if (!getLevel().getType().isInteger(32))
+    return emitOpError("texture_load level operand must be i32, got ")
+           << getLevel().getType();
+  if (!isVecFloat32(getResult().getType(), 4))
+    return emitOpError("texture_load result must be vector<4xf32>, got ")
+           << getResult().getType();
+  return success();
+}
+
 uint64_t mlir::gfx::computeSharedMemoryBytes(ModuleOp module,
                                              func::FuncOp entry) {
   if (!entry)
@@ -1558,26 +1687,95 @@ LogicalResult mlir::gfx::verifyShaderModule(ModuleOp module,
                 profile.verifySharedMemory(totalSharedBytes, function.getLoc())))
           return failure();
       }
-    } else {
+    }
+
+    enum class DescriptorKind { Buffer, Texture2D, Sampler };
+    struct DescriptorRecord {
+      DescriptorKind kind;
+      std::string name;
+      AccessMode access = AccessMode::ReadOnly;
+      Type elementType;
+    };
+    llvm::DenseMap<std::pair<uint32_t, uint32_t>, DescriptorRecord>
+        descriptorSlots;
+    auto checkSlot = [&](Location loc, Operation *diagOp, uint32_t set,
+                         uint32_t binding, const DescriptorRecord &rec)
+        -> LogicalResult {
+      auto [it, inserted] = descriptorSlots.try_emplace({set, binding}, rec);
+      if (!inserted) {
+        const auto &prev = it->second;
+        if (prev.kind != rec.kind || prev.name != rec.name ||
+            (rec.kind == DescriptorKind::Buffer &&
+             (prev.access != rec.access ||
+              prev.elementType != rec.elementType))) {
+          if (diagOp)
+            return diagOp->emitOpError(
+                       "conflicting descriptor declarations for set ")
+                   << set << ", binding " << binding;
+          return emitError(loc, "conflicting descriptor declarations for set ")
+                 << set << ", binding " << binding;
+        }
+      }
+      return success();
+    };
+
+    for (unsigned argIdx = 0; argIdx < function.getNumArguments(); ++argIdx) {
+      if (auto bufInfo = getArgumentBufferBinding(function, argIdx)) {
+        DescriptorRecord rec{DescriptorKind::Buffer, bufInfo->name,
+                             bufInfo->access, bufInfo->elementType};
+        if (failed(checkSlot(function.getLoc(), function.getOperation(),
+                             bufInfo->set, bufInfo->binding, rec)))
+          return failure();
+      }
+    }
+
+    {
       SmallVector<func::FuncOp, 8> pending{function};
       llvm::SmallPtrSet<Operation *, 8> visited;
       while (!pending.empty()) {
         func::FuncOp current = pending.pop_back_val();
         if (!visited.insert(current.getOperation()).second)
           continue;
-        WalkResult computeOnlyCheck = current.walk([&](Operation *op) {
-          if (isa<SharedAllocOp>(op)) {
-            op->emitOpError(
-                "shared memory allocations are only allowed in compute shaders");
+        WalkResult stageAndBindingCheck = current.walk([&](Operation *op) {
+          if (stage.getValue() != Stage::Compute) {
+            if (isa<SharedAllocOp>(op)) {
+              op->emitOpError(
+                  "shared memory allocations are only allowed in compute shaders");
+              return WalkResult::interrupt();
+            }
+            if (isa<BarrierOp>(op)) {
+              op->emitOpError("barriers are only allowed in compute shaders");
+              return WalkResult::interrupt();
+            }
+          }
+          if (stage.getValue() != Stage::Fragment && isa<TextureSampleOp>(op)) {
+            op->emitOpError("implicit-LOD texture_sample is only allowed in "
+                            "fragment shaders; use texture_sample_level");
             return WalkResult::interrupt();
           }
-          if (isa<BarrierOp>(op)) {
-            op->emitOpError("barriers are only allowed in compute shaders");
-            return WalkResult::interrupt();
+          if (auto bufOp = dyn_cast<BufferBindingOp>(op)) {
+            auto ptrType = cast<PtrType>(bufOp.getResult().getType());
+            DescriptorRecord rec{DescriptorKind::Buffer, bufOp.getName().str(),
+                                 bufOp.getAccess(), ptrType.getElementType()};
+            if (failed(checkSlot(op->getLoc(), op, bufOp.getSet(),
+                                 bufOp.getBinding(), rec)))
+              return WalkResult::interrupt();
+          } else if (auto texOp = dyn_cast<TextureBindingOp>(op)) {
+            DescriptorRecord rec{DescriptorKind::Texture2D,
+                                 texOp.getName().str()};
+            if (failed(checkSlot(op->getLoc(), op, texOp.getSet(),
+                                 texOp.getBinding(), rec)))
+              return WalkResult::interrupt();
+          } else if (auto sampOp = dyn_cast<SamplerBindingOp>(op)) {
+            DescriptorRecord rec{DescriptorKind::Sampler,
+                                 sampOp.getName().str()};
+            if (failed(checkSlot(op->getLoc(), op, sampOp.getSet(),
+                                 sampOp.getBinding(), rec)))
+              return WalkResult::interrupt();
           }
           return WalkResult::advance();
         });
-        if (computeOnlyCheck.wasInterrupted())
+        if (stageAndBindingCheck.wasInterrupted())
           return failure();
         current.walk([&](func::CallOp call) {
           if (auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee()))

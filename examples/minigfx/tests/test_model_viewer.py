@@ -376,7 +376,7 @@ f 2 4 3
             self.skipTest("gfx-compile or spirv-val not available in PATH")
 
         shaders = compile_minigfx_shaders("vulkan")
-        for stage_key in ("mesh_vs", "pbr_fs", "normal_fs", "overlay_vs", "overlay_fs"):
+        for stage_key in ("mesh_vs", "pbr_fs", "textured_pbr_fs", "normal_fs", "overlay_vs", "overlay_fs"):
             self.assertIn(stage_key, shaders)
             self.assertTrue(shaders[stage_key].is_file())
             self.assertGreater(shaders[stage_key].stat().st_size, 0)
@@ -391,7 +391,7 @@ f 2 4 3
             self.skipTest("gfx-compile, llc, or dxv not available in PATH")
 
         shaders = compile_minigfx_shaders("directx")
-        for stage_key in ("mesh_vs", "pbr_fs", "normal_fs", "overlay_vs", "overlay_fs"):
+        for stage_key in ("mesh_vs", "pbr_fs", "textured_pbr_fs", "normal_fs", "overlay_vs", "overlay_fs"):
             self.assertIn(stage_key, shaders)
             dxil_path = shaders[stage_key]
             self.assertEqual(dxil_path.suffix, ".dxil")
@@ -460,8 +460,15 @@ f 2 4 3
             norm_rgb = tuple(norm_rgba[center_off : center_off + 3])
             self.assertNotEqual(center_rgb, norm_rgb)
 
-            # Frame 3: dielectric material + window resize
-            app.handle_key_press("2")
+            # Frame 3: textured PBR material + window resize
+            from examples.minigfx.material import Material, Sampler, Texture
+
+            checker_tex = Texture.checkerboard(width=8, height=8, tile_size=2)
+            app.model_node.material = Material(
+                params=MaterialParams(albedo=(1.0, 1.0, 1.0, 1.0), roughness=0.4, metallic=0.1, ambient=0.1),
+                albedo_texture=checker_tex,
+                sampler=Sampler.nearest(),
+            )
             app._window.glfw.set_window_size(app._window.window, 360, 270)
             app._window.poll_and_sync(app)
             backend.request_frame_capture()

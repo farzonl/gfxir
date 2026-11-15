@@ -1,6 +1,21 @@
 """Device f32 math; these functions build MLIR, not host Python results."""
 
-from .frontend import VECTOR_SIZES, Node, Type, Value, _node, _operands, maximum, minimum, select, vec2, vec3
+from .frontend import (
+    VECTOR_SIZES,
+    Node,
+    Type,
+    Value,
+    _node,
+    _operands,
+    load_texture,
+    maximum,
+    minimum,
+    sample_texture,
+    sample_texture_level,
+    select,
+    vec2,
+    vec3,
+)
 
 
 def _floating(value: Value | float) -> Value:
