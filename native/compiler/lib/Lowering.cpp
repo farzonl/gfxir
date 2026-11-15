@@ -253,6 +253,90 @@ struct StorePattern : OpConversionPattern<gfx::StoreOp> {
   }
 };
 
+struct CoopMatrixZeroPattern : OpConversionPattern<gfx::CoopMatrixZeroOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(gfx::CoopMatrixZeroOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
+    auto resType = dyn_cast_or_null<spirv::CooperativeMatrixType>(
+        getTypeConverter()->convertType(op.getType()));
+    if (!resType)
+      return failure();
+    Type elemType = resType.getElementType();
+    Attribute zeroAttr;
+    if (auto floatType = dyn_cast<FloatType>(elemType)) {
+      zeroAttr = rewriter.getFloatAttr(floatType, 0.0);
+    } else if (auto intType = dyn_cast<IntegerType>(elemType)) {
+      zeroAttr = rewriter.getIntegerAttr(intType, 0);
+    } else {
+      return failure();
+    }
+    Value zeroScalar = spirv::ConstantOp::create(
+        rewriter, op.getLoc(), elemType, zeroAttr);
+    rewriter.replaceOpWithNewOp<spirv::CompositeConstructOp>(
+        op, resType, ValueRange{zeroScalar});
+    return success();
+  }
+};
+
+struct CoopMatrixLoadPattern : OpConversionPattern<gfx::CoopMatrixLoadOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(gfx::CoopMatrixLoadOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto resType = dyn_cast_or_null<spirv::CooperativeMatrixType>(
+        getTypeConverter()->convertType(op.getType()));
+    if (!resType)
+      return failure();
+    Value ptr = ensureSpirvElementPtr(
+        rewriter, op.getLoc(), adaptor.getPtr(), resType.getElementType());
+    auto layout = op.getRowMajor()
+                      ? spirv::CooperativeMatrixLayoutKHR::RowMajor
+                      : spirv::CooperativeMatrixLayoutKHR::ColumnMajor;
+    auto layoutAttr = spirv::CooperativeMatrixLayoutKHRAttr::get(
+        rewriter.getContext(), layout);
+    rewriter.replaceOpWithNewOp<spirv::KHRCooperativeMatrixLoadOp>(
+        op, resType, ptr, layoutAttr, adaptor.getStride(),
+        spirv::MemoryAccessAttr{}, IntegerAttr{});
+    return success();
+  }
+};
+
+struct CoopMatrixMulAddPattern : OpConversionPattern<gfx::CoopMatrixMulAddOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(gfx::CoopMatrixMulAddOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Type resType = getTypeConverter()->convertType(op.getType());
+    if (!resType)
+      return failure();
+    rewriter.replaceOpWithNewOp<spirv::KHRCooperativeMatrixMulAddOp>(
+        op, resType, adaptor.getA(), adaptor.getB(), adaptor.getC(),
+        spirv::CooperativeMatrixOperandsKHRAttr{});
+    return success();
+  }
+};
+
+struct CoopMatrixStorePattern : OpConversionPattern<gfx::CoopMatrixStoreOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(gfx::CoopMatrixStoreOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto matType = dyn_cast<spirv::CooperativeMatrixType>(
+        adaptor.getMatrix().getType());
+    if (!matType)
+      return failure();
+    Value ptr = ensureSpirvElementPtr(
+        rewriter, op.getLoc(), adaptor.getPtr(), matType.getElementType());
+    auto layout = op.getRowMajor()
+                      ? spirv::CooperativeMatrixLayoutKHR::RowMajor
+                      : spirv::CooperativeMatrixLayoutKHR::ColumnMajor;
+    auto layoutAttr = spirv::CooperativeMatrixLayoutKHRAttr::get(
+        rewriter.getContext(), layout);
+    rewriter.replaceOpWithNewOp<spirv::KHRCooperativeMatrixStoreOp>(
+        op, ptr, adaptor.getMatrix(), layoutAttr, adaptor.getStride(),
+        spirv::MemoryAccessAttr{}, IntegerAttr{});
+    return success();
+  }
+};
+
 struct BarrierPattern : OpConversionPattern<gfx::BarrierOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult matchAndRewrite(gfx::BarrierOp op, OpAdaptor adaptor,
@@ -546,6 +630,15 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
 
     bool usesStorageBuffer = false;
     bool usesVariablePointers = false;
+    bool usesCoopMatrix = profile.supportsCapability("cooperative_matrix");
+    for (auto func : reachable) {
+      func.walk([&](Operation *op) {
+        if (isa<gfx::CoopMatrixZeroOp, gfx::CoopMatrixLoadOp,
+                gfx::CoopMatrixMulAddOp, gfx::CoopMatrixStoreOp>(op)) {
+          usesCoopMatrix = true;
+        }
+      });
+    }
     if (!enableBDA) {
       auto checkPtrType = [&](Type type) {
         if (auto ptrType = dyn_cast<PtrType>(type)) {
@@ -591,14 +684,24 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       }
     }
 
+    spirv::Version spirvVersion = spirv::Version::V_1_0;
+    spirv::MemoryModel memoryModel = spirv::MemoryModel::GLSL450;
+    if (usesCoopMatrix) {
+      spirvVersion = spirv::Version::V_1_6;
+      memoryModel = spirv::MemoryModel::Vulkan;
+      capabilities.push_back(spirv::Capability::CooperativeMatrixKHR);
+      capabilities.push_back(spirv::Capability::VulkanMemoryModel);
+      extensions.push_back(spirv::Extension::SPV_KHR_cooperative_matrix);
+    }
+
     auto version = spirv::VerCapExtAttr::get(
-        spirv::Version::V_1_0, capabilities, extensions, context);
+        spirvVersion, capabilities, extensions, context);
     auto target = spirv::TargetEnvAttr::get(
         version, spirv::getDefaultResourceLimits(context),
         spirv::ClientAPI::Vulkan);
     auto shader = spirv::ModuleOp::create(builder, location,
                                           addressingModel,
-                                          spirv::MemoryModel::GLSL450, version);
+                                          memoryModel, version);
     struct EntryArgBuffer {
       unsigned argIndex;
       BufferInterfaceElement info;
@@ -665,6 +768,27 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
             break;
           }
           return std::nullopt;
+        });
+    converter.addConversion(
+        [&](gfx::CoopMatrixType coopType) -> std::optional<Type> {
+          Type elemType = converter.convertType(coopType.getElementType());
+          if (!elemType)
+            return std::nullopt;
+          spirv::CooperativeMatrixUseKHR use;
+          switch (coopType.getUse()) {
+          case CoopMatrixUse::MatrixA:
+            use = spirv::CooperativeMatrixUseKHR::MatrixA;
+            break;
+          case CoopMatrixUse::MatrixB:
+            use = spirv::CooperativeMatrixUseKHR::MatrixB;
+            break;
+          case CoopMatrixUse::MatrixAcc:
+            use = spirv::CooperativeMatrixUseKHR::MatrixAcc;
+            break;
+          }
+          return spirv::CooperativeMatrixType::get(
+              elemType, coopType.getRows(), coopType.getCols(),
+              spirv::Scope::Subgroup, use);
         });
 
     SmallVector<BufferBindingOp> bufferBindings;
@@ -1059,7 +1183,9 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
     ScfToSPIRVContext scfContext;
     patterns.add<PtrOffsetPattern, LoadPattern, StorePattern, BarrierPattern,
                  AtomicRMWPattern, AtomicCASPattern, TextureSamplePattern,
-                 TextureSampleLevelPattern, TextureLoadPattern>(converter,
+                 TextureSampleLevelPattern, TextureLoadPattern,
+                 CoopMatrixZeroPattern, CoopMatrixLoadPattern,
+                 CoopMatrixMulAddPattern, CoopMatrixStorePattern>(converter,
                                                                 context);
     patterns.add<TextureBindingPattern, SamplerBindingPattern>(
         converter, context, uniformConstGlobals);
@@ -1089,6 +1215,15 @@ struct GfxToSPIRVPass : impl::GfxToSPIRVBase<GfxToSPIRVPass> {
       }
     });
     auto converted = shader.lookupSymbol<spirv::FuncOp>(entryName);
+    if (spirvVersion >= spirv::Version::V_1_4) {
+      llvm::SmallPtrSet<Attribute, 8> seenInterface(interface.begin(),
+                                                    interface.end());
+      for (auto gv : shader.getOps<spirv::GlobalVariableOp>()) {
+        auto symAttr = SymbolRefAttr::get(context, gv.getSymName());
+        if (seenInterface.insert(symAttr).second)
+          interface.push_back(symAttr);
+      }
+    }
     builder.setInsertionPointToEnd(shader.getBody());
     spirv::ExecutionModel model;
     if (stage == Stage::Vertex)
@@ -1121,6 +1256,20 @@ struct GfxToLLVMPass : impl::GfxToLLVMBase<GfxToLLVMPass> {
     func::FuncOp function;
     Stage stage;
     if (failed(graphicsEntry(module, function, stage))) {
+      signalPassFailure();
+      return;
+    }
+    bool hasCoopMatrix = false;
+    module.walk([&](Operation *op) {
+      if (isa<gfx::CoopMatrixZeroOp, gfx::CoopMatrixLoadOp,
+              gfx::CoopMatrixMulAddOp, gfx::CoopMatrixStoreOp>(op)) {
+        op->emitError(
+            "cooperative matrix operations are only supported on SPIR-V "
+            "targets with cooperative_matrix capability");
+        hasCoopMatrix = true;
+      }
+    });
+    if (hasCoopMatrix) {
       signalPassFailure();
       return;
     }

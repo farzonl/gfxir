@@ -804,6 +804,42 @@ def full_barrier() -> None:
     raise TypeError("full_barrier() can only be called inside a @compute kernel.")
 
 
+def coop_matrix_zero(rows: int, cols: int, element_type: Any, use: str = "acc") -> Any:
+    """Create a zero-initialized cooperative matrix tile inside a @compute kernel."""
+    raise TypeError("coop_matrix_zero() can only be called inside a @compute kernel.")
+
+
+def coop_matrix_load(
+    target: Any,
+    index: Any,
+    stride: Value | int,
+    rows: int,
+    cols: int,
+    use: str = "a",
+    *,
+    row_major: bool = True,
+) -> Any:
+    """Load a cooperative matrix tile from target[index] with row/column stride."""
+    raise TypeError("coop_matrix_load() can only be called inside a @compute kernel.")
+
+
+def coop_matrix_mul_add(a: Any, b: Any, c: Any) -> Any:
+    """Compute (a * b) + c on cooperative matrix tiles."""
+    raise TypeError("coop_matrix_mul_add() can only be called inside a @compute kernel.")
+
+
+def coop_matrix_store(
+    target: Any,
+    index: Any,
+    matrix: Any,
+    stride: Value | int,
+    *,
+    row_major: bool = True,
+) -> None:
+    """Store a cooperative matrix tile to target[index] with row/column stride."""
+    raise TypeError("coop_matrix_store() can only be called inside a @compute kernel.")
+
+
 def atomic_add(target: Any, index: Any, value: Value | int) -> Value:
     """Atomically add value to target[index] and return the previous 32-bit integer value."""
     raise TypeError("atomic_add() can only be called inside a shader kernel.")

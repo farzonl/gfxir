@@ -125,4 +125,14 @@ def Gfx_AtomicOp : I32EnumAttr<"AtomicOp", "integer atomic read-modify-write ope
   let genSpecializedAttr = 0;
 }
 def Gfx_AtomicOpAttr : EnumAttr<Gfx_Dialect, Gfx_AtomicOp, "atomic_op">;
+
+def Gfx_CoopMatrixUse : I32EnumAttr<"CoopMatrixUse", "cooperative matrix operand role", [
+  I32EnumAttrCase<"MatrixA", 0, "a">,
+  I32EnumAttrCase<"MatrixB", 1, "b">,
+  I32EnumAttrCase<"MatrixAcc", 2, "acc">
+]> {
+  let cppNamespace = "::mlir::gfx";
+  let genSpecializedAttr = 0;
+}
+def Gfx_CoopMatrixUseAttr : EnumAttr<Gfx_Dialect, Gfx_CoopMatrixUse, "coop_matrix_use">;
 #endif

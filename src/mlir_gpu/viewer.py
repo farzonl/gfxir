@@ -1459,13 +1459,55 @@ class _Vulkan:
         self.max_compute_workgroup_count = tuple(int(v) for v in properties.limits.maxComputeWorkGroupCount)
         self.max_compute_workgroup_size = tuple(int(v) for v in properties.limits.maxComputeWorkGroupSize)
         self.max_compute_workgroup_invocations = int(properties.limits.maxComputeWorkGroupInvocations)
+        self.device_extensions = frozenset(device_extensions)
+        self.cooperative_matrix_configs: tuple[tuple[int, int, int], ...] = ()
         enabled = ["VK_KHR_swapchain"] if self.surface is not None else []
         if "VK_KHR_portability_subset" in device_extensions:
             enabled.append("VK_KHR_portability_subset")
         if "VK_KHR_storage_buffer_storage_class" in device_extensions:
             enabled.append("VK_KHR_storage_buffer_storage_class")
+        device_pnext = None
+        if "VK_KHR_cooperative_matrix" in device_extensions:
+            try:
+                get_props = self.instance_function("vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR")
+            except Exception:
+                get_props = getattr(vk, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR", None)
+            if get_props is not None:
+                try:
+                    raw_configs = get_props(self.physical)
+                    f32_configs: list[tuple[int, int, int]] = []
+                    f32_type = getattr(vk, "VK_COMPONENT_TYPE_FLOAT32_KHR", 1)
+                    subgroup_scope = getattr(vk, "VK_SCOPE_SUBGROUP_KHR", 3)
+                    for cfg in raw_configs:
+                        if (
+                            cfg.AType == f32_type
+                            and cfg.BType == f32_type
+                            and cfg.CType == f32_type
+                            and cfg.ResultType == f32_type
+                            and cfg.scope == subgroup_scope
+                        ):
+                            f32_configs.append((int(cfg.MSize), int(cfg.NSize), int(cfg.KSize)))
+                    if f32_configs:
+                        self.cooperative_matrix_configs = tuple(f32_configs)
+                        enabled.append("VK_KHR_cooperative_matrix")
+                        if "VK_KHR_vulkan_memory_model" in device_extensions:
+                            enabled.append("VK_KHR_vulkan_memory_model")
+                            mem_features = vk.VkPhysicalDeviceVulkanMemoryModelFeatures(
+                                vulkanMemoryModel=vk.VK_TRUE,
+                            )
+                            device_pnext = vk.VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
+                                pNext=mem_features,
+                                cooperativeMatrix=vk.VK_TRUE,
+                            )
+                        else:
+                            device_pnext = vk.VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
+                                cooperativeMatrix=vk.VK_TRUE,
+                            )
+                except Exception:
+                    self.cooperative_matrix_configs = ()
         queue_info = vk.VkDeviceQueueCreateInfo(queueFamilyIndex=self.family, pQueuePriorities=[1.0])
         self.device = vk.vkCreateDevice(self.physical, vk.VkDeviceCreateInfo(
+            pNext=device_pnext,
             pQueueCreateInfos=[queue_info],
             ppEnabledExtensionNames=enabled,
         ), None)

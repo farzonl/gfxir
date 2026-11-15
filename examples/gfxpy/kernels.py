@@ -10,6 +10,10 @@ from mlir_gpu import (
     Type,
     WorkgroupId,
     compute,
+    coop_matrix_load,
+    coop_matrix_mul_add,
+    coop_matrix_store,
+    coop_matrix_zero,
     global_invocation_id,
     i32,
     shared_array,
@@ -158,6 +162,35 @@ def tiled_matmul_f32_kernel(
 
     if (row < params.m) and (col < params.n):
         mat_c[row * params.n + col] = acc
+
+
+def make_coop_matmul_f32_kernel(
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    subgroup_size: int = 32,
+):
+    """Build a subgroup cooperative-matrix MatMul kernel for aligned M/N/K tiles."""
+
+    @compute(workgroup_size=(subgroup_size, 1, 1))
+    def coop_matmul_f32_kernel(
+        wid: WorkgroupId,
+        mat_a: Buffer[Type.F32, "read_only"],
+        mat_b: Buffer[Type.F32, "read_only"],
+        mat_c: Buffer[Type.F32, "write_only"],
+        params: MatMulParams,
+    ):
+        row = i32(wid.y) * tile_m
+        col = i32(wid.x) * tile_n
+        acc = coop_matrix_zero(tile_m, tile_n, Type.F32)
+        for t in range(params.num_tiles):
+            k_off = t * tile_k
+            a = coop_matrix_load(mat_a, row * params.k + k_off, params.k, tile_m, tile_k, "a")
+            b = coop_matrix_load(mat_b, k_off * params.n + col, params.n, tile_k, tile_n, "b")
+            acc = coop_matrix_mul_add(a, b, acc)
+        coop_matrix_store(mat_c, row * params.n + col, acc, params.n)
+
+    return coop_matmul_f32_kernel
 
 
 def compute_grid_1d(length: int) -> tuple[int, int, int]:
