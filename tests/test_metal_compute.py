@@ -177,9 +177,12 @@ class TestMetalComputeContract(unittest.TestCase):
                         pipe.dispatch({"src": b1}, parameters={"n": 4}, grid=(1, 1, 1))
                     with self.assertRaises(PersistentComputeError):
                         pipe.dispatch({"src": b1, "dst": b2}, parameters={"n": 4}, grid=(0, 1, 1))
+                    with self.assertRaises(PersistentComputeError):
+                        pipe.dispatch({"src": b1, "dst": b2}, parameters={"n": 4}, grid=(0x1_0000_0000, 1, 1))
 
                     pipe.dispatch({"src": b1, "dst": b2}, parameters={"n": 4}, grid=(1, 1, 1))
-                    self.assertEqual(len(fake.dispatches), 1)
+                    pipe.dispatch({"src": b1, "dst": b2}, parameters={"n": 4}, grid=(65536, 1, 1))
+                    self.assertEqual(len(fake.dispatches), 2)
 
                     pipe.close()
                     with self.assertRaises(PersistentComputeError):

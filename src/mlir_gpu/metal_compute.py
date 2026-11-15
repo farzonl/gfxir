@@ -25,7 +25,9 @@ from .compute_runtime import (
 )
 from .viewer import ComputeProgram, _check_binary, _preview_toolchain, _run, _validate_provider, load_compute_program
 
-_METAL_MAX_GRID_DIM = 65535
+# Metal dispatchThreadgroups uses MTLSize (NSUInteger) without D3D12's 65535 cap;
+# gfx_mtl_dispatch accepts uint32_t grid dimensions.
+_METAL_MAX_GRID_DIM = 0xFFFFFFFF
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _BRIDGE_LIB: ctypes.CDLL | None = None
 
