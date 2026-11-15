@@ -1,8 +1,9 @@
-"""1D contiguous float32 device-resident array contract for gfxpy."""
+"""1D and 2D contiguous float32 device-resident array contract for gfxpy."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+import math
 import struct
 from typing import Any
 
@@ -10,59 +11,114 @@ from .dtypes import DType, float32, resolve_dtype
 from .runtime import ComputeBuffer, Device, current_device
 from .targets import ArrayClosedError, CrossDeviceError, ShapeMismatchError
 
+_REDUCE_WORKGROUP_SIZE = 64
+
 
 def _is_scalar_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _validate_1d_float_sequence(data: object) -> list[float]:
-    """Validate that data is a 1D Python sequence of real numbers."""
-    if isinstance(data, (str, bytes, bytearray, memoryview)):
+def _is_sequence_element(value: object) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, memoryview))
+
+
+def _validate_float_sequence(data: object) -> tuple[tuple[int, ...], list[float]]:
+    """Validate that data is a 1D or rectangular 2D Python sequence of real numbers."""
+    if isinstance(data, (str, bytes, bytearray, memoryview)) or not isinstance(data, Sequence):
         raise TypeError(
-            f"Expected a 1D sequence of numbers, not {type(data).__name__}."
+            f"Expected a 1D or 2D Python sequence of numbers, got {type(data).__name__}."
         )
-    if not isinstance(data, Sequence):
-        raise TypeError(
-            f"Expected a 1D Python sequence (list, tuple, range), got {type(data).__name__}."
-        )
-    values: list[float] = []
+    if len(data) == 0:
+        return (0,), []
+
+    first = data[0]
+    if _is_sequence_element(first):
+        rows = len(data)
+        cols = len(first)
+        values: list[float] = []
+        for r, row in enumerate(data):
+            if not _is_sequence_element(row):
+                raise ShapeMismatchError(
+                    f"Ragged 2D sequence: row {r} is {type(row).__name__}, expected sequence."
+                )
+            if len(row) != cols:
+                raise ShapeMismatchError(
+                    f"Ragged 2D sequence: row {r} has length {len(row)}, expected {cols}."
+                )
+            for c, item in enumerate(row):
+                if _is_sequence_element(item):
+                    raise ShapeMismatchError(
+                        f"Only 1D and 2D sequences are supported; found nested sequence at ({r}, {c})."
+                    )
+                if not _is_scalar_number(item):
+                    raise TypeError(
+                        f"Expected numeric element at ({r}, {c}), got {type(item).__name__}."
+                    )
+                values.append(float(item))
+        return (rows, cols), values
+
+    values = []
     for idx, item in enumerate(data):
-        if isinstance(item, (list, tuple, Sequence)) and not isinstance(item, (str, bytes)):
+        if _is_sequence_element(item):
             raise ShapeMismatchError(
-                f"Only 1D contiguous sequences are supported; found nested sequence at index {idx}."
+                f"Ragged sequence: found nested sequence at index {idx}."
             )
         if not _is_scalar_number(item):
             raise TypeError(
                 f"Expected numeric element at index {idx}, got {type(item).__name__}."
             )
         values.append(float(item))
-    return values
+    return (len(values),), values
+
+
+def _normalize_shape(shape_or_len: int | tuple[int, ...]) -> tuple[int, ...]:
+    if isinstance(shape_or_len, bool):
+        raise TypeError("Array length/shape cannot be a bool.")
+    if isinstance(shape_or_len, int):
+        if shape_or_len < 0:
+            raise ValueError(f"Array length must be non-negative, got {shape_or_len}.")
+        return (shape_or_len,)
+    if isinstance(shape_or_len, tuple):
+        if len(shape_or_len) not in (1, 2):
+            raise ShapeMismatchError(
+                f"Only 1D and 2D shapes are supported, got {shape_or_len!r}."
+            )
+        dims: list[int] = []
+        for d in shape_or_len:
+            if isinstance(d, bool) or not isinstance(d, int):
+                raise TypeError(f"Shape dimensions must be ints, got {type(d).__name__}.")
+            if d < 0:
+                raise ValueError(f"Shape dimensions must be non-negative, got {shape_or_len!r}.")
+            dims.append(d)
+        return tuple(dims)
+    raise TypeError(f"Expected int length or 1D/2D shape tuple, got {type(shape_or_len).__name__}.")
 
 
 class GfxArray:
-    """Contiguous 1D float32 array backed by a persistent device buffer."""
+    """Contiguous 1D or 2D float32 array backed by a persistent device buffer."""
 
     def __init__(
         self,
         *,
-        size: int,
+        shape: tuple[int, ...],
         dtype: DType,
         device: Device,
         buffer: ComputeBuffer | None,
     ) -> None:
-        self._size = size
+        self._shape = shape
+        self._size = math.prod(shape)
         self._dtype = dtype
         self._device = device
         self._buffer = buffer
         self._closed = False
 
     @property
-    def shape(self) -> tuple[int]:
-        return (self._size,)
+    def shape(self) -> tuple[int, ...]:
+        return self._shape
 
     @property
     def ndim(self) -> int:
-        return 1
+        return len(self._shape)
 
     @property
     def size(self) -> int:
@@ -113,10 +169,12 @@ class GfxArray:
         except Exception:
             pass
 
-    def tolist(self) -> list[float]:
-        """Synchronize and download the array contents to a Python list of floats."""
+    def tolist(self) -> list[Any]:
+        """Synchronize and download the array contents to a Python list (or nested 2D list)."""
         self._ensure_open()
         if self._size == 0:
+            if self.ndim == 2:
+                return [[] for _ in range(self._shape[0])]
             return []
         assert self._buffer is not None
         raw = self._device.backend.download(self._buffer)
@@ -125,7 +183,11 @@ class GfxArray:
             raise RuntimeError(
                 f"Backend '{self._device.target}' returned {len(raw)} bytes, expected {expected_bytes}."
             )
-        return list(struct.unpack(f"<{self._size}{self._dtype.struct_code}", raw))
+        flat = list(struct.unpack(f"<{self._size}{self._dtype.struct_code}", raw))
+        if self.ndim == 2:
+            rows, cols = self._shape
+            return [flat[r * cols : (r + 1) * cols] for r in range(rows)]
+        return flat
 
     def _binary_or_scalar(self, op: str, other: object) -> Any:
         self._ensure_open()
@@ -135,12 +197,12 @@ class GfxArray:
                 raise CrossDeviceError(
                     f"Cannot combine arrays on different devices: {self._device!r} vs {other._device!r}."
                 )
-            if self._size != other._size:
+            if self._shape != other._shape:
                 raise ShapeMismatchError(
-                    f"Incompatible 1D lengths for '{op}': {self._size} vs {other._size}."
+                    f"Incompatible shapes for '{op}': {self._shape} vs {other._shape}."
                 )
             if self._size == 0:
-                return GfxArray(size=0, dtype=self._dtype, device=self._device, buffer=None)
+                return GfxArray(shape=self._shape, dtype=self._dtype, device=self._device, buffer=None)
             assert self._buffer is not None and other._buffer is not None
             backend = self._device.backend
             out_buf = backend.allocate(self.nbytes)
@@ -149,11 +211,11 @@ class GfxArray:
             except Exception:
                 out_buf.close()
                 raise
-            return GfxArray(size=self._size, dtype=self._dtype, device=self._device, buffer=out_buf)
+            return GfxArray(shape=self._shape, dtype=self._dtype, device=self._device, buffer=out_buf)
 
         if _is_scalar_number(other):
             if self._size == 0:
-                return GfxArray(size=0, dtype=self._dtype, device=self._device, buffer=None)
+                return GfxArray(shape=self._shape, dtype=self._dtype, device=self._device, buffer=None)
             assert self._buffer is not None
             backend = self._device.backend
             out_buf = backend.allocate(self.nbytes)
@@ -162,7 +224,7 @@ class GfxArray:
             except Exception:
                 out_buf.close()
                 raise
-            return GfxArray(size=self._size, dtype=self._dtype, device=self._device, buffer=out_buf)
+            return GfxArray(shape=self._shape, dtype=self._dtype, device=self._device, buffer=out_buf)
 
         return NotImplemented
 
@@ -178,6 +240,15 @@ class GfxArray:
     def __rmul__(self, other: object) -> Any:
         return self._binary_or_scalar("mul", other)
 
+    def __matmul__(self, other: object) -> Any:
+        if not isinstance(other, GfxArray):
+            return NotImplemented
+        return matmul(self, other)
+
+    def sum(self) -> GfxArray:
+        """Compute bounded sum reduction over all elements, returning a shape (1,) GfxArray."""
+        return sum(self)
+
     def __repr__(self) -> str:
         return (
             f"GfxArray(shape={self.shape}, dtype={self._dtype.name}, "
@@ -186,20 +257,20 @@ class GfxArray:
 
 
 def array(
-    data: Sequence[float | int],
+    data: Sequence[Any],
     dtype: DType | str | None = float32,
     *,
     device: Device | None = None,
 ) -> GfxArray:
-    """Create a 1D contiguous float32 GfxArray from a Python sequence."""
+    """Create a 1D or 2D contiguous float32 GfxArray from a Python sequence."""
     resolved_dtype = resolve_dtype(dtype)
-    values = _validate_1d_float_sequence(data)
+    shape, values = _validate_float_sequence(data)
     target_device = current_device() if device is None else device
     target_device.ensure_open()
 
     n = len(values)
     if n == 0:
-        return GfxArray(size=0, dtype=resolved_dtype, device=target_device, buffer=None)
+        return GfxArray(shape=shape, dtype=resolved_dtype, device=target_device, buffer=None)
 
     raw = struct.pack(f"<{n}{resolved_dtype.struct_code}", *values)
     backend = target_device.backend
@@ -209,27 +280,122 @@ def array(
     except Exception:
         buf.close()
         raise
-    return GfxArray(size=n, dtype=resolved_dtype, device=target_device, buffer=buf)
+    return GfxArray(shape=shape, dtype=resolved_dtype, device=target_device, buffer=buf)
 
 
 def empty(
-    length: int,
+    shape: int | tuple[int, ...],
     dtype: DType | str | None = float32,
     *,
     device: Device | None = None,
 ) -> GfxArray:
-    """Allocate an uninitialized 1D contiguous float32 GfxArray of the given length."""
-    if isinstance(length, bool) or not isinstance(length, int):
-        raise TypeError(f"Array length must be an int, got {type(length).__name__}.")
-    if length < 0:
-        raise ValueError(f"Array length must be non-negative, got {length}.")
-
+    """Allocate an uninitialized 1D or 2D contiguous float32 GfxArray."""
+    resolved_shape = _normalize_shape(shape)
     resolved_dtype = resolve_dtype(dtype)
     target_device = current_device() if device is None else device
     target_device.ensure_open()
 
-    if length == 0:
-        return GfxArray(size=0, dtype=resolved_dtype, device=target_device, buffer=None)
+    n = math.prod(resolved_shape)
+    if n == 0:
+        return GfxArray(shape=resolved_shape, dtype=resolved_dtype, device=target_device, buffer=None)
 
-    buf = target_device.backend.allocate(length * resolved_dtype.itemsize)
-    return GfxArray(size=length, dtype=resolved_dtype, device=target_device, buffer=buf)
+    buf = target_device.backend.allocate(n * resolved_dtype.itemsize)
+    return GfxArray(shape=resolved_shape, dtype=resolved_dtype, device=target_device, buffer=buf)
+
+
+def sum(x: GfxArray) -> GfxArray:  # noqa: A001
+    """Compute a device-resident float32 sum reduction returning shape (1,)."""
+    if not isinstance(x, GfxArray):
+        raise TypeError(f"sum() expects a GfxArray, got {type(x).__name__}.")
+    x._ensure_open()
+    dev = x.device
+    backend = dev.backend
+
+    if x.size == 0:
+        buf = backend.allocate(x.dtype.itemsize)
+        try:
+            backend.upload(buf, struct.pack("<f", 0.0))
+        except Exception:
+            buf.close()
+            raise
+        return GfxArray(shape=(1,), dtype=x.dtype, device=dev, buffer=buf)
+
+    assert x._buffer is not None
+    cur_buf = x._buffer
+    owns_cur = False
+    cur_len = x.size
+
+    try:
+        while cur_len > 1:
+            num_groups = (cur_len + _REDUCE_WORKGROUP_SIZE - 1) // _REDUCE_WORKGROUP_SIZE
+            next_buf = backend.allocate(num_groups * x.dtype.itemsize)
+            try:
+                backend.reduce_sum_pass(cur_buf, next_buf, cur_len)
+            except Exception:
+                next_buf.close()
+                raise
+            if owns_cur:
+                cur_buf.close()
+            cur_buf = next_buf
+            owns_cur = True
+            cur_len = num_groups
+
+        if not owns_cur:
+            # Single-element input: copy via a 1-workgroup pass into an owned output buffer.
+            out_buf = backend.allocate(x.dtype.itemsize)
+            try:
+                backend.reduce_sum_pass(cur_buf, out_buf, 1)
+            except Exception:
+                out_buf.close()
+                raise
+            cur_buf = out_buf
+
+        return GfxArray(shape=(1,), dtype=x.dtype, device=dev, buffer=cur_buf)
+    except Exception:
+        if owns_cur:
+            cur_buf.close()
+        raise
+
+
+def matmul(a: GfxArray, b: GfxArray) -> GfxArray:
+    """Compute 2D float32 matrix multiplication (M, K) @ (K, N) -> (M, N) on GPU."""
+    if not isinstance(a, GfxArray) or not isinstance(b, GfxArray):
+        raise TypeError("matmul() expects two GfxArray operands.")
+    a._ensure_open()
+    b._ensure_open()
+    if a.device is not b.device:
+        raise CrossDeviceError(
+            f"Cannot multiply arrays on different devices: {a.device!r} vs {b.device!r}."
+        )
+    if a.ndim != 2 or b.ndim != 2:
+        raise ShapeMismatchError(
+            f"matmul requires 2D arrays, got shapes {a.shape} and {b.shape}."
+        )
+    m, k_a = a.shape
+    k_b, n = b.shape
+    if k_a != k_b:
+        raise ShapeMismatchError(
+            f"Incompatible matrix shapes for matmul: {a.shape} and {b.shape}."
+        )
+
+    out_shape = (m, n)
+    if m == 0 or n == 0:
+        return GfxArray(shape=out_shape, dtype=a.dtype, device=a.device, buffer=None)
+
+    backend = a.device.backend
+    out_buf = backend.allocate(m * n * a.dtype.itemsize)
+    if k_a == 0:
+        try:
+            backend.upload(out_buf, b"\x00" * (m * n * a.dtype.itemsize))
+        except Exception:
+            out_buf.close()
+            raise
+        return GfxArray(shape=out_shape, dtype=a.dtype, device=a.device, buffer=out_buf)
+
+    assert a._buffer is not None and b._buffer is not None
+    try:
+        backend.matmul(a._buffer, b._buffer, out_buf, m, n, k_a)
+    except Exception:
+        out_buf.close()
+        raise
+    return GfxArray(shape=out_shape, dtype=a.dtype, device=a.device, buffer=out_buf)

@@ -189,7 +189,9 @@ class TestArrayContract(unittest.TestCase):
             with self.assertRaises(gp.UnsupportedDTypeError):
                 gp.empty(4, dtype="int32")
             with self.assertRaises(gp.ShapeMismatchError):
-                gp.array([[1.0, 2.0], [3.0, 4.0]])  # type: ignore[arg-type]
+                gp.array([[[1.0, 2.0]], [[3.0, 4.0]]])  # type: ignore[arg-type]
+            with self.assertRaises(gp.ShapeMismatchError):
+                gp.array([[1.0], [2.0, 3.0]])
             with self.assertRaises(TypeError):
                 gp.array("123")  # type: ignore[arg-type]
             with self.assertRaises(TypeError):

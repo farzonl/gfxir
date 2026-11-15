@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .array import GfxArray, array, empty
+from .array import GfxArray, array, empty, matmul, sum  # noqa: A004
 from .dtypes import DType, float32, resolve_dtype
 from .runtime import ComputeBackend, ComputeBuffer, Device, current_device, device
 from .targets import (
@@ -40,6 +40,8 @@ __all__ = [
     "device",
     "empty",
     "float32",
+    "matmul",
     "normalize_target",
     "resolve_dtype",
+    "sum",
 ]
