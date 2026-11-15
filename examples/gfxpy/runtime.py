@@ -125,6 +125,9 @@ class Device:
         backend: ComputeBackend | None = None,
         backend_factory: Callable[[str], ComputeBackend] | None = None,
         platform_name: str | None = None,
+        validation: bool = False,
+        provider: str | None = None,
+        toolchain: object | None = None,
     ) -> None:
         resolved = normalize_target(target, platform_name=platform_name)
         self._target = resolved
@@ -150,7 +153,19 @@ class Device:
                 raise BackendInitializationError(resolved, exc) from exc
             self._backend = created
         else:
-            self._backend = UninitializedBackend(resolved)
+            from .gpu_backend import GfxIRComputeBackend
+
+            try:
+                self._backend = GfxIRComputeBackend(
+                    resolved,
+                    validation=validation,
+                    provider=provider,
+                    toolchain=toolchain,  # type: ignore[arg-type]
+                )
+            except BackendInitializationError:
+                raise
+            except Exception as exc:
+                raise BackendInitializationError(resolved, exc) from exc
 
     @property
     def target(self) -> str:
@@ -194,6 +209,9 @@ def device(
     backend: ComputeBackend | None = None,
     backend_factory: Callable[[str], ComputeBackend] | None = None,
     platform_name: str | None = None,
+    validation: bool = False,
+    provider: str | None = None,
+    toolchain: object | None = None,
 ) -> Device:
     """Create a Device for the selected or platform-default target."""
     return Device(
@@ -201,6 +219,9 @@ def device(
         backend=backend,
         backend_factory=backend_factory,
         platform_name=platform_name,
+        validation=validation,
+        provider=provider,
+        toolchain=toolchain,
     )
 
 
