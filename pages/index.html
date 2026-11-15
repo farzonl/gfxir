@@ -4,23 +4,19 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>GfxIR vs NumPy — GPU Compute Benchmarks</title>
   <script>
-    (() => {
-      try {
-        const saved = localStorage.getItem("gfxir-bench-theme");
-        const theme = (saved === "light" || saved === "dark")
-          ? saved
-          : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-        document.documentElement.dataset.theme = theme;
-      } catch {
-        document.documentElement.dataset.theme = "light";
+    try {
+      const saved = localStorage.getItem("gfxir-bench-theme");
+      if (saved === "light" || saved === "dark") {
+        document.querySelector('meta[name="color-scheme"]').content = saved;
       }
-    })();
+    } catch {}
   </script>
+  <title>GfxIR vs NumPy — GPU Compute Benchmarks</title>
   <style>
     :root {
-      color-scheme: light;
+      color-scheme: light dark;
+
       --bg-light: #f8fafc;
       --bg-dark: #0b0f17;
       --surface-light: #ffffff;
@@ -35,10 +31,19 @@
       --muted-dark: #94a3b8;
       --accent-light: #0369a1;
       --accent-dark: #38bdf8;
-      --gfx-light: #0284c7;
-      --gfx-dark: #38bdf8;
+
       --np-light: #7c3aed;
       --np-dark: #a78bfa;
+      --metal-light: #0284c7;
+      --metal-dark: #38bdf8;
+      --moltenvk-light: #0d9488;
+      --moltenvk-dark: #2dd4bf;
+      --kosmic-light: #db2777;
+      --kosmic-dark: #f472b6;
+      --vulkan-light: #15803d;
+      --vulkan-dark: #4ade80;
+      --directx-light: #c2410c;
+      --directx-dark: #fb923c;
       --good-light: #15803d;
       --good-dark: #4ade80;
       --warn-light: #c2410c;
@@ -51,19 +56,24 @@
       --text: var(--text-light);
       --muted: var(--muted-light);
       --accent: var(--accent-light);
-      --c-gfx: var(--gfx-light);
       --c-np: var(--np-light);
+      --c-metal: var(--metal-light);
+      --c-moltenvk: var(--moltenvk-light);
+      --c-kosmic: var(--kosmic-light);
+      --c-vulkan: var(--vulkan-light);
+      --c-directx: var(--directx-light);
       --c-good: var(--good-light);
       --c-warn: var(--warn-light);
 
       --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       --radius: 12px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
     }
 
     @media (prefers-color-scheme: dark) {
-      :root:not([data-theme="light"]) {
-        color-scheme: dark;
+      :root:not(:has(> head > meta[name="color-scheme"][content="light"])) {
         --bg: var(--bg-dark);
         --surface: var(--surface-dark);
         --surface-alt: var(--surface-alt-dark);
@@ -71,14 +81,18 @@
         --text: var(--text-dark);
         --muted: var(--muted-dark);
         --accent: var(--accent-dark);
-        --c-gfx: var(--gfx-dark);
         --c-np: var(--np-dark);
+        --c-metal: var(--metal-dark);
+        --c-moltenvk: var(--moltenvk-dark);
+        --c-kosmic: var(--kosmic-dark);
+        --c-vulkan: var(--vulkan-dark);
+        --c-directx: var(--directx-dark);
         --c-good: var(--good-dark);
         --c-warn: var(--warn-dark);
       }
     }
 
-    :root[data-theme="dark"] {
+    :root:has(> head > meta[name="color-scheme"][content="dark"]) {
       color-scheme: dark;
       --bg: var(--bg-dark);
       --surface: var(--surface-dark);
@@ -87,157 +101,427 @@
       --text: var(--text-dark);
       --muted: var(--muted-dark);
       --accent: var(--accent-dark);
-      --c-gfx: var(--gfx-dark);
       --c-np: var(--np-dark);
+      --c-metal: var(--metal-dark);
+      --c-moltenvk: var(--moltenvk-dark);
+      --c-kosmic: var(--kosmic-dark);
+      --c-vulkan: var(--vulkan-dark);
+      --c-directx: var(--directx-dark);
       --c-good: var(--good-dark);
       --c-warn: var(--warn-dark);
     }
 
-    * { box-sizing: border-box; }
+    :root:has(> head > meta[name="color-scheme"][content="light"]) {
+      color-scheme: light;
+    }
+
+    @media (forced-colors: active) {
+      :root {
+        --bg: Canvas;
+        --surface: Canvas;
+        --surface-alt: Canvas;
+        --border: ButtonText;
+        --text: CanvasText;
+        --muted: GrayText;
+        --accent: LinkText;
+        --c-np: CanvasText;
+        --c-metal: CanvasText;
+        --c-moltenvk: CanvasText;
+        --c-kosmic: CanvasText;
+        --c-vulkan: CanvasText;
+        --c-directx: CanvasText;
+        --c-good: CanvasText;
+        --c-warn: CanvasText;
+      }
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+
     body {
       margin: 0;
       font-family: var(--font-sans);
       background: var(--bg);
       color: var(--text);
       line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
     }
-    .wrap {
-      max-width: 1200px;
+
+    .container {
+      max-width: 1280px;
       margin: 0 auto;
-      padding: 24px 20px 64px;
+      padding: 2rem 1.5rem 4rem;
+      display: grid;
+      gap: 1.5rem;
     }
+
     header {
       display: flex;
       flex-wrap: wrap;
-      align-items: center;
       justify-content: space-between;
-      gap: 16px;
-      margin-bottom: 24px;
-      padding-bottom: 16px;
+      align-items: center;
+      gap: 1rem;
+      padding-bottom: 1rem;
       border-bottom: 1px solid var(--border);
     }
-    h1 {
+
+    .title-group h1 {
       margin: 0;
-      font-size: 1.5rem;
+      font-size: clamp(1.35rem, 2.2vw, 1.85rem);
+      font-weight: 700;
       letter-spacing: -0.02em;
     }
+
     .subtitle {
-      margin: 4px 0 0;
+      margin: 0.25rem 0 0;
       color: var(--muted);
-      font-size: 0.92rem;
+      font-size: 0.94rem;
     }
-    .controls {
+
+    .controls-row {
       display: flex;
       flex-wrap: wrap;
       align-items: center;
-      gap: 10px;
+      gap: 0.65rem;
     }
-    select, button {
+
+    .meta-pill {
+      font-family: var(--font-mono);
+      font-size: 0.84rem;
+      padding: 0.44rem 0.85rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
       background: var(--surface);
       color: var(--text);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 7px 12px;
-      font: inherit;
-      font-size: 0.88rem;
-      cursor: pointer;
+      text-decoration: none;
+      line-height: 1.3;
     }
-    button:hover, select:hover { border-color: var(--accent); }
+
+    select.meta-pill, button.meta-pill {
+      cursor: pointer;
+      background: var(--surface-alt);
+    }
+
+    .meta-pill:hover {
+      border-color: var(--accent);
+    }
+
+    .meta-pill:focus-visible,
+    button:focus-visible,
+    select:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    button.meta-pill:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .scope-bar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.85rem 1.25rem;
+    }
+
+    .scope-label {
+      font-size: 0.85rem;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-weight: 600;
+    }
+
     .kpis {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 14px;
-      margin-bottom: 24px;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 1rem;
     }
+
     .card {
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: var(--radius);
-      padding: 16px 18px;
+      padding: 1.25rem 1.4rem;
+      display: grid;
+      gap: 0.9rem;
     }
+
+    .kpi-card {
+      gap: 0.3rem;
+    }
+
     .card-label {
       font-size: 0.78rem;
       text-transform: uppercase;
       letter-spacing: 0.06em;
       color: var(--muted);
-      margin-bottom: 6px;
-    }
-    .card-value {
-      font-size: 1.4rem;
-      font-weight: 700;
-      font-family: var(--font-mono);
-    }
-    .card-sub {
-      margin-top: 4px;
-      font-size: 0.84rem;
-      color: var(--muted);
-    }
-    .grid-2 {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
-      gap: 16px;
-      margin-bottom: 24px;
-    }
-    .panel-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 12px;
-    }
-    .panel-title {
-      margin: 0;
-      font-size: 1.02rem;
       font-weight: 600;
     }
+
+    .card-value {
+      font-size: 1.5rem;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      word-break: break-word;
+    }
+
+    .card-sub {
+      font-size: 0.85rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .panel-header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem 1.25rem;
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 1.08rem;
+      font-weight: 650;
+    }
+
     .legend {
       display: flex;
-      gap: 14px;
-      font-size: 0.82rem;
+      flex-wrap: wrap;
+      gap: 0.95rem;
+      font-size: 0.86rem;
+      color: var(--text);
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .swatch {
+      display: inline-block;
+      width: 11px;
+      height: 11px;
+      border-radius: 3px;
+      border: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .canvas-wrap {
+      position: relative;
+      width: 100%;
+      height: 340px;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: crosshair;
+    }
+
+    .tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.65rem 0.85rem;
+      font-size: 0.84rem;
+      min-width: 230px;
+      opacity: 0;
+      transform: translate(-50%, -105%);
+      transition: opacity 0.12s ease;
+      z-index: 5;
+      font-variant-numeric: tabular-nums;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+    }
+
+    .tooltip.visible { opacity: 1; }
+    .tooltip .tt-sha {
+      font-family: var(--font-mono);
+      font-weight: 700;
+      color: var(--accent);
+    }
+    .tooltip .tt-msg {
+      color: var(--muted);
+      margin: 0.15rem 0 0.4rem;
+      max-width: 280px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .tooltip .tt-hint {
+      margin-top: 0.35rem;
+      padding-top: 0.3rem;
+      border-top: 1px solid var(--border);
+      font-size: 0.76rem;
       color: var(--muted);
     }
-    .dot {
-      display: inline-block;
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      margin-right: 5px;
-      vertical-align: middle;
-    }
-    svg.chart {
+
+    .svg-chart-wrap {
       width: 100%;
-      height: auto;
-      display: block;
-      font-family: var(--font-mono);
-    }
-    .table-wrap {
       overflow-x: auto;
     }
-    table {
+
+    .svg-chart-wrap svg {
+      display: block;
       width: 100%;
-      border-collapse: collapse;
-      font-size: 0.87rem;
+      height: auto;
+      font-family: var(--font-mono);
     }
-    th, td {
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--border);
+
+    .table-wrapper {
+      overflow: auto;
+      max-inline-size: 100%;
+      max-block-size: min(560px, 72vh);
+      container-type: inline-size;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    .table-wrapper:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    table.bench-table {
+      width: 100%;
+      min-inline-size: 860px;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 0.9rem;
+      font-variant-numeric: tabular-nums;
+      --label-2: "Category";
+      --label-3: "Backend";
+      --label-4: "Runtime";
+      --label-5: "Compile (ms)";
+      --label-6: "Cold (ms)";
+      --label-7: "Median (ms)";
+      --label-8: "Min (ms)";
+      --label-9: "P95 (ms)";
+      --label-10: "vs NumPy";
+      --label-11: "Max Err";
+      --label-12: "Peak RSS (MB)";
+      --label-13: "Status";
+    }
+
+    table.bench-table caption {
       text-align: left;
-      white-space: nowrap;
-    }
-    th {
-      font-size: 0.78rem;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
+      padding: 0.7rem 0.95rem;
+      font-weight: 600;
+      font-size: 0.9rem;
       color: var(--muted);
       background: var(--surface-alt);
+      border-bottom: 1px solid var(--border);
     }
-    td.num { font-family: var(--font-mono); text-align: right; }
-    th.num { text-align: right; }
+
+    table.bench-table thead th {
+      position: sticky;
+      inset-block-start: 0;
+      z-index: 2;
+      background: var(--surface-alt);
+      color: var(--muted);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 650;
+      text-align: left;
+      padding: 0.65rem 0.9rem;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    table.bench-table thead th:has(> button) {
+      padding: 0;
+    }
+
+    table.bench-table thead th > button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.4rem;
+      width: 100%;
+      min-height: 36px;
+      padding: 0.65rem 0.9rem;
+      background: transparent;
+      border: 0;
+      color: inherit;
+      font: inherit;
+      text-transform: inherit;
+      letter-spacing: inherit;
+      text-align: inherit;
+      cursor: pointer;
+    }
+
+    table.bench-table thead th.num,
+    table.bench-table thead th.num > button {
+      justify-content: flex-end;
+      text-align: right;
+    }
+
+    table.bench-table thead th[aria-sort] {
+      color: var(--accent);
+    }
+
+    .sort-icon::after {
+      content: "⇅";
+      opacity: 0.45;
+      font-size: 0.78em;
+    }
+    th[aria-sort="ascending"] .sort-icon::after {
+      content: "▲";
+      opacity: 1;
+    }
+    th[aria-sort="descending"] .sort-icon::after {
+      content: "▼";
+      opacity: 1;
+    }
+
+    table.bench-table tbody th,
+    table.bench-table tbody td {
+      padding: 0.65rem 0.9rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+
+    table.bench-table tbody th {
+      position: sticky;
+      inset-inline-start: 0;
+      z-index: 1;
+      background: var(--surface);
+      color: var(--text);
+      text-align: left;
+      font-weight: 600;
+    }
+
+    table.bench-table tbody tr:hover th,
+    table.bench-table tbody tr:hover td {
+      background: var(--surface-alt);
+    }
+
+    td.num {
+      font-family: var(--font-mono);
+      text-align: right;
+    }
+
+    .backend-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+    }
+
     .badge {
       display: inline-block;
-      padding: 2px 8px;
+      padding: 2px 9px;
       border-radius: 999px;
-      font-size: 0.76rem;
+      font-size: 0.78rem;
       font-weight: 600;
       font-family: var(--font-mono);
     }
@@ -245,77 +529,282 @@
     .badge-skip { background: color-mix(in srgb, var(--c-warn) 15%, transparent); color: var(--c-warn); }
     .speedup-win { color: var(--c-good); font-weight: 700; }
     .speedup-lose { color: var(--c-warn); font-weight: 600; }
+
+    .pagination-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.85rem;
+      padding-top: 0.85rem;
+      border-top: 1px solid var(--border);
+      font-family: var(--font-mono);
+      font-size: 0.84rem;
+      color: var(--muted);
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+
     .empty-msg {
-      padding: 32px;
+      padding: 2rem;
       text-align: center;
       color: var(--muted);
     }
+
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
+
+    @container (width < 640px) {
+      table.bench-table { min-inline-size: 0; }
+      table.bench-table,
+      table.bench-table thead,
+      table.bench-table tbody,
+      table.bench-table tr,
+      table.bench-table th,
+      table.bench-table td { display: block; }
+      table.bench-table thead { display: none; }
+      table.bench-table tr {
+        margin-block-end: 0.85rem;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      table.bench-table tbody th {
+        position: sticky;
+        inset-block-start: 0;
+        z-index: 2;
+        background: var(--surface-alt);
+        border-bottom: 1px solid var(--border);
+      }
+      table.bench-table tbody td {
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+        text-align: right;
+      }
+      table.bench-table td:nth-child(2)::before { content: var(--label-2) ": "; color: var(--muted); font-weight: 600; }
+      table.bench-table td:nth-child(3)::before { content: var(--label-3) ": "; color: var(--muted); font-weight: 600; }
+      table.bench-table td:nth-child(4)::before { content: var(--label-4) ": "; color: var(--muted); font-weight: 600; }
+      table.bench-table td:nth-child(5)::before { content: var(--label-5) ": "; color: var(--muted); font-weight: 600; }
+      table.bench-table td:nth-child(6)::before { content: var(--label-6) ": "; color: var(--muted); font-weight: 600; }
+      table.bench-table td:nth-child(7)::before { content: var(--label-7) ": "; color: var(--muted); font-weight: 600; }
+      table.bench-table td:nth-child(8)::before { content: var(--label-8) ": "; color: var(--muted); font-weight: 600; }
+      table.bench-table td:nth-child(9)::before { content: var(--label-9) ": "; color: var(--muted); font-weight: 600; }
+      table.bench-table td:nth-child(10)::before { content: var(--label-10) ": "; color: var(--muted); font-weight: 600; }
+      table.bench-table td:nth-child(11)::before { content: var(--label-11) ": "; color: var(--muted); font-weight: 600; }
+      table.bench-table td:nth-child(12)::before { content: var(--label-12) ": "; color: var(--muted); font-weight: 600; }
+      table.bench-table td:nth-child(13)::before { content: var(--label-13) ": "; color: var(--muted); font-weight: 600; }
+    }
   </style>
 </head>
 <body>
-  <div class="wrap">
+  <main class="container">
     <header>
-      <div>
+      <div class="title-group">
         <h1>GfxIR vs NumPy (float32) Benchmarks</h1>
-        <p class="subtitle">Cross-platform GPU compute performance tracker for Epic #176 (Metal / Vulkan / DirectX 12)</p>
+        <p class="subtitle">Cross-platform GPU compute performance tracker (Metal / Vulkan / DirectX 12)</p>
       </div>
-      <div class="controls">
-        <select id="runSelect" aria-label="Select benchmark run"></select>
-        <select id="metricSelect" aria-label="Select latency metric">
-          <option value="medianMs">Warm Median (ms)</option>
-          <option value="meanMs">Warm Mean (ms)</option>
-          <option value="minMs">Warm Min (ms)</option>
-          <option value="p95Ms">Warm P95 (ms)</option>
-          <option value="coldMs">Cold / First Call (ms)</option>
-        </select>
-        <button id="themeToggle" type="button">Toggle Theme</button>
+      <div class="controls-row">
+        <select id="runSelect" class="meta-pill" aria-label="Select commit run"></select>
+        <button id="themeToggle" class="meta-pill" type="button" aria-pressed="false">☾ Dark mode</button>
+        <a id="commitPill" class="meta-pill" href="#" target="_blank" rel="noopener" hidden>Commit —</a>
       </div>
     </header>
 
-    <section class="kpis" id="kpis"></section>
-
-    <section class="grid-2">
-      <div class="card">
-        <div class="panel-header">
-          <h2 class="panel-title">Suite Latency Comparison (lower is better)</h2>
-          <div class="legend" id="suiteLegend">
-            <span><i class="dot" style="background: var(--c-np)"></i>NumPy CPU f32</span>
-            <span><i class="dot" style="background: var(--c-gfx)"></i>GfxIR GPU</span>
-          </div>
+    <section aria-label="Benchmark scope and metric controls">
+      <div class="scope-bar">
+        <div class="controls-row">
+          <label for="scopeSelect" class="scope-label">Benchmark &amp; Metric:</label>
+          <select id="scopeSelect" class="meta-pill" aria-label="Select benchmark scope"></select>
+          <select id="metricSelect" class="meta-pill" aria-label="Select latency or memory metric">
+            <option value="medianMs">Warm Median (ms)</option>
+            <option value="meanMs">Warm Mean (ms)</option>
+            <option value="minMs">Warm Min (ms)</option>
+            <option value="p95Ms">Warm P95 (ms)</option>
+            <option value="coldMs">Cold / First Call (ms)</option>
+            <option value="compileMs">Compile Time (ms)</option>
+            <option value="peakRssMb">Peak RSS (MB)</option>
+          </select>
+          <select id="commitWindow" class="meta-pill" aria-label="Limit commits shown in trend chart">
+            <option value="all" selected>All Commits</option>
+            <option value="15">Last 15 Commits</option>
+            <option value="30">Last 30 Commits</option>
+            <option value="60">Last 60 Commits</option>
+            <option value="120">Last 120 Commits</option>
+          </select>
         </div>
-        <div id="suiteChart"></div>
-      </div>
-
-      <div class="card">
-        <div class="panel-header">
-          <h2 class="panel-title">Commit History Geomean (ms)</h2>
-          <div class="legend" id="historyLegend">
-            <span><i class="dot" style="background: var(--c-np)"></i>NumPy</span>
-            <span><i class="dot" style="background: var(--c-gfx)"></i>GfxIR</span>
-          </div>
-        </div>
-        <div id="historyChart"></div>
+        <span id="runMeta" class="scope-label"></span>
       </div>
     </section>
 
-    <section class="card">
+    <section class="kpis" id="kpis" aria-label="Selected commit summary KPIs"></section>
+
+    <section class="card" aria-labelledby="historyTitle">
       <div class="panel-header">
-        <h2 class="panel-title">Detailed Suite Results</h2>
-        <span class="subtitle" id="runMeta"></span>
+        <h2 class="panel-title" id="historyTitle">Historical Trend Over Commits (lower is better)</h2>
+        <div class="legend" id="historyLegend"></div>
       </div>
-      <div class="table-wrap" id="resultsTable"></div>
+      <div class="canvas-wrap" id="historyWrap">
+        <canvas id="historyCanvas" aria-label="Interactive line chart of benchmark metric across commits"></canvas>
+        <div class="tooltip" id="historyTooltip" role="status" aria-live="polite"></div>
+      </div>
     </section>
-  </div>
+
+    <section class="card" aria-labelledby="suiteChartTitle">
+      <div class="panel-header">
+        <h2 class="panel-title" id="suiteChartTitle">Selected Commit Suite Comparison (lower is better)</h2>
+        <div class="controls-row">
+          <div class="legend" id="suiteLegend"></div>
+          <select id="sortSelect" class="meta-pill" aria-label="Sort benchmarks">
+            <option value="default:asc">Sort: Suite Order</option>
+            <option value="medianMs:asc">Sort: Median (ms) ↑</option>
+            <option value="medianMs:desc">Sort: Median (ms) ↓</option>
+            <option value="coldMs:asc">Sort: Cold (ms) ↑</option>
+            <option value="compileMs:asc">Sort: Compile (ms) ↑</option>
+            <option value="peakRssMb:asc">Sort: Peak RSS (MB) ↑</option>
+          </select>
+          <select id="barPageSize" class="meta-pill" aria-label="Suites per page">
+            <option value="12" selected>12 / page</option>
+            <option value="24">24 / page</option>
+            <option value="50">50 / page</option>
+            <option value="all">All</option>
+          </select>
+        </div>
+      </div>
+      <div class="svg-chart-wrap" id="suiteChart"></div>
+      <div class="pagination-bar" id="barPagination"></div>
+    </section>
+
+    <section class="card" aria-labelledby="benchTableTitle">
+      <div class="panel-header">
+        <h2 class="panel-title" id="benchTableTitle">Detailed Suite Results</h2>
+        <div class="controls-row">
+          <select id="tablePageSize" class="meta-pill" aria-label="Table rows per page">
+            <option value="12" selected>12 / page</option>
+            <option value="24">24 / page</option>
+            <option value="50">50 / page</option>
+            <option value="all">All</option>
+          </select>
+        </div>
+      </div>
+      <div id="sortStatus" class="sr-only" role="status" aria-live="polite"></div>
+      <div tabindex="0" role="region" aria-labelledby="benchTableCaption" class="table-wrapper">
+        <table class="bench-table" id="resultsTable">
+          <caption id="benchTableCaption">Selected commit benchmark timings (click column headers to sort)</caption>
+          <thead>
+            <tr>
+              <th scope="col" data-sort="benchName" data-type="text">
+                <button type="button" commandfor="resultsTable" command="--sort">Suite <span class="sort-icon" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" data-sort="category" data-type="text">
+                <button type="button" commandfor="resultsTable" command="--sort">Category <span class="sort-icon" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" data-sort="backend" data-type="text">
+                <button type="button" commandfor="resultsTable" command="--sort">Backend <span class="sort-icon" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" data-sort="runtimeMode" data-type="text">
+                <button type="button" commandfor="resultsTable" command="--sort">Runtime <span class="sort-icon" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num" data-sort="compileMs" data-type="number">
+                <button type="button" commandfor="resultsTable" command="--sort">Compile (ms) <span class="sort-icon" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num" data-sort="coldMs" data-type="number">
+                <button type="button" commandfor="resultsTable" command="--sort">Cold (ms) <span class="sort-icon" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num" data-sort="medianMs" data-type="number">
+                <button type="button" commandfor="resultsTable" command="--sort">Median (ms) <span class="sort-icon" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num" data-sort="minMs" data-type="number">
+                <button type="button" commandfor="resultsTable" command="--sort">Min (ms) <span class="sort-icon" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num" data-sort="p95Ms" data-type="number">
+                <button type="button" commandfor="resultsTable" command="--sort">P95 (ms) <span class="sort-icon" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num" data-sort="speedup" data-type="number">
+                <button type="button" commandfor="resultsTable" command="--sort">vs NumPy <span class="sort-icon" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num" data-sort="maxAbsError" data-type="number">
+                <button type="button" commandfor="resultsTable" command="--sort">Max Err <span class="sort-icon" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num" data-sort="peakRssMb" data-type="number">
+                <button type="button" commandfor="resultsTable" command="--sort">Peak RSS (MB) <span class="sort-icon" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" data-sort="status" data-type="text">
+                <button type="button" commandfor="resultsTable" command="--sort">Status <span class="sort-icon" aria-hidden="true"></span></button>
+              </th>
+            </tr>
+          </thead>
+          <tbody id="resultsTbody"></tbody>
+        </table>
+      </div>
+      <div class="pagination-bar" id="tablePagination"></div>
+    </section>
+  </main>
 
   <script>
-    const themeBtn = document.getElementById("themeToggle");
-    themeBtn.addEventListener("click", () => {
-      const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-      document.documentElement.dataset.theme = next;
-      try { localStorage.setItem("gfxir-bench-theme", next); } catch {}
-    });
+    const THEME_KEY = "gfxir-bench-theme";
+    const metaScheme = document.querySelector('meta[name="color-scheme"]');
+    const darkMedia = window.matchMedia("(prefers-color-scheme: dark)");
+
+    function getRenderedTheme() {
+      const c = metaScheme.content;
+      if (c === "dark" || c === "light") return c;
+      return darkMedia.matches ? "dark" : "light";
+    }
+
+    function updateThemeButton() {
+      const btn = document.getElementById("themeToggle");
+      if (!btn) return;
+      const isDark = getRenderedTheme() === "dark";
+      btn.textContent = isDark ? "☀ Light mode" : "☾ Dark mode";
+      btn.setAttribute("aria-pressed", String(isDark));
+      btn.title = isDark ? "Switch to light mode" : "Switch to dark mode";
+    }
+
+    function applyThemeFromStorage() {
+      let saved = null;
+      try { saved = localStorage.getItem(THEME_KEY); } catch {}
+      metaScheme.content = (saved === "light" || saved === "dark") ? saved : "light dark";
+      updateThemeButton();
+    }
+
+    function setupThemeToggle() {
+      updateThemeButton();
+      document.getElementById("themeToggle")?.addEventListener("click", () => {
+        const target = getRenderedTheme() === "dark" ? "light" : "dark";
+        const system = darkMedia.matches ? "dark" : "light";
+        try {
+          if (target === system) {
+            localStorage.removeItem(THEME_KEY);
+            metaScheme.content = "light dark";
+          } else {
+            localStorage.setItem(THEME_KEY, target);
+            metaScheme.content = target;
+          }
+        } catch {
+          metaScheme.content = target;
+        }
+        updateThemeButton();
+        drawHistoryChart();
+      });
+      darkMedia.addEventListener("change", () => {
+        updateThemeButton();
+        drawHistoryChart();
+      });
+      window.addEventListener("storage", (e) => {
+        if (e.key === THEME_KEY) {
+          applyThemeFromStorage();
+          drawHistoryChart();
+        }
+      });
+    }
 
     function esc(str) {
       return String(str ?? "").replace(/[&<>"']/g, c => ({
@@ -323,133 +812,369 @@
       }[c]));
     }
 
-    function fmtMs(v) {
-      if (v === null || v === undefined || Number.isNaN(v)) return "—";
-      if (v === 0) return "0.000";
-      return v < 1 ? v.toFixed(4) : v.toFixed(3);
+    function cssVar(name) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
     }
 
-    const BACKEND_COLORS = {
-      "numpy-cpu-f32": "var(--c-np)",
-      "gfxir-metal": "var(--c-gfx)",
-      "gfxir-vulkan-moltenvk": "#0ea5e9",
-      "gfxir-vulkan-kosmickrisp": "#10b981",
-      "gfxir-vulkan": "#0ea5e9",
-      "gfxir-directx": "#f59e0b",
-    };
-    const FALLBACK_COLORS = ["#0ea5e9", "#10b981", "#f59e0b", "#ec4899"];
+    function fmtVal(v, metric) {
+      if (v === null || v === undefined || Number.isNaN(v)) return "—";
+      if (metric === "peakRssMb") return Number(v).toFixed(1);
+      if (v === 0) return "0.000";
+      return v < 1 ? Number(v).toFixed(4) : Number(v).toFixed(3);
+    }
 
-    function colorForBackend(name, idx = 0) {
-      return BACKEND_COLORS[name] || FALLBACK_COLORS[idx % FALLBACK_COLORS.length];
+    function metricUnit(metric) {
+      return metric === "peakRssMb" ? "MB" : "ms";
+    }
+
+    const BACKEND_SPECS = [
+      { key: "numpy-cpu-f32", cssVar: "--c-np", fallback: "#7c3aed" },
+      { key: "gfxir-metal", cssVar: "--c-metal", fallback: "#0284c7" },
+      { key: "gfxir-vulkan-moltenvk", cssVar: "--c-moltenvk", fallback: "#0d9488" },
+      { key: "gfxir-vulkan-kosmickrisp", cssVar: "--c-kosmic", fallback: "#db2777" },
+      { key: "gfxir-vulkan", cssVar: "--c-vulkan", fallback: "#15803d" },
+      { key: "gfxir-directx", cssVar: "--c-directx", fallback: "#c2410c" },
+    ];
+    const EXTRA_COLORS = ["#0ea5e9", "#10b981", "#f59e0b", "#6366f1"];
+
+    function cssColorForBackend(name, idx = 0) {
+      const spec = BACKEND_SPECS.find(b => b.key === name);
+      if (spec) return `var(${spec.cssVar})`;
+      return EXTRA_COLORS[idx % EXTRA_COLORS.length];
+    }
+
+    function resolvedColorForBackend(name, idx = 0) {
+      const spec = BACKEND_SPECS.find(b => b.key === name);
+      if (spec) return cssVar(spec.cssVar) || spec.fallback;
+      return EXTRA_COLORS[idx % EXTRA_COLORS.length];
+    }
+
+    function geomean(arr) {
+      const pos = arr.filter(x => typeof x === "number" && x > 0);
+      if (!pos.length) return 0;
+      return Math.exp(pos.reduce((s, x) => s + Math.log(x), 0) / pos.length);
+    }
+
+    let benchHistory = [];
+    let selectedIndex = 0;
+    let hoveredIndex = -1;
+    let sortField = "default";
+    let sortDir = "asc";
+    let barPage = 1;
+    let tablePage = 1;
+    let pageSize = 12;
+
+    const textCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
+    function getActiveBackends(entries = benchHistory) {
+      const found = [];
+      for (const h of entries) {
+        for (const r of h.results || []) {
+          if (r.backend && !found.includes(r.backend)) found.push(r.backend);
+        }
+        for (const k of Object.keys(h.overallGeomeanMs || {})) {
+          if (!found.includes(k)) found.push(k);
+        }
+      }
+      const order = BACKEND_SPECS.map(b => b.key);
+      return found.sort((a, b) => {
+        const ia = order.indexOf(a), ib = order.indexOf(b);
+        if (ia !== -1 && ib !== -1) return ia - ib;
+        if (ia !== -1) return -1;
+        if (ib !== -1) return 1;
+        return a.localeCompare(b);
+      });
     }
 
     function renderLegend(el, backends) {
       if (!el) return;
       el.innerHTML = backends.map((b, i) =>
-        `<span><i class="dot" style="background: ${colorForBackend(b, i)}"></i>${esc(b)}</span>`
+        `<span class="legend-item"><span class="swatch" style="background: ${cssColorForBackend(b, i)}"></span>${esc(b)}</span>`
       ).join("");
     }
 
-    function renderBarChart(container, suites, metric, gpuBackends) {
-      if (!suites.length) {
-        container.innerHTML = '<div class="empty-msg">No suite data available.</div>';
-        return;
-      }
-      const barsPerSuite = 1 + Math.max(1, gpuBackends.length);
-      const barH = 11, barGap = 3;
-      const rowH = Math.max(44, 16 + barsPerSuite * (barH + barGap));
-      const W = 560, padL = 140, padR = 76, padT = 10, padB = 20;
-      const H = padT + padB + suites.length * rowH;
-      const maxVal = Math.max(
-        1e-6,
-        ...suites.flatMap(s => [
-          s.np && s.np.ran ? Number(s.np[metric] || 0) : 0,
-          ...s.gfxs.map(g => (g && g.ran ? Number(g[metric] || 0) : 0))
-        ])
-      );
-      const plotW = W - padL - padR;
-
-      let rows = "";
-      suites.forEach((s, i) => {
-        const y = padT + i * rowH;
-        const npVal = s.np && s.np.ran ? Number(s.np[metric] || 0) : null;
-        const npW = npVal !== null ? Math.max(2, (npVal / maxVal) * plotW) : 0;
-
-        rows += `<text x="${padL - 8}" y="${y + 18}" text-anchor="end" fill="currentColor" font-size="11">${esc(s.benchName)}</text>`;
-        let offsetY = y + 4;
-        if (npVal !== null) {
-          rows += `<rect x="${padL}" y="${offsetY}" width="${npW.toFixed(1)}" height="${barH}" rx="3" fill="${colorForBackend("numpy-cpu-f32")}"/>`;
-          rows += `<text x="${padL + npW + 6}" y="${offsetY + 9}" fill="var(--muted)" font-size="10">${fmtMs(npVal)} ms</text>`;
-          offsetY += barH + barGap;
-        }
-        gpuBackends.forEach((bName, bIdx) => {
-          const g = s.gfxs.find(x => x.backend === bName);
-          const gfxVal = g && g.ran ? Number(g[metric] || 0) : null;
-          if (gfxVal !== null) {
-            const gfxW = Math.max(2, (gfxVal / maxVal) * plotW);
-            rows += `<rect x="${padL}" y="${offsetY}" width="${gfxW.toFixed(1)}" height="${barH}" rx="3" fill="${colorForBackend(bName, bIdx)}"/>`;
-            rows += `<text x="${padL + gfxW + 6}" y="${offsetY + 9}" fill="var(--muted)" font-size="10">${fmtMs(gfxVal)} ms</text>`;
-          } else {
-            rows += `<text x="${padL + 4}" y="${offsetY + 9}" fill="var(--c-warn)" font-size="10">${esc(bName)} unavailable</text>`;
+    function populateScopeSelector() {
+      const sel = document.getElementById("scopeSelect");
+      if (!sel) return;
+      const categories = new Set();
+      const suites = new Map();
+      for (const h of benchHistory) {
+        for (const r of h.results || []) {
+          if (r.category) categories.add(r.category);
+          if (r.benchId && !suites.has(r.benchId)) {
+            suites.set(r.benchId, { name: r.benchName || r.benchId, cat: r.category || "Compute" });
           }
-          offsetY += barH + barGap;
-        });
-      });
-
-      container.innerHTML = `<svg class="chart" viewBox="0 0 ${W} ${H}">${rows}</svg>`;
+        }
+      }
+      const overallHtml = `<optgroup label="Overall"><option value="overall:all">Overall Geomean (All Suites)</option></optgroup>`;
+      const catHtml = categories.size
+        ? `<optgroup label="Category Averages">${[...categories].map(c =>
+            `<option value="cat:${esc(c)}">Category Avg: ${esc(c)}</option>`
+          ).join("")}</optgroup>`
+        : "";
+      const suiteHtml = suites.size
+        ? `<optgroup label="Individual Benchmarks">${[...suites.entries()].map(([id, info]) =>
+            `<option value="suite:${esc(id)}">${esc(info.name)} (${esc(info.cat)})</option>`
+          ).join("")}</optgroup>`
+        : "";
+      sel.innerHTML = overallHtml + catHtml + suiteHtml;
     }
 
-    function renderHistoryChart(container, history) {
-      if (!history.length) {
-        container.innerHTML = '<div class="empty-msg">No history recorded yet.</div>';
+    function populateRunSelector() {
+      const sel = document.getElementById("runSelect");
+      if (!sel) return;
+      sel.innerHTML = benchHistory
+        .map((h, idx) => ({ h, idx }))
+        .reverse()
+        .map(({ h, idx }) =>
+          `<option value="${idx}">${esc(h.shortSha)} — ${esc((h.timestamp || "").slice(0, 10))} (${esc(h.target || "")})</option>`
+        ).join("");
+      sel.value = String(selectedIndex);
+    }
+
+    function extractCommitMetricMap(entry, scope, metric) {
+      const [mode, param] = scope.split(":");
+      if (mode === "overall" && metric === "medianMs" && entry.overallGeomeanMs) {
+        const out = {};
+        for (const [k, v] of Object.entries(entry.overallGeomeanMs)) {
+          if (typeof v === "number" && v > 0) out[k] = v;
+        }
+        if (Object.keys(out).length) return out;
+      }
+      const buckets = new Map();
+      for (const r of entry.results || []) {
+        if (!r.ran) continue;
+        if (mode === "cat" && r.category !== param) continue;
+        if (mode === "suite" && r.benchId !== param) continue;
+        const val = Number(r[metric]);
+        if (!Number.isFinite(val) || val <= 0) continue;
+        if (!buckets.has(r.backend)) buckets.set(r.backend, []);
+        buckets.get(r.backend).push(val);
+      }
+      const out = {};
+      for (const [backend, vals] of buckets.entries()) {
+        out[backend] = mode === "suite" ? vals[0] : geomean(vals);
+      }
+      return out;
+    }
+
+    function filterResultsByScope(results) {
+      const [mode, param] = (document.getElementById("scopeSelect")?.value || "overall:all").split(":");
+      if (mode === "cat") return (results || []).filter(r => r.category === param);
+      if (mode === "suite") return (results || []).filter(r => r.benchId === param);
+      return results || [];
+    }
+
+    function getPagedSlice(items, page) {
+      if (pageSize <= 0) return { items, totalPages: 1, total: items.length, start: 0, page: 1 };
+      const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+      const clamped = Math.min(Math.max(1, page), totalPages);
+      const start = (clamped - 1) * pageSize;
+      return { items: items.slice(start, start + pageSize), totalPages, total: items.length, start, page: clamped };
+    }
+
+    function renderPagination(containerId, pageInfo, onPageChange) {
+      const el = document.getElementById(containerId);
+      if (!el) return;
+      if (pageInfo.total === 0) {
+        el.innerHTML = "";
         return;
       }
-      const W = 560, H = 220, padL = 54, padR = 20, padT = 16, padB = 34;
-      const plotW = W - padL - padR;
-      const plotH = H - padT - padB;
-      const pts = history.slice(-20);
+      const from = pageInfo.start + 1;
+      const to = pageInfo.start + pageInfo.items.length;
+      el.innerHTML = `
+        <span>Showing ${from}–${to} of ${pageInfo.total}</span>
+        <div class="controls-row">
+          <button type="button" class="meta-pill" data-act="prev" ${pageInfo.page <= 1 ? "disabled" : ""}>← Prev</button>
+          <span>Page ${pageInfo.page} / ${pageInfo.totalPages}</span>
+          <button type="button" class="meta-pill" data-act="next" ${pageInfo.page >= pageInfo.totalPages ? "disabled" : ""}>Next →</button>
+        </div>`;
+      el.querySelector('[data-act="prev"]')?.addEventListener("click", () => onPageChange(pageInfo.page - 1));
+      el.querySelector('[data-act="next"]')?.addEventListener("click", () => onPageChange(pageInfo.page + 1));
+    }
 
-      const vals = pts.flatMap(h => {
-        const g = h.overallGeomeanMs || {};
-        return Object.values(g).filter(v => typeof v === "number" && v > 0);
-      });
-      const maxVal = Math.max(1e-3, ...vals);
+    function drawHistoryChart() {
+      const canvas = document.getElementById("historyCanvas");
+      const wrap = document.getElementById("historyWrap");
+      if (!canvas || !wrap) return;
+      const rect = wrap.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
 
-      const xFor = i => pts.length === 1 ? padL + plotW / 2 : padL + (i / (pts.length - 1)) * plotW;
-      const yFor = v => padT + plotH - (v / maxVal) * plotH;
+      const scope = document.getElementById("scopeSelect")?.value || "overall:all";
+      const metric = document.getElementById("metricSelect")?.value || "medianMs";
+      const unit = metricUnit(metric);
+      const winVal = document.getElementById("commitWindow")?.value || "all";
+      const winCount = winVal === "all" ? benchHistory.length : Math.max(1, Number(winVal));
+      const startIdx = Math.max(0, benchHistory.length - winCount);
 
-      const backendKeys = [];
-      pts.forEach(h => {
-        for (const k of Object.keys(h.overallGeomeanMs || {})) {
-          if (!backendKeys.includes(k)) backendKeys.push(k);
-        }
-      });
-      renderLegend(document.getElementById("historyLegend"), backendKeys);
+      const backends = getActiveBackends();
+      renderLegend(document.getElementById("historyLegend"), backends);
 
-      const line = coords => coords.map((p, i) => `${i === 0 ? "M" : "L"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ");
-      let svg = `<line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT + plotH}" stroke="var(--border)"/>`;
-      svg += `<line x1="${padL}" y1="${padT + plotH}" x2="${W - padR}" y2="${padT + plotH}" stroke="var(--border)"/>`;
-      svg += `<text x="${padL - 6}" y="${padT + 10}" text-anchor="end" fill="var(--muted)" font-size="10">${fmtMs(maxVal)} ms</text>`;
-      svg += `<text x="${padL - 6}" y="${padT + plotH}" text-anchor="end" fill="var(--muted)" font-size="10">0</text>`;
+      const parsed = [];
+      for (let i = startIdx; i < benchHistory.length; i++) {
+        parsed.push({ h: benchHistory[i], i, vals: extractCommitMetricMap(benchHistory[i], scope, metric) });
+      }
 
-      backendKeys.forEach((key, bIdx) => {
-        const coords = [];
-        pts.forEach((h, i) => {
-          const v = (h.overallGeomeanMs || {})[key] || 0;
-          if (v > 0) coords.push([xFor(i), yFor(v), h.shortSha]);
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(rect.width * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+      const ctx = canvas.getContext("2d");
+      ctx.scale(dpr, dpr);
+
+      const W = rect.width;
+      const H = rect.height;
+      const pad = { top: 24, right: 28, bottom: 38, left: 72 };
+      const plotW = W - pad.left - pad.right;
+      const plotH = H - pad.top - pad.bottom;
+      const borderCol = cssVar("--border");
+      const mutedCol = cssVar("--muted");
+      const surfaceCol = cssVar("--surface");
+      const accentCol = cssVar("--accent");
+      const fontMono = cssVar("--font-mono");
+
+      ctx.clearRect(0, 0, W, H);
+
+      const allVals = parsed.flatMap(p => Object.values(p.vals)).filter(v => v > 0);
+      if (!allVals.length) {
+        ctx.font = `13px ${fontMono}`;
+        ctx.fillStyle = mutedCol;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("No data recorded for this benchmark & metric in the selected window.", W / 2, H / 2);
+        canvas._xs = [];
+        return;
+      }
+
+      const maxVal = Math.max(1e-4, ...allVals) * 1.12;
+      ctx.font = `12px ${fontMono}`;
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (let g = 0; g <= 4; g++) {
+        const v = (maxVal * g) / 4;
+        const y = pad.top + plotH * (1 - g / 4);
+        ctx.strokeStyle = borderCol;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(W - pad.right, y);
+        ctx.stroke();
+        ctx.fillStyle = mutedCol;
+        ctx.fillText(`${fmtVal(v, metric)} ${unit}`, pad.left - 8, y);
+      }
+
+      const xFor = localIdx => parsed.length === 1
+        ? pad.left + plotW / 2
+        : pad.left + (localIdx / (parsed.length - 1)) * plotW;
+      const yFor = v => pad.top + plotH * (1 - v / maxVal);
+
+      const highlightIdx = hoveredIndex >= 0 ? hoveredIndex : selectedIndex;
+      const highlightLocal = parsed.findIndex(p => p.i === highlightIdx);
+      if (highlightLocal >= 0) {
+        const hx = xFor(highlightLocal);
+        ctx.save();
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = accentCol;
+        ctx.globalAlpha = 0.45;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(hx, pad.top);
+        ctx.lineTo(hx, pad.top + plotH);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      backends.forEach((backend, bIdx) => {
+        const col = resolvedColorForBackend(backend, bIdx);
+        const pts = [];
+        parsed.forEach((p, localIdx) => {
+          const v = p.vals[backend];
+          if (v > 0) pts.push({ x: xFor(localIdx), y: yFor(v), i: p.i });
         });
-        if (coords.length) {
-          const color = colorForBackend(key, bIdx);
-          svg += `<path d="${line(coords)}" fill="none" stroke="${color}" stroke-width="2.2"/>`;
-          coords.forEach(p => { svg += `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="3.5" fill="${color}"/>`; });
+        if (pts.length > 1) {
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let k = 1; k < pts.length; k++) ctx.lineTo(pts[k].x, pts[k].y);
+          ctx.strokeStyle = col;
+          ctx.lineWidth = 2.4;
+          ctx.stroke();
+        }
+        for (const p of pts) {
+          const isSelected = p.i === selectedIndex;
+          const isHovered = p.i === hoveredIndex;
+          const r = (isSelected || isHovered) ? 5.5 : 3.5;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+          ctx.fillStyle = col;
+          ctx.fill();
+          ctx.lineWidth = isSelected ? 2.5 : 1.5;
+          ctx.strokeStyle = isSelected ? accentCol : surfaceCol;
+          ctx.stroke();
         }
       });
-      pts.forEach((h, i) => {
-        if (pts.length <= 8 || i === 0 || i === pts.length - 1 || i % Math.ceil(pts.length / 6) === 0) {
-          svg += `<text x="${xFor(i).toFixed(1)}" y="${H - 10}" text-anchor="middle" fill="var(--muted)" font-size="10">${esc(h.shortSha)}</text>`;
+
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      ctx.font = `11px ${fontMono}`;
+      const step = Math.max(1, Math.ceil(parsed.length / 10));
+      parsed.forEach((p, localIdx) => {
+        if (localIdx % step === 0 || localIdx === parsed.length - 1 || p.i === selectedIndex) {
+          ctx.fillStyle = p.i === selectedIndex ? accentCol : mutedCol;
+          ctx.fillText(p.h.shortSha, xFor(localIdx), pad.top + plotH + 10);
         }
       });
-      container.innerHTML = `<svg class="chart" viewBox="0 0 ${W} ${H}">${svg}</svg>`;
+
+      canvas._xs = parsed.map((p, localIdx) => ({ x: xFor(localIdx), p }));
+    }
+
+    function attachHistoryInteraction() {
+      const canvas = document.getElementById("historyCanvas");
+      const tooltip = document.getElementById("historyTooltip");
+      if (!canvas || !tooltip) return;
+
+      canvas.addEventListener("pointermove", (e) => {
+        const xs = canvas._xs || [];
+        if (!xs.length) return;
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        let nearest = xs[0];
+        let best = Math.abs(mx - nearest.x);
+        for (const item of xs) {
+          const d = Math.abs(mx - item.x);
+          if (d < best) { best = d; nearest = item; }
+        }
+        if (hoveredIndex !== nearest.p.i) {
+          hoveredIndex = nearest.p.i;
+          drawHistoryChart();
+        }
+
+        const metric = document.getElementById("metricSelect")?.value || "medianMs";
+        const unit = metricUnit(metric);
+        const backends = getActiveBackends();
+        const lines = backends.map((b, bIdx) => {
+          const v = nearest.p.vals[b];
+          const col = resolvedColorForBackend(b, bIdx);
+          return `<div><span class="swatch" style="background:${col};vertical-align:middle;margin-right:6px;"></span>${esc(b)}: <strong>${v ? `${fmtVal(v, metric)} ${unit}` : "—"}</strong></div>`;
+        }).join("");
+
+        tooltip.innerHTML = `
+          <div class="tt-sha">${esc(nearest.p.h.shortSha)} · ${esc((nearest.p.h.timestamp || "").slice(0, 10))}</div>
+          <div class="tt-msg">${esc(nearest.p.h.message || "—")}</div>
+          ${lines}
+          <div class="tt-hint">Click point to inspect this commit</div>`;
+        tooltip.style.left = `${Math.max(125, Math.min(rect.width - 125, nearest.x))}px`;
+        tooltip.style.top = `42px`;
+        tooltip.classList.add("visible");
+      });
+
+      canvas.addEventListener("pointerleave", () => {
+        hoveredIndex = -1;
+        tooltip.classList.remove("visible");
+        drawHistoryChart();
+      });
+
+      canvas.addEventListener("click", () => {
+        if (hoveredIndex >= 0) selectCommit(hoveredIndex);
+      });
     }
 
     function groupSuites(results) {
@@ -469,10 +1194,199 @@
       return { suites: Array.from(map.values()), gpuBackends };
     }
 
-    function renderRun(entry, history) {
-      const { suites, gpuBackends } = groupSuites(entry.results);
+    function sortSuitesList(suites, metric) {
+      if (sortField === "default") return suites;
+      const copy = [...suites];
+      const factor = sortDir === "asc" ? 1 : -1;
+      const activeField = ["compileMs", "coldMs", "medianMs", "minMs", "p95Ms", "peakRssMb"].includes(sortField)
+        ? sortField
+        : metric;
+      const suiteVal = (s) => {
+        const vals = [
+          s.np && s.np.ran ? Number(s.np[activeField] || 0) : null,
+          ...s.gfxs.map(g => (g && g.ran ? Number(g[activeField] || 0) : null))
+        ].filter(v => v !== null && v > 0);
+        return vals.length ? Math.min(...vals) : (sortDir === "asc" ? Infinity : -Infinity);
+      };
+      copy.sort((a, b) => {
+        if (sortField === "benchName" || sortField === "category") {
+          return factor * textCollator.compare(a[sortField] || "", b[sortField] || "");
+        }
+        return factor * (suiteVal(a) - suiteVal(b));
+      });
+      return copy;
+    }
+
+    function renderBarChart(entry, suites, gpuBackends, metric) {
+      const container = document.getElementById("suiteChart");
+      const sortedSuites = sortSuitesList(suites, metric);
+      const pageInfo = getPagedSlice(sortedSuites, barPage);
+      barPage = pageInfo.page;
+      renderPagination("barPagination", pageInfo, (next) => {
+        barPage = next;
+        renderBarChart(entry, suites, gpuBackends, metric);
+      });
+
+      const pageSuites = pageInfo.items;
+      if (!pageSuites.length) {
+        container.innerHTML = '<div class="empty-msg">No suite data available for this selection.</div>';
+        return;
+      }
+
+      const unit = metricUnit(metric);
+      const barsPerSuite = 1 + Math.max(1, gpuBackends.length);
+      const barH = 14, barGap = 4;
+      const rowH = Math.max(54, 18 + barsPerSuite * (barH + barGap));
+      const W = 1100, padL = 230, padR = 110, padT = 12, padB = 18;
+      const H = padT + padB + pageSuites.length * rowH;
+      const maxVal = Math.max(
+        1e-6,
+        ...pageSuites.flatMap(s => [
+          s.np && s.np.ran ? Number(s.np[metric] || 0) : 0,
+          ...s.gfxs.map(g => (g && g.ran ? Number(g[metric] || 0) : 0))
+        ])
+      );
+      const plotW = W - padL - padR;
+
+      let rows = "";
+      pageSuites.forEach((s, i) => {
+        const y = padT + i * rowH;
+        const npVal = s.np && s.np.ran ? Number(s.np[metric] || 0) : null;
+        const npW = npVal !== null ? Math.max(3, (npVal / maxVal) * plotW) : 0;
+
+        rows += `<text x="${padL - 12}" y="${y + 20}" text-anchor="end" fill="currentColor" font-size="12.5" font-weight="600">${esc(s.benchName)}</text>`;
+        let offsetY = y + 6;
+        if (npVal !== null) {
+          rows += `<rect x="${padL}" y="${offsetY}" width="${npW.toFixed(1)}" height="${barH}" rx="4" fill="${cssColorForBackend("numpy-cpu-f32")}"><title>${esc(s.benchName)} · numpy-cpu-f32: ${fmtVal(npVal, metric)} ${unit}</title></rect>`;
+          rows += `<text x="${padL + npW + 8}" y="${offsetY + 11}" fill="var(--muted)" font-size="11.5">${fmtVal(npVal, metric)} ${unit}</text>`;
+          offsetY += barH + barGap;
+        }
+        gpuBackends.forEach((bName, bIdx) => {
+          const g = s.gfxs.find(x => x.backend === bName);
+          const gfxVal = g && g.ran ? Number(g[metric] || 0) : null;
+          if (gfxVal !== null) {
+            const gfxW = Math.max(3, (gfxVal / maxVal) * plotW);
+            rows += `<rect x="${padL}" y="${offsetY}" width="${gfxW.toFixed(1)}" height="${barH}" rx="4" fill="${cssColorForBackend(bName, bIdx)}"><title>${esc(s.benchName)} · ${esc(bName)}: ${fmtVal(gfxVal, metric)} ${unit}</title></rect>`;
+            rows += `<text x="${padL + gfxW + 8}" y="${offsetY + 11}" fill="var(--muted)" font-size="11.5">${fmtVal(gfxVal, metric)} ${unit}</text>`;
+          } else {
+            rows += `<text x="${padL + 4}" y="${offsetY + 11}" fill="var(--c-warn)" font-size="11.5">${esc(bName)} unavailable</text>`;
+          }
+          offsetY += barH + barGap;
+        });
+      });
+
+      container.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Suite latency comparison">${rows}</svg>`;
+    }
+
+    function enrichRowsForTable(results, allSuites) {
+      const npMap = new Map();
+      for (const s of allSuites) {
+        if (s.np && s.np.ran) npMap.set(s.benchId, s.np.medianMs);
+      }
+      return results.map(r => {
+        const npMed = npMap.get(r.benchId);
+        let speedup = null;
+        if (r.backend !== "numpy-cpu-f32" && r.ran && npMed > 0 && r.medianMs > 0) {
+          speedup = npMed / r.medianMs;
+        }
+        return { ...r, speedup };
+      });
+    }
+
+    function sortTableRows(rows) {
+      if (sortField === "default") return rows;
+      const copy = [...rows];
+      const factor = sortDir === "asc" ? 1 : -1;
+      const numericFields = new Set(["compileMs", "coldMs", "medianMs", "minMs", "p95Ms", "speedup", "maxAbsError", "peakRssMb"]);
+      const isNum = numericFields.has(sortField);
+      copy.sort((a, b) => {
+        if (isNum) {
+          const va = (a[sortField] !== null && a[sortField] !== undefined && Number.isFinite(Number(a[sortField])))
+            ? Number(a[sortField])
+            : (sortDir === "asc" ? Infinity : -Infinity);
+          const vb = (b[sortField] !== null && b[sortField] !== undefined && Number.isFinite(Number(b[sortField])))
+            ? Number(b[sortField])
+            : (sortDir === "asc" ? Infinity : -Infinity);
+          return factor * (va - vb);
+        }
+        return factor * textCollator.compare(String(a[sortField] || ""), String(b[sortField] || ""));
+      });
+      return copy;
+    }
+
+    function syncSortIndicators() {
+      const table = document.getElementById("resultsTable");
+      if (table) {
+        for (const th of table.tHead.rows[0].cells) {
+          if (th.dataset.sort === sortField) {
+            th.setAttribute("aria-sort", sortDir === "asc" ? "ascending" : "descending");
+          } else {
+            th.removeAttribute("aria-sort");
+          }
+        }
+      }
+      const sortSel = document.getElementById("sortSelect");
+      if (sortSel) {
+        const candidate = `${sortField}:${sortDir}`;
+        if ([...sortSel.options].some(o => o.value === candidate)) {
+          sortSel.value = candidate;
+        }
+      }
+    }
+
+    function renderTable(entry, allSuites) {
+      const tbody = document.getElementById("resultsTbody");
+      const filtered = filterResultsByScope(entry.results);
+      const enriched = enrichRowsForTable(filtered, allSuites);
+      const sorted = sortTableRows(enriched);
+      const pageInfo = getPagedSlice(sorted, tablePage);
+      tablePage = pageInfo.page;
+      renderPagination("tablePagination", pageInfo, (next) => {
+        tablePage = next;
+        renderTable(entry, allSuites);
+      });
+      syncSortIndicators();
+
+      if (!pageInfo.items.length) {
+        tbody.innerHTML = '<tr><td colspan="13" class="empty-msg">No benchmark rows match this filter.</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = pageInfo.items.map(r => {
+        const speedupCell = r.speedup !== null
+          ? `<span class="${r.speedup >= 1 ? "speedup-win" : "speedup-lose"}">${r.speedup.toFixed(2)}x</span>`
+          : "—";
+        const badge = r.ran
+          ? `<span class="badge badge-ok">ran</span>`
+          : `<span class="badge badge-skip">${esc(r.status || "skipped")}</span>`;
+        const col = cssColorForBackend(r.backend);
+        return `<tr>
+          <th scope="row">${esc(r.benchName)}</th>
+          <td>${esc(r.category || "—")}</td>
+          <td><span class="backend-pill"><span class="swatch" style="background:${col}"></span><code>${esc(r.backend)}</code></span></td>
+          <td><code>${esc(r.runtimeMode || "—")}</code></td>
+          <td class="num" data-value="${r.compileMs ?? ""}">${fmtVal(r.compileMs, "ms")}</td>
+          <td class="num" data-value="${r.coldMs ?? ""}">${fmtVal(r.coldMs, "ms")}</td>
+          <td class="num" data-value="${r.medianMs ?? ""}">${fmtVal(r.medianMs, "ms")}</td>
+          <td class="num" data-value="${r.minMs ?? ""}">${fmtVal(r.minMs, "ms")}</td>
+          <td class="num" data-value="${r.p95Ms ?? ""}">${fmtVal(r.p95Ms, "ms")}</td>
+          <td class="num" data-value="${r.speedup ?? ""}">${speedupCell}</td>
+          <td class="num" data-value="${r.maxAbsError ?? ""}">${r.ran ? esc(r.maxAbsError) : "—"}</td>
+          <td class="num" data-value="${r.peakRssMb ?? ""}">${r.peakRssMb ? r.peakRssMb.toFixed(1) : "—"}</td>
+          <td>${badge}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    function renderRun(entry) {
+      if (!entry) return;
+      const metric = document.getElementById("metricSelect")?.value || "medianMs";
+      const allGrouped = groupSuites(entry.results);
+      const scopedResults = filterResultsByScope(entry.results);
+      const { suites, gpuBackends } = groupSuites(scopedResults);
+
       renderLegend(document.getElementById("suiteLegend"), ["numpy-cpu-f32", ...gpuBackends]);
-      const metric = document.getElementById("metricSelect").value;
+
       const g = entry.overallGeomeanMs || {};
       const npGeo = g["numpy-cpu-f32"] || 0;
       const gfxEntries = Object.entries(g).filter(([k, v]) => k.startsWith("gfxir-") && v > 0);
@@ -483,7 +1397,7 @@
 
       let bestSuite = "—";
       let bestRatio = 0;
-      for (const s of suites) {
+      for (const s of allGrouped.suites) {
         if (s.np && s.np.ran) {
           for (const gx of s.gfxs) {
             if (gx && gx.ran && gx.medianMs > 0) {
@@ -498,30 +1412,32 @@
       }
 
       const geoSummary = gfxEntries.length
-        ? gfxEntries.map(([k, v]) => `${k}: ${fmtMs(v)} ms`).join(" · ")
+        ? gfxEntries.map(([k, v]) =>
+            `<span class="legend-item"><span class="swatch" style="background:${cssColorForBackend(k)}"></span>${esc(k)}: ${fmtVal(v, "ms")} ms</span>`
+          ).join(" ")
         : "No GPU geomean";
 
       document.getElementById("kpis").innerHTML = `
-        <div class="card">
+        <article class="card kpi-card">
           <div class="card-label">Overall Winner</div>
-          <div class="card-value">${esc(entry.overallWinner || "—")}</div>
-          <div class="card-sub">NumPy ${fmtMs(npGeo)} ms · ${esc(geoSummary)}</div>
-        </div>
-        <div class="card">
+          <div class="card-value" style="color:${cssColorForBackend(entry.overallWinner)}">${esc(entry.overallWinner || "—")}</div>
+          <div class="card-sub">NumPy ${fmtVal(npGeo, "ms")} ms · ${geoSummary}</div>
+        </article>
+        <article class="card kpi-card">
           <div class="card-label">Fastest GPU vs NumPy</div>
           <div class="card-value">${speedup ? speedup.toFixed(2) + "x" : "—"}</div>
           <div class="card-sub">${esc(fastestGfx[0])} (${speedup && speedup >= 1 ? "faster overall" : "transfer/dispatch bound"})</div>
-        </div>
-        <div class="card">
+        </article>
+        <article class="card kpi-card">
           <div class="card-label">Best GPU Suite</div>
-          <div class="card-value" style="font-size:1.1rem">${esc(bestSuite)}</div>
+          <div class="card-value" style="font-size:1.12rem">${esc(bestSuite)}</div>
           <div class="card-sub">Warm median latency ratio</div>
-        </div>
-        <div class="card">
+        </article>
+        <article class="card kpi-card">
           <div class="card-label">Environment</div>
-          <div class="card-value" style="font-size:1.1rem">${esc(entry.os || "")} / ${esc(entry.target || "")}</div>
+          <div class="card-value" style="font-size:1.12rem">${esc(entry.os || "")} / ${esc(entry.target || "")}</div>
           <div class="card-sub">${esc(entry.arch || "")} · NumPy ${esc(entry.numpyVersion || "n/a")}</div>
-        </div>
+        </article>
       `;
 
       const shaLink = entry.runUrl
@@ -530,62 +1446,106 @@
       document.getElementById("runMeta").innerHTML =
         `Commit ${shaLink} · ${esc(entry.message || "")} · ${esc(entry.timestamp || "")}`;
 
-      renderBarChart(document.getElementById("suiteChart"), suites, metric, gpuBackends);
-      renderHistoryChart(document.getElementById("historyChart"), history);
+      const commitPill = document.getElementById("commitPill");
+      if (commitPill) {
+        commitPill.hidden = false;
+        commitPill.textContent = `Commit ${entry.shortSha}`;
+        if (entry.runUrl) commitPill.href = entry.runUrl;
+        else commitPill.removeAttribute("href");
+      }
 
-      const rowsHtml = (entry.results || []).map(r => {
-        const pair = suites.find(s => s.benchId === r.benchId);
-        let speedupCell = "—";
-        if (r.backend !== "numpy-cpu-f32" && r.ran && pair && pair.np && pair.np.ran && r.medianMs > 0) {
-          const ratio = pair.np.medianMs / r.medianMs;
-          const cls = ratio >= 1 ? "speedup-win" : "speedup-lose";
-          speedupCell = `<span class="${cls}">${ratio.toFixed(2)}x</span>`;
+      renderBarChart(entry, suites, gpuBackends, metric);
+      renderTable(entry, allGrouped.suites);
+      drawHistoryChart();
+    }
+
+    function selectCommit(idx) {
+      if (idx < 0 || idx >= benchHistory.length) return;
+      selectedIndex = idx;
+      barPage = 1;
+      tablePage = 1;
+      const runSelect = document.getElementById("runSelect");
+      if (runSelect) runSelect.value = String(idx);
+      renderRun(benchHistory[idx]);
+    }
+
+    function handleTableSort(th) {
+      const field = th?.dataset.sort;
+      if (!field) return;
+      if (sortField === field) {
+        sortDir = sortDir === "asc" ? "desc" : "asc";
+      } else {
+        sortField = field;
+        sortDir = "asc";
+      }
+      tablePage = 1;
+      barPage = 1;
+      renderRun(benchHistory[selectedIndex]);
+      const statusEl = document.getElementById("sortStatus");
+      if (statusEl) {
+        statusEl.textContent = `Sorted by ${th.textContent.trim()}, ${sortDir === "asc" ? "ascending" : "descending"}`;
+      }
+    }
+
+    function setupInteractions() {
+      document.getElementById("runSelect")?.addEventListener("change", (e) => {
+        selectCommit(Number(e.target.value) || 0);
+      });
+      document.getElementById("scopeSelect")?.addEventListener("change", () => {
+        barPage = 1;
+        tablePage = 1;
+        renderRun(benchHistory[selectedIndex]);
+      });
+      document.getElementById("metricSelect")?.addEventListener("change", () => {
+        renderRun(benchHistory[selectedIndex]);
+      });
+      document.getElementById("commitWindow")?.addEventListener("change", () => {
+        drawHistoryChart();
+      });
+      document.getElementById("sortSelect")?.addEventListener("change", (e) => {
+        const [field, dir] = e.target.value.split(":");
+        sortField = field;
+        sortDir = dir || "asc";
+        barPage = 1;
+        tablePage = 1;
+        renderRun(benchHistory[selectedIndex]);
+      });
+
+      const onPageSizeChange = (e) => {
+        const val = e.target.value;
+        pageSize = val === "all" ? 0 : Number(val);
+        barPage = 1;
+        tablePage = 1;
+        const barSel = document.getElementById("barPageSize");
+        const tblSel = document.getElementById("tablePageSize");
+        if (barSel) barSel.value = val;
+        if (tblSel) tblSel.value = val;
+        renderRun(benchHistory[selectedIndex]);
+      };
+      document.getElementById("barPageSize")?.addEventListener("change", onPageSizeChange);
+      document.getElementById("tablePageSize")?.addEventListener("change", onPageSizeChange);
+
+      const table = document.getElementById("resultsTable");
+      if (table) {
+        if ("command" in HTMLElement.prototype) {
+          table.addEventListener("command", (event) => {
+            if (event.command !== "--sort") return;
+            handleTableSort(event.source?.closest("th"));
+          });
+        } else {
+          table.tHead?.addEventListener("click", (event) => {
+            const btn = event.target.closest("button");
+            if (btn) handleTableSort(btn.closest("th"));
+          });
         }
-        const badge = r.ran
-          ? `<span class="badge badge-ok">ran</span>`
-          : `<span class="badge badge-skip">${esc(r.status || "skipped")}</span>`;
-        return `<tr>
-          <td>${esc(r.benchName)}</td>
-          <td>${esc(r.category)}</td>
-          <td><code>${esc(r.backend)}</code></td>
-          <td><code>${esc(r.runtimeMode || "—")}</code></td>
-          <td class="num">${fmtMs(r.compileMs)}</td>
-          <td class="num">${fmtMs(r.coldMs)}</td>
-          <td class="num">${fmtMs(r.medianMs)}</td>
-          <td class="num">${fmtMs(r.minMs)}</td>
-          <td class="num">${fmtMs(r.p95Ms)}</td>
-          <td class="num">${speedupCell}</td>
-          <td class="num">${r.ran ? esc(r.maxAbsError) : "—"}</td>
-          <td class="num">${r.peakRssMb ? r.peakRssMb.toFixed(1) : "—"}</td>
-          <td>${badge}</td>
-        </tr>`;
-      }).join("");
+      }
 
-      document.getElementById("resultsTable").innerHTML = `
-        <table>
-          <thead>
-            <tr>
-              <th>Suite</th>
-              <th>Category</th>
-              <th>Backend</th>
-              <th>Runtime</th>
-              <th class="num">Compile (ms)</th>
-              <th class="num">Cold (ms)</th>
-              <th class="num">Median (ms)</th>
-              <th class="num">Min (ms)</th>
-              <th class="num">P95 (ms)</th>
-              <th class="num">vs NumPy</th>
-              <th class="num">Max Err</th>
-              <th class="num">Peak RSS (MB)</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody>${rowsHtml}</tbody>
-        </table>
-      `;
+      attachHistoryInteraction();
+      new ResizeObserver(() => drawHistoryChart()).observe(document.getElementById("historyWrap"));
     }
 
     async function init() {
+      setupThemeToggle();
       let history = [];
       try {
         const resp = await fetch("data/bench-history.json", { cache: "no-store" });
@@ -598,16 +1558,12 @@
         return;
       }
 
-      const runSelect = document.getElementById("runSelect");
-      const reversed = [...history].reverse();
-      runSelect.innerHTML = reversed
-        .map((h, idx) => `<option value="${idx}">${esc(h.shortSha)} — ${esc((h.timestamp || "").slice(0, 10))} (${esc(h.target || "")})</option>`)
-        .join("");
-
-      const update = () => renderRun(reversed[Number(runSelect.value) || 0], history);
-      runSelect.addEventListener("change", update);
-      document.getElementById("metricSelect").addEventListener("change", update);
-      update();
+      benchHistory = history;
+      selectedIndex = benchHistory.length - 1;
+      populateScopeSelector();
+      populateRunSelector();
+      setupInteractions();
+      selectCommit(selectedIndex);
     }
 
     init();
