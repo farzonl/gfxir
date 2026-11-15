@@ -34,7 +34,7 @@ class TestMandelbrotManifestAndValidation(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.example = runpy.run_path(str(ROOT / "examples" / "mandelbrot_compute.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "mandelbrot_compute.py"))
         cls.pipeline = cls.example["pipeline"]
         cls.rgba_pipeline = cls.example["rgba_pipeline"]
         cls.default_params = cls.example["DEFAULT_MANDELBROT_PARAMS"]
@@ -82,7 +82,7 @@ class TestMandelbrotVulkanExecution(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.example = runpy.run_path(str(ROOT / "examples" / "mandelbrot_compute.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "mandelbrot_compute.py"))
         cls.pipeline = cls.example["pipeline"]
         cls.rgba_pipeline = cls.example["rgba_pipeline"]
         cls.default_params = cls.example["DEFAULT_MANDELBROT_PARAMS"]
@@ -175,7 +175,7 @@ class TestMandelbrotDirectXExecution(unittest.TestCase):
         if not (available("llc") and available("dxv") and available("mlir-gpu-directx-view")):
             raise unittest.SkipTest("DirectX 12 compute execution tools are unavailable")
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.example = runpy.run_path(str(ROOT / "examples" / "mandelbrot_compute.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "mandelbrot_compute.py"))
         cls.pipeline = cls.example["pipeline"]
         cls.rgba_pipeline = cls.example["rgba_pipeline"]
         cls.default_params = cls.example["DEFAULT_MANDELBROT_PARAMS"]
@@ -284,7 +284,7 @@ class TestMandelbrotMetalExecution(unittest.TestCase):
         if not all(available(tool) for tool in required):
             raise unittest.SkipTest("Metal compute execution tools are unavailable")
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.example = runpy.run_path(str(ROOT / "examples" / "mandelbrot_compute.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "mandelbrot_compute.py"))
         cls.pipeline = cls.example["pipeline"]
         cls.rgba_pipeline = cls.example["rgba_pipeline"]
         cls.default_params = cls.example["DEFAULT_MANDELBROT_PARAMS"]

@@ -76,7 +76,7 @@ class ShaderUtilityTests(unittest.TestCase):
 )
 class SDFRenderingTests(unittest.TestCase):
     def test_helpers_execute_and_match_bounded_analytic_identities(self):
-        quad = runpy.run_path(str(ROOT / "examples/quad.py"))["pipeline"]
+        quad = runpy.run_path(str(ROOT / "examples/basics/quad.py"))["pipeline"]
 
         @fragment
         def diagnostic(uv):
@@ -128,7 +128,7 @@ class SDFRenderingTests(unittest.TestCase):
         tools = Toolchain(Path(os.environ["LLVM_BIN"]) if "LLVM_BIN" in os.environ else None)
         with tempfile.TemporaryDirectory() as work:
             for example in ("distance_fields", "surface_normals"):
-                pipeline = runpy.run_path(str(ROOT / f"examples/{example}.py"))["pipeline"]
+                pipeline = runpy.run_path(str(ROOT / f"examples/raymarching/{example}.py"))["pipeline"]
                 fragment_stage = pipeline.trace()[1]
                 images = {}
                 for target in Target:

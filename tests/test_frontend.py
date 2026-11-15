@@ -120,14 +120,14 @@ class FrontendTests(unittest.TestCase):
             sm.pow(vec2(1), vec3(1))
 
     def test_math_example_uses_device_math_and_finite_output(self):
-        _, fs = runpy.run_path(str(ROOT / "examples/math.py"))["pipeline"].trace()
+        _, fs = runpy.run_path(str(ROOT / "examples/basics/math.py"))["pipeline"].trace()
         for uv in ((0.5, 0.5), (0.125, 0.75), (0.9, 0.1)):
             output = evaluate(fs.outputs[0], uv)
             self.assertTrue(all(math.isfinite(channel) and 0 <= channel <= 1 for channel in output))
             self.assertEqual(output[3], 1)
 
     def test_arithmetic_example_exposes_the_new_capabilities(self):
-        vs, fs = runpy.run_path(str(ROOT / "examples/arithmetic.py"))["pipeline"].trace()
+        vs, fs = runpy.run_path(str(ROOT / "examples/basics/arithmetic.py"))["pipeline"].trace()
         for index, expected in enumerate(((-1, -1, 0, 1), (3, -1, 0, 1), (-1, 3, 0, 1))):
             self.assertEqual(evaluate(vs.outputs[0], index), expected)
             self.assertEqual(evaluate(vs.outputs[2], index), 1)
@@ -241,7 +241,7 @@ class FrontendTests(unittest.TestCase):
         self.assertEqual(math.copysign(1, evaluate(abs(scalar).node, -0.0)), 1)
 
     def test_graphics_interfaces_and_draw_configuration_are_independent(self):
-        vs, fs = runpy.run_path(str(ROOT / "examples/quad.py"))["pipeline"].trace()
+        vs, fs = runpy.run_path(str(ROOT / "examples/basics/quad.py"))["pipeline"].trace()
         self.assertEqual(vs.output_interface[1].name, "uv")
         self.assertEqual(vs.output_interface[1].type, Type.VEC2)
         self.assertEqual(fs.input_interface[0], vs.output_interface[1])
@@ -285,7 +285,7 @@ class FrontendTests(unittest.TestCase):
             Pipeline(entry, consumer).trace()
 
     def test_triangle_coordinates_colors_and_fragment_passthrough(self):
-        vs, fs = runpy.run_path(str(ROOT / "examples/triangle.py"))["pipeline"].trace()
+        vs, fs = runpy.run_path(str(ROOT / "examples/basics/triangle.py"))["pipeline"].trace()
         positions = [(-0.6, -0.6), (0.6, -0.6), (0.0, 0.6)]
         colors = [(1.0, 0.0, 0.0, 1.0), (0.0, 1.0, 0.0, 1.0), (0.0, 0.0, 1.0, 1.0)]
         for index, (position, color) in enumerate(zip(positions, colors)):

@@ -8,7 +8,7 @@ This is a graphics-first **out-of-tree `gfx` MLIR compiler** with
 Vulkan, native DirectX 12, and DXIL-to-Metal viewers. Python is a bootstrap authoring frontend, not
 the compiler's internal representation or a permanent restriction on frontends.
 Examples range from triangle/quad basics to an original animated ray-marched
-[beacon gallery](examples/beacon_gallery.py). Compile them into artifacts,
+[beacon gallery](examples/raymarching/beacon_gallery.py). Compile them into artifacts,
 then open a live window or render a PNG through
 Vulkan (MoltenVK on macOS), native DirectX 12 on Windows, or native Metal using converted DXIL. The viewer loads
 the actual compiled shaders; it does not redraw the triangle with CPU code or
@@ -114,7 +114,7 @@ export PYTHONPATH="$PWD/src"
 
 cmake --build .toolchains/llvm-build --target check-gfx
 python3 -m unittest discover -s tests -v
-python3 -m mlir_gpu examples/triangle.py \
+python3 -m mlir_gpu examples/basics/triangle.py \
   --target vulkan --output build/triangle-vulkan
 ```
 
@@ -190,12 +190,12 @@ targets are not implemented in the preview; incompatible interfaces are rejected
 
 ### A different interface and draw count
 
-[The quad example](examples/quad.py) emits six vertices, passes a named `vec2` UV
+[The quad example](examples/basics/quad.py) emits six vertices, passes a named `vec2` UV
 varying instead of a fixed `vec4` color, and computes nonlinear color in the
 fragment shader:
 
 ```sh
-python3 -m mlir_gpu examples/quad.py --target metal --output build/quad-metal
+python3 -m mlir_gpu examples/basics/quad.py --target metal --output build/quad-metal
 .venv/bin/mlir-gpu-view build/quad-metal/pipeline.json -frames 0
 ```
 
@@ -407,9 +407,9 @@ and the Python viewer extra).
 ### Other native targets
 
 ```sh
-python3 -m mlir_gpu examples/triangle.py \
+python3 -m mlir_gpu examples/basics/triangle.py \
   --target directx --output build/triangle-directx
-python3 -m mlir_gpu examples/triangle.py \
+python3 -m mlir_gpu examples/basics/triangle.py \
   --target metal --output build/triangle-metal
 ```
 
@@ -466,7 +466,7 @@ required.
 After building the tools and compiling a **new** DirectX output directory:
 
 ```sh
-LLVM_BIN=/path/to/llvm/bin .venv/bin/python -m mlir_gpu examples/triangle.py \
+LLVM_BIN=/path/to/llvm/bin .venv/bin/python -m mlir_gpu examples/basics/triangle.py \
   --target directx --output build/triangle-directx
 .venv/bin/mlir-gpu-view build/triangle-directx/pipeline.json
 # Equivalently, explicitly request an unbounded live window:
@@ -497,7 +497,7 @@ error rather than a silent fallback to another installed version.
 
 ## Programming model
 
-See [the triangle](examples/triangle.py). Ordinary Python helpers compose device
+See [the triangle](examples/basics/triangle.py). Ordinary Python helpers compose device
 expressions through AST interpretation, without source rewriting or shader strings.
 `@vertex` receives a `u32` vertex index and returns `Vertex(position, color=...)`
 or `Vertex(position, varyings={"name": value, ...})`.
@@ -533,14 +533,14 @@ regions. Compute values conditionally, merge them with SSA, then write the
 stage interface unconditionally. Repeated identical input reads are allowed
 and merge under CSE; conflicting declarations at a location are rejected.
 
-[The sphere march example](examples/sphere_march.py) loads a native
+[The sphere march example](examples/raymarching/sphere_march.py) loads a native
 [sphere marcher](examples/ir/sphere_march.mlir). It executes a bounded GPU while
 loop with early hit/miss termination, a distance helper, a nested conditional,
 and carried iteration/distance/hit/glow state:
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/sphere_march.py \
+  .venv/bin/python -m mlir_gpu examples/raymarching/sphere_march.py \
   --target vulkan --output build/sphere-march-vulkan
 DYLD_LIBRARY_PATH=/usr/local/lib .venv/bin/mlir-gpu-view \
   build/sphere-march-vulkan/pipeline.json --width 256 --height 256 -frames 0 --validation
@@ -554,12 +554,12 @@ guarantee termination for arbitrary native programs.
 
 Both examples support Vulkan, DirectX, and converted Metal; the `--target`
 option selects the backend, not the example's filename. The
-[loop bands example](examples/loop_bands.py) additionally shows color
+[loop bands example](examples/basics/loop_bands.py) additionally shows color
 bands where each pixel selects the number of GPU loop iterations:
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/loop_bands.py \
+  .venv/bin/python -m mlir_gpu examples/basics/loop_bands.py \
   --target directx --output build/loop-bands-directx
 PATH="$PWD/.tools/bin:$PATH" .venv/bin/mlir-gpu-view \
   build/loop-bands-directx/pipeline.json -frames 0 --validation
@@ -600,13 +600,13 @@ Dynamic calls, recursion, arbitrary object mutation/introspection, and exception
 handling are outside this subset. SDK expression factories remain explicitly
 registered builders; Python builtins and math modules are not monkeypatched.
 
-[The capsule marcher](examples/capsule_march.py) demonstrates a Python-authored
+[The capsule marcher](examples/raymarching/capsule_march.py) demonstrates a Python-authored
 64-step GPU loop, nested hit/miss breaks, continue, carried scalar/vector state,
 an ordinary distance helper, and the reusable tetrahedral normal helper:
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/capsule_march.py \
+  .venv/bin/python -m mlir_gpu examples/raymarching/capsule_march.py \
   --target metal --output build/capsule-march-metal
 PATH="$PWD/.tools/bin:$PATH" .venv/bin/mlir-gpu-view \
   build/capsule-march-metal/pipeline.json --width 128 --height 128 -frames 0 --validation
@@ -618,14 +618,14 @@ for animation and resize-aware rendering.
 
 ### Typed structured input
 
-[The Julia example](examples/julia.py) loads [version-2 JSON](examples/ir/julia.json).
+[The Julia example](examples/basics/julia.py) loads [version-2 JSON](examples/ir/julia.json).
 It renders Julia-set escape iterations with a vector-return helper, a nested
 selection, and a GPU while loop carrying a counter, two coordinates, escape
 state, and accumulated color:
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/julia.py \
+  .venv/bin/python -m mlir_gpu examples/basics/julia.py \
   --target metal --output build/julia-metal
 PATH="$PWD/.tools/bin:$PATH" .venv/bin/mlir-gpu-view \
   build/julia-metal/pipeline.json --width 128 --height 128 -frames 0 --validation
@@ -699,7 +699,7 @@ still retaining the counter/glow updates performed in the terminating iteration.
 
 ### Read-only frame parameters
 
-[Frame bands](examples/frame_bands.py) reads elapsed time and framebuffer-pixel
+[Frame bands](examples/basics/frame_bands.py) reads elapsed time and framebuffer-pixel
 resolution through a typed, immutable parameter block, not interpolated inputs:
 
 ```python
@@ -757,7 +757,7 @@ Stale schemas, incomplete layouts, and mismatched bindings are rejected.
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/frame_bands.py \
+  .venv/bin/python -m mlir_gpu examples/basics/frame_bands.py \
   --target metal --output build/frame-bands-metal
 ```
 
@@ -768,7 +768,7 @@ only the standard `FrameParameters` profile.
 
 ### Animated previews and fixed-time snapshots
 
-[Orbiting sphere](examples/orbiting_sphere.py) is a portable Python ray marcher
+[Orbiting sphere](examples/raymarching/orbiting_sphere.py) is a portable Python ray marcher
 with an animated sphere center and a resize-aware camera. It uses the same
 frame-parameter ABI as frame bands. Vulkan live previews supply monotonic elapsed
 seconds since renderer initialization and the actual swapchain framebuffer-pixel
@@ -777,7 +777,7 @@ restoration and resize rebuild the swapchain and use its new extent.
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/orbiting_sphere.py \
+  .venv/bin/python -m mlir_gpu examples/raymarching/orbiting_sphere.py \
   --target vulkan --output build/orbiting-sphere-vulkan
 DYLD_LIBRARY_PATH=/usr/local/lib .venv/bin/mlir-gpu-view \
   build/orbiting-sphere-vulkan/pipeline.json --width 640 --height 480 -frames 0 --validation
@@ -802,11 +802,11 @@ drawable pixels, and a monotonic live clock. Reflected offsets and stage visibil
 control copied encoder bytes at the converter SDK's argument-buffer bind point.
 Each submission completes before the next frame; no buffer is reused in flight.
 
-[Pulse rings](examples/pulse_rings.py) demonstrates the Metal frame adapter:
+[Pulse rings](examples/raymarching/pulse_rings.py) demonstrates the Metal frame adapter:
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/pulse_rings.py \
+  .venv/bin/python -m mlir_gpu examples/raymarching/pulse_rings.py \
   --target metal --output build/pulse-rings-metal
 PATH="$PWD/.tools/bin:$PATH" .venv/bin/mlir-gpu-view \
   build/pulse-rings-metal/pipeline.json --time 0.4 --output build/pulse-rings.png --validation
@@ -877,7 +877,7 @@ Existing PNG and persistent-window behavior is unchanged.
 
 ### Original ray-marched beacon gallery
 
-[Beacon gallery](examples/beacon_gallery.py) combines repeated sphere/box
+[Beacon gallery](examples/raymarching/beacon_gallery.py) combines repeated sphere/box
 geometry inside a room, a moving camera, a **72-step GPU loop**, distance/hit
 termination, loop-carried glow, four-sample SDF normals, lighting, analytically
 filtered procedural lines, fog, and tone mapping. It is an original scene,
@@ -886,7 +886,7 @@ ordinary Python helpers built from the shared device library.
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/beacon_gallery.py \
+  .venv/bin/python -m mlir_gpu examples/raymarching/beacon_gallery.py \
   --target vulkan --output build/beacon-gallery-vulkan
 DYLD_LIBRARY_PATH=/usr/local/lib .venv/bin/mlir-gpu-view \
   build/beacon-gallery-vulkan/pipeline.json --width 320 --height 240 \
@@ -904,7 +904,7 @@ or omit output/time for a persistent, resize-aware window.
 
 ### User-provided Light Cycle shader
 
-[Light Cycle](examples/light_cycle.py) ports the shader supplied by the user,
+[Light Cycle](examples/raymarching/light_cycle.py) ports the shader supplied by the user,
 originally credited to **Noztol**. Unlike the original GfxIR beacon gallery,
 this is an adaptation of that supplied source. It retains the tunnel cutouts,
 cyan ribs, orange streams, curved/banked camera, cone coverage, volumetric glow,
@@ -923,7 +923,7 @@ has no portable result. Transcendentals/dithering need not be bit-identical.
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/light_cycle.py \
+  .venv/bin/python -m mlir_gpu examples/raymarching/light_cycle.py \
   --target vulkan --output build/light-cycle-vulkan
 DYLD_LIBRARY_PATH=/usr/local/lib .venv/bin/mlir-gpu-view \
   build/light-cycle-vulkan/pipeline.json --width 320 --height 240 \
@@ -943,7 +943,7 @@ Launch-converted DXIL and preconverted Metal readbacks are byte-identical.
 
 ### Device Python authoring walkthrough
 
-[Lit sphere](examples/lit_sphere.py) is a compact starting point before the
+[Lit sphere](examples/raymarching/lit_sphere.py) is a compact starting point before the
 gallery: a fixed sphere with animated directional lighting, SDF normals, rim
 lighting, fog, and display encoding. The same program runs on every target.
 
@@ -990,7 +990,7 @@ export DYLD_LIBRARY_PATH=/usr/local/lib  # macOS Vulkan loader
 
 # Use fresh directories/files; run from the repository root.
 for target in vulkan directx metal; do
-  .venv/bin/python -m mlir_gpu examples/beacon_gallery.py \
+  .venv/bin/python -m mlir_gpu examples/raymarching/beacon_gallery.py \
     --target "$target" --output "build/gallery-guide-$target"
   .venv/bin/mlir-gpu-view "build/gallery-guide-$target/pipeline.json" \
     --time 0.25 --width 320 --height 240 \
@@ -1007,7 +1007,7 @@ done
   --width 320 --height 240 --validation
 ```
 
-For the tutorial, substitute `examples/lit_sphere.py` and fresh output names.
+For the tutorial, substitute `examples/raymarching/lit_sphere.py` and fresh output names.
 For a bounded smoke preview add `--frames 4`; persistent windows otherwise stay
 open until closed or Esc. DXIL preview on macOS performs **launch-time conversion
 and Metal rendering**, not DirectX device execution. `--target metal` performs
@@ -1026,7 +1026,7 @@ hits at a cost, but does not add geometry or remove numerical discontinuities.
 
 ### Measured ray-march acceptance
 
-[March budget](examples/march_budget.py) visualizes a per-pixel device loop
+[March budget](examples/raymarching/march_budget.py) visualizes a per-pixel device loop
 bound: four iterations on the left and 64 on the right. Red encodes iterations
 used, green a confirmed hit, and bright blue a distance-limit miss; dark blue
 indicates budget exhaustion. It animates using the standard frame block.
@@ -1125,12 +1125,12 @@ Numeric literals are coerced to `f32` when combined with a device float or used
 as vector components. Device input values cannot leak between stages. `select`
 is an expression: both arms are built, not lazy control flow.
 
-The [arithmetic example](examples/arithmetic.py) draws a full-screen gradient
+The [arithmetic example](examples/basics/arithmetic.py) draws a full-screen gradient
 with a square outline using the new operations:
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/arithmetic.py \
+  .venv/bin/python -m mlir_gpu examples/basics/arithmetic.py \
   --target metal --output build/arithmetic-metal
 PATH="$PWD/.tools/bin:$PATH" \
   .venv/bin/mlir-gpu-view build/arithmetic-metal/pipeline.json -frames 0
@@ -1163,12 +1163,12 @@ over the example's bounded range and rendered colors against CPU references
 and other targets within 2/255; these are tested ranges, not a universal ULP
 guarantee. The existing arithmetic-only exact-parity tests remain unchanged.
 
-[The math example](examples/math.py) adds procedural rings, stripes, glow, and
+[The math example](examples/basics/math.py) adds procedural rings, stripes, glow, and
 grid cells without frame resources or loops:
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/math.py \
+  .venv/bin/python -m mlir_gpu examples/basics/math.py \
   --target metal --output build/math-metal
 PATH="$PWD/.tools/bin:$PATH" \
   .venv/bin/mlir-gpu-view build/math-metal/pipeline.json -frames 0
@@ -1203,12 +1203,12 @@ resolution: `camera = (pixel - resolution * 0.5) / resolution.y`, then
 be a compile-time `vec2(width, height)`; resize-aware reflected frame parameters
 are a separate pending feature, not inferred or baked into this builtin.
 
-[The coordinates example](examples/coordinates.py) shows 32-pixel color cells
+[The coordinates example](examples/basics/coordinates.py) shows 32-pixel color cells
 and 128-pixel bands. Their pixel sizes stay constant when the window resizes:
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/coordinates.py \
+  .venv/bin/python -m mlir_gpu examples/basics/coordinates.py \
   --target metal --output build/coordinates-metal
 PATH="$PWD/.tools/bin:$PATH" \
   .venv/bin/mlir-gpu-view build/coordinates-metal/pipeline.json -frames 0
@@ -1247,20 +1247,20 @@ coordinates. It is not truncating remainder: `mod(-0.25, 2) = 1.75` and centered
 `repeat(-0.25, 2) = -0.25`. `mix` permits extrapolation; clamp bounds must be
 ordered. These helpers preserve the numerical/NaN policy of their primitives.
 
-[Distance fields](examples/distance_fields.py) shows rotated, repeated box
-slices with smooth edges and glow. [Surface normals](examples/surface_normals.py)
+[Distance fields](examples/raymarching/distance_fields.py) shows rotated, repeated box
+slices with smooth edges and glow. [Surface normals](examples/raymarching/surface_normals.py)
 shows sphere normals as RGB. Both are visual helper demonstrations, not a
 ray marcher yet:
 
 ```sh
 LLVM_BIN="$PWD/.toolchains/llvm-build/bin" PATH="$PWD/.tools/bin:$PATH" \
-  .venv/bin/python -m mlir_gpu examples/distance_fields.py \
+  .venv/bin/python -m mlir_gpu examples/raymarching/distance_fields.py \
   --target metal --output build/distance-fields-metal
 PATH="$PWD/.tools/bin:$PATH" \
   .venv/bin/mlir-gpu-view build/distance-fields-metal/pipeline.json -frames 0
 ```
 
-Compile `examples/surface_normals.py` into another fresh directory for the
+Compile `examples/raymarching/surface_normals.py` into another fresh directory for the
 second example. The AST frontend deliberately inlines these small pure helpers,
 including four fixed normal samples. Direct range/while loops remain GPU loops;
 the capsule marcher above uses these helpers inside device control flow.

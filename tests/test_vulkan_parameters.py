@@ -59,8 +59,8 @@ class VulkanParameterTests(unittest.TestCase):
         for name, pipeline in (
             ("fragment", Pipeline(fullscreen_vertex, frame_diagnostic)),
             ("both", Pipeline(frame_vertex, both_stages)),
-            ("sphere", runpy.run_path(str(ROOT / "examples/orbiting_sphere.py"))["pipeline"]),
-            ("bands", runpy.run_path(str(ROOT / "examples/frame_bands.py"))["pipeline"]),
+            ("sphere", runpy.run_path(str(ROOT / "examples/raymarching/orbiting_sphere.py"))["pipeline"]),
+            ("bands", runpy.run_path(str(ROOT / "examples/basics/frame_bands.py"))["pipeline"]),
         ):
             manifest = compile_pipeline(pipeline, Target.VULKAN, cls.directory / name, TOOLS)
             cls.programs[name] = load_program(manifest)

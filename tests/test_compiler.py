@@ -47,7 +47,7 @@ TOOLS = Toolchain(LLVM_BIN, GPU_TOOLS_BIN)
 
 
 def triangle():
-    return runpy.run_path(str(ROOT / "examples/triangle.py"))["pipeline"]
+    return runpy.run_path(str(ROOT / "examples/basics/triangle.py"))["pipeline"]
 
 
 def arithmetic_pipeline():
@@ -69,7 +69,7 @@ def arithmetic_pipeline():
 
 
 def unused_varying_pipeline():
-    quad = runpy.run_path(str(ROOT / "examples/quad.py"))["pipeline"]
+    quad = runpy.run_path(str(ROOT / "examples/basics/quad.py"))["pipeline"]
 
     @vertex
     def extra_vertex(index):
@@ -84,7 +84,7 @@ def unused_varying_pipeline():
 
 
 def expanded_arithmetic_pipeline():
-    quad = runpy.run_path(str(ROOT / "examples/quad.py"))["pipeline"]
+    quad = runpy.run_path(str(ROOT / "examples/basics/quad.py"))["pipeline"]
 
     @vertex
     def expanded_vertex(index):
@@ -122,7 +122,7 @@ def expanded_arithmetic_pipeline():
 
 
 def shader_math_pipeline():
-    quad = runpy.run_path(str(ROOT / "examples/quad.py"))["pipeline"]
+    quad = runpy.run_path(str(ROOT / "examples/basics/quad.py"))["pipeline"]
 
     @fragment
     def checked_math(uv):
@@ -239,7 +239,7 @@ class CompilerTests(unittest.TestCase):
     def test_cli_reports_missing_native_tools_without_success_output(self):
         with tempfile.TemporaryDirectory() as work:
             arguments = [
-                "mlir-gpu", str(ROOT / "examples/triangle.py"),
+                "mlir-gpu", str(ROOT / "examples/basics/triangle.py"),
                 "--target", "metal", "--output", str(Path(work) / "out"),
             ]
             stdout, stderr = io.StringIO(), io.StringIO()

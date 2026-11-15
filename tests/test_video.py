@@ -559,7 +559,7 @@ class VideoRenderingTests(unittest.TestCase):
         work = tempfile.TemporaryDirectory()
         cls.addClassCleanup(work.cleanup)
         cls.directory = Path(work.name)
-        pipeline = runpy.run_path(str(ROOT / "examples/orbiting_sphere.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples/raymarching/orbiting_sphere.py"))["pipeline"]
         cls.program = load_program(compile_pipeline(pipeline, Target.VULKAN, cls.directory / "pipeline", TOOLS))
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
 

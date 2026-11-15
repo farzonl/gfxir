@@ -19,7 +19,7 @@ import compiler_inputs as structured
 
 
 def example():
-    return runpy.run_path(str(ROOT / "examples/frame_bands.py"))["pipeline"]
+    return runpy.run_path(str(ROOT / "examples/basics/frame_bands.py"))["pipeline"]
 
 
 FRAME_REFLECTION = {

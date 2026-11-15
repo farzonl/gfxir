@@ -17,11 +17,11 @@ from test_support import ROOT, TOOLS, available
 
 @unittest.skipUnless(available("gfx-compile"), "Requires native gfx-compile toolchain")
 class TestTiledMatMulCompilation(unittest.TestCase):
-    """Hermetic compilation and shared-memory footprint checks for examples/matmul.py."""
+    """Hermetic compilation and shared-memory footprint checks for examples/compute/matmul.py."""
 
     @classmethod
     def setUpClass(cls):
-        cls.example = runpy.run_path(str(ROOT / "examples" / "matmul.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "matmul.py"))
 
     def test_matmul_compiles_without_special_capabilities_and_reflects_shared_tiles(self):
         pipe = self.example["pipeline"]
@@ -86,7 +86,7 @@ class TestTiledMatMulVulkanExecution(_TiledMatMulExecutionMixin, unittest.TestCa
     @classmethod
     def setUpClass(cls):
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.example = runpy.run_path(str(ROOT / "examples" / "matmul.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "matmul.py"))
 
 
 @unittest.skipUnless(
@@ -102,7 +102,7 @@ class TestTiledMatMulDirectXExecution(_TiledMatMulExecutionMixin, unittest.TestC
         if not (available("llc") and available("dxv") and available("mlir-gpu-directx-view")):
             raise unittest.SkipTest("DirectX 12 compute execution tools are unavailable")
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.example = runpy.run_path(str(ROOT / "examples" / "matmul.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "matmul.py"))
 
 
 @unittest.skipUnless(
@@ -118,7 +118,7 @@ class TestTiledMatMulMetalExecution(_TiledMatMulExecutionMixin, unittest.TestCas
         if not all(available(tool) for tool in required):
             raise unittest.SkipTest("Metal compute execution tools are unavailable")
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.example = runpy.run_path(str(ROOT / "examples" / "matmul.py"))
+        cls.example = runpy.run_path(str(ROOT / "examples" / "compute" / "matmul.py"))
 
 
 if __name__ == "__main__":

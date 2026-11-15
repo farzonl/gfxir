@@ -28,7 +28,7 @@ class MetalParameterTests(unittest.TestCase):
             for name, pipeline in (
                 ("fragment", Pipeline(fullscreen_vertex, frame_diagnostic)),
                 ("both", Pipeline(frame_vertex, both_stages)),
-                ("rings", runpy.run_path(str(ROOT / "examples/pulse_rings.py"))["pipeline"]),
+                ("rings", runpy.run_path(str(ROOT / "examples/raymarching/pulse_rings.py"))["pipeline"]),
             ):
                 manifest = compile_pipeline(pipeline, target, cls.directory / f"{target.value}-{name}", TOOLS)
                 cls.programs[target.value, name] = load_program(manifest)

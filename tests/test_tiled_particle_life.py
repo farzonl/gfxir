@@ -25,7 +25,7 @@ class TestTiledParticleLifeCompilation(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.tiled = runpy.run_path(str(ROOT / "examples" / "tiled_particle_life.py"))
+        cls.tiled = runpy.run_path(str(ROOT / "examples" / "compute" / "tiled_particle_life.py"))
 
     def test_step_and_render_kernels_compile_and_reflect_shared_memory(self):
         with tempfile.TemporaryDirectory() as td:
@@ -153,8 +153,8 @@ class TestTiledParticleLifeVulkanExecution(_TiledParticleLifeExecutionMixin, uni
     @classmethod
     def setUpClass(cls):
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.tiled = runpy.run_path(str(ROOT / "examples" / "tiled_particle_life.py"))
-        cls.baseline = runpy.run_path(str(ROOT / "examples" / "particle_life_compute.py"))
+        cls.tiled = runpy.run_path(str(ROOT / "examples" / "compute" / "tiled_particle_life.py"))
+        cls.baseline = runpy.run_path(str(ROOT / "examples" / "compute" / "particle_life_compute.py"))
 
 
 @unittest.skipUnless(
@@ -170,8 +170,8 @@ class TestTiledParticleLifeDirectXExecution(_TiledParticleLifeExecutionMixin, un
         if not (available("llc") and available("dxv") and available("mlir-gpu-directx-view")):
             raise unittest.SkipTest("DirectX 12 compute execution tools are unavailable")
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.tiled = runpy.run_path(str(ROOT / "examples" / "tiled_particle_life.py"))
-        cls.baseline = runpy.run_path(str(ROOT / "examples" / "particle_life_compute.py"))
+        cls.tiled = runpy.run_path(str(ROOT / "examples" / "compute" / "tiled_particle_life.py"))
+        cls.baseline = runpy.run_path(str(ROOT / "examples" / "compute" / "particle_life_compute.py"))
 
 
 @unittest.skipUnless(
@@ -187,8 +187,8 @@ class TestTiledParticleLifeMetalExecution(_TiledParticleLifeExecutionMixin, unit
         if not all(available(tool) for tool in required):
             raise unittest.SkipTest("Metal compute execution tools are unavailable")
         cls.validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
-        cls.tiled = runpy.run_path(str(ROOT / "examples" / "tiled_particle_life.py"))
-        cls.baseline = runpy.run_path(str(ROOT / "examples" / "particle_life_compute.py"))
+        cls.tiled = runpy.run_path(str(ROOT / "examples" / "compute" / "tiled_particle_life.py"))
+        cls.baseline = runpy.run_path(str(ROOT / "examples" / "compute" / "particle_life_compute.py"))
 
 
 if __name__ == "__main__":

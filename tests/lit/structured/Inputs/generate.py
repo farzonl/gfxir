@@ -11,7 +11,7 @@ from compiler_inputs import ROOT, block, constant, operations, result, source
 
 def generate(case):
     if case.startswith("schema-"):
-        shader = runpy.run_path(str(ROOT / "examples/triangle.py"))["pipeline"].trace()[1].to_dict()
+        shader = runpy.run_path(str(ROOT / "examples/basics/triangle.py"))["pipeline"].trace()[1].to_dict()
         version = case.removeprefix("schema-")
         if version != "absent":
             shader["schema_version"] = json.loads(version)

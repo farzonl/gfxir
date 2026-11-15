@@ -10,7 +10,7 @@ from test_support import ROOT, TOOLS
 
 
 def gallery_pipeline():
-    return runpy.run_path(str(ROOT / "examples/beacon_gallery.py"))["pipeline"]
+    return runpy.run_path(str(ROOT / "examples/raymarching/beacon_gallery.py"))["pipeline"]
 
 
 @unittest.skipUnless(

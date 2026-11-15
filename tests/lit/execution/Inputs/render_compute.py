@@ -35,7 +35,7 @@ def main() -> None:
     validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
 
     if args.example == "mandelbrot":
-        ns = runpy.run_path(str(ROOT / "examples" / "mandelbrot_compute.py"))
+        ns = runpy.run_path(str(ROOT / "examples" / "compute" / "mandelbrot_compute.py"))
         rgba_pipeline = ns["rgba_pipeline"]
         params = {
             **ns["DEFAULT_MANDELBROT_PARAMS"],
@@ -59,7 +59,7 @@ def main() -> None:
                 write_png(output, image)
             print(f"Rendered mandelbrot for {target.value}: {image.width}x{image.height} on {image.device}")
     elif args.example == "particle_life":
-        ns = runpy.run_path(str(ROOT / "examples" / "particle_life_compute.py"))
+        ns = runpy.run_path(str(ROOT / "examples" / "compute" / "particle_life_compute.py"))
         simulate_and_render = ns["simulate_and_render_particle_life"]
         for target in targets:
             output = target_output_path(args.output_prefix, target.value)
@@ -75,7 +75,7 @@ def main() -> None:
             write_png(output, image)
             print(f"Rendered particle_life for {target.value}: {image.width}x{image.height} on {image.device}")
     else:
-        ns = runpy.run_path(str(ROOT / "examples" / "tiled_particle_life.py"))
+        ns = runpy.run_path(str(ROOT / "examples" / "compute" / "tiled_particle_life.py"))
         simulate_and_render = ns["simulate_and_render_tiled_particle_life"]
         for target in targets:
             output = target_output_path(args.output_prefix, target.value)

@@ -24,7 +24,7 @@ class StructuredInputRenderingTests(unittest.TestCase):
         return render_metal_offscreen(program, width, height, validation, TOOLS)
 
     def test_julia_iteration_state_helper_and_escape_match_all_targets(self):
-        pipeline = runpy.run_path(str(ROOT / "examples/julia.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples/basics/julia.py"))["pipeline"]
         images = {}
         with tempfile.TemporaryDirectory() as work:
             for target in Target:

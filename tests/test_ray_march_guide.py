@@ -15,7 +15,7 @@ from test_support import ROOT, TOOLS
 )
 class RayMarchGuideTests(unittest.TestCase):
     def test_lit_sphere_tutorial_is_portable_deterministic_and_animates_lighting(self):
-        pipeline = runpy.run_path(str(ROOT / "examples/lit_sphere.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples/raymarching/lit_sphere.py"))["pipeline"]
         validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
         snapshots = {}
         with tempfile.TemporaryDirectory() as work:

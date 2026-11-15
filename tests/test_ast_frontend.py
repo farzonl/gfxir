@@ -67,7 +67,7 @@ class ASTFrontendTests(unittest.TestCase):
         self.assertEqual(stage.outputs[0].args[1].literal, 0.0)
 
     def test_primitive_helper_captures_and_quad_metaprogramming_stay_compatible(self):
-        pipeline = runpy.run_path(str(ROOT / "examples/quad.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples/basics/quad.py"))["pipeline"]
         vertex, _ = pipeline.trace()
         self.assertNotIn("schema_version", vertex.to_dict())
         self.assertEqual(vertex.output_interface[1].name, "uv")
@@ -222,7 +222,7 @@ class ASTRenderingTests(unittest.TestCase):
         self.assert_targets(shader, lambda pixel: (pixel * pixel, 0.0625, 1, 1), width=2)
 
     def test_python_capsule_scene_hits_misses_and_matches_all_targets(self):
-        pipeline = runpy.run_path(str(ROOT / "examples/capsule_march.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples/raymarching/capsule_march.py"))["pipeline"]
         module = pipeline.trace()[1].to_dict()
         self.assertEqual(count_ops(module, "scf.while"), 1)
         images = {}

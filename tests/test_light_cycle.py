@@ -10,7 +10,7 @@ from mlir_gpu.viewer import load_program, render_metal_offscreen, render_offscre
 from test_support import ROOT, TOOLS
 
 
-SOURCE = ROOT / "examples/light_cycle.py"
+SOURCE = ROOT / "examples/raymarching/light_cycle.py"
 map_scene = runpy.run_path(str(SOURCE))["map_scene"]
 
 

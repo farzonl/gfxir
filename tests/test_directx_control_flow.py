@@ -27,7 +27,7 @@ class DirectXControlFlowRenderingTests(unittest.TestCase):
         )
 
     def test_sphere_while_loop_matches_vulkan_and_does_not_grow_with_cap(self):
-        pipeline = runpy.run_path(str(ROOT / "examples/sphere_march.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples/raymarching/sphere_march.py"))["pipeline"]
         images = {}
         with tempfile.TemporaryDirectory() as work:
             directory = Path(work)
@@ -59,7 +59,7 @@ class DirectXControlFlowRenderingTests(unittest.TestCase):
             self.assertLessEqual(max(sizes) - min(sizes), 64)
 
     def test_dynamic_loop_band_example_and_vector_helper_return(self):
-        pipeline = runpy.run_path(str(ROOT / "examples/loop_bands.py"))["pipeline"]
+        pipeline = runpy.run_path(str(ROOT / "examples/basics/loop_bands.py"))["pipeline"]
         images = {}
         with tempfile.TemporaryDirectory() as work:
             for target in Target:

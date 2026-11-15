@@ -274,12 +274,12 @@ class TestCiWarpOffscreenRendering(unittest.TestCase):
         cls.validation = VALIDATION_ENABLED
 
         # Compile triangle pipeline
-        triangle_pipe = runpy.run_path(str(ROOT / "examples" / "triangle.py"))["pipeline"]
+        triangle_pipe = runpy.run_path(str(ROOT / "examples" / "basics" / "triangle.py"))["pipeline"]
         manifest_tri = compile_pipeline(triangle_pipe, Target.DIRECTX, cls.work_dir / "triangle", cls.tools)
         cls.triangle_prog = load_program(manifest_tri)
 
         # Compile quad pipeline
-        quad_pipe = runpy.run_path(str(ROOT / "examples" / "quad.py"))["pipeline"]
+        quad_pipe = runpy.run_path(str(ROOT / "examples" / "basics" / "quad.py"))["pipeline"]
         manifest_quad = compile_pipeline(quad_pipe, Target.DIRECTX, cls.work_dir / "quad", cls.tools)
         cls.quad_prog = load_program(manifest_quad)
 
@@ -432,7 +432,7 @@ class TestCiWarpValidationLayer(unittest.TestCase):
 
         tools = get_warp_ci_toolchain()
         with tempfile.TemporaryDirectory() as tmp:
-            triangle_pipe = runpy.run_path(str(ROOT / "examples" / "triangle.py"))["pipeline"]
+            triangle_pipe = runpy.run_path(str(ROOT / "examples" / "basics" / "triangle.py"))["pipeline"]
             manifest = compile_pipeline(triangle_pipe, Target.DIRECTX, Path(tmp) / "tri", tools)
             prog = load_program(manifest)
             img = render_directx_offscreen(prog, 32, 24, validation=True, provider="warp", toolchain=tools)

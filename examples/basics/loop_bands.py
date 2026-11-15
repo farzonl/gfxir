@@ -3,7 +3,7 @@ from pathlib import Path
 from mlir_gpu import MLIRPipeline
 
 
-ir = Path(__file__).with_name("ir")
+ir = Path(__file__).resolve().parents[1] / "ir"
 pipeline = MLIRPipeline(
     vertex=ir / "fullscreen.mlir",
     fragment=ir / "loop_bands.mlir",
