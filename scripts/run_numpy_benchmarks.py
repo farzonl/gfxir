@@ -273,9 +273,9 @@ def _benchmark_gfx_suite(
             WorkgroupId,
             compile_pipeline,
             compute,
-            compute_session,
             global_invocation_id,
             i32,
+            open_compute_context,
             shared_array,
             workgroup_barrier,
         )
@@ -319,18 +319,44 @@ def _benchmark_gfx_suite(
                 else:
                     x_bytes = struct.pack(f"<{spec.n}f", *([1.0] * spec.n))
                     y_bytes = struct.pack(f"<{spec.n}f", *([2.0] * spec.n))
+                nbytes = spec.n * 4
                 grid = ((spec.n + 63) // 64, 1, 1)
 
-                def run_once(run_fn: Any) -> bytes:
-                    cur = x_bytes
-                    for _ in range(spec.chain_depth):
-                        res = run_fn(
-                            buffers={"x": cur, "y": y_bytes, "out": spec.n * 4},
-                            parameters={"n": spec.n, "alpha": 1.25},
-                            grid=grid,
-                        )
-                        cur = res.buffers["out"]
-                    return cur
+                with open_compute_context(target_name, validation=False, provider=provider) as ctx:
+                    pipe = ctx.compile_pipeline(manifest)
+                    buf_x = ctx.create_buffer(nbytes, initial_data=x_bytes)
+                    buf_y = ctx.create_buffer(nbytes, initial_data=y_bytes)
+                    buf_a = ctx.create_buffer(nbytes)
+                    buf_b = ctx.create_buffer(nbytes) if spec.chain_depth > 1 else None
+                    runtime_mode = f"persistent:{ctx.device_name}"
+
+                    def run_once() -> bytes:
+                        src_buf = buf_x
+                        dst_buf = buf_a
+                        for step in range(spec.chain_depth):
+                            if step > 0:
+                                assert buf_b is not None
+                                src_buf = buf_a if (step % 2 == 1) else buf_b
+                                dst_buf = buf_b if (step % 2 == 1) else buf_a
+                            pipe.dispatch(
+                                {"x": src_buf, "y": buf_y, "out": dst_buf},
+                                parameters={"n": spec.n, "alpha": 1.25},
+                                grid=grid,
+                            )
+                        return dst_buf.download()
+
+                    t_cold0 = time.perf_counter()
+                    out_bytes = run_once()
+                    cold_ms = compile_ms + (time.perf_counter() - t_cold0) * 1000.0
+
+                    for _ in range(warmup):
+                        run_once()
+
+                    samples = []
+                    for _ in range(iters):
+                        t0 = time.perf_counter()
+                        _ = run_once()
+                        samples.append((time.perf_counter() - t0) * 1000.0)
             else:
                 tile_dim = _TILE_DIM
 
@@ -383,27 +409,33 @@ def _benchmark_gfx_suite(
                 grid = ((spec.n + tile_dim - 1) // tile_dim, (spec.m + tile_dim - 1) // tile_dim, 1)
                 num_tiles = (spec.k + tile_dim - 1) // tile_dim
 
-                def run_once(run_fn: Any) -> bytes:
-                    res = run_fn(
-                        buffers={"mat_a": a_bytes, "mat_b": b_bytes, "mat_c": spec.m * spec.n * 4},
-                        parameters={"m": spec.m, "n": spec.n, "k": spec.k, "num_tiles": num_tiles},
-                        grid=grid,
-                    )
-                    return res.buffers["mat_c"]
+                with open_compute_context(target_name, validation=False, provider=provider) as ctx:
+                    pipe = ctx.compile_pipeline(manifest)
+                    buf_a = ctx.create_buffer(spec.m * spec.k * 4, initial_data=a_bytes)
+                    buf_b = ctx.create_buffer(spec.k * spec.n * 4, initial_data=b_bytes)
+                    buf_c = ctx.create_buffer(spec.m * spec.n * 4)
+                    runtime_mode = f"persistent:{ctx.device_name}"
 
-            with compute_session(manifest, validation=False, provider=provider, toolchain=toolchain) as run_fn:
-                t_cold0 = time.perf_counter()
-                out_bytes = run_once(run_fn)
-                cold_ms = compile_ms + (time.perf_counter() - t_cold0) * 1000.0
+                    def run_once() -> bytes:
+                        pipe.dispatch(
+                            {"mat_a": buf_a, "mat_b": buf_b, "mat_c": buf_c},
+                            parameters={"m": spec.m, "n": spec.n, "k": spec.k, "num_tiles": num_tiles},
+                            grid=grid,
+                        )
+                        return buf_c.download()
 
-                for _ in range(warmup):
-                    run_once(run_fn)
+                    t_cold0 = time.perf_counter()
+                    out_bytes = run_once()
+                    cold_ms = compile_ms + (time.perf_counter() - t_cold0) * 1000.0
 
-                samples: list[float] = []
-                for _ in range(iters):
-                    t0 = time.perf_counter()
-                    _ = run_once(run_fn)
-                    samples.append((time.perf_counter() - t0) * 1000.0)
+                    for _ in range(warmup):
+                        run_once()
+
+                    samples = []
+                    for _ in range(iters):
+                        t0 = time.perf_counter()
+                        _ = run_once()
+                        samples.append((time.perf_counter() - t0) * 1000.0)
 
         max_err = 0.0
         if np is not None and ref_output is not None:
@@ -422,7 +454,7 @@ def _benchmark_gfx_suite(
             rss_before_mb=rss_before,
             rss_after_run_mb=rss_after,
             max_abs_error=max_err,
-            runtime_mode="mlir_gpu.compute_session",
+            runtime_mode=runtime_mode,
         )
     except Exception as exc:
         return _make_record(
