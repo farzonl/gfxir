@@ -226,6 +226,10 @@ class TestArrayContract(unittest.TestCase):
         with self.assertRaises(gp.ArrayClosedError):
             a1.tolist()
         with self.assertRaises(gp.ArrayClosedError):
+            a1.tobytes()
+        with self.assertRaises(gp.ArrayClosedError):
+            a1.toarray()
+        with self.assertRaises(gp.ArrayClosedError):
             _ = a1 + 1.0
 
         d1.close()
@@ -233,6 +237,35 @@ class TestArrayContract(unittest.TestCase):
         self.assertTrue(b1.closed)
         with self.assertRaises(gp.DeviceClosedError):
             gp.empty(4, device=d1)
+
+    def test_tobytes_toarray_and_tolist_1d_2d_empty(self) -> None:
+        import array as stdlib_array
+        import struct
+
+        backend = _SpyBackend("vulkan")
+        with gp.device("vulkan", backend=backend):
+            a1 = gp.array([1.5, -2.0, 3.25])
+            self.assertEqual(a1.tobytes(), struct.pack("<3f", 1.5, -2.0, 3.25))
+            arr1 = a1.toarray()
+            self.assertIsInstance(arr1, stdlib_array.array)
+            self.assertEqual(arr1.typecode, "f")
+            self.assertEqual(arr1.tolist(), [1.5, -2.0, 3.25])
+            self.assertEqual(a1.tolist(), [1.5, -2.0, 3.25])
+
+            a2 = gp.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+            self.assertEqual(a2.tobytes(), struct.pack("<6f", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
+            self.assertEqual(a2.toarray().tolist(), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            self.assertEqual(a2.tolist(), [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+            empty_1d = gp.empty(0)
+            self.assertEqual(empty_1d.tobytes(), b"")
+            self.assertEqual(empty_1d.toarray().tolist(), [])
+            self.assertEqual(empty_1d.tolist(), [])
+
+            empty_2d = gp.empty((2, 0))
+            self.assertEqual(empty_2d.tobytes(), b"")
+            self.assertEqual(empty_2d.toarray().tolist(), [])
+            self.assertEqual(empty_2d.tolist(), [[], []])
 
 
 if __name__ == "__main__":

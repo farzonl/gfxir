@@ -211,6 +211,7 @@ class VulkanBuffer(PersistentBuffer):
         self._vk_buffer = vk_buffer
         self._vk_memory = vk_memory
         self._alloc_size = alloc_size
+        self._mapped: object | None = None
         self._closed = False
 
     @property
@@ -230,6 +231,12 @@ class VulkanBuffer(PersistentBuffer):
         if self._closed:
             raise PersistentComputeError("PersistentBuffer has been closed.")
 
+    def _ensure_mapped(self) -> object:
+        if self._mapped is None:
+            gpu = self._context._gpu
+            self._mapped = gpu.vk.vkMapMemory(gpu.device, self._vk_memory, 0, self._alloc_size, 0)
+        return self._mapped
+
     def upload(self, data: bytes | bytearray | memoryview, offset: int = 0) -> None:
         self._ensure_open()
         if not isinstance(data, (bytes, bytearray, memoryview)):
@@ -243,14 +250,9 @@ class VulkanBuffer(PersistentBuffer):
         if not payload:
             return
         self._context.synchronize()
-        gpu = self._context._gpu
-        vk = gpu.vk
         with _api_errors():
-            mapped = vk.vkMapMemory(gpu.device, self._vk_memory, 0, self._alloc_size, 0)
-            try:
-                mapped[offset : offset + len(payload)] = payload
-            finally:
-                vk.vkUnmapMemory(gpu.device, self._vk_memory)
+            mapped = self._ensure_mapped()
+            mapped[offset : offset + len(payload)] = payload
 
     def download(self, size_bytes: int | None = None, offset: int = 0) -> bytes:
         self._ensure_open()
@@ -269,14 +271,9 @@ class VulkanBuffer(PersistentBuffer):
         self._context.synchronize()
         if read_size == 0:
             return b""
-        gpu = self._context._gpu
-        vk = gpu.vk
         with _api_errors():
-            mapped = vk.vkMapMemory(gpu.device, self._vk_memory, 0, self._alloc_size, 0)
-            try:
-                return bytes(mapped[offset : offset + read_size])
-            finally:
-                vk.vkUnmapMemory(gpu.device, self._vk_memory)
+            mapped = self._ensure_mapped()
+            return bytes(mapped[offset : offset + read_size])
 
     def close(self) -> None:
         if self._closed:
@@ -286,6 +283,9 @@ class VulkanBuffer(PersistentBuffer):
             self._context.synchronize()
             gpu = self._context._gpu
             vk = gpu.vk
+            if self._mapped is not None:
+                vk.vkUnmapMemory(gpu.device, self._vk_memory)
+                self._mapped = None
             vk.vkDestroyBuffer(gpu.device, self._vk_buffer, None)
             vk.vkFreeMemory(gpu.device, self._vk_memory, None)
 
