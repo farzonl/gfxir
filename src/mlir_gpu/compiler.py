@@ -491,12 +491,22 @@ def _check_binary(path: Path, magic: bytes, minimum: int) -> None:
         raise CompileError(f"Compiler produced an invalid {path.suffix} binary: {path.name}.")
 
 
-def convert_dxil_to_metallib(dxil: Path, metallib: Path, entry_point: str, converter: str) -> None:
-    _run([
+def convert_dxil_to_metallib(
+    dxil: Path,
+    metallib: Path,
+    entry_point: str,
+    converter: str,
+    *,
+    minimum_gpu_family: str = "Metal3",
+) -> None:
+    cmd = [
         converter, str(dxil),
         f"--entry-point={entry_point}", f"--rename-entry-point={entry_point}",
-        "-o", str(metallib),
-    ])
+    ]
+    if minimum_gpu_family:
+        cmd.append(f"--minimum-gpu-family={minimum_gpu_family}")
+    cmd.extend(["-o", str(metallib)])
+    _run(cmd)
     _check_binary(metallib, b"MTLB", 16)
 
 
@@ -561,7 +571,7 @@ def _compile_stage(
         return output.name
     unsigned = directory / f"{stem}.unsigned.dxil"
     dxil = directory / f"{stem}.dxil"
-    _run([tools["llc"], "-O0", "-filetype=obj", str(output), "-o", str(unsigned)])
+    _run([tools["llc"], "-O2", "-filetype=obj", str(output), "-o", str(unsigned)])
     _check_binary(unsigned, b"DXBC", 32)
     _run([tools["dxv"], str(unsigned), "-o", str(dxil)])
     _check_binary(dxil, b"DXBC", 32)
