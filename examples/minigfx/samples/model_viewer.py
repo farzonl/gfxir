@@ -601,8 +601,6 @@ class ModelViewerApp(App):
     def update(self, dt: float) -> None:
         """Advance simulation time, orbit light vector, and update camera controller."""
         super().update(dt)
-        if self._window is not None and not self._window.poll_and_sync(self):
-            return
 
         # Enforce deterministic fixed time-step for headless offscreen rendering
         if self.offscreen:
@@ -868,12 +866,14 @@ class ModelViewerApp(App):
 
         return commands
 
+    def resize(self, width: int, height: int) -> None:
+        """Keep the projection aspect ratio in sync with drawable pixels."""
+        super().resize(width, height)
+        self.camera.aspect = float(width) / float(height)
+
     def cleanup(self) -> None:
         """Release allocated renderer and engine resources."""
         try:
-            if self._window is not None:
-                self._window.close()
-                self._window = None
             if self.output_path and self.last_rendered_image is not None:
                 self.save_png(self.output_path, self.last_rendered_image)
         finally:

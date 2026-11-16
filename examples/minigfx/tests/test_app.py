@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import examples.minigfx as minigfx
 from examples.minigfx.app import App, get_default_target, main
@@ -181,6 +181,108 @@ class TestAppLifecycle(unittest.TestCase):
         self.assertEqual(
             app.events, ["startup", "update:0", "render:0", "update:1", "render:1", "cleanup"]
         )
+
+    def test_stop_in_startup_prevents_frames(self):
+        class StopStartupApp(RecordingApp):
+            def startup(self):
+                super().startup()
+                self.stop()
+
+        app = StopStartupApp(App.parse_args(["--frames", "2"]))
+        self.assertEqual(app.run(), 0)
+        self.assertEqual(app.events, ["startup", "cleanup"])
+        self.assertEqual(app.frame_count, 0)
+
+
+class TestAppWindow(unittest.TestCase):
+    def test_events_and_resize_precede_frame_and_close_stops_loop(self):
+        app = RecordingApp(App.parse_args(["--frames", "5"]))
+        window = Mock()
+        app._window = window
+
+        def poll(app):
+            app.events.append("poll")
+            if app.frame_count == 0:
+                app.resize(1600, 900)
+                return True
+            return False
+
+        window.poll_and_sync.side_effect = poll
+        self.assertEqual(app.run(), 0)
+        self.assertEqual(app.events, [
+            "startup", "poll", "update:0", "render:0", "poll", "cleanup",
+        ])
+        self.assertEqual((app.width, app.height), (1600, 900))
+        self.assertEqual(app.frame_count, 1)
+        window.close.assert_called_once_with()
+        self.assertIsNone(app._window)
+
+    def test_window_closes_even_when_cleanup_hook_raises(self):
+        class FailCleanupApp(RecordingApp):
+            def cleanup(self):
+                super().cleanup()
+                raise RuntimeError("cleanup failure")
+
+        app = FailCleanupApp(App.parse_args(["--frames", "1"]))
+        window = Mock()
+        app._window = window
+        with self.assertRaisesRegex(RuntimeError, "cleanup failure"):
+            app.run()
+        window.close.assert_called_once_with()
+        self.assertFalse(app.is_running)
+
+    def test_poll_failure_closes_window_and_propagates(self):
+        app = RecordingApp(App.parse_args(["--frames", "1"]))
+        window = Mock()
+        window.poll_and_sync.side_effect = RuntimeError("event failure")
+        app._window = window
+        with self.assertRaisesRegex(RuntimeError, "event failure"):
+            app.run()
+        self.assertEqual(app.events, ["startup", "cleanup"])
+        window.close.assert_called_once_with()
+
+    def test_window_adapter_waits_for_restore_then_resizes(self):
+        from examples.minigfx.window import InteractiveWindow
+
+        app = App()
+        app.is_running = True
+        window = InteractiveWindow.__new__(InteractiveWindow)
+        window.window = object()
+        window.glfw = Mock()
+        window.glfw.window_should_close.return_value = False
+        window.glfw.get_framebuffer_size.side_effect = [(0, 0), (1920, 1080)]
+        self.assertTrue(window.poll_and_sync(app))
+        window.glfw.wait_events_timeout.assert_called_once_with(0.1)
+        self.assertEqual((app.width, app.height), (1920, 1080))
+
+    def test_minimized_window_can_close_without_a_frame(self):
+        from examples.minigfx.window import InteractiveWindow
+
+        app = App()
+        app.is_running = True
+        window = InteractiveWindow.__new__(InteractiveWindow)
+        window.window = object()
+        window.glfw = Mock()
+        window.glfw.window_should_close.side_effect = [False, True]
+        window.glfw.get_framebuffer_size.return_value = (0, 0)
+        self.assertFalse(window.poll_and_sync(app))
+        self.assertFalse(app.is_running)
+        self.assertEqual((app.width, app.height), (1280, 720))
+
+    def test_native_teardown_failure_still_destroys_os_window(self):
+        from examples.minigfx.window import InteractiveWindow
+
+        window = InteractiveWindow.__new__(InteractiveWindow)
+        handle = window.window = object()
+        window.glfw = Mock()
+        window.backend = Mock()
+        window.backend.destroy.side_effect = RuntimeError("GPU teardown failure")
+        with self.assertRaisesRegex(RuntimeError, "GPU teardown failure"):
+            window.close()
+        window.glfw.destroy_window.assert_called_once_with(handle)
+        window.glfw.terminate.assert_called_once_with()
+        self.assertIsNone(window.window)
+        self.assertIsNone(window.backend)
 
 
 class TestAppTiming(unittest.TestCase):
