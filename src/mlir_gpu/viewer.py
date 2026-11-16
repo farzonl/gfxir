@@ -102,13 +102,13 @@ class PostProcess:
 
     program: GraphicsProgram
     texture: str = "scene_color"
-    format: str = "rgba32_sfloat"
+    format: str = "rgba16_sfloat"
 
     def __post_init__(self) -> None:
         if not isinstance(self.program, GraphicsProgram):
             raise ViewerError("Post processing requires a GraphicsProgram.")
-        if self.format not in ("rgba8_unorm", "rgba32_sfloat"):
-            raise ViewerError("Render targets support rgba8_unorm and rgba32_sfloat only.")
+        if self.format not in ("rgba8_unorm", "rgba16_sfloat", "rgba32_sfloat"):
+            raise ViewerError("Render targets support rgba8_unorm, rgba16_sfloat, and rgba32_sfloat only.")
         p = self.program
         if p.post_process is not None:
             raise ViewerError("Nested post passes are not supported.")
@@ -141,7 +141,7 @@ class PostProcess:
 
 def with_post_process(
     scene: GraphicsProgram, post: GraphicsProgram, *,
-    texture: str = "scene_color", format: str = "rgba32_sfloat",
+    texture: str = "scene_color", format: str = "rgba16_sfloat",
 ) -> GraphicsProgram:
     """Render scene into a GPU texture, then post into the final output."""
     if scene.target != post.target:
@@ -2615,6 +2615,7 @@ def _prepare_vulkan_post(gpu, resources, scene, width, height):
     vk = gpu.vk
     format = {
         "rgba8_unorm": vk.VK_FORMAT_R8G8B8A8_UNORM,
+        "rgba16_sfloat": vk.VK_FORMAT_R16G16B16A16_SFLOAT,
         "rgba32_sfloat": vk.VK_FORMAT_R32G32B32A32_SFLOAT,
     }[post.format]
     features = vk.vkGetPhysicalDeviceFormatProperties(gpu.physical, format).optimalTilingFeatures
