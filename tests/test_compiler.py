@@ -292,6 +292,8 @@ class CompilerTests(unittest.TestCase):
                 calls = []
 
                 def tool(arguments):
+                    if arguments[-1] == "--help":
+                        return "--forceTextureArray"
                     calls.append(arguments)
                     if arguments[0] == "gfx-compile":
                         source = json.loads(Path(arguments[1]).read_text())
@@ -438,6 +440,8 @@ class CompilerTests(unittest.TestCase):
                 calls = []
 
                 def tool(arguments):
+                    if arguments[-1] == "--help":
+                        return "--forceTextureArray"
                     calls.append(arguments)
                     if arguments[0] == "gfx-compile":
                         source = json.loads(Path(arguments[1]).read_text())
