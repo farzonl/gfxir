@@ -16,6 +16,7 @@ if str(EXAMPLES_DIR) not in sys.path:
 
 import gfxpy as gp  # noqa: E402
 from gfxpy.gpu_backend import GfxIRComputeBackend  # noqa: E402
+from gfxpy.limits import ComputeLimits  # noqa: E402
 from mlir_gpu.compute_runtime import ComputeContext, PersistentBuffer, PersistentPipeline  # noqa: E402
 
 
@@ -238,6 +239,27 @@ class _LiveBackendMixin:
     target_name: str
     provider: str | None = None
 
+    def test_elementwise_operations_across_dispatch_rows(self) -> None:
+        with gp.device(self.target_name, provider=self.provider) as dev:
+            self.addCleanup(dev.close)
+            with mock.patch.object(
+                GfxIRComputeBackend, "limits", new_callable=mock.PropertyMock,
+                return_value=ComputeLimits(max_workgroup_count=(4, 2, 1)),
+            ):
+                for n in (256, 257, 511):
+                    with self.subTest(length=n):
+                        values = [float(i) for i in range(n)]
+                        x = gp.array(values)
+                        y = gp.full(n, 2.0)
+                        self.assertEqual(y.tolist(), [2.0] * n)
+                        self.assertEqual(gp.copy(x).tolist(), values)
+                        self.assertEqual((x + y).tolist(), [v + 2.0 for v in values])
+                        self.assertEqual((x * y).tolist(), [v * 2.0 for v in values])
+                        self.assertEqual((x + 1.0).tolist(), [v + 1.0 for v in values])
+                        self.assertEqual((x * 1.25).tolist(), [v * 1.25 for v in values])
+                        fused = gp.fuse(lambda a, b: a * 1.25 + b)
+                        self.assertEqual(fused(x, y).tolist(), [v * 1.25 + 2.0 for v in values])
+
     def test_bounds_checked_lengths_and_chained_expression(self) -> None:
         lengths = [0, 1, 63, 64, 65, 137, 1000]
         with gp.device(self.target_name, provider=self.provider) as dev:
@@ -314,6 +336,15 @@ class TestGfxPyDirectXLive(_LiveBackendMixin, unittest.TestCase):
 class TestGfxPyNacelleLive(_LiveBackendMixin, unittest.TestCase):
     target_name = "directx"
     provider = "nacelle"
+
+    def test_four_million_element_saxpy(self) -> None:
+        length = 4_194_304
+        with gp.device("directx", provider="nacelle") as dev:
+            self.addCleanup(dev.close)
+            x = gp.full(length, 1.0)
+            y = gp.full(length, 2.0)
+            z = 1.25 * x + y
+            self.assertEqual(z.tobytes(), struct.pack("<f", 3.25) * length)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from __future__ import annotations
 from .array import GfxArray, _is_scalar_number, _normalize_shape, array, empty
 from .dtypes import DType, float32, resolve_dtype
 from .kernels import WORKGROUP_SIZE_1D
-from .limits import coerce_float32, get_backend_limits, validate_1d_dispatch, validate_array_allocation
+from .limits import coerce_float32, get_backend_limits, validate_array_allocation, validate_elementwise_dispatch
 from .runtime import Device, current_device
 from .targets import CrossDeviceError
 
@@ -20,7 +20,7 @@ def _output(
     limits = get_backend_limits(dev.backend)
     size = validate_array_allocation(resolved_shape, resolved_dtype.itemsize, limits)
     if size:
-        validate_1d_dispatch(size, WORKGROUP_SIZE_1D[0], limits, op="constructor")
+        validate_elementwise_dispatch(size, WORKGROUP_SIZE_1D[0], limits, op="constructor")
     return empty(resolved_shape, resolved_dtype, device=dev)
 
 

@@ -16,6 +16,7 @@ from .limits import (
     get_backend_limits,
     validate_1d_dispatch,
     validate_array_allocation,
+    validate_elementwise_dispatch,
     validate_matmul_dispatch,
 )
 from .runtime import ComputeBackend, ComputeBuffer, Device, current_device
@@ -282,7 +283,7 @@ class GfxArray:
             backend = self._device.backend
             limits = get_backend_limits(backend)
             validate_array_allocation(self._shape, self._dtype.itemsize, limits)
-            validate_1d_dispatch(self._size, WORKGROUP_SIZE_1D[0], limits, op=f"binary_{op}")
+            validate_elementwise_dispatch(self._size, WORKGROUP_SIZE_1D[0], limits, op=f"binary_{op}")
             out_buf = _allocate_output(backend, self.nbytes)
             try:
                 backend.binary_op(op, self._buffer, other._buffer, out_buf, self._size)
@@ -299,7 +300,7 @@ class GfxArray:
             backend = self._device.backend
             limits = get_backend_limits(backend)
             validate_array_allocation(self._shape, self._dtype.itemsize, limits)
-            validate_1d_dispatch(self._size, WORKGROUP_SIZE_1D[0], limits, op=f"scalar_{op}")
+            validate_elementwise_dispatch(self._size, WORKGROUP_SIZE_1D[0], limits, op=f"scalar_{op}")
             out_buf = _allocate_output(backend, self.nbytes)
             try:
                 backend.scalar_op(op, self._buffer, scalar_f32, out_buf, self._size)

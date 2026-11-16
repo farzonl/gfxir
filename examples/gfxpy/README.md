@@ -208,7 +208,10 @@ use `rtol=1e-3`, `atol=1e-3`; `maxAbsError` is also recorded.
     (`I32_MAX = 2_147_483_647`). Before allocation, compilation, or dispatch,
     `gfxpy` validates:
     - Each dimension `d <= I32_MAX` and total element count `size <= I32_MAX`.
-    - Rounded-up 1D invocation index `grid_x * 64 - 1 <= I32_MAX`.
+    - Rounded-up invocation indices fit in `I32_MAX`. Elementwise operations
+      (including fill, copy, and fusion) spill into the dispatch Y axis when
+      the X workgroup limit is reached, using a checked flattened index
+      `grid_x * grid_y * 64 - 1 <= I32_MAX`. Reductions retain 1D dispatch.
     - MatMul dimensions `m, n, k <= I32_MAX`, operand/output sizes
       `m * k, k * n, m * n <= I32_MAX`, max linear offsets `< I32_MAX`, and
       rounded-up tile coordinates `grid_x * 16 - 1 <= I32_MAX`,
