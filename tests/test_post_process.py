@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 from mlir_gpu import (
     DepthStencil, Draw, FrameParameters, Pipeline, Sampler, Target, Texture2D, compile_pipeline,
-    fragment, fullscreen_uv_vertex, sample_texture, vec4,
+    fragment, fullscreen_uv_vertex, load_texture, sample_texture, vec4,
 )
 from mlir_gpu.viewer import (
     GraphicsProgram, PostProcess, Shader, ViewerError, _Vulkan, _directx_shaders, _metal_libraries,
@@ -30,6 +30,12 @@ def hdr_scene(uv, frame: FrameParameters):
 @fragment
 def post_fragment(uv, scene_color: Texture2D[0], scene_sampler: Sampler[1]):
     color = sample_texture(scene_color, scene_sampler, uv)
+    return vec4(color.x / (1.0 + color.x), color.y / (1.0 + color.y), color.z / (1.0 + color.z), color.w)
+
+
+@fragment
+def post_load_fragment(uv, frame: FrameParameters, scene_color: Texture2D[0]):
+    color = load_texture(scene_color, (int(uv.x * frame.resolution.x), int(uv.y * frame.resolution.y)), 0)
     return vec4(color.x / (1.0 + color.x), color.y / (1.0 + color.y), color.z / (1.0 + color.z), color.w)
 
 
@@ -88,7 +94,7 @@ class PostProcessValidationTests(unittest.TestCase):
                 tools = Mock()
                 tools.find.return_value = "viewer"
                 with prepare(program, tools) as (directory, arguments):
-                    self.assertEqual(arguments[arguments.index("--color-format") + 1], "rgba32_sfloat")
+                    self.assertEqual(arguments[arguments.index("--color-format") + 1], "rgba16_sfloat")
                     spec = json.loads(Path(arguments[arguments.index("--post-spec") + 1]).read_text())
                     for key in ("vertex", "fragment", "resources"):
                         self.assertTrue(Path(spec[key]).exists())
@@ -151,6 +157,37 @@ class PostProcessGpuTests(unittest.TestCase):
             with _offscreen_renderer(program, 8, 6, True) as render:
                 for time in (0.0, 2.0, 0.5):
                     self._assert_pixels(render(time), time)
+
+    def test_rgba32_sampling_renders_or_reports_missing_metal_capability(self):
+        for target, render in self._backends():
+            with self.subTest(target=target, renderer=render), tempfile.TemporaryDirectory() as tmp:
+                program = self._compile(Path(tmp), target)
+                program = replace(program, post_process=replace(program.post_process, format="rgba32_sfloat"))
+                kwargs = {"toolchain": TOOLS} if render is not render_offscreen else {}
+                try:
+                    image = render(program, 11, 7, validation=True, time=0.0, **kwargs)
+                except ViewerError as error:
+                    if render is not render_metal_offscreen:
+                        raise
+                    self.assertIn(
+                        "Sampling rgba32_sfloat render targets requires supports32BitFloatFiltering", str(error)
+                    )
+                else:
+                    self._assert_pixels(image, 0.0)
+
+    def test_rgba32_texel_load_does_not_require_filtering(self):
+        for target, render in self._backends():
+            with self.subTest(target=target, renderer=render), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                scene_path = compile_pipeline(
+                    Pipeline(fullscreen_uv_vertex, hdr_scene), target, directory / "scene", TOOLS,
+                )
+                post_path = compile_pipeline(
+                    Pipeline(fullscreen_uv_vertex, post_load_fragment), target, directory / "post", TOOLS,
+                )
+                program = with_post_process(load_program(scene_path), load_program(post_path), format="rgba32_sfloat")
+                kwargs = {"toolchain": TOOLS} if render is not render_offscreen else {}
+                self._assert_pixels(render(program, 11, 7, validation=True, time=1.5, **kwargs), 1.5)
 
     def test_emissive_demo_hdr_highlights_differ_from_clipped_ldr(self):
         from examples.basics.post_process import make_post, make_scene

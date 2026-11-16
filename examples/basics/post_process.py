@@ -181,7 +181,7 @@ def main():
         target = Target(args.target)
         scene = compile_pipeline(make_scene(args.view == "split"), target, directory / "scene", tools)
         post = compile_pipeline(make_post(args.view, args.exposure), target, directory / "post", tools)
-        format = "rgba8_unorm" if args.view == "ldr" else "rgba32_sfloat"
+        format = "rgba8_unorm" if args.view == "ldr" else "rgba16_sfloat"
         program = with_post_process(load_program(scene), load_program(post), format=format)
         print("Left: RGBA8 LDR clipping simulation. Right: floating-point HDR, then tonemapped."
               if args.view == "split" else f"View: {args.view.upper()}.")

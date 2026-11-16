@@ -382,6 +382,9 @@ static MetalStageResources loadStageResources(id<MTLDevice> device, id<MTLComman
 
     // Build SRV/UAV descriptor table matching GfxToLLVMPass register ordering:
     // UAV buffers sorted by (set, binding), then read-only buffers + 2D textures sorted together by (set, binding).
+    if (renderTarget && renderTarget.pixelFormat == MTLPixelFormatRGBA32Float &&
+        !stage.samplers.empty() && !device.supports32BitFloatFiltering)
+        throw failure(@"Sampling rgba32_sfloat render targets requires supports32BitFloatFiltering; use rgba16_sfloat or load_texture");
     struct OrderedSlot {
         uint32_t set = 0;
         uint32_t binding = 0;
@@ -1336,6 +1339,7 @@ int main(int argc, char** argv) {
                 if (arguments.count("--color-format")) {
                     const auto& fmt = arguments.at("--color-format");
                     if (fmt == "rgba32_sfloat") colorFormat = MTLPixelFormatRGBA32Float;
+                    else if (fmt == "rgba16_sfloat") colorFormat = MTLPixelFormatRGBA16Float;
                     else if (fmt == "rgba8_unorm") colorFormat = MTLPixelFormatRGBA8Unorm;
                     else throw std::runtime_error("Unsupported render target format: " + fmt);
                     if (!arguments.count("--post-spec"))
