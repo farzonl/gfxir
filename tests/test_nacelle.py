@@ -9,6 +9,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from contextlib import ExitStack, nullcontext
 from unittest.mock import Mock, patch
 
 from mlir_gpu import (
@@ -17,7 +18,7 @@ from mlir_gpu import (
 )
 from mlir_gpu.viewer import (
     ComputeProgram, GraphicsProgram, RenderedImage, Shader, ViewerError, _check_nacelle_device,
-    _offscreen_renderer, _validate_provider, compute_session, dispatch_compute,
+    _offscreen_renderer, _pixel_commands, _validate_provider, compute_session, dispatch_compute,
     get_device_capabilities, load_compute_program, load_program, render_directx_offscreen,
     render_offscreen, show_directx_window, with_post_process,
 )
@@ -118,16 +119,101 @@ class NacelleProviderTests(unittest.TestCase):
                         pass
                     self.assertEqual(session.call_args.kwargs["provider"], "nacelle")
 
-    def test_wrong_backend_window_and_driver_fallback_rejected(self):
+    def test_wrong_backend_and_driver_fallback_rejected(self):
         _validate_provider("nacelle", "directx")
         for backend in ("vulkan", "metal"):
             with self.assertRaisesRegex(ValueError, "not supported"):
                 _validate_provider("nacelle", backend)
         with self.assertRaisesRegex(ViewerError, "fallback rejected"):
             _check_nacelle_device("nacelle", "Microsoft Basic Render Driver")
+
+    def test_live_viewer_routes_nacelle_without_converting_dxil(self):
         program = GraphicsProgram(Shader("main", b"DXBC"), Shader("main", b"DXBC"), target="directx")
-        with self.assertRaisesRegex(ViewerError, "headless"):
-            show_directx_window(program, provider="nacelle")
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform), patch("mlir_gpu.viewer.sys.platform", platform), \
+                 patch("mlir_gpu.viewer._show_vulkan_window", return_value=3) as window, \
+                 patch("mlir_gpu.viewer._directx_offscreen_renderer") as renderer:
+                show_directx_window(program, 80, 60, frames=3, time=1.25, provider="nacelle", toolchain=TOOLS)
+                self.assertEqual(window.call_args.args, (program, 80, 60, 3, False, 1.25))
+                with window.call_args.kwargs["renderer"](160, 120):
+                    pass
+                renderer.assert_called_once_with(program, 160, 120, False, TOOLS, provider="nacelle")
+
+    def test_live_nacelle_rejects_invalid_options_before_opening_window(self):
+        program = GraphicsProgram(Shader("main", b"DXBC"), Shader("main", b"DXBC"), target="directx")
+        with patch("mlir_gpu.viewer.sys.platform", "linux"), patch("mlir_gpu.viewer._binding") as binding:
+            for frames in (-1, True, 1.5):
+                with self.assertRaisesRegex(ViewerError, "Frame count"):
+                    show_directx_window(program, frames=frames, provider="nacelle")
+            with self.assertRaisesRegex(ViewerError, "does not provide D3D12 validation"):
+                show_directx_window(program, validation=True, provider="nacelle")
+            with self.assertRaisesRegex(ViewerError, "requires DirectX artifacts"):
+                show_directx_window(
+                    GraphicsProgram(program.vertex, program.fragment, target="metal"), provider="nacelle",
+                )
+            with self.assertRaises(ViewerError):
+                show_directx_window(program, time=float("nan"), provider="nacelle")
+            binding.assert_not_called()
+
+    def test_pixel_commands_upload_rgba_or_bgra_and_validate_frame_size(self):
+        rgba = bytes((240, 32, 96, 255, 12, 24, 48, 255))
+        for bgra in (False, True):
+            with self.subTest(bgra=bgra), ExitStack() as resources:
+                gpu = Mock()
+                vk = gpu.vk
+                vk.VK_FORMAT_R8G8B8A8_UNORM = 1
+                vk.VK_FORMAT_B8G8R8A8_UNORM = 2
+                gpu.host_buffer.return_value = (object(), object())
+                vk.vkAllocateCommandBuffers.return_value = [object(), object()]
+                render = Mock(return_value=RenderedImage(2, 1, rgba, "Nacelle"))
+                commands, record = _pixel_commands(
+                    gpu, resources, [object(), object()], 2 if bgra else 1, 2, 1, render,
+                )
+                self.assertEqual(len(commands), 2)
+                record(1, 1.25)
+                render.assert_called_once_with(1.25)
+                expected = bytes((96, 32, 240, 255, 48, 24, 12, 255)) if bgra else rgba
+                vk.ffi.memmove.assert_called_once_with(vk.vkMapMemory.return_value, expected, 8)
+                self.assertEqual(vk.vkCmdCopyBufferToImage.call_count, 2)
+                render.return_value = RenderedImage(1, 1, rgba[:4], "Nacelle")
+                with self.assertRaisesRegex(ViewerError, "surface extent"):
+                    record(0, 0)
+                self.assertEqual(vk.vkMapMemory.call_count, 1)
+
+    def test_live_nacelle_escape_and_worker_failure_release_window(self):
+        program = GraphicsProgram(Shader("main", b"DXBC"), Shader("main", b"DXBC"), target="directx")
+        for fail in (False, True):
+            with self.subTest(render_failure=fail):
+                glfw, gpu = Mock(), Mock()
+                glfw.get_framebuffer_size.return_value = (2, 1)
+                glfw.get_window_attrib.return_value = 0
+                glfw.KEY_ESCAPE, glfw.PRESS = 256, 1
+                glfw.window_should_close.return_value = False
+                if fail:
+                    glfw.get_key.return_value = 0
+                else:
+                    glfw.get_key.return_value = glfw.PRESS
+                    glfw.set_window_should_close.side_effect = lambda *_: setattr(
+                        glfw.window_should_close, "return_value", True,
+                    )
+                gpu.vk.ffi.new.return_value = [0]
+                for name in ("VkTimeout", "VkNotReady", "VkSuboptimalKhr", "VkErrorOutOfDateKhr"):
+                    setattr(gpu.vk, name, type(name, (Exception,), {}))
+                record = Mock(side_effect=ViewerError("Nacelle render failed"))
+                with patch("mlir_gpu.viewer.sys.platform", "linux"), \
+                     patch("mlir_gpu.viewer._binding", return_value=glfw), \
+                     patch("mlir_gpu.viewer._api_errors", return_value=nullcontext()), \
+                     patch("mlir_gpu.viewer._Vulkan", return_value=gpu), \
+                     patch("mlir_gpu.viewer._swapchain", return_value=(object(), [object()], object(), [object()], record)):
+                    if fail:
+                        with self.assertRaisesRegex(ViewerError, "Nacelle render failed"):
+                            show_directx_window(program, provider="nacelle")
+                        record.assert_called_once()
+                    else:
+                        show_directx_window(program, provider="nacelle")
+                        record.assert_not_called()
+                glfw.destroy_window.assert_called_once_with(glfw.create_window.return_value)
+                glfw.terminate.assert_called_once_with()
 
     def test_offscreen_rejects_non_nacelle_readback(self):
         program = GraphicsProgram(Shader("main", b"DXBC"), Shader("main", b"DXBC"), target="directx")
@@ -296,6 +382,66 @@ class NacelleExecutionTests(unittest.TestCase):
     "Set MLIR_GPU_TEST_NACELLE=1 and MLIR_GPU_TEST_WINDOW=1 in a desktop session",
 )
 class NacelleWindowTests(unittest.TestCase):
+    def test_generic_viewer_nacelle_animation_fixed_time_resize_and_minimize(self):
+        import glfw
+        from mlir_gpu.viewer import _pixel_commands as pixel_commands
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = compile_pipeline(
+                Pipeline(fullscreen_uv_vertex, hdr_scene), Target.DIRECTX, Path(tmp) / "scene", TOOLS,
+            )
+            program = load_program(manifest)
+            for frozen_time in (1.25, None):
+                captures = []
+                original_size = glfw.get_framebuffer_size
+                original_attrib = glfw.get_window_attrib
+                resized = False
+                iconified = True
+
+                def resize(window):
+                    nonlocal resized
+                    if len(captures) == 1 and not resized:
+                        resized = True
+                        glfw.set_window_size(window, 96, 72)
+                        glfw.poll_events()
+                    return original_size(window)
+
+                def attrib(window, attribute):
+                    nonlocal iconified
+                    if attribute == glfw.ICONIFIED and iconified:
+                        iconified = False
+                        return 1
+                    return original_attrib(window, attribute)
+
+                def capture(gpu, resources, images, format, width, height, render):
+                    def record(elapsed):
+                        image = render(elapsed)
+                        captures.append((elapsed, image))
+                        return image
+                    return pixel_commands(gpu, resources, images, format, width, height, record)
+
+                with self.subTest(time=frozen_time), \
+                     patch.object(glfw, "get_framebuffer_size", side_effect=resize), \
+                     patch.object(glfw, "get_window_attrib", side_effect=attrib), \
+                     patch.object(glfw, "wait_events_timeout", wraps=glfw.wait_events_timeout) as wait, \
+                     patch("mlir_gpu.viewer._pixel_commands", side_effect=capture):
+                    show_directx_window(
+                        program, 80, 60, frames=3, time=frozen_time, provider="nacelle", toolchain=TOOLS,
+                    )
+                self.assertEqual(len(captures), 3)
+                self.assertNotEqual(
+                    (captures[0][1].width, captures[0][1].height),
+                    (captures[-1][1].width, captures[-1][1].height),
+                )
+                wait.assert_any_call(0.1)
+                for elapsed, image in captures:
+                    self.assertEqual(image.device, "Nacelle")
+                    self.assertEqual(len(image.rgba), image.width * image.height * 4)
+                    if frozen_time is not None:
+                        self.assertEqual(elapsed, frozen_time)
+                if frozen_time is None:
+                    self.assertGreater(captures[-1][0], captures[0][0])
+
     def test_live_glfw_input_resize_and_capture(self):
         from examples.minigfx.samples.model_viewer import ModelViewerApp
 

@@ -233,8 +233,29 @@ python3 -m examples.minigfx --target directx --provider nacelle \
 Nacelle executes the scene's DXIL, including textures, depth, HDR, and HUD draws.
 The existing Metal/macOS or Vulkan/Linux backend only copies the completed RGBA
 frame into the GLFW window. Live mode requires a desktop and a working platform
-presenter; it adds no SDL dependency. The generic `mlir_gpu.viewer` Nacelle path
-remains offscreen-only.
+presenter; it adds no SDL dependency.
+
+The generic viewer also supports **live Nacelle rendering** on Linux and macOS:
+
+```sh
+python3 -m mlir_gpu.viewer build/triangle-nacelle/pipeline.json \
+  --provider nacelle --width 320 --height 240 -frames 0
+# Or use an already-compiled DirectX Light Cycle:
+.venv/bin/mlir-gpu-view build/light-cycle-directx/pipeline.json \
+  --provider nacelle --width 320 --height 240 -frames 0
+```
+
+This path uses the viewer's Vulkan swapchain only to display Nacelle's RGBA
+readback; it does not translate DXIL to SPIR-V or Metal. Install the viewer extra
+and a Vulkan loader/driver (for example MoltenVK on macOS, with
+`DYLD_LIBRARY_PATH=/usr/local/lib` if needed). Vulkan ICD environment variables
+select the presentation driver, not the DXIL execution provider.
+Resize/minimize and **Esc** work as in the Vulkan viewer. Use `--frames N` to
+close after N presented frames, or `--time 1.25` to freeze shader time.
+Window events are processed while the CPU renders; closing waits for the current
+render to finish. Rendering uses the existing subprocess readback path, so start
+at a small resolution, especially for CPU-heavy raymarchers. PNG/MP4 output
+remains headless, and Nacelle validation remains unsupported.
 
 The HDR example can also run directly:
 
