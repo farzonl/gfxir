@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import struct
 
@@ -142,6 +142,34 @@ def validate_1d_dispatch(
             f"exceeds backend max_workgroup_count[0] ({max_wg_x})."
         )
     return (grid_x, 1, 1)
+
+
+def validate_elementwise_dispatch(
+    length: int,
+    workgroup_size_x: int,
+    limits: ComputeLimits,
+    *,
+    op: str = "dispatch",
+) -> tuple[int, int, int]:
+    """Spread linear elementwise work across X/Y within backend and i32 limits."""
+    groups, _, _ = validate_1d_dispatch(
+        length, workgroup_size_x,
+        replace(limits, max_workgroup_count=(U32_MAX, U32_MAX, U32_MAX)),
+        op=op,
+    )
+    max_x, max_y, max_z = limits.max_workgroup_count
+    if min(max_x, max_y, max_z) < 1:
+        raise IndexingLimitError(f"{op} requires positive backend workgroup counts.")
+    grid_x = min(groups, max_x)
+    grid_y = (groups + grid_x - 1) // grid_x
+    if grid_y > max_y:
+        raise IndexingLimitError(
+            f"{op} elementwise grid ({grid_x}, {grid_y}, 1) exceeds backend "
+            f"max_workgroup_count {limits.max_workgroup_count}."
+        )
+    if grid_x * grid_y * workgroup_size_x - 1 > I32_MAX:
+        raise IndexingLimitError(f"{op} flattened invocation index exceeds signed 32-bit limit ({I32_MAX}).")
+    return (grid_x, grid_y, 1)
 
 
 def validate_matmul_dispatch(

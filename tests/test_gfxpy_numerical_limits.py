@@ -21,6 +21,7 @@ from gfxpy.limits import (  # noqa: E402
     I32_MAX,
     ComputeLimits,
     validate_1d_dispatch,
+    validate_elementwise_dispatch,
     validate_matmul_dispatch,
 )
 
@@ -187,7 +188,7 @@ class TestIndexingAndResourceLimits(unittest.TestCase):
         limits = ComputeLimits(max_workgroup_count=(4, 2, 1))
         backend = _SpyLimitBackend("directx", limits=limits)
         with gp.device("directx", backend=backend) as dev:
-            # 1D workgroup size is 64 -> 4 workgroups = 256 elements allowed; 257 rejected.
+            # Reductions remain 1D; elementwise operations can also use the Y axis.
             a_ok = gp.empty(256, device=dev)
             b_ok = gp.empty(256, device=dev)
             _ = a_ok + b_ok
@@ -195,8 +196,13 @@ class TestIndexingAndResourceLimits(unittest.TestCase):
             _ = a_ok.sum()
             _ = gp.fuse(lambda x: x * 2.0 + 1.0)(a_ok)
 
-            a_bad = gp.empty(257, device=dev)
-            b_bad = gp.empty(257, device=dev)
+            a_two_rows = gp.empty(257, device=dev)
+            _ = a_two_rows + 1.0
+            with self.assertRaises(gp.IndexingLimitError):
+                a_two_rows.sum()
+
+            a_bad = gp.empty(513, device=dev)
+            b_bad = gp.empty(513, device=dev)
             allocs_before = len(backend.allocations)
             dispatches_before = len(backend.dispatches)
 
@@ -226,6 +232,17 @@ class TestIndexingAndResourceLimits(unittest.TestCase):
                 _ = m_ok_a @ m_bad_cols
             self.assertEqual(len(backend.allocations), allocs_before)
             self.assertEqual(len(backend.dispatches), dispatches_before)
+
+    def test_elementwise_dispatch_spills_into_y_without_relaxing_limits(self) -> None:
+        limits = ComputeLimits(max_workgroup_count=(65535, 65535, 65535))
+        self.assertEqual(validate_elementwise_dispatch(65535 * 64, 64, limits), (65535, 1, 1))
+        self.assertEqual(validate_elementwise_dispatch(4_194_304, 64, limits), (65535, 2, 1))
+        with self.assertRaises(gp.IndexingLimitError):
+            validate_elementwise_dispatch(513, 64, ComputeLimits(max_workgroup_count=(4, 2, 1)))
+        with self.assertRaises(gp.IndexingLimitError):
+            validate_elementwise_dispatch(I32_MAX, 64, limits)
+        with self.assertRaises(gp.IndexingLimitError):
+            validate_elementwise_dispatch(I32_MAX, 96, ComputeLimits())
 
     def test_rounded_up_invocation_index_overflow_rejected(self) -> None:
         # length <= I32_MAX, but rounding up to non-power-of-two workgroup_size_x=96 makes gid.x > I32_MAX.

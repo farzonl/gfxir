@@ -41,6 +41,7 @@ from .limits import (
     I32_MAX,
     default_limits_for_target,
     validate_1d_dispatch,
+    validate_elementwise_dispatch,
     validate_matmul_dispatch,
 )
 from .runtime import ComputeBackend, ComputeBuffer
@@ -230,11 +231,11 @@ class GfxIRComputeBackend(ComputeBackend):
         assert isinstance(lhs, PersistentBuffer)
         assert isinstance(rhs, PersistentBuffer)
         assert isinstance(out, PersistentBuffer)
-        grid = validate_1d_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op=f"binary_{op}")
+        grid = validate_elementwise_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op=f"binary_{op}")
         pipe = self._get_or_compile(f"binary_{op}", BINARY_KERNELS[op])
         pipe.dispatch(
             {"lhs": lhs, "rhs": rhs, "out": out},
-            parameters={"n": length},
+            parameters={"n": length, "row_stride": grid[0] * WORKGROUP_SIZE_1D[0] if grid[1] > 1 else 0},
             grid=grid,
         )
 
@@ -250,31 +251,43 @@ class GfxIRComputeBackend(ComputeBackend):
             raise ValueError(f"Unsupported scalar op {op!r}.")
         assert isinstance(lhs, PersistentBuffer)
         assert isinstance(out, PersistentBuffer)
-        grid = validate_1d_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op=f"scalar_{op}")
+        grid = validate_elementwise_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op=f"scalar_{op}")
         pipe = self._get_or_compile(f"scalar_{op}", SCALAR_KERNELS[op])
         pipe.dispatch(
             {"lhs": lhs, "out": out},
-            parameters={"n": length, "scalar": float(scalar)},
+            parameters={
+                "n": length,
+                "row_stride": grid[0] * WORKGROUP_SIZE_1D[0] if grid[1] > 1 else 0,
+                "scalar": float(scalar),
+            },
             grid=grid,
         )
 
     def fill(self, out: ComputeBuffer, value: float, length: int) -> None:
         assert isinstance(out, PersistentBuffer)
-        grid = validate_1d_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op="fill")
+        grid = validate_elementwise_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op="fill")
         pipe = self._get_or_compile("fill", fill_f32_kernel)
         # A scalar buffer preserves NaN/Inf, which ParameterBlock floats reject.
         scalar = self._ctx.create_buffer(4, initial_data=struct.pack("<f", value))
         try:
-            pipe.dispatch({"value": scalar, "out": out}, parameters={"n": length}, grid=grid)
+            pipe.dispatch(
+                {"value": scalar, "out": out},
+                parameters={"n": length, "row_stride": grid[0] * WORKGROUP_SIZE_1D[0] if grid[1] > 1 else 0},
+                grid=grid,
+            )
         finally:
             scalar.close()
 
     def copy_buffer(self, src: ComputeBuffer, out: ComputeBuffer, length: int) -> None:
         assert isinstance(src, PersistentBuffer)
         assert isinstance(out, PersistentBuffer)
-        grid = validate_1d_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op="copy")
+        grid = validate_elementwise_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op="copy")
         pipe = self._get_or_compile("copy", copy_f32_kernel)
-        pipe.dispatch({"lhs": src, "out": out}, parameters={"n": length}, grid=grid)
+        pipe.dispatch(
+            {"lhs": src, "out": out},
+            parameters={"n": length, "row_stride": grid[0] * WORKGROUP_SIZE_1D[0] if grid[1] > 1 else 0},
+            grid=grid,
+        )
 
     def fused_op(
         self,
@@ -316,8 +329,11 @@ class GfxIRComputeBackend(ComputeBackend):
                 artifact_subdir=subdir,
             )
 
-        grid = validate_1d_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op="fused_op")
-        params: dict[str, object] = {"n": length}
+        grid = validate_elementwise_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op="fused_op")
+        params: dict[str, object] = {
+            "n": length,
+            "row_stride": grid[0] * WORKGROUP_SIZE_1D[0] if grid[1] > 1 else 0,
+        }
         for idx, val in enumerate(scalars):
             params[f"s{idx}"] = float(val)
         pipe.dispatch(bindings, parameters=params, grid=grid)

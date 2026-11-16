@@ -26,8 +26,8 @@ from .kernels import WORKGROUP_SIZE_1D
 from .limits import (
     coerce_float32,
     get_backend_limits,
-    validate_1d_dispatch,
     validate_array_allocation,
+    validate_elementwise_dispatch,
 )
 from .targets import (
     BackendNotImplementedError,
@@ -195,7 +195,9 @@ def build_fused_compute_kernel(spec: FusedExpressionSpec, out_dir: Path) -> Any:
     digest = hashlib.sha256(spec.signature.encode("utf-8")).hexdigest()[:16]
     kernel_path = out_dir / f"fused_{digest}.py"
 
-    param_fields = [("n", Type.I32)] + [(f"s{i}", Type.F32) for i in range(spec.num_scalars)]
+    param_fields = [("n", Type.I32), ("row_stride", Type.I32)] + [
+        (f"s{i}", Type.F32) for i in range(spec.num_scalars)
+    ]
     params_block = ParameterBlock(f"gfxpy_fused_params_{digest}", tuple(param_fields))
 
     input_params = ",\n    ".join(
@@ -208,7 +210,7 @@ def build_fused_compute_kernel(spec: FusedExpressionSpec, out_dir: Path) -> Any:
         f'    out: Buffer[Type.F32, "write_only"],\n'
         f"    params: FusedParams,\n"
         f"):\n"
-        f"    idx = i32(global_invocation_id().x)\n"
+        f"    idx = i32(global_invocation_id().x) + i32(global_invocation_id().y) * params.row_stride\n"
         f"    if idx < params.n:\n"
         f"        out[idx] = {spec.expr_code}\n"
     )
@@ -303,7 +305,7 @@ def fuse(fn: Callable[..., Any]) -> Callable[..., GfxArray]:
 
         limits = get_backend_limits(backend)
         validate_array_allocation(first_array.shape, first_array.dtype.itemsize, limits)
-        validate_1d_dispatch(first_array.size, WORKGROUP_SIZE_1D[0], limits, op="fused_op")
+        validate_elementwise_dispatch(first_array.size, WORKGROUP_SIZE_1D[0], limits, op="fused_op")
         out_buf = _allocate_output(backend, first_array.nbytes)
         try:
             in_bufs = [arr._buffer for arr in input_arrays]

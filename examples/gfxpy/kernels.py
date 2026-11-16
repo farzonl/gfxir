@@ -26,13 +26,15 @@ UNROLLED_TILE_STEPS = tuple(range(TILE_DIM))
 
 BinaryElementwiseParams = ParameterBlock(
     "gfxpy_binary_params",
-    (("n", Type.I32),),
+    (("n", Type.I32), ("row_stride", Type.I32)),
 )
 
 ScalarElementwiseParams = ParameterBlock(
     "gfxpy_scalar_params",
-    (("n", Type.I32), ("scalar", Type.F32)),
+    (("n", Type.I32), ("row_stride", Type.I32), ("scalar", Type.F32)),
 )
+
+ReductionParams = ParameterBlock("gfxpy_reduce_params", (("n", Type.I32),))
 
 MatMulParams = ParameterBlock(
     "gfxpy_matmul_params",
@@ -51,7 +53,7 @@ def fill_f32_kernel(
     out: Buffer[Type.F32, "write_only"],
     params: BinaryElementwiseParams,
 ):
-    idx = i32(global_invocation_id().x)
+    idx = i32(global_invocation_id().x) + i32(global_invocation_id().y) * params.row_stride
     if idx < params.n:
         out[idx] = value[0]
 
@@ -62,7 +64,7 @@ def copy_f32_kernel(
     out: Buffer[Type.F32, "write_only"],
     params: BinaryElementwiseParams,
 ):
-    idx = i32(global_invocation_id().x)
+    idx = i32(global_invocation_id().x) + i32(global_invocation_id().y) * params.row_stride
     if idx < params.n:
         out[idx] = lhs[idx]
 
@@ -74,7 +76,7 @@ def add_f32_kernel(
     out: Buffer[Type.F32, "write_only"],
     params: BinaryElementwiseParams,
 ):
-    idx = i32(global_invocation_id().x)
+    idx = i32(global_invocation_id().x) + i32(global_invocation_id().y) * params.row_stride
     if idx < params.n:
         out[idx] = lhs[idx] + rhs[idx]
 
@@ -86,7 +88,7 @@ def mul_f32_kernel(
     out: Buffer[Type.F32, "write_only"],
     params: BinaryElementwiseParams,
 ):
-    idx = i32(global_invocation_id().x)
+    idx = i32(global_invocation_id().x) + i32(global_invocation_id().y) * params.row_stride
     if idx < params.n:
         out[idx] = lhs[idx] * rhs[idx]
 
@@ -97,7 +99,7 @@ def scalar_add_f32_kernel(
     out: Buffer[Type.F32, "write_only"],
     params: ScalarElementwiseParams,
 ):
-    idx = i32(global_invocation_id().x)
+    idx = i32(global_invocation_id().x) + i32(global_invocation_id().y) * params.row_stride
     if idx < params.n:
         out[idx] = lhs[idx] + params.scalar
 
@@ -108,7 +110,7 @@ def scalar_mul_f32_kernel(
     out: Buffer[Type.F32, "write_only"],
     params: ScalarElementwiseParams,
 ):
-    idx = i32(global_invocation_id().x)
+    idx = i32(global_invocation_id().x) + i32(global_invocation_id().y) * params.row_stride
     if idx < params.n:
         out[idx] = lhs[idx] * params.scalar
 
@@ -120,7 +122,7 @@ def reduce_sum_f32_kernel(
     wid: WorkgroupId,
     inp: Buffer[Type.F32, "read_only"],
     out: Buffer[Type.F32, "write_only"],
-    params: BinaryElementwiseParams,
+    params: ReductionParams,
 ):
     shared_sum = shared_array(Type.F32, 64, name="reduce_sum")
     lx = i32(lid.x)
