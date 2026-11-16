@@ -382,9 +382,6 @@ static MetalStageResources loadStageResources(id<MTLDevice> device, id<MTLComman
 
     // Build SRV/UAV descriptor table matching GfxToLLVMPass register ordering:
     // UAV buffers sorted by (set, binding), then read-only buffers + 2D textures sorted together by (set, binding).
-    if (renderTarget && renderTarget.pixelFormat == MTLPixelFormatRGBA32Float &&
-        !stage.samplers.empty() && !device.supports32BitFloatFiltering)
-        throw failure(@"Sampling rgba32_sfloat render targets requires supports32BitFloatFiltering; use rgba16_sfloat or load_texture");
     struct OrderedSlot {
         uint32_t set = 0;
         uint32_t binding = 0;
@@ -545,6 +542,7 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
 @property(nonatomic, strong) GraphicsRenderer* postRenderer;
 @property(nonatomic, copy) NSString* postResourcesPath;
 @property(nonatomic, strong) id<MTLTexture> sceneColor;
+@property(nonatomic, strong) id<MTLFence> postFence;
 @property(nonatomic) double frameTime;
 - (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
@@ -572,6 +570,8 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
                         fragment:(ReflectedArgBufferLayout)fragmentLayout;
 - (void)encode:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass;
 - (void)encodeScene:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass;
+- (void)encodeScene:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass
+        signalFence:(id<MTLFence>)signalFence waitFence:(id<MTLFence>)waitFence;
 @end
 
 @implementation GraphicsRenderer
@@ -776,16 +776,26 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
     scenePass.colorAttachments[0].texture = self.sceneColor;
     scenePass.colorAttachments[0].storeAction = MTLStoreActionStore;
     self.postRenderer.frameTime = self.frameTime;
-    [self encodeScene:command pass:scenePass];
+    if (!self.postFence) {
+        self.postFence = [self.device newFence];
+        if (!self.postFence) throw failure(@"Cannot allocate scene-to-post synchronization fence");
+    }
+    [self encodeScene:command pass:scenePass signalFence:self.postFence waitFence:nil];
     MTLRenderPassDescriptor* postPass = [pass copy];
     postPass.depthAttachment.texture = nil;
     postPass.stencilAttachment.texture = nil;
-    [self.postRenderer encodeScene:command pass:postPass];
+    [self.postRenderer encodeScene:command pass:postPass signalFence:nil waitFence:self.postFence];
 }
 
 - (void)encodeScene:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass {
+    [self encodeScene:command pass:pass signalFence:nil waitFence:nil];
+}
+
+- (void)encodeScene:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass
+        signalFence:(id<MTLFence>)signalFence waitFence:(id<MTLFence>)waitFence {
     id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
     if (!encoder) throw failure(@"Cannot create a Metal render encoder");
+    if (waitFence) [encoder waitForFence:waitFence beforeStages:MTLRenderStageFragment];
     if (self.depthState) {
         [encoder setDepthStencilState:self.depthState];
     }
@@ -1001,6 +1011,7 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
             }
         }
     }
+    if (signalFence) [encoder updateFence:signalFence afterStages:MTLRenderStageFragment];
     [encoder endEncoding];
 }
 
@@ -1339,7 +1350,6 @@ int main(int argc, char** argv) {
                 if (arguments.count("--color-format")) {
                     const auto& fmt = arguments.at("--color-format");
                     if (fmt == "rgba32_sfloat") colorFormat = MTLPixelFormatRGBA32Float;
-                    else if (fmt == "rgba16_sfloat") colorFormat = MTLPixelFormatRGBA16Float;
                     else if (fmt == "rgba8_unorm") colorFormat = MTLPixelFormatRGBA8Unorm;
                     else throw std::runtime_error("Unsupported render target format: " + fmt);
                     if (!arguments.count("--post-spec"))

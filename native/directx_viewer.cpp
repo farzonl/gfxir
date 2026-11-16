@@ -2079,7 +2079,6 @@ int wmain(int argc, wchar_t** argv) {
         if (options.count(L"--color-format")) {
             const auto& fmt = options.at(L"--color-format");
             if (fmt == L"rgba32_sfloat") colorFormat = DXGI_FORMAT_R32G32B32A32_FLOAT;
-            else if (fmt == L"rgba16_sfloat") colorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
             else if (fmt != L"rgba8_unorm") throw std::runtime_error("Unsupported render target format");
         }
         Renderer renderer(options.at(L"--vertex"), options.at(L"--fragment"), count, validation,
