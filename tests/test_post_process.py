@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from mlir_gpu.viewer import (
     render_directx_offscreen, render_metal_offscreen, render_offscreen,
     show_directx_window, show_metal_window, show_window, with_post_process,
 )
+from mlir_gpu.compiler import _run
 from test_support import TOOLS, available
 
 
@@ -48,7 +50,49 @@ def _post_program():
     )
 
 
+def _metal_ci_validation_skip_reason():
+    if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
+        return None
+    version_text = _run([TOOLS.find("metal-shaderconverter"), "--version"])
+    version = re.search(r"metal-irconverter version:\s*(\d+)\.(\d+)", version_text)
+    if version is None:
+        raise RuntimeError(f"Cannot identify Metal Shader Converter version: {version_text.strip()}")
+    if tuple(map(int, version.groups())) < (3, 0):
+        return (
+            f"Metal Shader Converter {version.group(1)}.{version.group(2)} on macOS CI: "
+            "validated Metal texture tests require the locally verified converter >= 3.0. "
+            "Unvalidated Metal rendering remains tested."
+        )
+    return None
+
+
 class PostProcessValidationTests(unittest.TestCase):
+    def test_metal_ci_validation_gate_is_version_and_environment_specific(self):
+        cases = (
+            ("darwin", "true", "1.1.0", True),
+            ("darwin", "true", "2.0.0", True),
+            ("darwin", "true", "3.0.0", False),
+            ("darwin", "true", "4.0.0", False),
+            ("darwin", "", "1.1.0", False),
+            ("linux", "true", "1.1.0", False),
+        )
+        for platform, actions, version, skipped in cases:
+            with self.subTest(platform=platform, actions=actions, version=version), \
+                 patch("test_post_process.sys.platform", platform), \
+                 patch.dict(os.environ, GITHUB_ACTIONS=actions), \
+                 patch.object(type(TOOLS), "find", return_value="converter"), \
+                 patch("test_post_process._run", return_value=f"metal-irconverter version: {version}") as run:
+                self.assertEqual(_metal_ci_validation_skip_reason() is not None, skipped)
+                self.assertEqual(run.called, platform == "darwin" and actions == "true")
+
+    def test_unknown_metal_converter_version_does_not_silently_skip(self):
+        with patch("test_post_process.sys.platform", "darwin"), \
+             patch.dict(os.environ, GITHUB_ACTIONS="true"), \
+             patch.object(type(TOOLS), "find", return_value="converter"), \
+             patch("test_post_process._run", return_value="unexpected version output"):
+            with self.assertRaisesRegex(RuntimeError, "Cannot identify"):
+                _metal_ci_validation_skip_reason()
+
     def test_invalid_passes_rejected(self):
         p = _post_program()
         for bad in (
@@ -105,6 +149,16 @@ class PostProcessValidationTests(unittest.TestCase):
 
 @unittest.skipUnless(available("gfx-opt", "gfx-compile"), "Native compiler required")
 class PostProcessGpuTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.metal_validation_skip_reason = (
+            _metal_ci_validation_skip_reason() if os.environ.get("MLIR_GPU_TEST_METAL") == "1" else None
+        )
+
+    def _require_metal_validation(self, render):
+        if render is render_metal_offscreen and self.metal_validation_skip_reason:
+            self.skipTest(self.metal_validation_skip_reason)
+
     def _backends(self):
         backends = []
         if os.environ.get("MLIR_GPU_TEST_VULKAN") == "1":
@@ -141,6 +195,7 @@ class PostProcessGpuTests(unittest.TestCase):
     def test_hdr_post_pass_orientation_alpha_and_dimensions(self):
         for target, render in self._backends():
             with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
+                self._require_metal_validation(render)
                 program = self._compile(Path(tmp), target)
                 for width, height, time in ((11, 7, 0.0), (5, 9, 1.5)):
                     kwargs = {"toolchain": TOOLS} if target != Target.VULKAN else {}
@@ -148,6 +203,15 @@ class PostProcessGpuTests(unittest.TestCase):
                     self._assert_pixels(image, time)
                 ldr = replace(program, post_process=replace(program.post_process, format="rgba8_unorm"))
                 self._assert_pixels(render(ldr, 5, 3, validation=True, **kwargs), 0.0, ldr=True)
+
+    def test_hdr_post_pass_without_shader_validation(self):
+        for target, render in self._backends():
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
+                program = self._compile(Path(tmp), target)
+                kwargs = {"toolchain": TOOLS} if render is not render_offscreen else {}
+                self._assert_pixels(render(program, 11, 7, validation=False, time=1.5, **kwargs), 1.5)
+                ldr = replace(program, post_process=replace(program.post_process, format="rgba8_unorm"))
+                self._assert_pixels(render(ldr, 5, 3, validation=False, **kwargs), 0.0, ldr=True)
 
     def test_persistent_vulkan_target_is_rendered_again_each_frame(self):
         if os.environ.get("MLIR_GPU_TEST_VULKAN") != "1":
@@ -161,6 +225,7 @@ class PostProcessGpuTests(unittest.TestCase):
     def test_rgba32_texel_load_does_not_require_filtering(self):
         for target, render in self._backends():
             with self.subTest(target=target, renderer=render), tempfile.TemporaryDirectory() as tmp:
+                self._require_metal_validation(render)
                 directory = Path(tmp)
                 scene_path = compile_pipeline(
                     Pipeline(fullscreen_uv_vertex, hdr_scene), target, directory / "scene", TOOLS,
@@ -193,6 +258,8 @@ class PostProcessGpuTests(unittest.TestCase):
                     kwargs = {"toolchain": TOOLS} if render is not render_offscreen else {}
                     for validation in (False, True):
                         with self.subTest(validation=validation):
+                            if validation:
+                                self._require_metal_validation(render)
                             self._assert_pixels(
                                 render(program, width, height, validation=validation, time=time, **kwargs), time,
                             )
@@ -202,6 +269,7 @@ class PostProcessGpuTests(unittest.TestCase):
 
         for target, render in self._backends():
             with self.subTest(target=target, renderer=render), tempfile.TemporaryDirectory() as tmp:
+                self._require_metal_validation(render)
                 directory = Path(tmp)
                 scene_path = compile_pipeline(make_scene(split=True), target, directory / "scene", TOOLS)
                 post_path = compile_pipeline(make_post(), target, directory / "post", TOOLS)
@@ -228,6 +296,7 @@ class PostProcessGpuTests(unittest.TestCase):
     def test_post_pass_window_three_frames(self):
         for target, render in self._backends():
             with self.subTest(target=target, renderer=render), tempfile.TemporaryDirectory() as tmp:
+                self._require_metal_validation(render)
                 program = self._compile(Path(tmp), target)
                 if render is render_metal_offscreen:
                     show_metal_window(program, 160, 120, frames=3, validation=True, toolchain=TOOLS, time=1.0)

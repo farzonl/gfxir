@@ -216,6 +216,10 @@ window resize recreates the intermediate target at drawable-pixel dimensions.
 Single-pass programs are unchanged.
 Converted Metal binds single-layer array textures, matching the converter 1.x/2.x
 ABI; newer converters are explicitly configured to use the same texture types.
+On macOS GitHub Actions with a converter older than 3.0, the post-process tests
+skip Metal shader-validation cases that produce black texture reads. Unvalidated
+Metal HDR/LDR rendering still runs, and local or converter 3.0+ validation tests
+remain enabled.
 
 See [the runnable HDR/post example](examples/basics/post_process.py):
 
