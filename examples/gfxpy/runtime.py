@@ -45,6 +45,10 @@ class ComputeBackend(Protocol):
 
     def download(self, buf: ComputeBuffer) -> bytes: ...
 
+    def fill(self, out: ComputeBuffer, value: float, length: int) -> None: ...
+
+    def copy_buffer(self, src: ComputeBuffer, out: ComputeBuffer, length: int) -> None: ...
+
     def binary_op(
         self,
         op: str,
@@ -106,6 +110,12 @@ class UninitializedBackend:
 
     def download(self, buf: ComputeBuffer) -> bytes:
         raise BackendNotImplementedError(self._target, "download")
+
+    def fill(self, out: ComputeBuffer, value: float, length: int) -> None:
+        raise BackendNotImplementedError(self._target, "fill")
+
+    def copy_buffer(self, src: ComputeBuffer, out: ComputeBuffer, length: int) -> None:
+        raise BackendNotImplementedError(self._target, "copy_buffer")
 
     def binary_op(
         self,

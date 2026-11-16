@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import hashlib
 from pathlib import Path
+import struct
 import tempfile
 from typing import Any
 
@@ -29,6 +30,8 @@ from .kernels import (
     SCALAR_KERNELS,
     TILE_DIM,
     WORKGROUP_SIZE_1D,
+    copy_f32_kernel,
+    fill_f32_kernel,
     make_coop_matmul_f32_kernel,
     reduce_sum_f32_kernel,
     tiled_matmul_f32_kernel,
@@ -254,6 +257,24 @@ class GfxIRComputeBackend(ComputeBackend):
             parameters={"n": length, "scalar": float(scalar)},
             grid=grid,
         )
+
+    def fill(self, out: ComputeBuffer, value: float, length: int) -> None:
+        assert isinstance(out, PersistentBuffer)
+        grid = validate_1d_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op="fill")
+        pipe = self._get_or_compile("fill", fill_f32_kernel)
+        # A scalar buffer preserves NaN/Inf, which ParameterBlock floats reject.
+        scalar = self._ctx.create_buffer(4, initial_data=struct.pack("<f", value))
+        try:
+            pipe.dispatch({"value": scalar, "out": out}, parameters={"n": length}, grid=grid)
+        finally:
+            scalar.close()
+
+    def copy_buffer(self, src: ComputeBuffer, out: ComputeBuffer, length: int) -> None:
+        assert isinstance(src, PersistentBuffer)
+        assert isinstance(out, PersistentBuffer)
+        grid = validate_1d_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op="copy")
+        pipe = self._get_or_compile("copy", copy_f32_kernel)
+        pipe.dispatch({"lhs": src, "out": out}, parameters={"n": length}, grid=grid)
 
     def fused_op(
         self,
