@@ -191,7 +191,11 @@ class PostProcessGpuTests(unittest.TestCase):
                         samplers={"scene_sampler": sampler} if shader is post_fragment else {},
                     )
                     kwargs = {"toolchain": TOOLS} if render is not render_offscreen else {}
-                    self._assert_pixels(render(program, width, height, validation=True, time=time, **kwargs), time)
+                    for validation in (False, True):
+                        with self.subTest(validation=validation):
+                            self._assert_pixels(
+                                render(program, width, height, validation=validation, time=time, **kwargs), time,
+                            )
 
     def test_emissive_demo_hdr_highlights_differ_from_clipped_ldr(self):
         from examples.basics.post_process import make_post, make_scene
