@@ -275,6 +275,21 @@ PYTHONPATH=src:tests MLIR_GPU_TEST_NACELLE=1 \
 
 For live GLFW/resize tests, also set `MLIR_GPU_TEST_WINDOW=1` in a desktop session.
 
+The [gfxpy array example](examples/gfxpy/README.md) uses the same persistent
+DirectX runtime with `gp.device("directx", provider="nacelle")`:
+
+```sh
+python3 -m examples.gfxpy.chain_example --target directx --provider nacelle
+python3 scripts/run_numpy_benchmarks.py --target directx --provider nacelle \
+  --preset full --require-all --out build/bench-nacelle.json
+```
+
+Benchmarking requires the existing `bench` extra (`python3 -m pip install -e '.[bench]'`).
+The macOS benchmark CI publishes a distinct `gfxir-directx-nacelle` website
+series alongside Metal/Vulkan, explicitly identified as **CPU software DXIL
+execution**. Its full workload is identical to the other backends, and any
+missing or numerically incorrect suite fails the Nacelle benchmark step.
+
 ### HDR render targets and fullscreen post processing
 
 The viewer can render a scene into a GPU-only, framebuffer-sized color texture

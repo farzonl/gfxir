@@ -3,6 +3,7 @@
 Run directly from a repository checkout:
     python examples/gfxpy/chain_example.py --target auto
     python examples/gfxpy/chain_example.py --target directx --provider warp
+    python -m examples.gfxpy.chain_example --target directx --provider nacelle
     python examples/gfxpy/chain_example.py --target vulkan --provider swiftshader
     python examples/gfxpy/chain_example.py --target metal
 """
@@ -181,7 +182,7 @@ def run_example(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run NumPy-free gfxpy chained GPU array example.")
     parser.add_argument("--target", default="auto", help="auto, vulkan, directx, or metal")
-    parser.add_argument("--provider", default=None, help="Backend provider override (e.g. warp, swiftshader, hardware)")
+    parser.add_argument("--provider", default=None, help="Backend provider override (e.g. nacelle, warp, swiftshader, hardware)")
     parser.add_argument("--validation", action="store_true", help="Enable GPU API validation layers")
     parser.add_argument("--length", type=int, default=137, help="Input array length (default: 137)")
     args = parser.parse_args(argv)

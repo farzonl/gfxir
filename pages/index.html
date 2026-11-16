@@ -44,6 +44,8 @@
       --vulkan-dark: #4ade80;
       --directx-light: #c2410c;
       --directx-dark: #fb923c;
+      --nacelle-light: #a16207;
+      --nacelle-dark: #facc15;
       --good-light: #15803d;
       --good-dark: #4ade80;
       --warn-light: #c2410c;
@@ -62,6 +64,7 @@
       --c-kosmic: var(--kosmic-light);
       --c-vulkan: var(--vulkan-light);
       --c-directx: var(--directx-light);
+      --c-nacelle: var(--nacelle-light);
       --c-good: var(--good-light);
       --c-warn: var(--warn-light);
 
@@ -87,6 +90,7 @@
         --c-kosmic: var(--kosmic-dark);
         --c-vulkan: var(--vulkan-dark);
         --c-directx: var(--directx-dark);
+        --c-nacelle: var(--nacelle-dark);
         --c-good: var(--good-dark);
         --c-warn: var(--warn-dark);
       }
@@ -107,6 +111,7 @@
       --c-kosmic: var(--kosmic-dark);
       --c-vulkan: var(--vulkan-dark);
       --c-directx: var(--directx-dark);
+      --c-nacelle: var(--nacelle-dark);
       --c-good: var(--good-dark);
       --c-warn: var(--warn-dark);
     }
@@ -130,6 +135,7 @@
         --c-kosmic: CanvasText;
         --c-vulkan: CanvasText;
         --c-directx: CanvasText;
+        --c-nacelle: CanvasText;
         --c-good: CanvasText;
         --c-warn: CanvasText;
       }
@@ -609,7 +615,8 @@
     <header>
       <div class="title-group">
         <h1>GfxIR vs NumPy (float32) Benchmarks</h1>
-        <p class="subtitle">Cross-platform GPU compute performance tracker (Metal / Vulkan / DirectX 12)</p>
+        <p class="subtitle">Cross-platform compute performance tracker (Metal / Vulkan / DirectX 12)</p>
+        <p class="subtitle">Nacelle runs DirectX DXIL on the CPU; its series measures software execution, not Apple GPU performance.</p>
       </div>
       <div class="controls-row">
         <select id="runSelect" class="meta-pill" aria-label="Select commit run"></select>
@@ -834,6 +841,7 @@
       { key: "gfxir-vulkan-kosmickrisp", cssVar: "--c-kosmic", fallback: "#db2777" },
       { key: "gfxir-vulkan", cssVar: "--c-vulkan", fallback: "#15803d" },
       { key: "gfxir-directx", cssVar: "--c-directx", fallback: "#c2410c" },
+      { key: "gfxir-directx-nacelle", cssVar: "--c-nacelle", fallback: "#a16207" },
     ];
     const EXTRA_COLORS = ["#0ea5e9", "#10b981", "#f59e0b", "#6366f1"];
 

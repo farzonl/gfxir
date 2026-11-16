@@ -377,6 +377,20 @@ class TestNumericalAccuracyVulkanLive(_NumericalAccuracyMixin, unittest.TestCase
             self._run_numerical_checks(dev)
 
 
+@unittest.skipUnless(
+    sys.platform in ("linux", "darwin") and os.environ.get("MLIR_GPU_TEST_NACELLE") == "1",
+    "Set MLIR_GPU_TEST_NACELLE=1 on Linux/macOS to run live Nacelle numerical accuracy tests",
+)
+class TestNumericalAccuracyNacelleLive(_NumericalAccuracyMixin, unittest.TestCase):
+    target_name = "directx"
+
+    def test_live_numerical_accuracy_and_non_finite(self) -> None:
+        dev = gp.device(self.target_name, provider="nacelle")
+        self.addCleanup(dev.close)
+        with dev:
+            self._run_numerical_checks(dev)
+
+
 class TestNumericalAccuracyDirectXLive(_NumericalAccuracyMixin, unittest.TestCase):
     target_name = "directx"
 

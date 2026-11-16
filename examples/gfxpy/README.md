@@ -4,6 +4,8 @@
 The same Python source executes on **Linux Vulkan**, **Windows DirectX 12**,
 and **macOS Metal** using persistent device-resident GPU buffers without
 generating GLSL, HLSL, or MSL source.
+**Linux/macOS DirectX via Nacelle** is also supported explicitly, using CPU
+software DXIL execution rather than a GPU or a Metal/Vulkan translation.
 
 ## Quick Example
 
@@ -31,9 +33,9 @@ Python reference is provided in [chain_example.py](chain_example.py).
 
 | Platform (`sys.platform`) | Default Target | Explicit Override |
 | --- | --- | --- |
-| macOS (`darwin`) | `"metal"` | `gp.device("metal")` |
+| macOS (`darwin`) | `"metal"` | `gp.device("metal")` or `gp.device("directx", provider="nacelle")` |
 | Windows (`win32`) | `"directx"` | `gp.device("directx")` |
-| Linux (`linux*`) | `"vulkan"` | `gp.device("vulkan")` |
+| Linux (`linux*`) | `"vulkan"` | `gp.device("vulkan")` or `gp.device("directx", provider="nacelle")` |
 
 Pass `target="auto"` (or `None`) for platform-default selection, or pass
 `"vulkan"`, `"directx"`, or `"metal"` explicitly. Unsupported platforms or
@@ -61,6 +63,53 @@ unknown target names raise `UnsupportedTargetError`.
   - Apple Metal Shader Converter (`metal-shaderconverter` and
     `libmetalirconverter`), plus `clang++` or prebuilt
     `libmlir_gpu_metal_compute.dylib` for `native/metal_compute_bridge.mm`.
+
+### DirectX/Nacelle on Linux and macOS
+
+Follow the Nacelle SDK/native-helper setup in the [project README](../../README.md).
+Then, from the repository root:
+
+```sh
+PYTHONPATH=src python3 -m examples.gfxpy.chain_example --target directx --provider nacelle
+```
+
+In Python, select `gp.device("directx", provider="nacelle")` and use the same
+array operators, `@gp.fuse`, reductions, and matrix multiplication. Buffers and
+pipelines remain in a persistent DirectX compute context; only explicit readback
+transfers results to Python. Omitting the provider preserves platform defaults.
+Unsupported hosts, missing libraries, and device identity mismatches fail
+explicitly instead of switching to another backend. Do not enable validation:
+Nacelle v0.0.1 lacks the D3D12 validation info queue.
+
+To run the real Nacelle array/fusion/reduction/matmul and numerical checks:
+
+```sh
+PYTHONPATH=src MLIR_GPU_TEST_NACELLE=1 \
+  python3 -m unittest discover -s tests -p 'test_gfxpy_*.py' -v
+```
+
+### macOS benchmarks and website
+
+The macOS benchmark workflow also runs the pinned Nacelle release against the
+same full NumPy/GfxIR SAXPY and tiled-matmul workloads as the other backends.
+It publishes a separate `gfxir-directx-nacelle` series alongside Metal and
+Vulkan runtimes. This is **CPU software DirectX**, not Apple GPU performance.
+The benchmark runner measures the persistent compute API directly; the
+array-library tests above verify gfxpy on that same runtime.
+
+For a local report, install the existing `bench` extra and export `LLVM_BIN`
+and the native-helper/SDK `PATH` as in the project setup, then run:
+
+```sh
+PYTHONPATH=src python3 scripts/run_numpy_benchmarks.py \
+  --target directx --provider nacelle --preset full \
+  --warmup 2 --iters 5 --require-all --out build/bench-nacelle.json
+```
+
+The default label distinguishes Nacelle from native DirectX. `--require-all`
+fails if any NumPy or DirectX suite is unavailable, skipped, or numerically
+incorrect, while retaining the diagnostic JSON report. Numerical comparisons
+use `rtol=1e-3`, `atol=1e-3`; `maxAbsError` is also recorded.
 
 ## API Scope, Limits, and Error Semantics
 

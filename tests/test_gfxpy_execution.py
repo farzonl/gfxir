@@ -362,6 +362,9 @@ def _run_live_chain_check(
         try:
             with dev:
                 provider_label = format_provider_label(raw_backend._ctx)
+                if provider == "nacelle":
+                    test_case.assertEqual(provider_label, "nacelle")
+                    test_case.assertTrue(raw_backend._ctx.is_software)
                 print(
                     f"[GfxPyLive] target={dev.target} provider={provider_label} "
                     f"device={raw_backend.device_name!r}"
@@ -397,6 +400,13 @@ def _run_live_chain_check(
 
 class TestGfxPyLiveExecution(unittest.TestCase):
     """Opt-in live GPU execution checks for DirectX 12, Vulkan, and Metal."""
+
+    @unittest.skipUnless(
+        sys.platform in ("linux", "darwin") and os.environ.get("MLIR_GPU_TEST_NACELLE") == "1",
+        "Set MLIR_GPU_TEST_NACELLE=1 on Linux/macOS to run live Nacelle execution tests",
+    )
+    def test_nacelle_chained_execution(self) -> None:
+        _run_live_chain_check(self, target="directx", provider="nacelle", validation=False)
 
     @unittest.skipUnless(
         sys.platform == "win32" and os.environ.get("MLIR_GPU_TEST_DIRECTX") == "1",

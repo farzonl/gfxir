@@ -236,10 +236,12 @@ class TestGfxPyDeviceResidentHost(unittest.TestCase):
 
 class _LiveBackendMixin:
     target_name: str
+    provider: str | None = None
 
     def test_bounds_checked_lengths_and_chained_expression(self) -> None:
         lengths = [0, 1, 63, 64, 65, 137, 1000]
-        with gp.device(self.target_name) as dev:
+        with gp.device(self.target_name, provider=self.provider) as dev:
+            self.addCleanup(dev.close)
             for n in lengths:
                 host_x = [float(i) * 0.5 - 3.0 for i in range(n)]
                 host_y = [float(i % 7) + 1.25 for i in range(n)]
@@ -261,7 +263,7 @@ class _LiveBackendMixin:
     def test_repeated_arrays_temporaries_reductions_and_close_baseline(self) -> None:
         import gc
 
-        with gp.device(self.target_name) as dev:
+        with gp.device(self.target_name, provider=self.provider) as dev:
             try:
                 for _ in range(20):
                     a = gp.array([1.0, 2.0, 3.0, 4.0], device=dev)
@@ -303,6 +305,15 @@ class TestGfxPyMetalLive(_LiveBackendMixin, unittest.TestCase):
 )
 class TestGfxPyDirectXLive(_LiveBackendMixin, unittest.TestCase):
     target_name = "directx"
+
+
+@unittest.skipUnless(
+    sys.platform in ("linux", "darwin") and os.environ.get("MLIR_GPU_TEST_NACELLE") == "1",
+    "Set MLIR_GPU_TEST_NACELLE=1 on Linux/macOS to run live Nacelle gfxpy tests",
+)
+class TestGfxPyNacelleLive(_LiveBackendMixin, unittest.TestCase):
+    target_name = "directx"
+    provider = "nacelle"
 
 
 if __name__ == "__main__":

@@ -290,6 +290,7 @@ class TestGfxPyFusionHost(unittest.TestCase):
 
 class _LiveFusionMixin:
     target_name: str
+    provider: str | None = None
 
     def test_fused_vs_eager_accuracy_cancellation_and_timings(self) -> None:
         @gp.fuse
@@ -300,7 +301,7 @@ class _LiveFusionMixin:
         def fused_cancel(a, b, c):
             return (a * 1.0001 + (-1.0001) * b) + c
 
-        raw_backend = GfxIRComputeBackend(self.target_name)
+        raw_backend = GfxIRComputeBackend(self.target_name, provider=self.provider)
         counted = _CountingBackend(raw_backend)
         with gp.device(self.target_name, backend=counted) as dev:
             try:
@@ -382,6 +383,15 @@ class TestGfxPyFusionVulkanLive(_LiveFusionMixin, unittest.TestCase):
 )
 class TestGfxPyFusionDirectXLive(_LiveFusionMixin, unittest.TestCase):
     target_name = "directx"
+
+
+@unittest.skipUnless(
+    sys.platform in ("linux", "darwin") and os.environ.get("MLIR_GPU_TEST_NACELLE") == "1",
+    "Set MLIR_GPU_TEST_NACELLE=1 on Linux/macOS to run live Nacelle fusion tests",
+)
+class TestGfxPyFusionNacelleLive(_LiveFusionMixin, unittest.TestCase):
+    target_name = "directx"
+    provider = "nacelle"
 
 
 if __name__ == "__main__":

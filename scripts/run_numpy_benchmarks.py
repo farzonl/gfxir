@@ -101,6 +101,10 @@ def resolve_target(target_arg: str) -> str:
     return name
 
 
+def _resolve_backend_label(target: str, provider: str | None, label: str | None) -> str:
+    return label or f"gfxir-{target}{'-nacelle' if provider == 'nacelle' else ''}"
+
+
 def _summarize_timings_ms(samples_ms: list[float]) -> dict[str, float]:
     """Compute mean, median, min, and p95 latency in milliseconds."""
     if not samples_ms:
@@ -262,7 +266,7 @@ def _benchmark_gfx_suite(
     backend_label: str | None = None,
 ) -> dict[str, Any]:
     """Run a suite on GfxIR GPU compute and return its result record."""
-    backend_label = backend_label or f"gfxir-{target_name}"
+    backend_label = _resolve_backend_label(target_name, provider, backend_label)
     rss_before = _get_rss_mb()
 
     try:
@@ -489,6 +493,8 @@ def _benchmark_gfx_suite(
         if np is not None and ref_output is not None:
             got = np.frombuffer(out_bytes, dtype=np.float32).reshape(ref_output.shape)
             max_err = float(np.max(np.abs(got - ref_output)))
+            if not np.allclose(got, ref_output, rtol=1e-3, atol=1e-3):
+                raise RuntimeError(f"Numerical mismatch against NumPy: max absolute error {max_err:.3e}")
 
         rss_after = _get_rss_mb()
         return _make_record(
@@ -527,7 +533,7 @@ def run_benchmarks(
 ) -> dict[str, Any]:
     """Run all benchmark suites and return the structured JSON report."""
     target_name = resolve_target(target_arg)
-    gfx_label = backend_label or f"gfxir-{target_name}"
+    gfx_label = _resolve_backend_label(target_name, provider, backend_label)
     suites = build_suites(preset)
 
     try:
@@ -604,6 +610,7 @@ def main() -> int:
     parser.add_argument("--backend-label", default=None, help="Optional backend label (e.g. gfxir-vulkan-moltenvk).")
     parser.add_argument("--skip-gpu", action="store_true", help="Run only the NumPy baseline (for host-only testing).")
     parser.add_argument("--require-gpu", action="store_true", help="Exit non-zero if no GPU benchmark executed.")
+    parser.add_argument("--require-all", action="store_true", help="Exit non-zero if any NumPy or GPU suite failed or was skipped.")
     parser.add_argument("--list-suites", action="store_true", help="Print suite IDs for the chosen preset and exit.")
     parser.add_argument("--out", type=Path, default=Path("bench-results.json"))
     args = parser.parse_args()
@@ -627,6 +634,12 @@ def main() -> int:
     args.out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote benchmark report to {args.out}")
 
+    if args.require_all:
+        failed = [r for r in report["results"] if not r["ran"]]
+        if failed:
+            for row in failed:
+                print(f"Error: {row['backend']} / {row['benchId']}: {row['status']}", file=sys.stderr)
+            return 1
     gpu_ran = any(r["ran"] and r["backend"].startswith("gfxir-") for r in report["results"])
     if args.require_gpu and not gpu_ran:
         print("Error: --require-gpu set, but no GPU benchmark executed.", file=sys.stderr)
