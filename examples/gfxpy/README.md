@@ -127,6 +127,19 @@ use `rtol=1e-3`, `atol=1e-3`; `maxAbsError` is also recorded.
   Ragged or >2D sequences raise `ShapeMismatchError`; other dtypes raise
   `UnsupportedDTypeError`.
 - **Supported operations**:
+  - GPU-filled `zeros`, `ones`, `full`, and `zeros_like` / `ones_like` /
+    `full_like` for 1D/2D shapes and `float32`. The `*_like` forms take a
+    `GfxArray` and preserve its shape, dtype, and device unless explicitly
+    overridden. Generation writes device buffers, transferring only one
+    float32 fill value rather than a host-sized payload.
+  - `asarray` reuses a compatible open `GfxArray`; `copy` creates an independent
+    device buffer using a GPU copy kernel. Both also accept Python sequences
+    via the existing explicit host-input upload path. Cross-device conversion
+    fails explicitly rather than downloading/re-uploading through the CPU.
+    Empty constructor outputs avoid allocations and dispatches; fill values
+    retain signed zero, infinities, and NaNs.
+    `arange`, `linspace`, and `eye` remain tracked by #243 and are not yet
+    implemented in this increment.
   - Elementwise `+` and `*` (array/array and array/scalar, including reflected
     scalar ops `2.0 * a` and `10.0 + b`).
   - Bounded sum reduction (`gp.sum(a)` / `a.sum()`) over all elements of a 1D or

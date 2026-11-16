@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .array import GfxArray, array, empty, matmul, sum  # noqa: A004
+from .constructors import asarray, copy, full, full_like, ones, ones_like, zeros, zeros_like
 from .dtypes import DType, float32, resolve_dtype
 from .fusion import fuse
 from .limits import (
@@ -60,16 +61,24 @@ __all__ = [
     "UnsupportedFusionError",
     "UnsupportedTargetError",
     "array",
+    "asarray",
     "close_default_device",
     "coerce_float32",
+    "copy",
     "current_device",
     "default_target",
     "device",
     "empty",
     "float32",
     "fuse",
+    "full",
+    "full_like",
     "matmul",
     "normalize_target",
+    "ones",
+    "ones_like",
     "resolve_dtype",
     "sum",
+    "zeros",
+    "zeros_like",
 ]

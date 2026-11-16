@@ -46,6 +46,28 @@ MatMulParams = ParameterBlock(
 
 
 @compute(workgroup_size=WORKGROUP_SIZE_1D)
+def fill_f32_kernel(
+    value: Buffer[Type.F32, "read_only"],
+    out: Buffer[Type.F32, "write_only"],
+    params: BinaryElementwiseParams,
+):
+    idx = i32(global_invocation_id().x)
+    if idx < params.n:
+        out[idx] = value[0]
+
+
+@compute(workgroup_size=WORKGROUP_SIZE_1D)
+def copy_f32_kernel(
+    lhs: Buffer[Type.F32, "read_only"],
+    out: Buffer[Type.F32, "write_only"],
+    params: BinaryElementwiseParams,
+):
+    idx = i32(global_invocation_id().x)
+    if idx < params.n:
+        out[idx] = lhs[idx]
+
+
+@compute(workgroup_size=WORKGROUP_SIZE_1D)
 def add_f32_kernel(
     lhs: Buffer[Type.F32, "read_only"],
     rhs: Buffer[Type.F32, "read_only"],
