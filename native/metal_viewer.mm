@@ -480,12 +480,6 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
     if (stage.srvUavTable != nil) tableAddresses.push_back(stage.srvUavTable.gpuAddress);
     if (stage.samplerTable != nil) tableAddresses.push_back(stage.samplerTable.gpuAddress);
     if (rootConstantSize == 0 && tableAddresses.empty()) return {};
-    if (!tableAddresses.empty()) {
-        std::cerr << "Metal argument layout: constants=" << rootConstantSize
-                  << " buffer=" << reflected.bufferSize << " pointers=";
-        for (size_t offset : reflected.pointerOffsets) std::cerr << offset << ",";
-        std::cerr << " tables=" << tableAddresses.size() << "\n";
-    }
 
     std::vector<size_t> offsets = reflected.pointerOffsets;
     size_t nextFallbackOffset = (rootConstantSize + 7) & ~static_cast<size_t>(7);
