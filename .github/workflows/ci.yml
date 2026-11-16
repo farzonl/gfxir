@@ -47,6 +47,7 @@ jobs:
             mesa-vulkan-drivers \
             vulkan-validationlayers \
             libglfw3 \
+            libopenblas0 \
             xvfb \
             xauth
 

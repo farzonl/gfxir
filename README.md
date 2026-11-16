@@ -26,7 +26,7 @@ python3 -m venv .venv
 ```
 
 > **Note (macOS Vulkan)**: If using the Vulkan viewer via MoltenVK, set `export DYLD_LIBRARY_PATH=/usr/local/lib` (or your Vulkan SDK lib path) before running Python.
-> **Note (DirectX on Linux/macOS)**: CPU DXIL execution is supported via [Nacelle](https://github.com/farzonl/Nacelle/releases/tag/v0.0.1) (`python3 tools/setup_nacelle.py`).
+> **Note (DirectX on Linux/macOS)**: CPU DXIL execution is supported via [Nacelle](https://github.com/farzonl/Nacelle/releases/tag/v0.0.2) (`python3 tools/setup_nacelle.py`).
 
 ---
 

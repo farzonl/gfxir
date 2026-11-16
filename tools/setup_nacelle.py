@@ -13,10 +13,10 @@ import tempfile
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.0.1"
+VERSION = "0.0.2"
 RELEASES = {
-    ("Linux", "x86_64"): ("linux-x64", "44b4a22dd4eabd40d49c50690a21463a0a5d650887f333df4f56030357b452b1"),
-    ("Darwin", "arm64"): ("macos-arm64", "03c1176523eb14a6c0c56d9c358edf4abec1ac1b25864f9603feff2d664201a9"),
+    ("Linux", "x86_64"): ("linux-x64", "193734f2dff2c5add501ca2da99ba7efbdce48508e64e5ba6dbb437afb704fa0"),
+    ("Darwin", "arm64"): ("macos-arm64", "1c5079337f7612c0c7f96628d711439bc960e915673353b2c63e51a704d780b8"),
 }
 
 
