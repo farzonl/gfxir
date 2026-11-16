@@ -83,7 +83,7 @@ from .frontend import (
     workgroup_barrier,
     workgroup_id,
 )
-from .graphics import fullscreen_vertex
+from .graphics import fullscreen_vertex, fullscreen_uv_vertex
 from .imgdiff import ImageDiffError, ImageDiffResult, imgdiff, read_png
 from .parameters import (
     FrameParameters,
@@ -117,12 +117,14 @@ from .viewer import (
     ComputeDispatchResult,
     ComputeProgram,
     RenderedImage,
+    PostProcess,
     ViewerError,
     compute_session,
     dispatch_compute,
     load_compute_program,
     render_compute_rgba,
     write_png,
+    with_post_process,
 )
 from . import shader_math, sdf
 
@@ -138,16 +140,16 @@ __all__ = [
     "Draw", "DrawCall", "FragmentCoord", "FrameParameters", "GlobalInvocationId",
     "HIGH_END_COMPUTE", "ImageDiffError", "ImageDiffResult", "LocalInvocationId", "MLIRPipeline",
     "MULTI_DRAW_SCHEMA_VERSION", "MetalBuffer", "MetalComputeContext", "MetalPipeline", "MultiDrawManifest", "PRESETS", "ParameterBlock", "PersistentBuffer", "PersistentComputeError", "PersistentPipeline", "Pipeline",
-    "PointerType", "ReflectedBufferBinding", "ReflectedSamplerBinding", "ReflectedTextureBinding", "RenderedImage", "Sampler", "SamplerBinding", "SamplerDesc", "StorageClass", "StructField",
+    "PointerType", "PostProcess", "ReflectedBufferBinding", "ReflectedSamplerBinding", "ReflectedTextureBinding", "RenderedImage", "Sampler", "SamplerBinding", "SamplerDesc", "StorageClass", "StructField",
     "Target", "TargetProfile", "Texture2D", "TextureBinding", "TextureData", "Toolchain", "Type", "VULKAN_PORTABLE_1_0", "Value", "Vertex",
     "ViewerError", "VulkanBuffer", "VulkanComputeContext", "VulkanPipeline", "WorkgroupId", "atomic_add", "atomic_and", "atomic_cas",
     "atomic_compare_exchange", "atomic_exchange", "atomic_max", "atomic_min", "atomic_or",
     "atomic_sub", "atomic_umax", "atomic_umin", "atomic_xor", "compile_pipeline", "compute",
-    "compute_session", "coop_matrix_load", "coop_matrix_mul_add", "coop_matrix_store", "coop_matrix_zero", "dispatch_compute", "f32", "fragment", "full_barrier", "fullscreen_vertex",
+    "compute_session", "coop_matrix_load", "coop_matrix_mul_add", "coop_matrix_store", "coop_matrix_zero", "dispatch_compute", "f32", "fragment", "full_barrier", "fullscreen_vertex", "fullscreen_uv_vertex",
     "global_invocation_id", "i32", "imgdiff", "is_struct", "load_compute_program", "load_texture",
     "local_invocation_id", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4", "mat4",
     "mat4x2", "mat4x3", "mat4x4", "maximum", "minimum", "natural_alignment", "open_compute_context", "pack_parameters",
     "read_png", "render_compute_rgba", "sample_texture", "sample_texture_level", "sdf", "select", "shader_math", "shared_array",
     "storage_barrier", "struct", "u32", "vec2", "vec3", "vec4", "verify_multi_draw_manifest",
-    "vertex", "workgroup_barrier", "workgroup_id", "write_png",
+    "vertex", "with_post_process", "workgroup_barrier", "workgroup_id", "write_png",
 ]

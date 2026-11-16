@@ -251,6 +251,13 @@ struct TextureResourceSpec {
     uint32_t height = 0;
     std::string format;
     std::string path;
+    bool render_target = false;
+};
+
+struct PostProcessSpec {
+    std::string vertex;
+    std::string fragment;
+    std::string resources;
 };
 
 struct SamplerResourceSpec {
@@ -372,7 +379,10 @@ struct LoadedStageResources {
 
     size_t srvUavCount() const { return uavBufferIndices.size() + srvEntries.size(); }
     size_t samplerCount() const { return samplers.size(); }
-    bool hasUploads() const { return !buffers.empty() || !textures.empty(); }
+    bool hasUploads() const {
+        return !buffers.empty() || std::any_of(textures.begin(), textures.end(),
+            [](const UploadedTexture2D& tex) { return !tex.spec.render_target; });
+    }
 };
 
 static LoadedStageResources allocateStageResources(
@@ -461,6 +471,15 @@ static LoadedStageResources allocateStageResources(
 
     loaded.textures.reserve(stageSpec.textures.size());
     for (const auto& texSpec : stageSpec.textures) {
+        if (texSpec.render_target) {
+            if (enableReadback)
+                throw std::runtime_error("Render-target bindings are graphics-only");
+            UploadedTexture2D entry;
+            entry.spec = texSpec;
+            loaded.srvEntries.push_back(SrvSlotEntry{texSpec.set, texSpec.binding, true, loaded.textures.size()});
+            loaded.textures.push_back(std::move(entry));
+            continue;
+        }
         if (texSpec.width == 0 || texSpec.height == 0) {
             throw std::runtime_error("Texture dimensions must be positive: " + texSpec.name);
         }
@@ -587,6 +606,7 @@ static void recordStageUploads(ID3D12GraphicsCommandList* commands,
 
     if (!loaded.textures.empty()) {
         for (const auto& tex : loaded.textures) {
+            if (tex.spec.render_target) continue;
             D3D12_TEXTURE_COPY_LOCATION dstLoc{};
             dstLoc.pResource = tex.texture.Get();
             dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -603,6 +623,7 @@ static void recordStageUploads(ID3D12GraphicsCommandList* commands,
         std::vector<D3D12_RESOURCE_BARRIER> texBarriers;
         texBarriers.reserve(loaded.textures.size());
         for (const auto& tex : loaded.textures) {
+            if (tex.spec.render_target) continue;
             D3D12_RESOURCE_BARRIER b{};
             b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             b.Transition.pResource = tex.texture.Get();
@@ -611,7 +632,8 @@ static void recordStageUploads(ID3D12GraphicsCommandList* commands,
             b.Transition.StateAfter = srvTargetState;
             texBarriers.push_back(b);
         }
-        commands->ResourceBarrier(static_cast<UINT>(texBarriers.size()), texBarriers.data());
+        if (!texBarriers.empty())
+            commands->ResourceBarrier(static_cast<UINT>(texBarriers.size()), texBarriers.data());
     }
 }
 
@@ -636,6 +658,10 @@ static void writeStageSrvUavDescriptors(ID3D12Device* dev,
     for (const auto& item : loaded.srvEntries) {
         if (item.isTexture) {
             const auto& tex = loaded.textures[item.index];
+            if (tex.spec.render_target && !tex.texture) {
+                handle.ptr += increment;
+                continue;
+            }
             D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
             srvDesc.Format = tex.dxgiFormat;
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -1173,6 +1199,10 @@ class Renderer {
     std::vector<std::string> semanticStorage;
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements;
     std::chrono::steady_clock::time_point started;
+    DXGI_FORMAT colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    std::unique_ptr<Renderer> postRenderer;
+    ComPtr<ID3D12Resource> sceneColor;
+    bool sceneColorReadable = false;
 
     void validationErrors() {
         if (!diagnostics) return;
@@ -1257,6 +1287,44 @@ class Renderer {
     }
 
     void draw(ID3D12Resource* target, UINT width, UINT height, double elapsed) {
+        if (!postRenderer) {
+            drawScene(target, width, height, elapsed);
+            return;
+        }
+        if (!sceneColor || sceneColor->GetDesc().Width != width || sceneColor->GetDesc().Height != height) {
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.Width = width;
+            desc.Height = height;
+            desc.DepthOrArraySize = desc.MipLevels = 1;
+            desc.Format = colorFormat;
+            desc.SampleDesc.Count = 1;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&sceneColor)),
+                "Create sampled offscreen render target");
+            sceneColorReadable = false;
+            auto& entry = postRenderer->psLoadedResources.textures.at(0);
+            entry.texture = sceneColor;
+            entry.dxgiFormat = colorFormat;
+            auto handle = postRenderer->srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += postRenderer->psSrvUavOffset * postRenderer->srvUavIncrement;
+            writeStageSrvUavDescriptors(device.Get(), postRenderer->psLoadedResources, handle,
+                                       postRenderer->srvUavIncrement);
+        }
+        if (sceneColorReadable)
+            barrier(sceneColor.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        drawScene(sceneColor.Get(), width, height, elapsed);
+        barrier(sceneColor.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        sceneColorReadable = true;
+        postRenderer->commands = commands;
+        commands->SetPipelineState(postRenderer->pipeline.Get());
+        postRenderer->drawScene(target, width, height, elapsed);
+    }
+
+    void drawScene(ID3D12Resource* target, UINT width, UINT height, double elapsed) {
         auto handle = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         device->CreateRenderTargetView(target, nullptr, handle);
         commands->SetGraphicsRootSignature(root.Get());
@@ -1363,6 +1431,23 @@ class Renderer {
     }
 
 public:
+    void setPostProcess(const std::wstring& path, bool validation) {
+        auto bytes = binaryFile(std::filesystem::path(path), "post-pass spec");
+        PostProcessSpec spec;
+        auto err = glz::read<glz::opts{.error_on_unknown_keys = false}>(spec, std::string(bytes.begin(), bytes.end()));
+        if (err || spec.vertex.empty() || spec.fragment.empty() || spec.resources.empty())
+            throw std::runtime_error("Invalid post-pass spec");
+        postRenderer = std::make_unique<Renderer>(
+            std::filesystem::path(spec.vertex).wstring(), std::filesystem::path(spec.fragment).wstring(),
+            3, validation, false, false, 0.0, DepthSettings{}, L"", L"", L"", false, 0, L"uint16",
+            std::filesystem::path(spec.resources).wstring(), DXGI_FORMAT_R8G8B8A8_UNORM, this);
+        const auto& vs = postRenderer->vsLoadedResources;
+        const auto& ps = postRenderer->psLoadedResources;
+        if (!vs.buffers.empty() || !vs.textures.empty() || !vs.samplers.empty() ||
+            !ps.buffers.empty() || ps.textures.size() != 1 || !ps.textures[0].spec.render_target)
+            throw std::runtime_error("Post pass requires exactly one fragment render-target texture");
+    }
+
     void setDraws(std::vector<DirectXDrawCall> drawList) {
         draws = std::move(drawList);
     }
@@ -1378,15 +1463,23 @@ public:
              const std::wstring& indexBufferPath = L"",
              bool indexed = false, UINT idxCount = 0,
              const std::wstring& idxType = L"uint16",
-             const std::wstring& resourcesPath = L"")
+             const std::wstring& resourcesPath = L"",
+             DXGI_FORMAT renderFormat = DXGI_FORMAT_R8G8B8A8_UNORM, Renderer* shared = nullptr)
         : vertexCount(count), hasFixedTime(hasTime), fixedTime(time),
           depthSettings(depthSettings),
           isIndexed(indexed), indexCount(idxCount), indexType(idxType),
           started(std::chrono::steady_clock::now()) {
-        auto dev = createDirectXDevice(warp, validation);
-        factory = std::move(dev.factory);
-        device = std::move(dev.device);
-        name = std::move(dev.name);
+        colorFormat = renderFormat;
+        if (shared) {
+            factory = shared->factory;
+            device = shared->device;
+            name = shared->name;
+        } else {
+            auto dev = createDirectXDevice(warp, validation);
+            factory = std::move(dev.factory);
+            device = std::move(dev.device);
+            name = std::move(dev.name);
+        }
         if (validation) check(device.As(&diagnostics), "Get D3D12 validation queue");
         D3D12_COMMAND_QUEUE_DESC queueDescription{};
         queueDescription.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -1616,7 +1709,7 @@ public:
         description.DepthStencilState.BackFace = stencil;
         description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         description.NumRenderTargets = 1;
-        description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        description.RTVFormats[0] = colorFormat;
         description.SampleDesc.Count = 1;
         if (!inputElements.empty()) {
             description.InputLayout = { inputElements.data(), static_cast<UINT>(inputElements.size()) };
@@ -1925,7 +2018,7 @@ int wmain(int argc, wchar_t** argv) {
                 key != L"--vertex-buffer" && key != L"--index-buffer" && key != L"--index-type" &&
                 key != L"--index-count" && key != L"--compute" && key != L"--compute-spec" &&
                 key != L"--depth-compare" && key != L"--depth-write" && key != L"--depth-format" &&
-                key != L"--resources")
+                key != L"--resources" && key != L"--color-format" && key != L"--post-spec")
                 throw std::runtime_error("Unknown native DirectX viewer argument");
             if (++index == argc || !options.emplace(key, argv[index]).second)
                 throw std::runtime_error("Missing or duplicate native viewer argument");
@@ -1943,7 +2036,8 @@ int wmain(int argc, wchar_t** argv) {
                 options.count(L"--readback") || options.count(L"--time") ||
                 options.count(L"--input-layout") || options.count(L"--vertex-buffer") ||
                 options.count(L"--index-buffer") || options.count(L"--index-type") ||
-                options.count(L"--index-count") || options.count(L"--resources"))
+                options.count(L"--index-count") || options.count(L"--resources") ||
+                options.count(L"--post-spec") || options.count(L"--color-format"))
                 throw std::runtime_error("Compute dispatch arguments cannot be combined with graphics arguments");
             runComputeDispatch(options.at(L"--compute"), options.at(L"--compute-spec"), warp, validation);
             return 0;
@@ -1981,10 +2075,20 @@ int wmain(int argc, wchar_t** argv) {
             if (fmt != L"d32_sfloat") throw std::runtime_error("Unsupported depth format");
         }
 
+        DXGI_FORMAT colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (options.count(L"--color-format")) {
+            const auto& fmt = options.at(L"--color-format");
+            if (fmt == L"rgba32_sfloat") colorFormat = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            else if (fmt != L"rgba8_unorm") throw std::runtime_error("Unsupported render target format");
+        }
         Renderer renderer(options.at(L"--vertex"), options.at(L"--fragment"), count, validation,
                           warp, hasTime, fixedTime, depthSettings,
                           inputLayout, vertexBuffer, indexBuffer,
-                          isIndexed, indexCount, indexType, resourcesPath);
+                          isIndexed, indexCount, indexType, resourcesPath, colorFormat);
+        if (options.count(L"--color-format") && !options.count(L"--post-spec"))
+            throw std::runtime_error("--color-format requires --post-spec");
+        if (options.count(L"--post-spec"))
+            renderer.setPostProcess(options.at(L"--post-spec"), validation);
         if (options.count(L"--readback")) {
             renderer.readback(width, height, options.at(L"--readback"));
         } else {

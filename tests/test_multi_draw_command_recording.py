@@ -123,6 +123,25 @@ class MultiDrawCommandRecordingTests(unittest.TestCase):
         self.assertEqual(len(begin_rp), 1, "Multi-draw sequence must execute within exactly one render pass begin")
         self.assertEqual(len(end_rp), 1, "Multi-draw sequence must execute within exactly one render pass end")
 
+    def test_scene_and_post_pass_share_one_command_buffer_in_order(self):
+        def before(command, elapsed):
+            self.ctx.command(
+                None, "scene_pass", self.pipeline_alpha, "scene_framebuffer", 8, 6,
+                Draw(vertex_count=6), command=command, recording_only=True,
+            )
+
+        self.ctx.command(
+            None, "post_pass", self.pipeline_beta, "output_framebuffer", 8, 6,
+            Draw(), command="command", before=before,
+        )
+        calls = self.mock_vk.calls
+        self.assertEqual(sum(c[0] == "vkBeginCommandBuffer" for c in calls), 1)
+        self.assertEqual(sum(c[0] == "vkEndCommandBuffer" for c in calls), 1)
+        self.assertEqual(sum(c[0] == "vkResetCommandBuffer" for c in calls), 1)
+        self.assertEqual([c[2] for c in calls if c[0] == "vkCmdDraw"], [6, 3])
+        self.assertEqual([c[3] for c in calls if c[0] == "vkCmdBindPipeline"],
+                         [self.pipeline_alpha, self.pipeline_beta])
+
     def test_pipeline_switching_between_distinct_pipelines(self):
         draws = [
             DrawCall(pipeline="pipe_alpha", vertex_count=36),

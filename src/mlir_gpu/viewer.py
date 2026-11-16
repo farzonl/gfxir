@@ -15,7 +15,7 @@ import time as clock
 import zlib
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -85,12 +85,70 @@ class GraphicsProgram:
     buffers: Mapping[str, bytes | bytearray | memoryview] | None = None
     textures: Mapping[str, TextureData] | None = None
     samplers: Mapping[str, SamplerDesc] | None = None
+    post_process: PostProcess | None = None
 
     def __post_init__(self) -> None:
         if self.pipelines is None:
             object.__setattr__(self, "pipelines", {})
         if self.draws is None:
             object.__setattr__(self, "draws", [])
+        if self.post_process is not None and self.post_process.program.target != self.target:
+            raise ViewerError("Scene and post pass must use the same artifact target.")
+
+
+@dataclass(frozen=True)
+class PostProcess:
+    """One fullscreen pass sampling a framebuffer-sized, single-mip HDR target."""
+
+    program: GraphicsProgram
+    texture: str = "scene_color"
+    format: str = "rgba32_sfloat"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.program, GraphicsProgram):
+            raise ViewerError("Post processing requires a GraphicsProgram.")
+        if self.format not in ("rgba8_unorm", "rgba32_sfloat"):
+            raise ViewerError("Render targets support rgba8_unorm and rgba32_sfloat only.")
+        p = self.program
+        if p.post_process is not None:
+            raise ViewerError("Nested post passes are not supported.")
+        if (p.draws == [DrawCall(pipeline="default", vertex_count=3)]
+                and set(p.pipelines) == {"default"}
+                and p.pipelines["default"] == PipelineState(
+                    p.vertex, p.fragment, parameters=p.parameters, interface=p.interface)):
+            p = replace(p, draws=[], pipelines={})
+            object.__setattr__(self, "program", p)
+        if (p.draw != Draw(vertex_count=3) or p.draws or p.pipelines or p.input_layout
+                or p.vertex_buffer is not None or p.index_buffer is not None or p.depth_stencil):
+            raise ViewerError("The post pass requires one non-indexed fullscreen triangle without depth or vertex buffers.")
+        if (len(p.texture_bindings) != 1 or p.texture_bindings[0]["name"] != self.texture
+                or p.texture_bindings[0].get("stages") != ["fragment"]
+                or p.buffer_bindings):
+            raise ViewerError("The post pass must declare exactly one fragment texture and no storage buffers.")
+        if p.textures:
+            raise ViewerError("The post-pass texture is supplied by the render target, not TextureData.")
+        _frame_parameters(p.parameters)
+        if p.samplers is None:
+            p = replace(p, samplers={
+                s["name"]: SamplerDesc(
+                    mag_filter="nearest", min_filter="nearest",
+                    address_mode_u="clamp_to_edge", address_mode_v="clamp_to_edge",
+                ) for s in p.sampler_bindings
+            })
+            object.__setattr__(self, "program", p)
+        _validate_resource_maps((), (), p.sampler_bindings, samplers=p.samplers)
+
+
+def with_post_process(
+    scene: GraphicsProgram, post: GraphicsProgram, *,
+    texture: str = "scene_color", format: str = "rgba32_sfloat",
+) -> GraphicsProgram:
+    """Render scene into a GPU texture, then post into the final output."""
+    if scene.target != post.target:
+        raise ViewerError("Scene and post pass must use the same artifact target.")
+    if scene.post_process is not None:
+        raise ViewerError("The scene already has a post pass.")
+    return replace(scene, post_process=PostProcess(post, texture, format))
 
 
 @dataclass(frozen=True)
@@ -235,6 +293,7 @@ def _with_resource_overrides(
         buffers=resolved_buffers,
         textures=resolved_textures,
         samplers=resolved_samplers,
+        post_process=program.post_process,
     )
 
 
@@ -806,8 +865,11 @@ def write_png(path: Path, image: RenderedImage) -> None:
         output.write(encoded)
 
 
-def _write_native_graphics_resources(directory: Path, program: GraphicsProgram) -> Path | None:
-    resolved_buffers, resolved_textures, resolved_samplers = _resolve_program_resources(program)
+def _write_native_graphics_resources(
+    directory: Path, program: GraphicsProgram, *, render_target: str | None = None,
+) -> Path | None:
+    resource_program = replace(program, texture_bindings=()) if render_target is not None else program
+    resolved_buffers, resolved_textures, resolved_samplers = _resolve_program_resources(resource_program)
     if not (program.buffer_bindings or program.texture_bindings or program.sampler_bindings):
         return None
 
@@ -841,6 +903,12 @@ def _write_native_graphics_resources(directory: Path, program: GraphicsProgram) 
         stage_textures = []
         for t in program.texture_bindings:
             if stage in t.get("stages", [stage]):
+                if t["name"] == render_target:
+                    stage_textures.append({
+                        "name": t["name"], "set": t["set"], "binding": t["binding"],
+                        "render_target": True,
+                    })
+                    continue
                 tex = resolved_textures[t["name"]]
                 stage_textures.append({
                     "name": t["name"],
@@ -876,7 +944,7 @@ def _write_native_graphics_resources(directory: Path, program: GraphicsProgram) 
 
 
 @contextmanager
-def _metal_libraries(program: GraphicsProgram, toolchain: Toolchain):
+def _metal_libraries(program: GraphicsProgram, toolchain: Toolchain, *, render_target=None):
     if sys.platform != "darwin":
         raise ViewerError("DXIL-to-Metal preview requires macOS. This is not a DirectX runtime renderer.")
     if program.target not in ("directx", "metal"):
@@ -974,6 +1042,7 @@ def _metal_libraries(program: GraphicsProgram, toolchain: Toolchain):
                     "parameters": p_state.parameters,
                     "depth_stencil": p_state.depth_stencil,
                     "input_layout": p_state.input_layout or program.input_layout,
+                    "color_format": program.post_process.format if program.post_process else "rgba8_unorm",
                 }
             multi_draws = []
             for d in draws_list:
@@ -984,10 +1053,27 @@ def _metal_libraries(program: GraphicsProgram, toolchain: Toolchain):
             multi_spec = directory / "multi-spec.json"
             multi_spec.write_text(json.dumps({"pipelines": multi_pipes, "draws": multi_draws}, allow_nan=False))
             arguments.extend(["--multi-spec", str(multi_spec)])
-        res_path = _write_native_graphics_resources(directory, program)
+        res_path = _write_native_graphics_resources(directory, program, render_target=render_target)
         if res_path is not None:
             arguments.extend(["--resources", str(res_path)])
-        yield directory, arguments
+        with _native_post_arguments(directory, arguments, program, toolchain, _metal_libraries) as arguments:
+            yield directory, arguments
+
+
+@contextmanager
+def _native_post_arguments(directory, arguments, program, toolchain, shaders):
+    if program.post_process is None:
+        yield arguments
+        return
+    post = program.post_process
+    with shaders(post.program, toolchain, render_target=post.texture) as (_, post_args):
+        spec = {
+            post_args[i][2:].replace("-", "_"): post_args[i + 1]
+            for i in range(1, len(post_args), 2)
+        }
+        path = directory / "post-spec.json"
+        path.write_text(json.dumps(spec, allow_nan=False) + "\n")
+        yield [*arguments, "--color-format", post.format, "--post-spec", str(path)]
 
 
 def _native_run(arguments: list[str], capture: bool, backend: str, environment: dict[str, str] | None = None) -> str:
@@ -1077,7 +1163,7 @@ def _preview_toolchain() -> Toolchain:
 
 
 @contextmanager
-def _directx_shaders(program: GraphicsProgram, toolchain: Toolchain):
+def _directx_shaders(program: GraphicsProgram, toolchain: Toolchain, *, render_target=None):
     if sys.platform != "win32":
         raise ViewerError("Native DirectX 12 preview requires Windows.")
     if program.target != "directx":
@@ -1122,10 +1208,11 @@ def _directx_shaders(program: GraphicsProgram, toolchain: Toolchain):
             else:
                 ib_path = Path(program.index_buffer).resolve()
             arguments.extend(["--index-buffer", str(ib_path)])
-        res_path = _write_native_graphics_resources(directory, program)
+        res_path = _write_native_graphics_resources(directory, program, render_target=render_target)
         if res_path is not None:
             arguments.extend(["--resources", str(res_path)])
-        yield directory, arguments
+        with _native_post_arguments(directory, arguments, program, toolchain, _directx_shaders) as arguments:
+            yield directory, arguments
 
 
 def _readback_result(text: str, output: Path, width: int, height: int, backend: str) -> RenderedImage:
@@ -1556,17 +1643,20 @@ class _Vulkan:
         resources.callback(vk.vkDestroyImageView, self.device, view, None)
         return view
 
-    def image(self, resources, width, height, format):
+    def image(self, resources, width, height, format, *, sampled=False):
         vk = self.vk
         properties = vk.vkGetPhysicalDeviceFormatProperties(self.physical, format)
         if not properties.optimalTilingFeatures & vk.VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT:
             raise ViewerError("The Vulkan device does not support the offscreen color format.")
+        if sampled and not properties.optimalTilingFeatures & vk.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT:
+            raise ViewerError("The Vulkan device does not support sampling the render target format.")
         image = vk.vkCreateImage(self.device, vk.VkImageCreateInfo(
             imageType=vk.VK_IMAGE_TYPE_2D, format=format,
             extent=vk.VkExtent3D(width=width, height=height, depth=1),
             mipLevels=1, arrayLayers=1, samples=vk.VK_SAMPLE_COUNT_1_BIT,
             tiling=vk.VK_IMAGE_TILING_OPTIMAL,
-            usage=vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            usage=(vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                   | (vk.VK_IMAGE_USAGE_SAMPLED_BIT if sampled else 0)),
             sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE, initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
         ), None)
         memory = None
@@ -1952,12 +2042,14 @@ class _Vulkan:
         resources.callback(vk.vkDestroyPipeline, self.device, pipeline, None)
         return pipeline, layout, set_layouts
 
-    def pipeline(self, resources, program, format, width, height, present):
+    def pipeline(self, resources, program, format, width, height, present, *, sampled=False):
         vk = self.vk
         _frame_parameters(program.parameters)
         if width > self.max_width or height > self.max_height:
             raise ViewerError("The requested preview exceeds the device's framebuffer limits.")
         final_layout = vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR if present else vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+        if sampled:
+            final_layout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
 
         depth_format = None
         depth_stencil_state = None
@@ -2036,8 +2128,10 @@ class _Vulkan:
                 vk.VkSubpassDependency(
                     srcSubpass=0, dstSubpass=vk.VK_SUBPASS_EXTERNAL,
                     srcStageMask=src_stages, srcAccessMask=src_access,
-                    dstStageMask=vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT if present else vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    dstAccessMask=0 if present else vk.VK_ACCESS_TRANSFER_READ_BIT,
+                    dstStageMask=(vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT if sampled else
+                                  vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT if present else vk.VK_PIPELINE_STAGE_TRANSFER_BIT),
+                    dstAccessMask=(vk.VK_ACCESS_SHADER_READ_BIT if sampled else
+                                   0 if present else vk.VK_ACCESS_TRANSFER_READ_BIT),
                 ),
             ],
         ), None)
@@ -2232,12 +2326,13 @@ class _Vulkan:
             }[stage]
         return flags
 
-    def create_graphics_descriptor_sets(self, resources, program, layout):
+    def create_graphics_descriptor_sets(self, resources, program, layout, *, render_target=None):
         vk = self.vk
         set_layouts = getattr(self, "pipeline_set_layouts", {}).get(layout, [])
         if not set_layouts:
             return []
-        resolved_buffers, resolved_textures, resolved_samplers = _resolve_program_resources(program)
+        resource_program = replace(program, texture_bindings=()) if render_target is not None else program
+        resolved_buffers, resolved_textures, resolved_samplers = _resolve_program_resources(resource_program)
         buf_bindings = getattr(program, "buffer_bindings", ())
         tex_bindings = getattr(program, "texture_bindings", ())
         samp_bindings = getattr(program, "sampler_bindings", ())
@@ -2290,8 +2385,11 @@ class _Vulkan:
                 pBufferInfo=[info],
             ))
         for tex_meta in tex_bindings:
-            tex_data = resolved_textures[tex_meta["name"]]
-            _, vk_view = self.sampled_image(resources, tex_data)
+            if render_target is not None:
+                vk_view = render_target
+            else:
+                tex_data = resolved_textures[tex_meta["name"]]
+                _, vk_view = self.sampled_image(resources, tex_data)
             info = vk.VkDescriptorImageInfo(
                 sampler=vk.VK_NULL_HANDLE,
                 imageView=vk_view,
@@ -2338,19 +2436,24 @@ class _Vulkan:
 
     def command(self, resources, render_pass, pipeline, framebuffer, width, height, draw: Draw, copy=None,
                 *, layout=None, parameters=None, elapsed=0.0, command=None, draws=None, has_depth=False,
-                vertex_buffer=None, index_buffer=None, descriptor_sets=None):
+                vertex_buffer=None, index_buffer=None, descriptor_sets=None, before=None, recording_only=False):
         vk = self.vk
         data = _frame_data(parameters, width, height, elapsed) if parameters is not None else None
         if data is not None and layout is None:
             raise ViewerError("Frame parameters require the reflected pipeline layout.")
+        if recording_only and command is None:
+            raise ViewerError("Recording a render pass requires an active command buffer.")
         if command is None:
             command = vk.vkAllocateCommandBuffers(self.device, vk.VkCommandBufferAllocateInfo(
                 commandPool=self.pool, level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount=1,
             ))[0]
             resources.callback(vk.vkFreeCommandBuffers, self.device, self.pool, 1, [command])
-        else:
+        elif not recording_only:
             vk.vkResetCommandBuffer(command, 0)
-        vk.vkBeginCommandBuffer(command, vk.VkCommandBufferBeginInfo())
+        if not recording_only:
+            vk.vkBeginCommandBuffer(command, vk.VkCommandBufferBeginInfo())
+        if before is not None:
+            before(command, elapsed)
         clear_values = [
             vk.VkClearValue(color=vk.VkClearColorValue(float32=[0.02, 0.02, 0.04, 1.0]))
         ]
@@ -2500,8 +2603,47 @@ class _Vulkan:
                 1, [vk.VkMemoryBarrier(srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT, dstAccessMask=vk.VK_ACCESS_HOST_READ_BIT)],
                 0, None, 0, None,
             )
-        vk.vkEndCommandBuffer(command)
+        if not recording_only:
+            vk.vkEndCommandBuffer(command)
         return command
+
+
+def _prepare_vulkan_post(gpu, resources, scene, width, height):
+    post = scene.post_process
+    if post is None:
+        return scene, {}
+    vk = gpu.vk
+    format = {
+        "rgba8_unorm": vk.VK_FORMAT_R8G8B8A8_UNORM,
+        "rgba32_sfloat": vk.VK_FORMAT_R32G32B32A32_SFLOAT,
+    }[post.format]
+    features = vk.vkGetPhysicalDeviceFormatProperties(gpu.physical, format).optimalTilingFeatures
+    if any(s.mag_filter == "linear" or s.min_filter == "linear" for s in (post.program.samplers or {}).values()):
+        if not features & vk.VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT:
+            raise ViewerError("The Vulkan render target does not support linear filtering; use a nearest sampler.")
+    _, view = gpu.image(resources, width, height, format, sampled=True)
+    render_pass, pipeline, layout = gpu.pipeline(resources, scene, format, width, height, False, sampled=True)
+    sets = gpu.create_graphics_descriptor_sets(resources, scene, layout)
+    depth_view = None
+    if scene.depth_stencil:
+        _, depth_view = gpu.depth_image(
+            resources, width, height, _vulkan_depth_format(vk, scene.depth_stencil.get("format", "d32_sfloat"))
+        )
+    framebuffer = gpu.framebuffer(resources, render_pass, view, width, height, depth_view=depth_view)
+    vertex_buffer = (gpu.create_buffer(resources, scene.vertex_buffer, vk.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
+                     if scene.vertex_buffer is not None else None)
+    index_buffer = (gpu.create_buffer(resources, scene.index_buffer, vk.VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
+                    if scene.index_buffer is not None else None)
+
+    def before(command, elapsed):
+        gpu.command(
+            resources, render_pass, pipeline, framebuffer, width, height, scene.draw,
+            layout=layout, parameters=scene.parameters, elapsed=elapsed, command=command,
+            recording_only=True, has_depth=depth_view is not None,
+            vertex_buffer=vertex_buffer, index_buffer=index_buffer, descriptor_sets=sets,
+        )
+
+    return post.program, {"before": before, "render_target": view}
 
 
 def render_offscreen(
@@ -2547,6 +2689,7 @@ def _offscreen_renderer(
     with _api_errors(), ExitStack() as resources:
         gpu = _Vulkan(resources, validation=validation, **vulkan_kwargs)
         vk = gpu.vk
+        program, post_kwargs = _prepare_vulkan_post(gpu, resources, program, width, height)
         format = vk.VK_FORMAT_R8G8B8A8_UNORM
         image, view = gpu.image(resources, width, height, format)
         has_depth = program.depth_stencil is not None
@@ -2557,8 +2700,11 @@ def _offscreen_renderer(
         buffer, memory = gpu.readback_buffer(resources, width * height * 4)
         render_pass, pipeline, layout = gpu.pipeline(resources, program, format, width, height, False)
         create_sets = getattr(gpu, "create_graphics_descriptor_sets", None)
-        descriptor_sets = create_sets(resources, program, layout) if create_sets is not None else []
+        target_kwargs = {"render_target": post_kwargs["render_target"]} if post_kwargs else {}
+        descriptor_sets = create_sets(resources, program, layout, **target_kwargs) if create_sets is not None else []
         desc_kwargs = {"descriptor_sets": descriptor_sets} if descriptor_sets else {}
+        if post_kwargs:
+            desc_kwargs["before"] = post_kwargs["before"]
         framebuffer = gpu.framebuffer(resources, render_pass, view, width, height, depth_view=depth_view)
         fence = vk.vkCreateFence(gpu.device, vk.VkFenceCreateInfo(), None)
         resources.callback(vk.vkDestroyFence, gpu.device, fence, None)
@@ -3479,6 +3625,7 @@ def _swapchain(gpu, resources, program, width, height):
         presentMode=vk.VK_PRESENT_MODE_FIFO_KHR, clipped=vk.VK_TRUE,
     ), None)
     resources.callback(gpu.device_function("vkDestroySwapchainKHR"), gpu.device, swapchain, None)
+    program, post_kwargs = _prepare_vulkan_post(gpu, resources, program, width, height)
     has_depth = program.depth_stencil is not None
     depth_view = None
     if has_depth:
@@ -3486,8 +3633,11 @@ def _swapchain(gpu, resources, program, width, height):
         depth_image, depth_view = gpu.depth_image(resources, width, height, depth_format)
     render_pass, pipeline, layout = gpu.pipeline(resources, program, format, width, height, True)
     create_sets = getattr(gpu, "create_graphics_descriptor_sets", None)
-    descriptor_sets = create_sets(resources, program, layout) if create_sets is not None else []
+    target_kwargs = {"render_target": post_kwargs["render_target"]} if post_kwargs else {}
+    descriptor_sets = create_sets(resources, program, layout, **target_kwargs) if create_sets is not None else []
     desc_kwargs = {"descriptor_sets": descriptor_sets} if descriptor_sets else {}
+    if post_kwargs:
+        desc_kwargs["before"] = post_kwargs["before"]
     vertex_buffer = None
     if getattr(program, "vertex_buffer", None) is not None:
         vertex_buffer = gpu.create_buffer(resources, program.vertex_buffer, vk.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
@@ -3509,7 +3659,7 @@ def _swapchain(gpu, resources, program, width, height):
     resources.callback(vk.vkDestroySemaphore, gpu.device, acquired, None)
     resources.callback(vk.vkDeviceWaitIdle, gpu.device)
     def record_frame(index, elapsed):
-        if program.parameters is not None:
+        if program.parameters is not None or post_kwargs:
             gpu.command(resources, render_pass, pipeline, framebuffers[index], width, height, program.draw,
                         layout=layout, parameters=program.parameters, elapsed=elapsed, command=commands[index],
                         has_depth=has_depth, vertex_buffer=vertex_buffer, index_buffer=index_buffer, **desc_kwargs)

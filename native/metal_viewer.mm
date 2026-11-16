@@ -170,7 +170,8 @@ static MTLSamplerAddressMode parseMetalAddressMode(const std::string& mode) {
     throw std::runtime_error("Unsupported sampler address mode: " + mode);
 }
 
-static MetalStageResources loadStageResources(id<MTLDevice> device, id<MTLCommandQueue> queue, NSDictionary* spec) {
+static MetalStageResources loadStageResources(id<MTLDevice> device, id<MTLCommandQueue> queue, NSDictionary* spec,
+                                             id<MTLTexture> renderTarget = nil) {
     MetalStageResources stage;
     if (!spec) return stage;
     NSError* error = nil;
@@ -242,6 +243,19 @@ static MetalStageResources loadStageResources(id<MTLDevice> device, id<MTLComman
                 throw failure(@"Invalid texture entry in resource spec");
             NSDictionary* dict = item;
             NSString* nameNs = dict[@"name"];
+            if ([dict[@"render_target"] boolValue]) {
+                if (![nameNs isKindOfClass:[NSString class]] || !renderTarget)
+                    throw failure(@"Post-pass render target is missing");
+                MetalTextureResource entry;
+                entry.name = nameNs.UTF8String;
+                entry.set = [dict[@"set"] unsignedIntValue];
+                entry.binding = [dict[@"binding"] unsignedIntValue];
+                entry.width = renderTarget.width;
+                entry.height = renderTarget.height;
+                entry.texture = renderTarget;
+                stage.textures.push_back(std::move(entry));
+                continue;
+            }
             NSString* fmtNs = dict[@"format"];
             NSString* pathNs = dict[@"path"];
             NSNumber* widthNs = dict[@"width"];
@@ -524,10 +538,20 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
 @property(nonatomic, strong) NSDictionary* inputLayout;
 @property(nonatomic, strong) id<MTLBuffer> vertexBuffer;
 @property(nonatomic, strong) id<MTLBuffer> indexBuffer;
+@property(nonatomic) MTLPixelFormat colorFormat;
+@property(nonatomic, strong) GraphicsRenderer* postRenderer;
+@property(nonatomic, copy) NSString* postResourcesPath;
+@property(nonatomic, strong) id<MTLTexture> sceneColor;
+@property(nonatomic) double frameTime;
 - (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
                     inputLayout:(NSDictionary*)inputLayout
                   depthSettings:(MetalDepthSettings)depthSettings;
+- (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
+                       fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
+                    inputLayout:(NSDictionary*)inputLayout
+                  depthSettings:(MetalDepthSettings)depthSettings
+                         device:(id<MTLDevice>)device colorFormat:(MTLPixelFormat)colorFormat;
 - (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
                     inputLayout:(NSDictionary*)inputLayout;
@@ -537,12 +561,14 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
                   depthSettings:(MetalDepthSettings)depthSettings;
 - (void)loadResourcesFromPath:(NSString*)path;
+- (void)loadResourcesFromPath:(NSString*)path renderTarget:(id<MTLTexture>)renderTarget;
 - (ReflectedArgBufferLayout)vertexArgLayout;
 - (ReflectedArgBufferLayout)fragmentArgLayout;
 - (void)setArgLayoutsForPipeline:(NSString*)pipeId
                           vertex:(ReflectedArgBufferLayout)vertexLayout
                         fragment:(ReflectedArgBufferLayout)fragmentLayout;
 - (void)encode:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass;
+- (void)encodeScene:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass;
 @end
 
 @implementation GraphicsRenderer
@@ -576,10 +602,22 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
                     inputLayout:(NSDictionary*)inputLayout
                   depthSettings:(MetalDepthSettings)depthSettings {
+    return [self initWithVertex:vertex vertexEntry:vertexEntry
+                      fragment:fragment fragmentEntry:fragmentEntry
+                   inputLayout:inputLayout depthSettings:depthSettings
+                        device:nil colorFormat:MTLPixelFormatBGRA8Unorm];
+}
+
+- (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
+                       fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
+                    inputLayout:(NSDictionary*)inputLayout
+                  depthSettings:(MetalDepthSettings)depthSettings
+                         device:(id<MTLDevice>)device colorFormat:(MTLPixelFormat)colorFormat {
     self = [super init];
     if (!self) throw failure(@"Cannot allocate Metal renderer");
     _inputLayout = inputLayout;
-    _device = MTLCreateSystemDefaultDevice();
+    _device = device ?: MTLCreateSystemDefaultDevice();
+    _colorFormat = colorFormat;
     if (!_device) throw failure(@"No Metal device is available");
     if (_device.argumentBuffersSupport != MTLArgumentBuffersTier2)
         throw failure(@"Converted DXIL requires Argument Buffers Tier 2");
@@ -593,7 +631,7 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
     descriptor.fragmentFunction = [fs newFunctionWithName:fragmentEntry];
     if (!descriptor.vertexFunction || !descriptor.fragmentFunction)
         throw failure(@"The converted library does not contain the manifest's entry point");
-    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    descriptor.colorAttachments[0].pixelFormat = colorFormat;
     descriptor.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
     if (depthSettings.enabled) {
         descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
@@ -677,6 +715,10 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
 }
 
 - (void)loadResourcesFromPath:(NSString*)path {
+    [self loadResourcesFromPath:path renderTarget:nil];
+}
+
+- (void)loadResourcesFromPath:(NSString*)path renderTarget:(id<MTLTexture>)renderTarget {
     NSError* error = nil;
     NSData* data = [NSData dataWithContentsOfFile:path options:0 error:&error];
     if (!data) throw failure(@"Cannot read graphics resources JSON", error);
@@ -685,10 +727,10 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
         throw failure(@"Invalid graphics resources JSON", error);
     NSDictionary* dict = raw;
     if ([dict[@"vertex"] isKindOfClass:[NSDictionary class]]) {
-        _vertexResources = loadStageResources(_device, _queue, dict[@"vertex"]);
+        _vertexResources = loadStageResources(_device, _queue, dict[@"vertex"], renderTarget);
     }
     if ([dict[@"fragment"] isKindOfClass:[NSDictionary class]]) {
-        _fragmentResources = loadStageResources(_device, _queue, dict[@"fragment"]);
+        _fragmentResources = loadStageResources(_device, _queue, dict[@"fragment"], renderTarget);
     }
 }
 
@@ -710,6 +752,35 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
 }
 
 - (void)encode:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass {
+    self.frameTime = self.hasFixedTime ? self.fixedTime :
+        (self.live ? std::chrono::duration<double>(std::chrono::steady_clock::now() - _started).count() : 0);
+    if (!self.postRenderer) {
+        [self encodeScene:command pass:pass];
+        return;
+    }
+    id<MTLTexture> output = pass.colorAttachments[0].texture;
+    if (!output) throw failure(@"Post pass requires a color output");
+    if (!self.sceneColor || self.sceneColor.width != output.width || self.sceneColor.height != output.height) {
+        MTLTextureDescriptor* desc = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:self.colorFormat width:output.width height:output.height mipmapped:NO];
+        desc.storageMode = MTLStorageModePrivate;
+        desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        self.sceneColor = [self.device newTextureWithDescriptor:desc];
+        if (!self.sceneColor) throw failure(@"Cannot allocate sampled offscreen render target");
+        [self.postRenderer loadResourcesFromPath:self.postResourcesPath renderTarget:self.sceneColor];
+    }
+    MTLRenderPassDescriptor* scenePass = [pass copy];
+    scenePass.colorAttachments[0].texture = self.sceneColor;
+    scenePass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    self.postRenderer.frameTime = self.frameTime;
+    [self encodeScene:command pass:scenePass];
+    MTLRenderPassDescriptor* postPass = [pass copy];
+    postPass.depthAttachment.texture = nil;
+    postPass.stencilAttachment.texture = nil;
+    [self.postRenderer encodeScene:command pass:postPass];
+}
+
+- (void)encodeScene:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass {
     id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
     if (!encoder) throw failure(@"Cannot create a Metal render encoder");
     if (self.depthState) {
@@ -724,8 +795,7 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
     bool fragmentHasFrame = false;
     NSUInteger argBufBindIndex = kIRArgumentBufferBindPoint;
     if (self.frameLayout) {
-        double elapsed = self.hasFixedTime ? self.fixedTime :
-            (self.live ? std::chrono::duration<double>(std::chrono::steady_clock::now() - _started).count() : 0);
+        double elapsed = self.frameTime;
         if (!std::isfinite(elapsed) || elapsed < 0 || elapsed > 3.4028234663852886e38)
             throw failure(@"Invalid elapsed frame time");
         frameBytes.assign([self.frameLayout[@"size"] unsignedIntegerValue], 0);
@@ -1217,7 +1287,8 @@ int main(int argc, char** argv) {
                         pair.first != "--compute-spec" && pair.first != "--multi-spec" &&
                         pair.first != "--resources" &&
                         pair.first != "--depth-compare" && pair.first != "--depth-write" &&
-                        pair.first != "--depth-format")
+                        pair.first != "--depth-format" && pair.first != "--color-format" &&
+                        pair.first != "--post-spec")
                         throw std::runtime_error("Unknown option: " + pair.first);
                 }
                 if (arguments.count("--depth-compare")) {
@@ -1261,6 +1332,15 @@ int main(int argc, char** argv) {
                 NSDictionary* layout = arguments.count("--frame-layout") ? frameLayout(arguments.at("--frame-layout")) : nil;
                 double fixedTime = arguments.count("--time") ? seconds(arguments.at("--time")) : 0;
                 NSDictionary* inputLayoutDict = nil;
+                MTLPixelFormat colorFormat = MTLPixelFormatBGRA8Unorm;
+                if (arguments.count("--color-format")) {
+                    const auto& fmt = arguments.at("--color-format");
+                    if (fmt == "rgba32_sfloat") colorFormat = MTLPixelFormatRGBA32Float;
+                    else if (fmt == "rgba8_unorm") colorFormat = MTLPixelFormatRGBA8Unorm;
+                    else throw std::runtime_error("Unsupported render target format: " + fmt);
+                    if (!arguments.count("--post-spec"))
+                        throw std::runtime_error("--color-format requires --post-spec");
+                }
                 if (arguments.count("--input-layout")) {
                     NSData* data = [NSData dataWithContentsOfFile:@(arguments.at("--input-layout").c_str())];
                     if (data) {
@@ -1279,7 +1359,7 @@ int main(int argc, char** argv) {
                     initWithVertex:@(required("--vertex").c_str()) vertexEntry:@(required("--vertex-entry").c_str())
                     fragment:@(required("--fragment").c_str()) fragmentEntry:@(required("--fragment-entry").c_str())
                     inputLayout:inputLayoutDict
-                  depthSettings:depthSettings];
+                  depthSettings:depthSettings device:nil colorFormat:colorFormat];
                 if (arguments.count("--index-count")) {
                     renderer.isIndexed = YES;
                     renderer.indexCount = number(arguments.at("--index-count"), UINT32_MAX);
@@ -1340,7 +1420,7 @@ int main(int argc, char** argv) {
                                 initWithVertex:pCfg[@"vertex"] vertexEntry:pCfg[@"vertex_entry"]
                                       fragment:pCfg[@"fragment"] fragmentEntry:pCfg[@"fragment_entry"]
                                    inputLayout:pLayout
-                                 depthSettings:pDepth];
+                                 depthSettings:pDepth device:renderer.device colorFormat:colorFormat];
                             builtPipes[pId] = sub.pipeline;
                             [renderer setArgLayoutsForPipeline:pId
                                                         vertex:[sub vertexArgLayout]
@@ -1357,6 +1437,28 @@ int main(int argc, char** argv) {
                     if ([specDict[@"draws"] isKindOfClass:[NSArray class]]) {
                         renderer.draws = specDict[@"draws"];
                     }
+                }
+                if (arguments.count("--post-spec")) {
+                    NSError* error = nil;
+                    NSData* data = [NSData dataWithContentsOfFile:@(arguments.at("--post-spec").c_str()) options:0 error:&error];
+                    if (!data) throw failure(@"Cannot read post-pass spec", error);
+                    NSDictionary* spec = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+                    if (![spec isKindOfClass:[NSDictionary class]] ||
+                        ![spec[@"vertex"] isKindOfClass:[NSString class]] ||
+                        ![spec[@"fragment"] isKindOfClass:[NSString class]] ||
+                        ![spec[@"vertex_entry"] isKindOfClass:[NSString class]] ||
+                        ![spec[@"fragment_entry"] isKindOfClass:[NSString class]] ||
+                        ![spec[@"resources"] isKindOfClass:[NSString class]])
+                        throw failure(@"Invalid post-pass spec", error);
+                    GraphicsRenderer* post = [[GraphicsRenderer alloc]
+                        initWithVertex:spec[@"vertex"] vertexEntry:spec[@"vertex_entry"]
+                        fragment:spec[@"fragment"] fragmentEntry:spec[@"fragment_entry"]
+                        inputLayout:nil depthSettings:{} device:renderer.device colorFormat:MTLPixelFormatBGRA8Unorm];
+                    post.vertexCount = 3;
+                    if ([spec[@"frame_layout"] isKindOfClass:[NSString class]])
+                        post.frameLayout = frameLayout([spec[@"frame_layout"] UTF8String]);
+                    renderer.postRenderer = post;
+                    renderer.postResourcesPath = spec[@"resources"];
                 }
                 if (arguments.count("--readback")) {
                     readback(renderer, width, height, arguments.at("--readback"));

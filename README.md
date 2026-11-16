@@ -178,6 +178,79 @@ still requires a Vulkan driver, but does not require GLFW or a desktop session.
 On macOS this uses Vulkan through MoltenVK, **not** the native DXIL-to-Metal
 compiler adapter.
 
+### HDR render targets and fullscreen post processing
+
+The viewer can render a scene into a GPU-only, framebuffer-sized color texture
+and sample it in a separate fullscreen pass. Compile both pipelines for the same
+target, then connect the loaded programs on the host:
+
+```python
+from mlir_gpu.viewer import load_program, render_offscreen, with_post_process
+
+scene = load_program("build/scene/pipeline.json")
+post = load_program("build/post/pipeline.json")
+program = with_post_process(scene, post, texture="scene_color")
+image = render_offscreen(program, 800, 600, validation=True)
+```
+
+Use `fullscreen_uv_vertex` from `mlir_gpu` for the post vertex shader. Its `uv`
+varying has a top-left origin. The post fragment shader must declare exactly one
+`Texture2D` resource named `scene_color` (or the name passed to `texture`), and
+may declare samplers. The render target is bound automatically: do not supply
+`TextureData` for it. Samplers default to nearest/clamp-to-edge; explicit sampler
+maps on the post program override these defaults. Linear filtering requires
+device support for the chosen target format.
+
+The default target format is `rgba32_sfloat`, preserving HDR values above 1.0
+until the post shader maps them to the final RGBA8/BGRA8 UNORM output.
+`format="rgba8_unorm"` is also supported for LDR effects. The source scene keeps
+its existing draws, depth attachment, constants, and resources. The post pass
+is one non-indexed, bufferless triangle without depth or storage buffers.
+Nested post passes, mip chains, MSAA, and multiple color attachments are not
+supported. This is an opt-in runtime composition, not a change to pipeline
+manifest schemas or to MiniGfx's existing inline tonemapper.
+
+Vulkan, native DX12, and converted Metal execute both passes on the same device
+without intermediate CPU readback. PNG, MP4, and viewer windows use this path;
+window resize recreates the intermediate target at drawable-pixel dimensions.
+Single-pass programs are unchanged.
+
+See [the runnable HDR/post example](examples/basics/post_process.py):
+
+```sh
+PYTHONPATH=src python -m examples.basics.post_process \
+  --target metal --validation
+```
+
+This opens an animated neon hand-and-eye tunnel inspired by the user-supplied
+Infinite Hamsa reference by Noztol. **Left: LDR clipping simulation;
+right: HDR preserved until tonemapping.** Both halves show the same scene:
+the left clamps/quantizes the sampled emission to RGBA8 before the same
+exposure/tonemap operation, so bright colors lose their internal detail.
+The right retains values above 1.0 and compresses intensity while preserving
+RGB ratios. This demonstrates HDR *processing*, not HDR monitor output:
+the final window/PNG is still SDR.
+
+![Emissive tunnel comparison: clipped LDR on the left, tonemapped HDR on the right](examples/basics/hdr-post-comparison.png)
+
+Use `--view hdr` for the full HDR scene, or `--view ldr` to render through an
+actual RGBA8 intermediate target. `--exposure 0.6` changes exposure,
+`--time 2` freezes animation, and `--frames 3` bounds a window smoke test.
+To save a still instead of opening a window:
+
+```sh
+PYTHONPATH=src python -m examples.basics.post_process \
+  --target metal --output build/hdr-tunnel.png --time 2 --validation
+```
+
+Choose `--target vulkan` for Vulkan or `--target directx` on Windows.
+
+Acceptance tests: `PYTHONPATH=src:tests python -m unittest test_post_process -v`.
+Enable `MLIR_GPU_TEST_VULKAN=1`, `MLIR_GPU_TEST_METAL=1`, or
+`MLIR_GPU_TEST_DIRECTX=1` for GPU readback checks; use
+`MLIR_GPU_TEST_WINDOW=1` only in an interactive desktop session.
+Native DX12 execution must be verified on Windows.
+
 For a bounded window smoke test, use `--frames 3` instead of `--output`.
 `-frames` is also accepted: `-frames 0` and `--frames 0` both mean render
 continuously until Esc or window close, as does omitting the option entirely.
