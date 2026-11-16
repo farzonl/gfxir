@@ -14,6 +14,7 @@ import tempfile
 import time as clock
 import zlib
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -1316,11 +1317,24 @@ def show_directx_window(
     program = _with_resource_overrides(program, buffers=buffers, textures=textures, samplers=samplers)
     _dimensions(width, height)
     _validate_provider(provider, "directx")
-    if provider == "nacelle":
-        raise ViewerError("Nacelle supports headless execution only; use --output or --video.")
     _require_directx_platform(provider)
     if type(frames) is not int or frames < 0:
         raise ViewerError("Frame count must be a nonnegative integer (0 means until closed).")
+    if provider == "nacelle":
+        if program.target != "directx":
+            raise ViewerError("The DirectX 12 viewer requires DirectX artifacts.")
+        _frame_parameters(program.parameters)
+        if validation:
+            raise ViewerError("Nacelle does not provide D3D12 validation; omit --validation.")
+
+        def renderer(frame_width, frame_height):
+            return _directx_offscreen_renderer(
+                program, frame_width, frame_height, False, toolchain, provider="nacelle",
+            )
+
+        count = _show_vulkan_window(program, width, height, frames, False, time, renderer=renderer)
+        print(f"Presented {count} Nacelle frames.")
+        return
     timing = ["--time", str(_time_value(time))] if time is not None else []
     warp_args = ["--warp"] if provider == "warp" else []
     with _directx_shaders(program, toolchain or _preview_toolchain()) as (_, arguments):
@@ -1735,9 +1749,12 @@ class _Vulkan:
         return image, self.view(resources, image, format, aspect_mask=vk.VK_IMAGE_ASPECT_DEPTH_BIT)
 
     def readback_buffer(self, resources, size):
+        return self.host_buffer(resources, size, self.vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+
+    def host_buffer(self, resources, size, usage):
         vk = self.vk
         buffer = vk.vkCreateBuffer(self.device, vk.VkBufferCreateInfo(
-            size=size, usage=vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT, sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+            size=size, usage=usage, sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
         ), None)
         memory = None
 
@@ -3642,7 +3659,77 @@ def export_mp4(program: GraphicsProgram, path: Path, width: int = 640, height: i
     return count
 
 
-def _swapchain(gpu, resources, program, width, height):
+def _pixel_commands(gpu, resources, images, format, width, height, render):
+    vk = gpu.vk
+    size = width * height * 4
+    buffer, memory = gpu.host_buffer(resources, size, vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
+    commands = vk.vkAllocateCommandBuffers(gpu.device, vk.VkCommandBufferAllocateInfo(
+        commandPool=gpu.pool, level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount=len(images),
+    ))
+    resources.callback(vk.vkFreeCommandBuffers, gpu.device, gpu.pool, len(commands), commands)
+    for command, image in zip(commands, images):
+        vk.vkBeginCommandBuffer(command, vk.VkCommandBufferBeginInfo())
+        subresource = vk.VkImageSubresourceRange(
+            aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, levelCount=1, layerCount=1,
+        )
+        vk.vkCmdPipelineBarrier(
+            command, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, None, 0, None, 1, [vk.VkImageMemoryBarrier(
+                oldLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED, newLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED, dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                dstAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT, image=image, subresourceRange=subresource,
+            )],
+        )
+        vk.vkCmdCopyBufferToImage(
+            command, buffer, image, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, [vk.VkBufferImageCopy(
+                imageSubresource=vk.VkImageSubresourceLayers(
+                    aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, layerCount=1,
+                ), imageExtent=vk.VkExtent3D(width=width, height=height, depth=1),
+            )],
+        )
+        vk.vkCmdPipelineBarrier(
+            command, vk.VK_PIPELINE_STAGE_TRANSFER_BIT, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0, 0, None, 0, None, 1, [vk.VkImageMemoryBarrier(
+                oldLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, newLayout=vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED, dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT, image=image, subresourceRange=subresource,
+            )],
+        )
+        vk.vkEndCommandBuffer(command)
+
+    def record_frame(index, elapsed):
+        image = render(elapsed)
+        if (image.width, image.height) != (width, height) or len(image.rgba) != size:
+            raise ViewerError("Nacelle RGBA frame does not match the Vulkan surface extent.")
+        rgba = image.rgba
+        if format == vk.VK_FORMAT_B8G8R8A8_UNORM:
+            pixels = bytearray(rgba)
+            pixels[0::4], pixels[2::4] = rgba[2::4], rgba[0::4]
+            rgba = bytes(pixels)
+        mapped = vk.vkMapMemory(gpu.device, memory, 0, size, 0)
+        try:
+            vk.ffi.memmove(mapped, rgba, size)
+        finally:
+            vk.vkUnmapMemory(gpu.device, memory)
+
+    return commands, record_frame
+
+
+def _swapchain_sync(gpu, resources, count):
+    vk = gpu.vk
+    finished = []
+    for _ in range(count):
+        semaphore = vk.vkCreateSemaphore(gpu.device, vk.VkSemaphoreCreateInfo(), None)
+        resources.callback(vk.vkDestroySemaphore, gpu.device, semaphore, None)
+        finished.append(semaphore)
+    acquired = vk.vkCreateSemaphore(gpu.device, vk.VkSemaphoreCreateInfo(), None)
+    resources.callback(vk.vkDestroySemaphore, gpu.device, acquired, None)
+    resources.callback(vk.vkDeviceWaitIdle, gpu.device)
+    return acquired, finished
+
+
+def _swapchain(gpu, resources, program, width, height, *, renderer=None):
     vk = gpu.vk
     capabilities = gpu.instance_function("vkGetPhysicalDeviceSurfaceCapabilitiesKHR")(gpu.physical, gpu.surface)
     formats = gpu.instance_function("vkGetPhysicalDeviceSurfaceFormatsKHR")(gpu.physical, gpu.surface)
@@ -3663,8 +3750,10 @@ def _swapchain(gpu, resources, program, width, height):
         format, color_space = vk.VK_FORMAT_B8G8R8A8_UNORM, formats[0].colorSpace
     if format is None:
         raise ViewerError("The surface requires a linear RGBA/BGRA8 UNORM attachment with sRGB presentation for target parity.")
-    if not capabilities.supportedUsageFlags & vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT:
-        raise ViewerError("The surface does not support color attachments.")
+    usage = vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT if renderer is not None else vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+    if not capabilities.supportedUsageFlags & usage:
+        raise ViewerError("The surface does not support pixel transfers." if renderer is not None
+                          else "The surface does not support color attachments.")
     if capabilities.currentExtent.width != 0xFFFFFFFF:
         width, height = capabilities.currentExtent.width, capabilities.currentExtent.height
     else:
@@ -3683,11 +3772,17 @@ def _swapchain(gpu, resources, program, width, height):
     swapchain = gpu.device_function("vkCreateSwapchainKHR")(gpu.device, vk.VkSwapchainCreateInfoKHR(
         surface=gpu.surface, minImageCount=count, imageFormat=format, imageColorSpace=color_space,
         imageExtent=vk.VkExtent2D(width=width, height=height), imageArrayLayers=1,
-        imageUsage=vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, imageSharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+        imageUsage=usage, imageSharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
         preTransform=capabilities.currentTransform, compositeAlpha=alpha,
         presentMode=vk.VK_PRESENT_MODE_FIFO_KHR, clipped=vk.VK_TRUE,
     ), None)
     resources.callback(gpu.device_function("vkDestroySwapchainKHR"), gpu.device, swapchain, None)
+    images = gpu.device_function("vkGetSwapchainImagesKHR")(gpu.device, swapchain)
+    if renderer is not None:
+        render = resources.enter_context(renderer(width, height))
+        commands, record_frame = _pixel_commands(gpu, resources, images, format, width, height, render)
+        acquired, finished = _swapchain_sync(gpu, resources, len(commands))
+        return swapchain, commands, acquired, finished, record_frame
     program, post_kwargs = _prepare_vulkan_post(gpu, resources, program, width, height)
     has_depth = program.depth_stencil is not None
     depth_view = None
@@ -3707,20 +3802,15 @@ def _swapchain(gpu, resources, program, width, height):
     index_buffer = None
     if getattr(program, "index_buffer", None) is not None:
         index_buffer = gpu.create_buffer(resources, program.index_buffer, vk.VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
-    commands, finished, framebuffers = [], [], []
-    for image in gpu.device_function("vkGetSwapchainImagesKHR")(gpu.device, swapchain):
+    commands, framebuffers = [], []
+    for image in images:
         view = gpu.view(resources, image, format)
         framebuffer = gpu.framebuffer(resources, render_pass, view, width, height, depth_view=depth_view)
         framebuffers.append(framebuffer)
         commands.append(gpu.command(resources, render_pass, pipeline, framebuffer, width, height, program.draw,
                                     layout=layout, parameters=program.parameters, has_depth=has_depth,
                                     vertex_buffer=vertex_buffer, index_buffer=index_buffer, **desc_kwargs))
-        semaphore = vk.vkCreateSemaphore(gpu.device, vk.VkSemaphoreCreateInfo(), None)
-        resources.callback(vk.vkDestroySemaphore, gpu.device, semaphore, None)
-        finished.append(semaphore)
-    acquired = vk.vkCreateSemaphore(gpu.device, vk.VkSemaphoreCreateInfo(), None)
-    resources.callback(vk.vkDestroySemaphore, gpu.device, acquired, None)
-    resources.callback(vk.vkDeviceWaitIdle, gpu.device)
+    acquired, finished = _swapchain_sync(gpu, resources, len(commands))
     def record_frame(index, elapsed):
         if program.parameters is not None or post_kwargs:
             gpu.command(resources, render_pass, pipeline, framebuffers[index], width, height, program.draw,
@@ -3747,6 +3837,12 @@ def show_window(
         raise ViewerError("Vulkan rendering requires Vulkan artifacts; use the Metal preview for DXIL.")
     if type(frames) is not int or frames < 0:
         raise ViewerError("Frame count must be a nonnegative integer (0 means until closed).")
+    return _show_vulkan_window(program, width, height, frames, validation, frozen_time, provider)
+
+
+def _show_vulkan_window(program, width, height, frames, validation, time, provider=None, *, renderer=None):
+    frozen_time = _time_value(time) if time is not None else None
+    label = "Nacelle (Vulkan presentation)" if renderer is not None else "Vulkan"
     glfw = _binding("glfw")
     if not glfw.init():
         raise ViewerError(f"GLFW initialization failed: {glfw.get_error()}. A desktop session is required.")
@@ -3756,12 +3852,13 @@ def show_window(
         if not glfw.vulkan_supported():
             raise ViewerError("GLFW cannot find a Vulkan loader and driver.")
         glfw.window_hint(glfw.CLIENT_API, glfw.NO_API)
-        window = glfw.create_window(width, height, "mlir-gpu | Vulkan triangle | Esc to close", None, None)
+        window = glfw.create_window(width, height, f"mlir-gpu | {label} | Esc to close", None, None)
         if not window:
             raise ViewerError(f"GLFW window creation failed: {glfw.get_error()}.")
         resources.callback(glfw.destroy_window, window)
         vulkan_kwargs = {"provider": provider} if provider is not None else {}
         gpu = _Vulkan(resources, window, glfw, validation, **vulkan_kwargs)
+        executor = resources.enter_context(ThreadPoolExecutor(max_workers=1)) if renderer is not None else None
         started = clock.monotonic()
         vk = gpu.vk
         presented = 0
@@ -3774,12 +3871,15 @@ def show_window(
                 continue
             with ExitStack() as swap_resources:
                 try:
-                    swapchain, commands, acquired, finished, record_frame = _swapchain(gpu, swap_resources, program, *size)
+                    pixel_kwargs = {"renderer": renderer} if renderer is not None else {}
+                    swapchain, commands, acquired, finished, record_frame = _swapchain(
+                        gpu, swap_resources, program, *size, **pixel_kwargs,
+                    )
                 except vk.VkErrorOutOfDateKhr:
                     glfw.wait_events_timeout(0.1)
                     continue
                 if not announced:
-                    print(f"Vulkan viewer ready on {gpu.name}. Close the window or press Esc to exit.", flush=True)
+                    print(f"{label} viewer ready on {gpu.name}. Close the window or press Esc to exit.", flush=True)
                     announced = True
                 recreate = False
                 while not recreate and not glfw.window_should_close(window) and (frames == 0 or presented < frames):
@@ -3801,9 +3901,24 @@ def show_window(
                     except vk.VkErrorOutOfDateKhr:
                         break
                     image_index = index[0]
-                    record_frame(image_index, frozen_time if frozen_time is not None else clock.monotonic() - started)
+                    elapsed = frozen_time if frozen_time is not None else clock.monotonic() - started
+                    if executor is None:
+                        record_frame(image_index, elapsed)
+                    else:
+                        pending = executor.submit(record_frame, image_index, elapsed)
+                        try:
+                            while not pending.done():
+                                glfw.wait_events_timeout(0.01)
+                                if glfw.get_key(window, glfw.KEY_ESCAPE) == glfw.PRESS:
+                                    glfw.set_window_should_close(window, True)
+                        finally:
+                            pending.result()
+                        if glfw.window_should_close(window):
+                            break
+                    wait_stage = (vk.VK_PIPELINE_STAGE_TRANSFER_BIT if renderer is not None
+                                  else vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)
                     vk.vkQueueSubmit(gpu.queue, 1, [vk.VkSubmitInfo(
-                        pWaitSemaphores=[acquired], pWaitDstStageMask=[vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT],
+                        pWaitSemaphores=[acquired], pWaitDstStageMask=[wait_stage],
                         pCommandBuffers=[commands[image_index]], pSignalSemaphores=[finished[image_index]],
                     )], vk.VK_NULL_HANDLE)
                     try:
@@ -4168,7 +4283,7 @@ def match_device_profile(device_caps: dict[str, Any], profile: TargetProfile) ->
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Open a live Vulkan, DirectX 12 (Windows), or Metal preview window by default.",
+        description="Open a live Vulkan, DirectX 12 (Windows or Nacelle), or Metal preview window by default.",
         epilog="Use -frames 0 to keep the window open, --output for PNG, or --video for MP4 on Vulkan/Metal.",
     )
     parser.add_argument("manifest", type=Path, nargs="?", default=None, help="Compiled Vulkan, DirectX, or Metal pipeline.json")
@@ -4177,7 +4292,7 @@ def main() -> int:
     parser.add_argument("--width", type=int, default=800)
     parser.add_argument("--height", type=int, default=600)
     parser.add_argument("--provider", choices=sorted(VALID_PROVIDERS),
-                        help="Explicitly select hardware, warp, lavapipe, swiftshader, or headless nacelle")
+                        help="Explicitly select hardware, warp, lavapipe, swiftshader, or nacelle")
     parser.add_argument("--report-capabilities", action="store_true",
                         help="Report device capabilities as JSON and exit")
     mode = parser.add_mutually_exclusive_group()
