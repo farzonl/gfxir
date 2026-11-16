@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   macos-benchmark:
-    name: Benchmark (NumPy vs GfxIR macOS GPU)
+    name: Benchmark (NumPy vs GfxIR macOS backends)
     runs-on: macos-latest
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     environment:
@@ -42,9 +42,10 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install -e '.[viewer,bench]'
 
-      - name: Ensure Ninja is installed (macOS)
+      - name: Ensure Ninja and Nacelle runtime dependencies are installed (macOS)
         run: |
           command -v ninja >/dev/null 2>&1 || brew install ninja
+          brew list --versions zstd >/dev/null 2>&1 || brew install zstd
 
       - name: Restore GPU SDK dependencies cache
         id: cache-gpu-sdk
@@ -81,6 +82,17 @@ jobs:
           cp -a /tmp/msc-bins/lib/libmetalirconverter* .sdk/lib/
           rm -rf /tmp/msc /tmp/msc-bins
 
+      - name: Cache Nacelle release SDK
+        id: cache-nacelle
+        uses: actions/cache@v4
+        with:
+          path: .sdk/nacelle
+          key: nacelle-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/setup_nacelle.py') }}
+
+      - name: Install pinned Nacelle release binaries
+        if: steps.cache-nacelle.outputs.cache-hit != 'true'
+        run: python3 tools/setup_nacelle.py
+
       - name: Restore compiled gfx compiler & LLVM runtime binaries
         id: cache-compiler-binaries
         uses: actions/cache/restore@v4
@@ -105,7 +117,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .tools/bin
-          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm', 'native/directx_viewer.cpp') }}
+          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm', 'native/directx_viewer.cpp', 'native/directx_compute_bridge.cpp', 'native/nacelle_compat.h', 'examples/minigfx/_directx_bridge.cpp', 'tools/setup_nacelle.py') }}
 
       - name: Build native helper binaries (fallback)
         if: steps.cache-native-tools.outputs.cache-hit != 'true'
@@ -115,12 +127,13 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/.sdk" \
             -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.tools" \
+            -DNACELLE_ROOT="$GITHUB_WORKSPACE/.sdk/nacelle" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DCMAKE_OSX_SYSROOT="$SDK_PATH"
           cmake --build build/native
           cmake --install build/native
 
-      - name: Run NumPy vs GfxIR benchmarks (macOS GPU)
+      - name: Run NumPy vs GfxIR benchmarks (macOS backends)
         run: |
           export PYTHONPATH="$GITHUB_WORKSPACE/src"
           export LLVM_BIN="$GITHUB_WORKSPACE/.toolchains/llvm-build/bin"
@@ -177,10 +190,20 @@ jobs:
             echo "Notice: Metal Argument Buffers Tier 2 unavailable on this runner; skipping Metal benchmark."
           fi
 
-          if [ ${#BENCH_FILES[@]} -eq 0 ]; then
-            echo "Error: no GPU benchmark reports were generated."
-            exit 1
-          fi
+          echo "Checking gfxpy through DirectX/Nacelle (CPU software execution)..."
+          python3 -m examples.gfxpy.chain_example --target directx --provider nacelle
+          echo "Benchmarking DirectX/Nacelle against the same full NumPy workload..."
+          python3 scripts/run_numpy_benchmarks.py \
+            --target directx \
+            --provider nacelle \
+            --backend-label gfxir-directx-nacelle \
+            --preset full \
+            --warmup 2 \
+            --iters 5 \
+            --require-all \
+            --out "$GITHUB_WORKSPACE/bench-nacelle.json"
+          BENCH_FILES+=("$GITHUB_WORKSPACE/bench-nacelle.json")
+
           echo "BENCH_ARGS=${BENCH_FILES[*]}" >> "$GITHUB_ENV"
 
       - name: Restore historical benchmark data cache

@@ -206,9 +206,11 @@ class TestReductionsAndMatmulHost(unittest.TestCase):
 
 class _LiveReductionMatmulMixin:
     target_name: str
+    provider: str | None = None
 
     def test_live_bounded_sum_and_non_tile_aligned_matmul(self) -> None:
-        with gp.device(self.target_name) as dev:
+        with gp.device(self.target_name, provider=self.provider) as dev:
+            self.addCleanup(dev.close)
             # Multi-dispatch reduction for non-workgroup-aligned 5000 elements
             vals = [float((i % 17) - 8) * 0.125 for i in range(5000)]
             x = gp.array(vals, device=dev)
@@ -251,6 +253,15 @@ class TestGfxPyReductionsMatmulMetalLive(_LiveReductionMatmulMixin, unittest.Tes
 )
 class TestGfxPyReductionsMatmulDirectXLive(_LiveReductionMatmulMixin, unittest.TestCase):
     target_name = "directx"
+
+
+@unittest.skipUnless(
+    sys.platform in ("linux", "darwin") and os.environ.get("MLIR_GPU_TEST_NACELLE") == "1",
+    "Set MLIR_GPU_TEST_NACELLE=1 on Linux/macOS to run live Nacelle reduction/matmul tests",
+)
+class TestGfxPyReductionsMatmulNacelleLive(_LiveReductionMatmulMixin, unittest.TestCase):
+    target_name = "directx"
+    provider = "nacelle"
 
 
 if __name__ == "__main__":
