@@ -120,6 +120,8 @@ struct MgfxDirectXContext {
 
     std::array<ComPtr<ID3D12Resource>, kSwapchainBufferCount> backBuffers;
     ComPtr<ID3D12Resource> depthTexture;
+    bool hdrActive = false;
+    bool hdrReadable = false;
     int scWidth = 0;
     int scHeight = 0;
     UINT currentBackBuffer = 0;
@@ -643,7 +645,7 @@ __declspec(dllexport) void* mgfx_dx12_create(
 
     D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc{};
     rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    rtvHeapDesc.NumDescriptors = kSwapchainBufferCount;
+    rtvHeapDesc.NumDescriptors = kSwapchainBufferCount + 1;
     if (FAILED(ctx->device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&ctx->rtvHeap)))) {
         writeErr("Failed to create RTV descriptor heap");
         return nullptr;
@@ -743,7 +745,8 @@ __declspec(dllexport) int mgfx_dx12_create_pipeline(
     const char* vs_dxil_path,
     const char* ps_dxil_path,
     int depth_enabled,
-    int alpha_blend
+    int alpha_blend,
+    int hdr_target
 ) {
     if (handle == nullptr || vs_dxil_path == nullptr || ps_dxil_path == nullptr) {
         return -1;
@@ -978,7 +981,7 @@ __declspec(dllexport) int mgfx_dx12_create_pipeline(
 
     psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     psoDesc.NumRenderTargets = 1;
-    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    psoDesc.RTVFormats[0] = hdr_target ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
     psoDesc.SampleDesc.Count = 1;
 
     hr = ctx->device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&entry.state));
@@ -1280,7 +1283,8 @@ __declspec(dllexport) int mgfx_dx12_begin_frame(
     float clear_r,
     float clear_g,
     float clear_b,
-    float clear_a
+    float clear_a,
+    int hdr_enabled
 ) {
     if (handle == nullptr) {
         return -1;
@@ -1293,6 +1297,61 @@ __declspec(dllexport) int mgfx_dx12_begin_frame(
     if (fb_width != ctx->scWidth || fb_height != ctx->scHeight) {
         if (!resizeSwapchain(ctx, fb_width, fb_height)) {
             return -1;
+        }
+        ctx->hdrActive = hdr_enabled != 0;
+        if (ctx->hdrActive) {
+            auto& scene = ctx->textureSamplers[-2];
+            if (!scene.texture || scene.texture->GetDesc().Width != static_cast<UINT64>(fb_width) ||
+                scene.texture->GetDesc().Height != static_cast<UINT>(fb_height)) {
+                if (scene.srvSlot == UINT_MAX) {
+                    if (ctx->nextSrvSlot >= kMaxSrvDescriptors || ctx->nextSamplerSlot >= kMaxSamplerDescriptors) {
+                        setError(ctx, "No descriptor slots available for HDR target");
+                        return -1;
+                    }
+                    scene.srvSlot = ctx->nextSrvSlot++;
+                    scene.samplerSlot = ctx->nextSamplerSlot++;
+                }
+                D3D12_HEAP_PROPERTIES heap{};
+                heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+                D3D12_RESOURCE_DESC desc{};
+                desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                desc.Width = fb_width;
+                desc.Height = fb_height;
+                desc.DepthOrArraySize = 1;
+                desc.MipLevels = 1;
+                desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                desc.SampleDesc.Count = 1;
+                desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+                scene.texture.Reset();
+                HRESULT hr = ctx->device->CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    nullptr, IID_PPV_ARGS(&scene.texture));
+                if (FAILED(hr)) {
+                    setError(ctx, "Cannot allocate DX12 HDR render target", hr);
+                    return -1;
+                }
+                auto rtv = ctx->rtvHeap->GetCPUDescriptorHandleForHeapStart();
+                rtv.ptr += static_cast<SIZE_T>(kSwapchainBufferCount) * ctx->rtvIncrement;
+                ctx->device->CreateRenderTargetView(scene.texture.Get(), nullptr, rtv);
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                srv.Format = desc.Format;
+                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                srv.Texture2D.MipLevels = 1;
+                auto srvHandle = ctx->srvHeap->GetCPUDescriptorHandleForHeapStart();
+                srvHandle.ptr += static_cast<SIZE_T>(scene.srvSlot) * ctx->srvIncrement;
+                ctx->device->CreateShaderResourceView(scene.texture.Get(), &srv, srvHandle);
+                D3D12_SAMPLER_DESC sampler{};
+                sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+                sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                sampler.MaxLOD = D3D12_FLOAT32_MAX;
+                sampler.MaxAnisotropy = 1;
+                sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+                auto samplerHandle = ctx->samplerHeap->GetCPUDescriptorHandleForHeapStart();
+                samplerHandle.ptr += static_cast<SIZE_T>(scene.samplerSlot) * ctx->samplerIncrement;
+                ctx->device->CreateSampler(&sampler, samplerHandle);
+                ctx->hdrReadable = false;
+            }
         }
     }
 
@@ -1311,9 +1370,14 @@ __declspec(dllexport) int mgfx_dx12_begin_frame(
     ID3D12Resource* backBuf = ctx->backBuffers[ctx->currentBackBuffer].Get();
     recordTransitionBarrier(
         ctx->cmdList.Get(), backBuf, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (ctx->hdrActive && ctx->hdrReadable) {
+        recordTransitionBarrier(ctx->cmdList.Get(), ctx->textureSamplers[-2].texture.Get(),
+                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        ctx->hdrReadable = false;
+    }
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = ctx->rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    rtvHandle.ptr += static_cast<SIZE_T>(ctx->currentBackBuffer) * ctx->rtvIncrement;
+    rtvHandle.ptr += static_cast<SIZE_T>(ctx->hdrActive ? kSwapchainBufferCount : ctx->currentBackBuffer) * ctx->rtvIncrement;
     D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = ctx->dsvHeap->GetCPUDescriptorHandleForHeapStart();
 
     const float clearColor[4] = {clear_r, clear_g, clear_b, clear_a};
@@ -1367,18 +1431,18 @@ __declspec(dllexport) int mgfx_dx12_draw(
     if (pipeline_id < 0 || static_cast<size_t>(pipeline_id) >= ctx->pipelines.size()) {
         return -1;
     }
+    const auto& pipe = ctx->pipelines[static_cast<size_t>(pipeline_id)];
     auto bufIt = ctx->buffers.find(buf_id);
-    if (bufIt == ctx->buffers.end() || !bufIt->second.uploadBuffer) {
+    if (pipe.hasVsSrvTable && (bufIt == ctx->buffers.end() || !bufIt->second.uploadBuffer)) {
+        setError(ctx, "DX12 draw requires a valid vertex storage buffer");
         return -1;
     }
 
-    const auto& pipe = ctx->pipelines[static_cast<size_t>(pipeline_id)];
-    const auto& buf = bufIt->second;
     ID3D12GraphicsCommandList* cmd = ctx->cmdList.Get();
 
     if (pipe.depthEnabled != ctx->currentDepthBound) {
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = ctx->rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        rtvHandle.ptr += static_cast<SIZE_T>(ctx->currentBackBuffer) * ctx->rtvIncrement;
+        rtvHandle.ptr += static_cast<SIZE_T>(ctx->hdrActive ? kSwapchainBufferCount : ctx->currentBackBuffer) * ctx->rtvIncrement;
         if (pipe.depthEnabled) {
             D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = ctx->dsvHeap->GetCPUDescriptorHandleForHeapStart();
             cmd->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
@@ -1422,12 +1486,12 @@ __declspec(dllexport) int mgfx_dx12_draw(
 
     if (pipe.hasVsSrvTable) {
         D3D12_GPU_DESCRIPTOR_HANDLE gpuSrv = ctx->srvHeap->GetGPUDescriptorHandleForHeapStart();
-        gpuSrv.ptr += static_cast<UINT64>(buf.srvSlot) * ctx->srvIncrement;
+        gpuSrv.ptr += static_cast<UINT64>(bufIt->second.srvSlot) * ctx->srvIncrement;
         cmd->SetGraphicsRootDescriptorTable(pipe.vsSrvParamIndex, gpuSrv);
     }
 
     if (pipe.hasPsSrvTable || pipe.hasPsSamplerTable) {
-        if (tex_id < 0) {
+        if (tex_id < 0 && tex_id != -2) {
             setError(ctx, "Textured DirectX 12 pipeline requires a valid texture/sampler ID");
             return -1;
         }
@@ -1452,6 +1516,25 @@ __declspec(dllexport) int mgfx_dx12_draw(
 
     cmd->DrawInstanced(vertex_count, 1, 0, 0);
     return 0;
+}
+
+__declspec(dllexport) int mgfx_dx12_tonemap(void* handle, int pipeline_id, const void* constants, size_t size) {
+    if (!handle) return -1;
+    auto* ctx = static_cast<MgfxDirectXContext*>(handle);
+    if (!ctx->frameActive || !ctx->hdrActive || !constants || size != 16) {
+        setError(ctx, "Invalid DX12 HDR post pass");
+        return -1;
+    }
+    recordTransitionBarrier(ctx->cmdList.Get(), ctx->textureSamplers[-2].texture.Get(),
+                            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ctx->hdrReadable = true;
+    ctx->hdrActive = false;
+    auto rtv = ctx->rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += static_cast<SIZE_T>(ctx->currentBackBuffer) * ctx->rtvIncrement;
+    ctx->cmdList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    ctx->currentDepthBound = false;
+    ctx->activePipelineId = -1;
+    return mgfx_dx12_draw(handle, pipeline_id, -1, 3, constants, size, nullptr, 0, nullptr, 0, nullptr, 0, -2);
 }
 
 __declspec(dllexport) int mgfx_dx12_end_frame(void* handle) {

@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -212,6 +213,160 @@ class TestModelViewerApp(unittest.TestCase):
         args = ModelViewerApp.parse_args(["--offscreen", "--frames", "0", "--model", "missing_model_file.obj"])
         with self.assertRaises(FileNotFoundError):
             ModelViewerApp(args)
+
+    def test_keyboard_model_cycling_preserves_state_and_reuses_meshes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for i in range(3):
+                path = Path(tmp) / f"model_{i}.obj"
+                path.write_text(
+                    f"v 0 0 0\nv {i + 1} 0 0\nv 0 {i + 1} 0\nf 1 2 3\n",
+                    encoding="utf-8",
+                )
+                paths.append(str(path))
+            app = ModelViewerApp(ModelViewerApp.parse_args(["--models", *paths]))
+            first_mesh = app.model_node.mesh
+            app.set_material("dielectric")
+            camera = app.camera.view_proj
+            light = app.light_params
+            nodes = tuple(app.scene.children)
+            meshes = [first_mesh]
+            for path in paths[1:]:
+                app.handle_key_press("N")
+                self.assertEqual(app.model_path, path)
+                self.assertNotIn(app.model_node.mesh, meshes)
+                meshes.append(app.model_node.mesh)
+                self.assertEqual(app.camera.view_proj, camera)
+                self.assertIs(app.light_params, light)
+                self.assertEqual(tuple(app.scene.children), nodes)
+                self.assertIs(app.model_node.material, app.materials["dielectric"])
+                self.assertEqual(app.model_node.pipeline_id, "dielectric")
+            app.handle_key_press("key_n")
+            self.assertEqual(app.model_path, paths[0])
+            self.assertIs(app.model_node.mesh, first_mesh)
+
+    def test_model_cycling_without_playlist_keeps_current_mesh(self) -> None:
+        app = ModelViewerApp(ModelViewerApp.parse_args([]))
+        mesh = app.model_node.mesh
+        app.handle_key_press("n")
+        self.assertIs(app.model_node.mesh, mesh)
+        self.assertIsNone(app.model_path)
+
+    def test_invalid_later_model_is_rejected_before_switching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            valid = Path(tmp) / "valid.obj"
+            invalid = Path(tmp) / "invalid.obj"
+            valid.write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", encoding="utf-8")
+            invalid.write_text("# no geometry\n", encoding="utf-8")
+            args = ModelViewerApp.parse_args(["--models", str(valid), str(invalid)])
+            with self.assertRaisesRegex(ValueError, "no valid geometry"):
+                ModelViewerApp(args)
+
+    def test_glfw_next_model_key_is_forwarded_only_on_press(self) -> None:
+        from examples.minigfx.window import InteractiveWindow
+
+        window = InteractiveWindow.__new__(InteractiveWindow)
+        window.glfw = MagicMock()
+        for i, name in enumerate((
+            "KEY_1", "KEY_2", "KEY_3", "KEY_M", "KEY_N", "KEY_SPACE",
+            "KEY_Q", "KEY_ESCAPE", "KEY_H", "KEY_C", "KEY_LEFT_BRACKET",
+            "KEY_RIGHT_BRACKET", "PRESS", "RELEASE", "MOD_SHIFT",
+        )):
+            setattr(window.glfw, name, i + 1)
+        window._app_ref = MagicMock()
+        window._on_key(None, window.glfw.KEY_N, 0, window.glfw.RELEASE, 0)
+        window._app_ref.handle_key_press.assert_not_called()
+        window._on_key(None, window.glfw.KEY_N, 0, window.glfw.PRESS, 0)
+        window._app_ref.handle_key_press.assert_called_once_with("n")
+
+    @patch("examples.minigfx.window.build_hud_overlay_vertices", return_value=(b"", 0))
+    def test_model_cycle_hud_hint_tracks_current_model(self, build_hud: MagicMock) -> None:
+        from examples.minigfx.window import InteractiveWindow
+
+        window = InteractiveWindow.__new__(InteractiveWindow)
+        window.window = object()
+        window.target = "metal"
+        window.glfw = MagicMock()
+        window.glfw.get_framebuffer_size.return_value = (1280, 720)
+        window.glfw.get_window_size.return_value = (1280, 720)
+        window.backend = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = [Path(tmp) / f"model_{i}.obj" for i in range(3)]
+            for path in paths:
+                path.write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", encoding="utf-8")
+            app = ModelViewerApp(ModelViewerApp.parse_args(["--models", *map(str, paths)]))
+            for i in (0, 1, 2, 0):
+                window.present_frame(app, [])
+                lines = build_hud.call_args.args[0]
+                self.assertEqual(
+                    lines[2][0], f"[N] NEXT MODEL  |  MODEL {i + 1}/3: model_{i}.obj",
+                )
+                app.handle_key_press("n")
+            single = ModelViewerApp(ModelViewerApp.parse_args(["--model", str(paths[0])]))
+            window.present_frame(single, [])
+            self.assertEqual(len(build_hud.call_args.args[0]), 2)
+            single.handle_key_press("c")
+            window.present_frame(single, [])
+            self.assertTrue(build_hud.call_args.kwargs["split_view"])
+            lines = build_hud.call_args.args[0]
+            self.assertIn("[C] COMPARE:ON", lines[1][0])
+            self.assertEqual(lines[2][0], "COMPARE: LEFT = HDR OFF | RIGHT = HDR ON + EXPOSURE")
+            self.assertTrue(window.backend.render.call_args.kwargs["comparison"])
+            single.handle_key_press("c")
+            window.present_frame(single, [])
+            self.assertFalse(build_hud.call_args.kwargs["split_view"])
+            self.assertEqual(len(build_hud.call_args.args[0]), 2)
+
+    def test_comparison_hud_adds_a_center_divider(self) -> None:
+        from examples.minigfx.window import build_hud_overlay_vertices
+
+        lines = [("COMPARE", (1.0, 1.0, 1.0, 1.0))]
+        normal, count = build_hud_overlay_vertices(lines, 1280, 720)
+        split, split_count = build_hud_overlay_vertices(lines, 1280, 720, split_view=True)
+        self.assertEqual(split_count, count + 6)
+        self.assertEqual(len(split), len(normal) + 6 * 32)
+        vertices = [struct.unpack_from("<8f", split, i * 32) for i in range(6, 12)]
+        self.assertAlmostEqual(min(v[0] for v in vertices), -4 / 1280)
+        self.assertAlmostEqual(max(v[0] for v in vertices), 4 / 1280)
+        self.assertAlmostEqual(min(v[1] for v in vertices), -1.0)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Metal GPU pixel validation requires macOS")
+    def test_comparison_keeps_ldr_left_while_exposure_changes_right(self) -> None:
+        import shutil
+        from examples.minigfx.window import _ensure_toolchain_paths
+
+        _ensure_toolchain_paths()
+        if shutil.which("gfx-compile") is None:
+            self.skipTest("gfx-compile not available in PATH")
+        app = ModelViewerApp(ModelViewerApp.parse_args([
+            "--target", "metal", "--offscreen", "--width", "160", "--height", "120",
+        ]))
+        app.debug_overlay = None
+        try:
+            baseline = app.render_offscreen_frame()
+            app.handle_key_press("c")
+            comparison = app.render_offscreen_frame()
+            app.handle_key_press("]")
+            exposed = app.render_offscreen_frame()
+            max_left_delta = 0
+            right_changed_pixels = 0
+            for y in range(120):
+                for x in range(160):
+                    offset = (y * 160 + x) * 4
+                    if x < 79:
+                        max_left_delta = max(max_left_delta, *(
+                            abs(baseline.rgba[offset + c] - exposed.rgba[offset + c])
+                            for c in range(3)
+                        ))
+                    elif x > 80:
+                        right_changed_pixels += any(
+                            abs(comparison.rgba[offset + c] - exposed.rgba[offset + c]) > 2
+                            for c in range(3)
+                        )
+            self.assertLessEqual(max_left_delta, 1)
+            self.assertGreater(right_changed_pixels, 1000)
+        finally:
+            app.cleanup()
 
     def test_corrupted_model_file_raises_value_error(self) -> None:
         """Verifies corrupted OBJ file without valid geometry raises ValueError immediately."""
