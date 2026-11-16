@@ -64,12 +64,19 @@ unknown target names raise `UnsupportedTargetError`.
 
 ## API Scope, Limits, and Error Semantics
 
-- **Supported types & shapes**: Contiguous 1D `float32` arrays (`gp.array(seq, dtype=gp.float32)`,
-  `gp.empty(length, dtype=gp.float32)`). Nested sequences raise `ShapeMismatchError`;
-  other dtypes raise `UnsupportedDTypeError`.
-- **Supported operations**: Elementwise `+` and `*` (array/array and array/scalar,
-  including reflected scalar ops `2.0 * a` and `10.0 + b`), and explicit host
-  readback via `tolist()`.
+- **Supported types & shapes**: Contiguous 1D and 2D `float32` arrays
+  (`gp.array(seq, dtype=gp.float32)`, `gp.empty(shape_or_len, dtype=gp.float32)`).
+  Ragged or >2D sequences raise `ShapeMismatchError`; other dtypes raise
+  `UnsupportedDTypeError`.
+- **Supported operations**:
+  - Elementwise `+` and `*` (array/array and array/scalar, including reflected
+    scalar ops `2.0 * a` and `10.0 + b`).
+  - Bounded sum reduction (`gp.sum(a)` / `a.sum()`) over all elements of a 1D or
+    2D array, returning a device-resident `(1,)` `GfxArray`.
+  - 2D matrix multiplication (`gp.matmul(a, b)` / `a @ b`) for `(M, K) @ (K, N) -> (M, N)`.
+    Non-2D or mismatched inner dimensions raise `ShapeMismatchError`.
+  - Explicit host readback via `tolist()`, `tobytes()`, `toarray()`,
+    `tomemoryview()`, and `download_into()`.
 - **Explicit elementwise fusion (`@gp.fuse` / `gp.fuse(fn)`)**:
   Ordinary `GfxArray` operators remain eager. Wrapping a function in `gp.fuse`
   lowers a contiguous `float32` `+`/`*` expression tree into a single
@@ -89,8 +96,57 @@ unknown target names raise `UnsupportedTargetError`.
     GfxIR kernel preserves the exact parenthesized Python expression order
     without fast-math or algebraic reassociation (target shader compilers may
     still perform hardware FMA contraction unless disabled by the driver).
-- **Empty arrays**: `gp.array([])` and `gp.empty(0)` are handled at the array
-  layer without zero-byte GPU allocations or zero-grid dispatches.
+- **Empty arrays & `sum` / `matmul` shape semantics**:
+  - Empty 1D `(0,)` and 2D `(0, N)` / `(M, 0)` arrays avoid zero-byte GPU
+    allocations and zero-grid dispatches.
+  - `gp.sum(x)` always returns a `(1,)` `GfxArray`; for any empty `x`, it
+    returns `[0.0]` without dispatching a compute kernel.
+  - `gp.matmul(a, b)` with `M == 0` or `N == 0` returns an empty `(M, N)`
+    `GfxArray` without allocation/dispatch; `(M, 0) @ (0, N)` returns a
+    zero-filled `(M, N)` `GfxArray`.
+
+## Numerical Accuracy & Indexing Limits Contract
+
+- **Scalar/array conversion & overflow**:
+  - Python `int` and `float` inputs are converted to IEEE 754 `float32`
+    (`FLOAT32_MAX ≈ 3.4028235e+38`, `FLOAT32_EPSILON = 2^-23 ≈ 1.1920929e-07`).
+  - Finite host array elements or scalar operands outside `[-FLOAT32_MAX, FLOAT32_MAX]`
+    raise `OverflowError` before GPU buffer allocation or dispatch.
+  - Sub-minimum magnitudes (e.g. `1e-50`) underflow toward `0.0` according to
+    IEEE 754 `float32` rounding.
+  - Arithmetic overflow during GPU execution (e.g. `3e38 + 3e38` or
+    `1e20 * 1e20`) produces `±inf`.
+- **Float32 accumulation & reduction ordering**:
+  - All elementwise, fused, `sum`, and `matmul` kernels accumulate in `float32`
+    (not `float64`). Target shader compilers may contract `a * b + c` into
+    hardware FMA unless disabled by the driver.
+  - `gp.sum(x)` uses a multi-pass 64-lane parallel tree reduction
+    (`reduce_sum_f32_kernel`, padding out-of-bounds lanes with `0.0`), and
+    `gp.matmul` accumulates in 16-element `K` tiles. Because `float32` addition
+    is non-associative, results are not bitwise identical to sequential CPU
+    `sum()` or NumPy pairwise reductions; error bounds must account for
+    `float32` rounding and conditioning (cancellation / mixed magnitudes).
+- **Non-finite behavior (`inf`, `-inf`, `nan`)**:
+  - `inf`, `-inf`, and `nan` are accepted in `gp.array()`, scalar ops,
+    `gp.fuse()`, `gp.sum()`, and `gp.matmul()`, and propagate according to
+    IEEE 754 `float32` rules (`inf + (-inf) -> nan`, `0.0 * inf -> nan`, `nan`
+    propagates; out-of-bounds reduction/tile padding uses `0.0` so it never
+    injects `nan` or `inf`).
+- **Checked indexing, offset & backend dispatch limits (`IndexingLimitError`)**:
+  - Kernels index buffers and parameters using signed 32-bit integers
+    (`I32_MAX = 2_147_483_647`). Before allocation, compilation, or dispatch,
+    `gfxpy` validates:
+    - Each dimension `d <= I32_MAX` and total element count `size <= I32_MAX`.
+    - Rounded-up 1D invocation index `grid_x * 64 - 1 <= I32_MAX`.
+    - MatMul dimensions `m, n, k <= I32_MAX`, operand/output sizes
+      `m * k, k * n, m * n <= I32_MAX`, max linear offsets `< I32_MAX`, and
+      rounded-up tile coordinates `grid_x * 16 - 1 <= I32_MAX`,
+      `grid_y * 16 - 1 <= I32_MAX`.
+    - Backend `ComputeLimits` (`max_workgroup_count` per axis, e.g. `65535` on
+      DirectX 12 and typical Vulkan devices, and `max_buffer_bytes` when
+      reported).
+  - Violations raise `IndexingLimitError` (subclass of `GfxPyError` and
+    `ValueError`) before any GPU buffer allocation or native dispatch.
 - **Explicit ownership & lifecycle**: `Device` and `GfxArray` support `close()`
   and `with ...:` context managers (`Device.__exit__` restores the active
   context; call `dev.close()` to release GPU resources). Use-after-close raises
@@ -113,8 +169,11 @@ unknown target names raise `UnsupportedTargetError`.
   backend initialization failures raise `BackendInitializationError`,
   `PersistentComputeError`, or `BackendNotImplementedError` with the target and
   cause. `gfxpy` never silently falls back to CPU execution.
-- **Out of scope**: Broadcasting beyond scalars, slicing/strides, reductions,
-  matmul, kernel fusion, or broad NumPy/CuPy compatibility.
+- **Optional NumPy & out of scope**: NumPy is **not** required by `gfxpy` and
+  is only an optional benchmark/reference dependency if used externally.
+  `float64`, arbitrary NumPy broadcasting, slicing/strides, full IEEE
+  reproducibility across differently ordered reductions, and SciPy coverage are
+  out of scope.
 
 ## Running the Example & Checks
 

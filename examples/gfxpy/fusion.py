@@ -22,6 +22,13 @@ from typing import Any
 
 from .array import GfxArray, _allocate_output, _is_scalar_number
 from .dtypes import float32
+from .kernels import WORKGROUP_SIZE_1D
+from .limits import (
+    coerce_float32,
+    get_backend_limits,
+    validate_1d_dispatch,
+    validate_array_allocation,
+)
 from .targets import (
     BackendNotImplementedError,
     CrossDeviceError,
@@ -72,7 +79,7 @@ class _TraceContext:
 
     def add_scalar(self, value: float) -> _ScalarInput:
         idx = len(self.scalar_values)
-        self.scalar_values.append(float(value))
+        self.scalar_values.append(coerce_float32(value))
         return _ScalarInput(idx)
 
 
@@ -294,6 +301,9 @@ def fuse(fn: Callable[..., Any]) -> Callable[..., GfxArray]:
         if not hasattr(backend, "fused_op"):
             raise BackendNotImplementedError(first_array.device.target, "fused_op")
 
+        limits = get_backend_limits(backend)
+        validate_array_allocation(first_array.shape, first_array.dtype.itemsize, limits)
+        validate_1d_dispatch(first_array.size, WORKGROUP_SIZE_1D[0], limits, op="fused_op")
         out_buf = _allocate_output(backend, first_array.nbytes)
         try:
             in_bufs = [arr._buffer for arr in input_arrays]

@@ -25,6 +25,10 @@ class ShapeMismatchError(GfxPyError, ValueError):
     """Raised when array shapes or lengths are incompatible."""
 
 
+class IndexingLimitError(GfxPyError, ValueError):
+    """Raised when array shape, element count, offset, or dispatch grid exceeds supported limits."""
+
+
 class CrossDeviceError(GfxPyError, ValueError):
     """Raised when an operation combines arrays from different devices."""
 
