@@ -331,6 +331,8 @@ class ViewerTests(unittest.TestCase):
         calls = []
 
         def compiler(arguments):
+            if arguments[-1] == "--help":
+                return "--forceTextureArray"
             calls.append(arguments)
             output = Path(arguments[arguments.index("-o") + 1])
             output.write_bytes(b"MTLB" + bytes(12) if output.suffix == ".metallib" else b"DXBC" + bytes(28))

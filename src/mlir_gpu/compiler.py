@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -491,6 +492,11 @@ def _check_binary(path: Path, magic: bytes, minimum: int) -> None:
         raise CompileError(f"Compiler produced an invalid {path.suffix} binary: {path.name}.")
 
 
+@cache
+def _metal_converter_supports_force_texture_array(converter: str) -> bool:
+    return "--forceTextureArray" in _run([converter, "--help"])
+
+
 def convert_dxil_to_metallib(
     dxil: Path,
     metallib: Path,
@@ -505,6 +511,9 @@ def convert_dxil_to_metallib(
     ]
     if minimum_gpu_family:
         cmd.append(f"--minimum-gpu-family={minimum_gpu_family}")
+    # Before converter 3.0, texture operations always used array types.
+    if _metal_converter_supports_force_texture_array(converter):
+        cmd.append("--forceTextureArray")
     cmd.extend(["-o", str(metallib)])
     _run(cmd)
     _check_binary(metallib, b"MTLB", 16)

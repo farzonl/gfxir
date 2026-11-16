@@ -36,7 +36,7 @@ from mlir_gpu import (
 )
 from mlir_gpu.__main__ import main
 from mlir_gpu.compiler import COMPUTE_SCHEMA_VERSION, PIPELINE_SCHEMA_VERSION, RASTER_CONVENTION, _check_binary, _run
-from mlir_gpu.compiler import compile_pipeline
+from mlir_gpu.compiler import _metal_converter_supports_force_texture_array, compile_pipeline, convert_dxil_to_metallib
 from mlir_gpu.frontend import Type
 
 
@@ -190,6 +190,29 @@ class CompilerTests(unittest.TestCase):
         with patch("mlir_gpu.compiler.subprocess.run", side_effect=PermissionError("denied")):
             with self.assertRaisesRegex(CompileError, "Could not execute"):
                 _run(["tool"])
+
+    def test_metal_conversion_keeps_texture_array_abi_across_converter_versions(self):
+        self.addCleanup(_metal_converter_supports_force_texture_array.cache_clear)
+        for help_text, expected_options in (("old converter", []), ("--forceTextureArray", ["--forceTextureArray"])):
+            with self.subTest(help_text=help_text):
+                _metal_converter_supports_force_texture_array.cache_clear()
+                with patch("mlir_gpu.compiler._run", side_effect=[help_text, "", ""]) as run, \
+                     patch("mlir_gpu.compiler._check_binary"):
+                    for _ in range(2):
+                        convert_dxil_to_metallib(Path("shader.dxil"), Path("shader.metallib"), "main", "converter")
+                    self.assertEqual(run.call_args_list[0].args[0], ["converter", "--help"])
+                    for call in run.call_args_list[1:]:
+                        self.assertEqual(call.args[0], [
+                            "converter", "shader.dxil", "--entry-point=main", "--rename-entry-point=main",
+                            "--minimum-gpu-family=Metal3", *expected_options, "-o", "shader.metallib",
+                        ])
+
+    def test_metal_converter_capability_probe_failure_is_not_hidden(self):
+        _metal_converter_supports_force_texture_array.cache_clear()
+        self.addCleanup(_metal_converter_supports_force_texture_array.cache_clear)
+        with patch("mlir_gpu.compiler._run", side_effect=CompileError("converter failed")):
+            with self.assertRaisesRegex(CompileError, "converter failed"):
+                convert_dxil_to_metallib(Path("shader.dxil"), Path("shader.metallib"), "main", "converter")
 
     def test_invalid_or_missing_binaries_rejected(self):
         with tempfile.TemporaryDirectory() as work:
