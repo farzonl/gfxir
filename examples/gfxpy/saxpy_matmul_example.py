@@ -24,7 +24,7 @@ def run_saxpy(n: int = SAXPY_N, alpha: float = 1.25) -> None:
     x = np.array([1.0] * n, dtype=np.float32)
     y = np.array([2.0] * n, dtype=np.float32)
 
-    _ = alpha * x + y  # warmup (compile kernels)
+    _ = (alpha * x + y).tobytes()  # warmup + sync GPU
 
     t0 = time.perf_counter()
     z = alpha * x + y
@@ -40,7 +40,7 @@ def run_matmul(n: int = MATMUL_N) -> None:
     a = np.array([[0.5] * n for _ in range(n)], dtype=np.float32)
     b = np.array([[0.25] * n for _ in range(n)], dtype=np.float32)
 
-    _ = a @ b  # warmup (compile kernel)
+    _ = (a @ b).tobytes()  # warmup + sync GPU
 
     t0 = time.perf_counter()
     c = a @ b
