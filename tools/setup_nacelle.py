@@ -15,8 +15,8 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "0.0.2"
 RELEASES = {
-    ("Linux", "x86_64"): ("linux-x64", "193734f2dff2c5add501ca2da99ba7efbdce48508e64e5ba6dbb437afb704fa0"),
-    ("Darwin", "arm64"): ("macos-arm64", "1c5079337f7612c0c7f96628d711439bc960e915673353b2c63e51a704d780b8"),
+    ("Linux", "x86_64"): ("linux-x64", "a314d92fa5298355c18057b65c88361400c463a4895049d0ef57710db0fd3889"),
+    ("Darwin", "arm64"): ("macos-arm64", "b5eba3d4f0f5bd78f7f22e0da638d0f87bee3aea4ba554100432ba9f40cf47d4"),
 }
 
 
