@@ -1,6 +1,6 @@
 # gfxpy (NumPy-Free Cross-Backend GPU Array Example)
 
-`gfxpy` is a NumPy-free, CuPy-inspired example array library built on GfxIR.
+`gfxpy` is an installable, NumPy-free, CuPy-inspired array library built on GfxIR.
 The same Python source executes on **Linux Vulkan**, **Windows DirectX 12**,
 and **macOS Metal** using persistent device-resident GPU buffers without
 generating GLSL, HLSL, or MSL source.
@@ -44,10 +44,19 @@ unknown target names raise `UnsupportedTargetError`.
 ## Setup & Backend Prerequisites
 
 - **Python**: `>= 3.11` with only the standard library (NumPy is **not** required).
-  Install `mlir_gpu` in editable mode (`pip install -e .`) or run with
+  Install the project with `python -m pip install -e .` for development or
+  `python -m pip install .` for a regular installation. Both `gfxpy` and
+  `mlir_gpu` are then importable from any working directory without `PYTHONPATH`.
+  NumPy remains optional via the `bench` extra, not a runtime dependency.
+  Running directly from an uninstalled checkout still supports
   `PYTHONPATH=src:examples`.
+  Sources remain in this directory, preserving checkout examples and
+  conformance fixture paths.
 - **GfxIR Compiler Toolchain**: `gfx-compile` and `gfx-opt` (built via
-  `tools/build_toolchain.py` into `.toolchains/llvm-build/bin`, or set `LLVM_BIN`).
+  `tools/build_toolchain.py` into `.toolchains/llvm-build/bin`). For use outside
+  the checkout, add the absolute toolchain/native-helper directories to `PATH`
+  or pass an explicit `Toolchain` to `gp.device(..., toolchain=...)`.
+  Installing the Python package does not install these native tools.
 - **Linux (`vulkan`)**:
   - Vulkan loader (`libvulkan1`) and a hardware Vulkan ICD or SwiftShader ICD
     (`VK_ICD_FILENAMES` / `VK_DRIVER_FILES` for software execution).

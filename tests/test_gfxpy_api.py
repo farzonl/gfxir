@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 import struct
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -98,6 +100,32 @@ class _SpyBackend:
         self._closed = True
         for buf in self.buffers:
             buf.close()
+
+
+class TestInstalledPackage(unittest.TestCase):
+    def test_import_outside_checkout_without_pythonpath_or_numpy(self) -> None:
+        script = """
+import sys
+from importlib.metadata import requires
+sys.modules["numpy"] = None
+import gfxpy as np
+from gfxpy.gpu_backend import GfxIRComputeBackend
+from mlir_gpu import ComputePipeline
+numpy_requirements = [r for r in requires("mlir-gpu") or [] if r.lower().startswith("numpy")]
+assert all("extra ==" in r for r in numpy_requirements), numpy_requirements
+"""
+        with tempfile.TemporaryDirectory() as td:
+            result = subprocess.run(
+                [sys.executable, "-I", "-c", script],
+                cwd=td,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(
+            result.returncode, 0,
+            "Installed-package import failed; run python -m pip install -e . first.\n" + result.stderr,
+        )
 
 
 class TestTargetSelection(unittest.TestCase):
