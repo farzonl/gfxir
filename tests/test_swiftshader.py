@@ -946,14 +946,29 @@ class TestSwiftShaderCiWorkflowSchema(unittest.TestCase):
         self.assertIn("vk_swiftshader_icd.json", env.get("VK_DRIVER_FILES", ""))
 
     def test_ci_yaml_session0_window_exclusion(self):
-        """Workflow steps must never enable MLIR_GPU_TEST_WINDOW."""
-        for job_name, job in self.ci_data.get("jobs", {}).items():
-            for step in job.get("steps", []):
-                env = step.get("env", {})
-                self.assertNotIn(
-                    "MLIR_GPU_TEST_WINDOW", env,
-                    f"MLIR_GPU_TEST_WINDOW must not be set in job {job_name} step {step.get('name')}",
-                )
+        """Windows Session-0 jobs must never enable MLIR_GPU_TEST_WINDOW."""
+        job = self.ci_data["jobs"]["test-windows-warp"]
+        self.assertNotIn("MLIR_GPU_TEST_WINDOW", job.get("env", {}))
+        for step in job.get("steps", []):
+            self.assertNotIn(
+                "MLIR_GPU_TEST_WINDOW", step.get("env", {}),
+                f"MLIR_GPU_TEST_WINDOW must not be set in Windows step {step.get('name')}",
+            )
+
+    def test_ci_yaml_linux_window_tests_use_xvfb(self):
+        """Window-enabled matrix steps must run only on Linux under Xvfb."""
+        job = self.ci_data["jobs"]["build-and-test"]
+        self.assertNotIn("MLIR_GPU_TEST_WINDOW", job.get("env", {}))
+        window_steps = [
+            step for step in job.get("steps", [])
+            if "MLIR_GPU_TEST_WINDOW" in step.get("env", {})
+        ]
+        self.assertTrue(window_steps, "Missing Linux live window coverage")
+        for step in window_steps:
+            with self.subTest(step=step.get("name")):
+                self.assertEqual(step.get("if"), "runner.os == 'Linux'")
+                self.assertEqual(step["env"]["MLIR_GPU_TEST_WINDOW"], "1")
+                self.assertIn("xvfb-run -a ", step.get("run", ""))
 
 
 if __name__ == "__main__":

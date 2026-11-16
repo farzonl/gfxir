@@ -85,7 +85,7 @@ class Camera:
         r = float(radius)
         return all(p.x * cx + p.y * cy + p.z * cz + p.w >= -r - 1e-7 for p in self.frustum_planes)
 
-    def get_params(self, time: float = 0.0) -> CameraParams:
+    def get_params(self, time: float = 0.0) -> "CameraParams":
         return CameraParams.from_camera(self, time=time)
 
 
@@ -136,7 +136,7 @@ else:
             return bytes(data)
 
         @classmethod
-        def from_bytes(cls, buffer: bytes | bytearray | memoryview) -> CameraParams:
+        def from_bytes(cls, buffer: bytes | bytearray | memoryview) -> "CameraParams":
             if len(buffer) < 80:
                 raise ValueError(f"Buffer size {len(buffer)} < 80 bytes")
             vp = Mat4x4.from_bytes(buffer[0:64])
@@ -144,7 +144,7 @@ else:
             return cls(vp, eye, struct.unpack_from("<f", buffer, 76)[0])
 
         @classmethod
-        def from_camera(cls, camera: Camera, time: float = 0.0) -> CameraParams:
+        def from_camera(cls, camera: Camera, time: float = 0.0) -> "CameraParams":
             return cls(camera.view_proj, camera.eye, time)
 
         def __repr__(self) -> str:
@@ -182,7 +182,7 @@ class OrbitController:
         self._target_pitch: float = max(self.min_pitch, min(self.max_pitch, self.pitch))
 
     @classmethod
-    def from_camera(cls, camera: Camera, damping: float = 0.1) -> OrbitController:
+    def from_camera(cls, camera: Camera, damping: float = 0.1) -> "OrbitController":
         offset = camera.eye - camera.target
         dist = offset.length()
         if dist < 1e-6:
