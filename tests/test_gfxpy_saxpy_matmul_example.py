@@ -96,7 +96,14 @@ class TestSaxpyMatmulExample(unittest.TestCase):
 
         self.assertEqual(
             backend.dispatches,
-            ["scalar:mul:137", "binary:add:137", "matmul:19x19x19"],
+            [
+                "scalar:mul:137",
+                "binary:add:137",
+                "scalar:mul:137",
+                "binary:add:137",
+                "matmul:19x19x19",
+                "matmul:19x19x19",
+            ],
         )
         self.assertTrue(backend.closed)
 
