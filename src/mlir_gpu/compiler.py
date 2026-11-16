@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -42,6 +43,8 @@ class TargetProfile:
     max_workgroup_size: tuple[int, int, int] = (1024, 1024, 64)
     max_workgroup_invocations: int = 1024
     max_shared_memory_bytes: int = 32768
+    metal_gpu_family: str = "Metal3"
+    dxil_opt_level: int = 2
 
     def __post_init__(self) -> None:
         if not isinstance(self.required_capabilities, tuple):
@@ -66,6 +69,12 @@ class TargetProfile:
             raise ValueError(f"max_workgroup_invocations must be positive, got {self.max_workgroup_invocations}")
         if type(self.max_shared_memory_bytes) is not int or isinstance(self.max_shared_memory_bytes, bool) or self.max_shared_memory_bytes < 0:
             raise ValueError(f"max_shared_memory_bytes cannot be negative, got {self.max_shared_memory_bytes}")
+        if self.metal_gpu_family not in ("", "Metal3", "Apple6", "Apple7", "Apple8", "Apple9"):
+            raise ValueError(
+                f"metal_gpu_family must be one of Metal3, Apple6, Apple7, Apple8, Apple9, or '', got {self.metal_gpu_family!r}"
+            )
+        if type(self.dxil_opt_level) is not int or isinstance(self.dxil_opt_level, bool) or self.dxil_opt_level not in (0, 1, 2, 3):
+            raise ValueError(f"dxil_opt_level must be 0, 1, 2, or 3, got {self.dxil_opt_level!r}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -75,6 +84,8 @@ class TargetProfile:
             "max_workgroup_size": list(self.max_workgroup_size),
             "max_workgroup_invocations": self.max_workgroup_invocations,
             "max_shared_memory_bytes": self.max_shared_memory_bytes,
+            "metal_gpu_family": self.metal_gpu_family,
+            "dxil_opt_level": self.dxil_opt_level,
         }
 
     @classmethod
@@ -88,6 +99,8 @@ class TargetProfile:
             max_workgroup_size=tuple(data.get("max_workgroup_size", (1024, 1024, 64))),
             max_workgroup_invocations=int(data.get("max_workgroup_invocations", 1024)),
             max_shared_memory_bytes=int(data.get("max_shared_memory_bytes", 32768)),
+            metal_gpu_family=str(data.get("metal_gpu_family", "Metal3")),
+            dxil_opt_level=int(data.get("dxil_opt_level", 2)),
         )
 
     def to_json(self, indent: int | None = 2) -> str:
@@ -497,6 +510,93 @@ def _metal_converter_supports_force_texture_array(converter: str) -> bool:
     return "--forceTextureArray" in _run([converter, "--help"])
 
 
+def _promote_metal_root_descriptors(ll_path: Path, reflection_path: Path) -> bool:
+    """Promote compute buffer DescriptorTable to direct RootUAV/RootSRV in DXIL IR.
+
+    Returns True when the LLVM IR root signature metadata was rewritten so
+    metal-shaderconverter places buffer gpuAddress pointers directly in the
+    top-level argument buffer without an intermediate IRDescriptorTableEntry table.
+    """
+    refl = json.loads(reflection_path.read_text())
+    if refl.get("textures") or refl.get("samplers"):
+        return False
+    buffers = refl.get("buffers") or []
+    if not buffers:
+        return False
+
+    seen: set[tuple[int, int]] = set()
+    uav_count = 0
+    srv_count = 0
+    for buf in buffers:
+        key = (int(buf.get("set", 0)), int(buf.get("binding", 0)))
+        if key in seen:
+            continue
+        seen.add(key)
+        if buf.get("access") == "read_only":
+            srv_count += 1
+        else:
+            uav_count += 1
+    if uav_count == 0 and srv_count == 0:
+        return False
+
+    text = ll_path.read_text()
+    sig_match = re.search(r"!dx\.rootsignatures\s*=\s*!\{!(\d+)\}", text)
+    if not sig_match:
+        return False
+    sig_id = sig_match.group(1)
+    list_match = re.search(rf"!{sig_id}\s*=\s*!\{{ptr @[^,]+,\s*!(\d+),\s*i32 \d+\}}", text)
+    if not list_match:
+        return False
+    list_id = list_match.group(1)
+    elems_match = re.search(rf"(!{list_id}\s*=\s*!\{{)([^}}]*)(\}})", text)
+    if not elems_match:
+        return False
+
+    elem_refs = [tok.strip() for tok in elems_match.group(2).split(",") if tok.strip()]
+    kept_refs: list[str] = []
+    replaced_table = False
+    for ref in elem_refs:
+        if not ref.startswith("!"):
+            kept_refs.append(ref)
+            continue
+        node_match = re.search(rf"^{re.escape(ref)}\s*=\s*!\{{!\"([^\"]+)\"", text, re.MULTILINE)
+        if node_match and node_match.group(1) == "DescriptorTable":
+            replaced_table = True
+        else:
+            kept_refs.append(ref)
+    if not replaced_table:
+        return False
+
+    used_ids = [int(m.group(1)) for m in re.finditer(r"(?m)^!(\d+)\s*=", text)]
+    next_id = (max(used_ids) + 1) if used_ids else 100
+    new_lines: list[str] = []
+    new_refs: list[str] = []
+    for reg in range(uav_count):
+        ref = f"!{next_id}"
+        next_id += 1
+        new_refs.append(ref)
+        new_lines.append(f'{ref} = !{{!"RootUAV", i32 0, i32 {reg}, i32 0, i32 4}}')
+    for reg in range(srv_count):
+        ref = f"!{next_id}"
+        next_id += 1
+        new_refs.append(ref)
+        new_lines.append(f'{ref} = !{{!"RootSRV", i32 0, i32 {reg}, i32 0, i32 4}}')
+
+    all_refs = kept_refs + new_refs
+    updated = (
+        text[: elems_match.start()]
+        + elems_match.group(1)
+        + ", ".join(all_refs)
+        + elems_match.group(3)
+        + text[elems_match.end() :]
+    )
+    if not updated.endswith("\n"):
+        updated += "\n"
+    updated += "\n".join(new_lines) + "\n"
+    ll_path.write_text(updated)
+    return True
+
+
 def convert_dxil_to_metallib(
     dxil: Path,
     metallib: Path,
@@ -580,14 +680,25 @@ def _compile_stage(
         return output.name
     unsigned = directory / f"{stem}.unsigned.dxil"
     dxil = directory / f"{stem}.dxil"
-    _run([tools["llc"], "-O2", "-filetype=obj", str(output), "-o", str(unsigned)])
+    if target == Target.METAL and stem == "compute":
+        if _promote_metal_root_descriptors(output, reflection):
+            (directory / f"{stem}.metal_root_descriptors").write_text("1")
+    opt_level = target_profile.dxil_opt_level if target_profile is not None else 2
+    _run([tools["llc"], f"-O{opt_level}", "-filetype=obj", str(output), "-o", str(unsigned)])
     _check_binary(unsigned, b"DXBC", 32)
     _run([tools["dxv"], str(unsigned), "-o", str(dxil)])
     _check_binary(dxil, b"DXBC", 32)
     if target == Target.DIRECTX:
         return dxil.name
     metallib = directory / f"{stem}.metallib"
-    convert_dxil_to_metallib(dxil, metallib, stage.name, tools["metal-shaderconverter"])
+    gpu_family = target_profile.metal_gpu_family if target_profile is not None else "Metal3"
+    convert_dxil_to_metallib(
+        dxil,
+        metallib,
+        stage.name,
+        tools["metal-shaderconverter"],
+        minimum_gpu_family=gpu_family,
+    )
     return metallib.name
 
 
@@ -801,6 +912,8 @@ def compile_pipeline(
                 manifest["parameters"] = compute_refl["parameters"]
             if compute_refl.get("shared_memory_bytes", 0) > 0:
                 manifest["shared_memory_bytes"] = compute_refl["shared_memory_bytes"]
+            if target == Target.METAL and (directory / f"{stage.kind}.metal_root_descriptors").is_file():
+                manifest["metal_root_descriptors"] = True
             (directory / "pipeline.json").write_text(json.dumps(manifest, indent=2) + "\n")
             directory.rename(output)
             return output / "pipeline.json"

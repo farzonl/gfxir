@@ -93,7 +93,7 @@ class _FakeMetalBridge:
         ctypes.cast(out_size_ptr, ctypes.POINTER(ctypes.c_uint64))[0] = len(buf)
         return ctypes.addressof(c_arr)
 
-    def gfx_mtl_create_pipeline(self, ctx, path, entry, wg_x, wg_y, wg_z, err_buf, err_cap):
+    def gfx_mtl_create_pipeline(self, ctx, path, entry, wg_x, wg_y, wg_z, use_root_descriptors, err_buf, err_cap):
         handle = self._alloc_id()
         self.pipelines.add(handle)
         return handle
@@ -486,6 +486,49 @@ class TestPersistentMetalComputeExecution(unittest.TestCase):
                 out_vals = struct.unpack(f"<{length}f", buf_out.download())
                 for got, exp in zip(out_vals, expected):
                     self.assertAlmostEqual(got, exp, delta=1e-3)
+
+    def test_target_profile_apple9_o3_and_root_descriptors(self) -> None:
+        import json
+        from mlir_gpu import TargetProfile
+
+        with self.assertRaises(ValueError):
+            TargetProfile(metal_gpu_family="InvalidFamily")
+        with self.assertRaises(ValueError):
+            TargetProfile(dxil_opt_level=4)
+
+        @compute(workgroup_size=(64, 1, 1))
+        def add_one(
+            src: Buffer[Type.F32, "read_only"],
+            dst: Buffer[Type.F32, "write_only"],
+        ):
+            idx = i32(global_invocation_id().x)
+            if idx < 16:
+                dst[idx] = src[idx] + 1.0
+
+        profile = TargetProfile(metal_gpu_family="Apple9", dxil_opt_level=3)
+        with tempfile.TemporaryDirectory() as td:
+            m = compile_pipeline(
+                ComputePipeline(add_one, Dispatch(grid=(1, 1, 1))),
+                Target.METAL,
+                Path(td) / "apple9_o3",
+                TOOLS,
+                target_profile=profile,
+            )
+            manifest = json.loads(Path(m).read_text())
+            self.assertTrue(manifest.get("metal_root_descriptors"))
+            self.assertEqual(manifest["target_profile"]["metal_gpu_family"], "Apple9")
+            self.assertEqual(manifest["target_profile"]["dxil_opt_level"], 3)
+
+            host_in = [float(i) for i in range(16)]
+            in_bytes = struct.pack("<16f", *host_in)
+            with open_compute_context("metal") as ctx:
+                buf_in = ctx.create_buffer(len(in_bytes), initial_data=in_bytes)
+                buf_out = ctx.create_buffer(len(in_bytes))
+                pipe = ctx.compile_pipeline(m)
+                pipe.dispatch({"src": buf_in, "dst": buf_out}, grid=(1, 1, 1))
+                out_vals = struct.unpack("<16f", buf_out.download())
+                for got, exp in zip(out_vals, [v + 1.0 for v in host_in]):
+                    self.assertAlmostEqual(got, exp, delta=1e-5)
 
 
 if __name__ == "__main__":
