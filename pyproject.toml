@@ -20,4 +20,5 @@ mlir-gpu-view = "mlir_gpu.viewer:main"
 mlir-gpu-imgdiff = "mlir_gpu.imgdiff:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "examples"]
+include = ["mlir_gpu*", "gfxpy*"]
