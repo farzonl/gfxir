@@ -197,6 +197,7 @@ def _load_bridge() -> ctypes.CDLL:
         ctypes.c_uint32,
         ctypes.c_uint32,
         ctypes.c_uint32,
+        ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_size_t,
     ]
@@ -749,6 +750,7 @@ class MetalComputeContext(ComputeContext):
                 wg_x,
                 wg_y,
                 wg_z,
+                1 if getattr(loaded, "metal_root_descriptors", False) else 0,
                 err_buf,
                 len(err_buf),
             )

@@ -161,6 +161,7 @@ class ComputeProgram:
     parameters: dict | None = None
     textures: tuple[dict, ...] = ()
     samplers: tuple[dict, ...] = ()
+    metal_root_descriptors: bool = False
 
 
 @dataclass(frozen=True)
@@ -812,6 +813,7 @@ def load_compute_program(manifest: Path) -> ComputeProgram:
         parameters=parameters,
         textures=tuple(validated_textures),
         samplers=tuple(validated_samplers),
+        metal_root_descriptors=bool(data.get("metal_root_descriptors", False)),
     )
 
 

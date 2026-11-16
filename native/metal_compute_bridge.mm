@@ -80,6 +80,8 @@ struct GfxMtlPipeline {
     size_t reflected_arg_size = 0;
     size_t descriptor_table_offset = 0;
     bool has_descriptor_table_offset = false;
+    bool use_root_descriptors = false;
+    std::vector<size_t> root_descriptor_offsets;
     std::vector<DescriptorCacheEntry> descriptor_cache;
 };
 
@@ -328,6 +330,7 @@ void* gfx_mtl_create_pipeline(
     uint32_t wg_x,
     uint32_t wg_y,
     uint32_t wg_z,
+    int use_root_descriptors,
     char* err_buf,
     size_t err_cap
 ) {
@@ -380,6 +383,7 @@ void* gfx_mtl_create_pipeline(
         pipe->wg_x = wg_x;
         pipe->wg_y = wg_y;
         pipe->wg_z = wg_z;
+        pipe->use_root_descriptors = (use_root_descriptors != 0);
 
         if (reflection != nil) {
             for (id<MTLBinding> binding in reflection.bindings) {
@@ -390,7 +394,12 @@ void* gfx_mtl_create_pipeline(
                     MTLStructType* structType = bufferBinding.bufferStructType;
                     if (structType != nil) {
                         for (MTLStructMember* member in structType.members) {
-                            if (member.dataType == MTLDataTypePointer) {
+                            if (pipe->use_root_descriptors) {
+                                if (member.dataType == MTLDataTypePointer ||
+                                    member.dataType == MTLDataTypeULong) {
+                                    pipe->root_descriptor_offsets.push_back(member.offset);
+                                }
+                            } else if (member.dataType == MTLDataTypePointer) {
                                 pipe->descriptor_table_offset = member.offset;
                                 pipe->has_descriptor_table_offset = true;
                             }
@@ -487,7 +496,7 @@ int gfx_mtl_dispatch(
         );
 
         id<MTLBuffer> descriptor_table = nil;
-        if (num_bindings > 0) {
+        if (num_bindings > 0 && !pipe->use_root_descriptors) {
             std::vector<DescriptorKeyEntry> cache_key;
             cache_key.reserve(num_bindings);
             for (uint32_t i = 0; i < num_bindings; ++i) {
@@ -541,7 +550,14 @@ int gfx_mtl_dispatch(
                 pipe->has_descriptor_table_offset ? pipe->descriptor_table_offset : fallback_offset;
             size_t min_size = root_constants_size;
             if (num_bindings > 0) {
-                min_size = std::max<size_t>(min_size, table_offset + sizeof(uint64_t));
+                if (pipe->use_root_descriptors) {
+                    min_size = std::max<size_t>(min_size, fallback_offset + static_cast<size_t>(num_bindings) * sizeof(uint64_t));
+                    if (!pipe->root_descriptor_offsets.empty()) {
+                        min_size = std::max<size_t>(min_size, pipe->root_descriptor_offsets.back() + sizeof(uint64_t));
+                    }
+                } else {
+                    min_size = std::max<size_t>(min_size, table_offset + sizeof(uint64_t));
+                }
             }
             const size_t arg_buf_size = std::max<size_t>(std::max<size_t>(pipe->reflected_arg_size, min_size), 16);
             const size_t aligned_arg_size = (arg_buf_size + 255) & ~static_cast<size_t>(255);
@@ -572,9 +588,35 @@ int gfx_mtl_dispatch(
             if (root_constants && root_constants_size > 0) {
                 std::memcpy(arg_bytes, root_constants, root_constants_size);
             }
-            if (num_bindings > 0 && descriptor_table != nil) {
-                uint64_t table_addr = descriptor_table.gpuAddress;
-                std::memcpy(arg_bytes + table_offset, &table_addr, sizeof(table_addr));
+            if (num_bindings > 0) {
+                if (pipe->use_root_descriptors) {
+                    size_t slot = 0;
+                    for (uint32_t i = 0; i < num_bindings; ++i) {
+                        if (ordered_ptr[i]->is_uav) {
+                            auto* buf = static_cast<GfxMtlBuffer*>(ordered_ptr[i]->buffer);
+                            const size_t off = (slot < pipe->root_descriptor_offsets.size())
+                                                   ? pipe->root_descriptor_offsets[slot]
+                                                   : (fallback_offset + slot * sizeof(uint64_t));
+                            uint64_t addr = buf->buffer.gpuAddress;
+                            std::memcpy(arg_bytes + off, &addr, sizeof(addr));
+                            ++slot;
+                        }
+                    }
+                    for (uint32_t i = 0; i < num_bindings; ++i) {
+                        if (!ordered_ptr[i]->is_uav) {
+                            auto* buf = static_cast<GfxMtlBuffer*>(ordered_ptr[i]->buffer);
+                            const size_t off = (slot < pipe->root_descriptor_offsets.size())
+                                                   ? pipe->root_descriptor_offsets[slot]
+                                                   : (fallback_offset + slot * sizeof(uint64_t));
+                            uint64_t addr = buf->buffer.gpuAddress;
+                            std::memcpy(arg_bytes + off, &addr, sizeof(addr));
+                            ++slot;
+                        }
+                    }
+                } else if (descriptor_table != nil) {
+                    uint64_t table_addr = descriptor_table.gpuAddress;
+                    std::memcpy(arg_bytes + table_offset, &table_addr, sizeof(table_addr));
+                }
             }
         }
 
