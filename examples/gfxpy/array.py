@@ -10,10 +10,18 @@ import sys
 from typing import Any
 
 from .dtypes import DType, float32, resolve_dtype
-from .runtime import ComputeBuffer, Device, current_device
+from .kernels import TILE_DIM, WORKGROUP_SIZE_1D
+from .limits import (
+    coerce_float32,
+    get_backend_limits,
+    validate_1d_dispatch,
+    validate_array_allocation,
+    validate_matmul_dispatch,
+)
+from .runtime import ComputeBackend, ComputeBuffer, Device, current_device
 from .targets import ArrayClosedError, CrossDeviceError, ShapeMismatchError
 
-_REDUCE_WORKGROUP_SIZE = 64
+_REDUCE_WORKGROUP_SIZE = WORKGROUP_SIZE_1D[0]
 
 
 def _is_scalar_number(value: object) -> bool:
@@ -272,6 +280,9 @@ class GfxArray:
                 return GfxArray(shape=self._shape, dtype=self._dtype, device=self._device, buffer=None)
             assert self._buffer is not None and other._buffer is not None
             backend = self._device.backend
+            limits = get_backend_limits(backend)
+            validate_array_allocation(self._shape, self._dtype.itemsize, limits)
+            validate_1d_dispatch(self._size, WORKGROUP_SIZE_1D[0], limits, op=f"binary_{op}")
             out_buf = _allocate_output(backend, self.nbytes)
             try:
                 backend.binary_op(op, self._buffer, other._buffer, out_buf, self._size)
@@ -281,13 +292,17 @@ class GfxArray:
             return GfxArray(shape=self._shape, dtype=self._dtype, device=self._device, buffer=out_buf)
 
         if _is_scalar_number(other):
+            scalar_f32 = coerce_float32(other)
             if self._size == 0:
                 return GfxArray(shape=self._shape, dtype=self._dtype, device=self._device, buffer=None)
             assert self._buffer is not None
             backend = self._device.backend
+            limits = get_backend_limits(backend)
+            validate_array_allocation(self._shape, self._dtype.itemsize, limits)
+            validate_1d_dispatch(self._size, WORKGROUP_SIZE_1D[0], limits, op=f"scalar_{op}")
             out_buf = _allocate_output(backend, self.nbytes)
             try:
-                backend.scalar_op(op, self._buffer, float(other), out_buf, self._size)
+                backend.scalar_op(op, self._buffer, scalar_f32, out_buf, self._size)
             except Exception:
                 out_buf.close()
                 raise
@@ -339,8 +354,9 @@ def array(
     if n == 0:
         return GfxArray(shape=shape, dtype=resolved_dtype, device=target_device, buffer=None)
 
-    raw = struct.pack(f"<{n}{resolved_dtype.struct_code}", *values)
     backend = target_device.backend
+    validate_array_allocation(shape, resolved_dtype.itemsize, get_backend_limits(backend))
+    raw = struct.pack(f"<{n}{resolved_dtype.struct_code}", *values)
     buf = backend.allocate(len(raw))
     try:
         backend.upload(buf, raw)
@@ -372,7 +388,9 @@ def empty(
     if n == 0:
         return GfxArray(shape=resolved_shape, dtype=resolved_dtype, device=target_device, buffer=None)
 
-    buf = _allocate_output(target_device.backend, n * resolved_dtype.itemsize)
+    backend = target_device.backend
+    validate_array_allocation(resolved_shape, resolved_dtype.itemsize, get_backend_limits(backend))
+    buf = _allocate_output(backend, n * resolved_dtype.itemsize)
     return GfxArray(shape=resolved_shape, dtype=resolved_dtype, device=target_device, buffer=buf)
 
 
@@ -393,6 +411,8 @@ def sum(x: GfxArray) -> GfxArray:  # noqa: A001
             raise
         return GfxArray(shape=(1,), dtype=x.dtype, device=dev, buffer=buf)
 
+    limits = get_backend_limits(backend)
+    validate_1d_dispatch(x.size, _REDUCE_WORKGROUP_SIZE, limits, op="sum")
     assert x._buffer is not None
     cur_buf = x._buffer
     owns_cur = False
@@ -456,6 +476,16 @@ def matmul(a: GfxArray, b: GfxArray) -> GfxArray:
         return GfxArray(shape=out_shape, dtype=a.dtype, device=a.device, buffer=None)
 
     backend = a.device.backend
+    validate_matmul_dispatch(
+        m,
+        n,
+        k_a,
+        a.dtype.itemsize,
+        TILE_DIM,
+        TILE_DIM,
+        TILE_DIM,
+        get_backend_limits(backend),
+    )
     out_buf = _allocate_output(backend, m * n * a.dtype.itemsize)
     if k_a == 0:
         try:

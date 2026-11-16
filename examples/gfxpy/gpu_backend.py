@@ -29,11 +29,16 @@ from .kernels import (
     SCALAR_KERNELS,
     TILE_DIM,
     WORKGROUP_SIZE_1D,
-    compute_grid_1d,
-    compute_matmul_grid,
     make_coop_matmul_f32_kernel,
     reduce_sum_f32_kernel,
     tiled_matmul_f32_kernel,
+)
+from .limits import (
+    ComputeLimits,
+    I32_MAX,
+    default_limits_for_target,
+    validate_1d_dispatch,
+    validate_matmul_dispatch,
 )
 from .runtime import ComputeBackend, ComputeBuffer
 from .targets import BackendInitializationError
@@ -107,6 +112,19 @@ class GfxIRComputeBackend(ComputeBackend):
     @property
     def compiled_pipeline_count(self) -> int:
         return len(self._pipelines)
+
+    @property
+    def limits(self) -> ComputeLimits:
+        base = default_limits_for_target(self._target)
+        gpu = getattr(self._ctx, "_gpu", None)
+        wg_count = getattr(gpu, "max_compute_workgroup_count", None)
+        if wg_count is not None and len(wg_count) == 3:
+            return ComputeLimits(
+                max_elements=base.max_elements,
+                max_buffer_bytes=base.max_buffer_bytes,
+                max_workgroup_count=(int(wg_count[0]), int(wg_count[1]), int(wg_count[2])),
+            )
+        return base
 
     def _toolchain_key(self) -> tuple[str | None, str | None]:
         llvm_bin = getattr(self._toolchain, "llvm_bin", None)
@@ -209,11 +227,12 @@ class GfxIRComputeBackend(ComputeBackend):
         assert isinstance(lhs, PersistentBuffer)
         assert isinstance(rhs, PersistentBuffer)
         assert isinstance(out, PersistentBuffer)
+        grid = validate_1d_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op=f"binary_{op}")
         pipe = self._get_or_compile(f"binary_{op}", BINARY_KERNELS[op])
         pipe.dispatch(
             {"lhs": lhs, "rhs": rhs, "out": out},
             parameters={"n": length},
-            grid=compute_grid_1d(length),
+            grid=grid,
         )
 
     def scalar_op(
@@ -228,11 +247,12 @@ class GfxIRComputeBackend(ComputeBackend):
             raise ValueError(f"Unsupported scalar op {op!r}.")
         assert isinstance(lhs, PersistentBuffer)
         assert isinstance(out, PersistentBuffer)
+        grid = validate_1d_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op=f"scalar_{op}")
         pipe = self._get_or_compile(f"scalar_{op}", SCALAR_KERNELS[op])
         pipe.dispatch(
             {"lhs": lhs, "out": out},
             parameters={"n": length, "scalar": float(scalar)},
-            grid=compute_grid_1d(length),
+            grid=grid,
         )
 
     def fused_op(
@@ -275,10 +295,11 @@ class GfxIRComputeBackend(ComputeBackend):
                 artifact_subdir=subdir,
             )
 
+        grid = validate_1d_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op="fused_op")
         params: dict[str, object] = {"n": length}
         for idx, val in enumerate(scalars):
             params[f"s{idx}"] = float(val)
-        pipe.dispatch(bindings, parameters=params, grid=compute_grid_1d(length))
+        pipe.dispatch(bindings, parameters=params, grid=grid)
 
     def reduce_sum_pass(
         self,
@@ -288,11 +309,12 @@ class GfxIRComputeBackend(ComputeBackend):
     ) -> None:
         assert isinstance(inp, PersistentBuffer)
         assert isinstance(out, PersistentBuffer)
+        grid = validate_1d_dispatch(length, WORKGROUP_SIZE_1D[0], self.limits, op="reduce_sum")
         pipe = self._get_or_compile("reduce_sum", reduce_sum_f32_kernel, WORKGROUP_SIZE_1D)
         pipe.dispatch(
             {"inp": inp, "out": out},
             parameters={"n": length},
-            grid=compute_grid_1d(length),
+            grid=grid,
         )
 
     def _select_coop_matmul_shape(self, m: int, n: int, k: int) -> tuple[int, int, int] | None:
@@ -323,6 +345,7 @@ class GfxIRComputeBackend(ComputeBackend):
         coop_shape = self._select_coop_matmul_shape(m, n, k)
         if coop_shape is not None:
             tile_m, tile_n, tile_k = coop_shape
+            grid = validate_matmul_dispatch(m, n, k, 4, tile_m, tile_n, tile_k, self.limits)
             op_key = f"coop_matmul_{tile_m}x{tile_n}x{tile_k}"
             pipe = self._get_or_compile(
                 op_key,
@@ -336,16 +359,17 @@ class GfxIRComputeBackend(ComputeBackend):
             pipe.dispatch(
                 {"mat_a": a, "mat_b": b, "mat_c": out},
                 parameters={"m": m, "n": n, "k": k, "num_tiles": k // tile_k},
-                grid=(n // tile_n, m // tile_m, 1),
+                grid=grid,
             )
             return
 
+        grid = validate_matmul_dispatch(m, n, k, 4, TILE_DIM, TILE_DIM, TILE_DIM, self.limits)
         pipe = self._get_or_compile("tiled_matmul", tiled_matmul_f32_kernel, (TILE_DIM, TILE_DIM, 1))
         num_tiles = (k + TILE_DIM - 1) // TILE_DIM
         pipe.dispatch(
             {"mat_a": a, "mat_b": b, "mat_c": out},
             parameters={"m": m, "n": n, "k": k, "num_tiles": num_tiles},
-            grid=compute_matmul_grid(m, n),
+            grid=grid,
         )
 
     def synchronize(self) -> None:
