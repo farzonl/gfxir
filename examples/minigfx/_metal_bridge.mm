@@ -42,6 +42,9 @@ struct MgfxMetalContext {
     id<MTLDepthStencilState> depthEnabledState = nil;
     id<MTLDepthStencilState> depthDisabledState = nil;
     id<MTLTexture> depthTexture = nil;
+    id<MTLTexture> pixelUpload = nil;
+    std::vector<uint8_t> pixelBytes;
+    bool pixelsOnly = false;
     MgfxTextureSamplerEntry sceneColor;
     bool hdrActive = false;
     int depthWidth = 0;
@@ -77,7 +80,8 @@ static void setError(MgfxMetalContext* ctx, NSString* msg, NSError* err = nil) {
 
 extern "C" {
 
-void* mgfx_metal_create(void* cocoa_nswindow, int fb_width, int fb_height, char* err_buf, size_t err_cap) {
+static void* createMetalContext(void* cocoa_nswindow, int fb_width, int fb_height,
+                               char* err_buf, size_t err_cap, bool pixelsOnly) {
     @autoreleasepool {
         auto write_err = [&](const char* msg) {
             if (err_buf && err_cap > 0) {
@@ -96,7 +100,7 @@ void* mgfx_metal_create(void* cocoa_nswindow, int fb_width, int fb_height, char*
             write_err("No Metal device available on this system");
             return nullptr;
         }
-        if (device.argumentBuffersSupport != MTLArgumentBuffersTier2) {
+        if (!pixelsOnly && device.argumentBuffersSupport != MTLArgumentBuffersTier2) {
             write_err("Metal Argument Buffers Tier 2 is required for GfxIR DXIL-to-Metal execution");
             return nullptr;
         }
@@ -117,7 +121,7 @@ void* mgfx_metal_create(void* cocoa_nswindow, int fb_width, int fb_height, char*
         CAMetalLayer* layer = [CAMetalLayer layer];
         layer.device = device;
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        layer.framebufferOnly = YES;
+        layer.framebufferOnly = !pixelsOnly;
         CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
         if (cs) {
             layer.colorspace = cs;
@@ -152,7 +156,72 @@ void* mgfx_metal_create(void* cocoa_nswindow, int fb_width, int fb_height, char*
         ctx->queue = queue;
         ctx->depthEnabledState = depthOn;
         ctx->depthDisabledState = depthOff;
+        ctx->pixelsOnly = pixelsOnly;
         return ctx.release();
+    }
+}
+
+void* mgfx_metal_create(void* window, int width, int height, char* err, size_t capacity) {
+    return createMetalContext(window, width, height, err, capacity, false);
+}
+
+void* mgfx_metal_create_presenter(void* window, int width, int height, char* err, size_t capacity) {
+    return createMetalContext(window, width, height, err, capacity, true);
+}
+
+int mgfx_metal_present_rgba(void* handle, const void* rgba, size_t size, int width, int height) {
+    @autoreleasepool {
+        if (!handle) return -1;
+        auto* ctx = static_cast<MgfxMetalContext*>(handle);
+        if (width <= 0 || height <= 0 || !rgba ||
+            size != static_cast<size_t>(width) * height * 4 ||
+            !ctx->pixelsOnly) {
+            setError(ctx, @"Invalid RGBA presentation frame");
+            return -1;
+        }
+        ctx->layer.drawableSize = CGSizeMake(width, height);
+        if (!ctx->pixelUpload || ctx->pixelUpload.width != width || ctx->pixelUpload.height != height) {
+            MTLTextureDescriptor* desc = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                width:width height:height mipmapped:NO];
+            desc.storageMode = MTLStorageModeShared;
+            ctx->pixelUpload = [ctx->device newTextureWithDescriptor:desc];
+            if (!ctx->pixelUpload) {
+                setError(ctx, @"Cannot allocate RGBA presentation texture");
+                return -1;
+            }
+        }
+        ctx->pixelBytes.resize(size);
+        const auto* source = static_cast<const uint8_t*>(rgba);
+        for (size_t i = 0; i < size; i += 4) {
+            ctx->pixelBytes[i] = source[i + 2];
+            ctx->pixelBytes[i + 1] = source[i + 1];
+            ctx->pixelBytes[i + 2] = source[i];
+            ctx->pixelBytes[i + 3] = source[i + 3];
+        }
+        [ctx->pixelUpload replaceRegion:MTLRegionMake2D(0, 0, width, height)
+                            mipmapLevel:0 withBytes:ctx->pixelBytes.data()
+                            bytesPerRow:static_cast<size_t>(width) * 4];
+        id<CAMetalDrawable> drawable = [ctx->layer nextDrawable];
+        if (!drawable) return 1;
+        id<MTLCommandBuffer> commands = [ctx->queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
+        if (!commands || !blit) {
+            setError(ctx, @"Cannot create RGBA presentation commands");
+            return -1;
+        }
+        [blit copyFromTexture:ctx->pixelUpload sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(width, height, 1) toTexture:drawable.texture
+             destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        [commands presentDrawable:drawable];
+        [commands commit];
+        [commands waitUntilCompleted];
+        if (commands.status == MTLCommandBufferStatusError) {
+            setError(ctx, @"RGBA presentation failed", commands.error);
+            return -1;
+        }
+        return 0;
     }
 }
 

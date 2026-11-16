@@ -10,7 +10,7 @@ the compiler's internal representation or a permanent restriction on frontends.
 Examples range from triangle/quad basics to an original animated ray-marched
 [beacon gallery](examples/raymarching/beacon_gallery.py). Compile them into artifacts,
 then open a live window or render a PNG through
-Vulkan (MoltenVK on macOS), native DirectX 12 on Windows, or native Metal using converted DXIL. The viewer loads
+Vulkan (MoltenVK on macOS), native DirectX 12 on Windows, Nacelle CPU DirectX 12 on Linux/macOS, or native Metal using converted DXIL. The viewer loads
 the actual compiled shaders; it does not redraw the triangle with CPU code or
 generate shading-language source.
 Vulkan and both Metal preview paths can export deterministic MP4 animation.
@@ -178,6 +178,82 @@ still requires a Vulkan driver, but does not require GLFW or a desktop session.
 On macOS this uses Vulkan through MoltenVK, **not** the native DXIL-to-Metal
 compiler adapter.
 
+### DirectX execution on Linux and macOS with Nacelle
+
+[Nacelle v0.0.1](https://github.com/farzonl/Nacelle/releases/tag/v0.0.1)
+executes the project's DirectX DXIL binaries on the CPU, without translating them
+to Vulkan or Metal. Supported release hosts are **Linux x86_64** and **macOS
+arm64**. Install the existing DXC SDK/native-helper prerequisites first, then:
+
+```sh
+python3 tools/setup_nacelle.py
+cmake -S . -B build/native -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="$PWD/.sdk" \
+  -DCMAKE_INSTALL_PREFIX="$PWD/.tools" \
+  -DNACELLE_ROOT="$PWD/.sdk/nacelle"
+cmake --build build/native
+cmake --install build/native
+export PYTHONPATH="$PWD/src"
+export GPU_TOOLS_BIN="$PWD/.tools/bin"
+export PATH="$PWD/.toolchains/llvm-build/bin:$PWD/.tools/bin:$PATH"
+python3 -m mlir_gpu.viewer --provider nacelle --report-capabilities
+
+python3 -m mlir_gpu examples/basics/triangle.py \
+  --target directx --output build/triangle-nacelle
+python3 -m mlir_gpu.viewer build/triangle-nacelle/pipeline.json \
+  --provider nacelle --output build/triangle-nacelle.png
+```
+
+The setup script verifies the archive against a pinned SHA256 before extracting.
+CMake fetches the matching pinned Microsoft DirectX-Headers; it links the release
+library rather than building Nacelle or its LLVM toolchain. Keep the extracted
+SDK in place: the installed helpers reference its library directory.
+The macOS release also needs Homebrew `zstd` at its standard `/opt/homebrew`
+location (`brew install zstd` if the loader reports it missing).
+
+Select `provider="nacelle"` explicitly in `render_offscreen`,
+`render_directx_offscreen`, `dispatch_compute`, `compute_session`, or
+`open_compute_context("directx", provider="nacelle")`. This supports offscreen
+graphics, HDR/post processing, PNG/MP4 output, subprocess compute, and persistent
+compute buffers/pipelines. Offscreen execution needs no window/desktop or physical GPU.
+Other providers and the default macOS DXIL-to-Metal preview are unchanged.
+Nacelle v0.0.1 does **not** implement the D3D12 validation info queue:
+`--validation` / `validation=True` fails explicitly rather than claiming validation.
+
+MiniGfx also supports **live Nacelle rendering in its existing GLFW window**:
+
+```sh
+python3 -m examples.minigfx --target directx --provider nacelle --width 640 --height 480
+# Save a snapshot instead:
+python3 -m examples.minigfx --target directx --provider nacelle \
+  --output build/minigfx-nacelle.png --frames 1 --width 640 --height 480
+```
+
+Nacelle executes the scene's DXIL, including textures, depth, HDR, and HUD draws.
+The existing Metal/macOS or Vulkan/Linux backend only copies the completed RGBA
+frame into the GLFW window. Live mode requires a desktop and a working platform
+presenter; it adds no SDL dependency. The generic `mlir_gpu.viewer` Nacelle path
+remains offscreen-only.
+
+The HDR example can also run directly:
+
+```sh
+python3 -m examples.basics.post_process --target directx --provider nacelle \
+  --output build/hdr-nacelle.png --width 320 --height 180 --time 2
+```
+
+Linux/macOS CI installs the same release and enables Nacelle pixel/readback and
+compute execution tests. Linux additionally exercises live GLFW presentation
+under Xvfb. To run the headless tests locally:
+
+```sh
+PYTHONPATH=src:tests MLIR_GPU_TEST_NACELLE=1 \
+  python3 -m unittest test_nacelle test_directx_compute -v
+```
+
+For live GLFW/resize tests, also set `MLIR_GPU_TEST_WINDOW=1` in a desktop session.
+
 ### HDR render targets and fullscreen post processing
 
 The viewer can render a scene into a GPU-only, framebuffer-sized color texture
@@ -255,7 +331,8 @@ Acceptance tests: `PYTHONPATH=src:tests python -m unittest test_post_process -v`
 Enable `MLIR_GPU_TEST_VULKAN=1`, `MLIR_GPU_TEST_METAL=1`, or
 `MLIR_GPU_TEST_DIRECTX=1` for GPU readback checks; use
 `MLIR_GPU_TEST_WINDOW=1` only in an interactive desktop session.
-Native DX12 execution must be verified on Windows.
+Native GPU/WARP execution requires Windows; CPU DXIL execution can also be
+verified with `MLIR_GPU_TEST_NACELLE=1` on Linux/macOS as described above.
 
 For a bounded window smoke test, use `--frames 3` instead of `--output`.
 `-frames` is also accepted: `-frames 0` and `--frames 0` both mean render
@@ -1088,9 +1165,10 @@ done
 
 For the tutorial, substitute `examples/raymarching/lit_sphere.py` and fresh output names.
 For a bounded smoke preview add `--frames 4`; persistent windows otherwise stay
-open until closed or Esc. DXIL preview on macOS performs **launch-time conversion
+open until closed or Esc. Default DXIL preview on macOS performs **launch-time conversion
 and Metal rendering**, not DirectX device execution. `--target metal` performs
 conversion while compiling and previews its existing metallibs directly.
+For headless DirectX execution without conversion, select `--provider nacelle`.
 
 Troubleshooting: install the documented Vulkan loader/layers for Vulkan errors,
 rebuild/install the native Metal viewer after adapter changes, check converter

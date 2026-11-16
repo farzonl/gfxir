@@ -5,9 +5,19 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
+#ifdef GFX_NACELLE
+#include "nacelle_compat.h"
+#else
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#endif
+
+#ifdef GFX_NACELLE
+#define GFX_DX12_EXPORT __attribute__((visibility("default")))
+#else
+#define GFX_DX12_EXPORT __declspec(dllexport)
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -28,6 +38,7 @@ static std::string hresultToString(HRESULT hr) {
     return out.str();
 }
 
+#ifndef GFX_NACELLE
 static std::string wideToUtf8(const wchar_t* wide) {
     if (!wide || !*wide) return {};
     int len = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
@@ -36,6 +47,7 @@ static std::string wideToUtf8(const wchar_t* wide) {
     WideCharToMultiByte(CP_UTF8, 0, wide, -1, out.data(), len, nullptr, nullptr);
     return out;
 }
+#endif
 
 static void writeErrorBuffer(char* errBuf, size_t errBufLen, const std::string& msg) {
     if (!errBuf || errBufLen == 0) return;
@@ -51,20 +63,24 @@ struct EventHandle {
 
     EventHandle() = default;
     ~EventHandle() {
+#ifndef GFX_NACELLE
         if (handle) {
             CloseHandle(handle);
             handle = nullptr;
         }
+#endif
     }
     EventHandle(const EventHandle&) = delete;
     EventHandle& operator=(const EventHandle&) = delete;
 
     bool init(std::string& err) {
+#ifndef GFX_NACELLE
         handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!handle) {
             err = "CreateEventW failed";
             return false;
         }
+#endif
         return true;
     }
 };
@@ -159,12 +175,14 @@ struct GfxDx12Device {
                          "SetEventOnCompletion")) {
                 return false;
             }
+#ifndef GFX_NACELLE
             DWORD waitStatus = WaitForSingleObject(fenceEvent.handle, 30000);
             if (waitStatus != WAIT_OBJECT_0) {
                 HRESULT removed = device->GetDeviceRemovedReason();
                 return setError("Compute GPU completion wait failed or timed out (device removed: " +
                                 hresultToString(removed) + ")");
             }
+#endif
         }
         HRESULT removed = device->GetDeviceRemovedReason();
         if (FAILED(removed)) {
@@ -254,11 +272,30 @@ struct GfxDx12BufferBinding {
     int is_uav;
 };
 
-__declspec(dllexport) void* gfx_dx12_create_device(
+GFX_DX12_EXPORT void* gfx_dx12_create_device(
     int use_warp, int enable_validation, char* err_buf, size_t err_buf_len) {
     auto dev = std::make_unique<GfxDx12Device>();
     dev->validationEnabled = (enable_validation != 0);
 
+#ifdef GFX_NACELLE
+    if (use_warp != 0) {
+        writeErrorBuffer(err_buf, err_buf_len, "WARP is not available in the Nacelle runtime");
+        return nullptr;
+    }
+    try {
+        checkNacelleValidation(dev->validationEnabled);
+    } catch (const std::exception& error) {
+        writeErrorBuffer(err_buf, err_buf_len, error.what());
+        return nullptr;
+    }
+    if (!dev->checkHr(NacelleCreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0,
+                                        IID_PPV_ARGS(&dev->device)), "NacelleCreateDevice")) {
+        writeErrorBuffer(err_buf, err_buf_len, dev->lastError);
+        return nullptr;
+    }
+    dev->name = "Nacelle";
+    dev->isSoftware = true;
+#else
     if (dev->validationEnabled) {
         ComPtr<ID3D12Debug> debug;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
@@ -352,6 +389,7 @@ __declspec(dllexport) void* gfx_dx12_create_device(
         dev->name = (use_warp != 0) ? "Microsoft Basic Render Driver" : "DirectX 12 Adapter";
     }
     dev->isSoftware = (chosenDesc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+#endif
 
     if (dev->validationEnabled) {
         if (!dev->checkHr(dev->device.As(&dev->diagnostics), "Get ID3D12InfoQueue")) {
@@ -405,24 +443,25 @@ __declspec(dllexport) void* gfx_dx12_create_device(
     return dev.release();
 }
 
-__declspec(dllexport) const char* gfx_dx12_device_name(void* dev_ptr) {
+GFX_DX12_EXPORT const char* gfx_dx12_device_name(void* dev_ptr) {
     if (!dev_ptr) return "";
     return static_cast<GfxDx12Device*>(dev_ptr)->name.c_str();
 }
 
-__declspec(dllexport) int gfx_dx12_device_is_software(void* dev_ptr) {
+GFX_DX12_EXPORT int gfx_dx12_device_is_software(void* dev_ptr) {
     if (!dev_ptr) return 0;
     return static_cast<GfxDx12Device*>(dev_ptr)->isSoftware ? 1 : 0;
 }
 
-__declspec(dllexport) const char* gfx_dx12_last_error(void* dev_ptr) {
+GFX_DX12_EXPORT const char* gfx_dx12_last_error(void* dev_ptr) {
     if (!dev_ptr) return "Null DirectX 12 device";
     return static_cast<GfxDx12Device*>(dev_ptr)->lastError.c_str();
 }
 
-__declspec(dllexport) void gfx_dx12_destroy_device(void* dev_ptr) {
+GFX_DX12_EXPORT void gfx_dx12_destroy_device(void* dev_ptr) {
     if (!dev_ptr) return;
     std::unique_ptr<GfxDx12Device> dev(static_cast<GfxDx12Device*>(dev_ptr));
+#ifndef GFX_NACELLE
     if (dev->queue && dev->fence && dev->fenceEvent.handle) {
         ++dev->fenceValue;
         if (SUCCEEDED(dev->queue->Signal(dev->fence.Get(), dev->fenceValue)) &&
@@ -432,9 +471,10 @@ __declspec(dllexport) void gfx_dx12_destroy_device(void* dev_ptr) {
             }
         }
     }
+#endif
 }
 
-__declspec(dllexport) void* gfx_dx12_create_buffer(void* dev_ptr, uint64_t size_bytes) {
+GFX_DX12_EXPORT void* gfx_dx12_create_buffer(void* dev_ptr, uint64_t size_bytes) {
     if (!dev_ptr) return nullptr;
     auto* dev = static_cast<GfxDx12Device*>(dev_ptr);
     if (size_bytes == 0) {
@@ -474,12 +514,12 @@ __declspec(dllexport) void* gfx_dx12_create_buffer(void* dev_ptr, uint64_t size_
     return buf.release();
 }
 
-__declspec(dllexport) uint64_t gfx_dx12_buffer_size(void* buf_ptr) {
+GFX_DX12_EXPORT uint64_t gfx_dx12_buffer_size(void* buf_ptr) {
     if (!buf_ptr) return 0;
     return static_cast<GfxDx12Buffer*>(buf_ptr)->sizeBytes;
 }
 
-__declspec(dllexport) int gfx_dx12_upload_buffer(
+GFX_DX12_EXPORT int gfx_dx12_upload_buffer(
     void* dev_ptr, void* buf_ptr, const void* data, uint64_t size_bytes, uint64_t offset) {
     if (!dev_ptr) return -1;
     auto* dev = static_cast<GfxDx12Device*>(dev_ptr);
@@ -534,7 +574,7 @@ __declspec(dllexport) int gfx_dx12_upload_buffer(
     return dev->executeAndWait() ? 0 : -1;
 }
 
-__declspec(dllexport) int gfx_dx12_download_buffer(
+GFX_DX12_EXPORT int gfx_dx12_download_buffer(
     void* dev_ptr, void* buf_ptr, void* out_data, uint64_t size_bytes, uint64_t offset) {
     if (!dev_ptr) return -1;
     auto* dev = static_cast<GfxDx12Device*>(dev_ptr);
@@ -603,12 +643,12 @@ __declspec(dllexport) int gfx_dx12_download_buffer(
     return 0;
 }
 
-__declspec(dllexport) void gfx_dx12_destroy_buffer(void* buf_ptr) {
+GFX_DX12_EXPORT void gfx_dx12_destroy_buffer(void* buf_ptr) {
     if (!buf_ptr) return;
     delete static_cast<GfxDx12Buffer*>(buf_ptr);
 }
 
-__declspec(dllexport) void* gfx_dx12_create_pipeline(
+GFX_DX12_EXPORT void* gfx_dx12_create_pipeline(
     void* dev_ptr, const void* dxil_bytes, size_t dxil_size) {
     if (!dev_ptr) return nullptr;
     auto* dev = static_cast<GfxDx12Device*>(dev_ptr);
@@ -694,18 +734,18 @@ __declspec(dllexport) void* gfx_dx12_create_pipeline(
     return pipe.release();
 }
 
-__declspec(dllexport) uint32_t gfx_dx12_pipeline_root_constants_bytes(void* pipe_ptr) {
+GFX_DX12_EXPORT uint32_t gfx_dx12_pipeline_root_constants_bytes(void* pipe_ptr) {
     if (!pipe_ptr) return 0;
     auto* pipe = static_cast<GfxDx12Pipeline*>(pipe_ptr);
     return pipe->hasRootConstants ? pipe->rootConstantsNumWords * 4U : 0U;
 }
 
-__declspec(dllexport) void gfx_dx12_destroy_pipeline(void* pipe_ptr) {
+GFX_DX12_EXPORT void gfx_dx12_destroy_pipeline(void* pipe_ptr) {
     if (!pipe_ptr) return;
     delete static_cast<GfxDx12Pipeline*>(pipe_ptr);
 }
 
-__declspec(dllexport) int gfx_dx12_dispatch(
+GFX_DX12_EXPORT int gfx_dx12_dispatch(
     void* dev_ptr,
     void* pipe_ptr,
     uint32_t gx,

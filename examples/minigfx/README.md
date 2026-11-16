@@ -1,5 +1,34 @@
 # MiniGfx: Embedded-Shader Python Graphics Engine Proof-of-Concept
 
+## DirectX on Linux/macOS with Nacelle
+
+After following the Nacelle SDK setup in the [project README](../../README.md),
+run:
+
+```sh
+PYTHONPATH=src python3 -m examples.minigfx --target directx --provider nacelle \
+  --width 640 --height 480
+```
+
+This keeps GLFW for windows, keyboard/mouse input, resizing, and teardown. Nacelle
+executes the actual DirectX DXIL scene using persistent D3D12 pipelines and
+resources, including textured materials, depth, HDR/post processing, and the HUD.
+Metal on macOS or Vulkan on Linux only uploads/copies the final RGBA frame to the
+window; the scene is not converted or re-rendered with those backends. No SDL is used.
+The existing controls, including **H** for HDR and **C** for comparison, still work.
+
+Use `--frames 3` for a bounded live smoke test, or render without a desktop:
+
+```sh
+PYTHONPATH=src python3 -m examples.minigfx --target directx --provider nacelle \
+  --output build/minigfx-nacelle.png --frames 1 --width 640 --height 480
+```
+
+Nacelle release hosts are Linux x86_64 and macOS arm64. Live mode additionally
+requires the existing GLFW/platform presentation dependencies; snapshots do not.
+Nacelle v0.0.1 does not provide D3D12 debug-layer validation.
+Omitting `--provider` preserves existing backend selection.
+
 ## 1. Executive Summary & Core Thesis
 
 **MiniGfx** is a lightweight real-time graphics engine proof-of-concept inspired by Microsoft MiniEngine. It demonstrates that **embedding GPU shaders directly within the host programming language (Python)** fundamentally eliminates CPU/GPU code duplication, eradicates struct layout synchronization hazards, and provides seamless cross-backend graphics across **Vulkan**, **DirectX 12**, and **Metal** with **zero external shading-language files** (no `.hlsl`, `.glsl`, or `.metal`).

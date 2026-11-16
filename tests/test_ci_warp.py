@@ -125,7 +125,7 @@ class TestCiWarpEnvironment(unittest.TestCase):
     def test_warp_flag_forwarding_in_python_runtime(self):
         """render_directx_offscreen forwards --warp argument when provider='warp'."""
         prog = GraphicsProgram(Shader("main", b"DXBC" + bytes(28)), Shader("main", b"DXBC" + bytes(28)), target="directx")
-        with patch("mlir_gpu.viewer._directx_run") as mock_run:
+        with patch("mlir_gpu.viewer.sys.platform", "win32"), patch("mlir_gpu.viewer._directx_run") as mock_run:
             mock_run.return_value = json.dumps({"device": "Microsoft Basic Render Driver", "width": 64, "height": 48})
             with tempfile.TemporaryDirectory() as tmp:
                 readback_path = Path(tmp) / "readback.rgba"
@@ -442,7 +442,7 @@ class TestCiWarpValidationLayer(unittest.TestCase):
     def test_warp_d3d12_validation_flag_passed_to_native_viewer(self):
         """When validation=True, --validation flag is explicitly passed to subprocess arguments."""
         prog = GraphicsProgram(Shader("main", b"DXBC" + bytes(28)), Shader("main", b"DXBC" + bytes(28)), target="directx")
-        with patch("mlir_gpu.viewer._directx_run") as mock_run:
+        with patch("mlir_gpu.viewer.sys.platform", "win32"), patch("mlir_gpu.viewer._directx_run") as mock_run:
             mock_run.return_value = json.dumps({"device": "Microsoft Basic Render Driver", "width": 32, "height": 24})
             with tempfile.TemporaryDirectory() as tmp:
                 readback_file = Path(tmp) / "readback.rgba"
@@ -661,7 +661,7 @@ class TestCiWarpSession0Safety(unittest.TestCase):
     def test_offscreen_rendering_never_creates_window_or_calls_presentation(self):
         """render_directx_offscreen exclusively passes --readback and never passes --frames."""
         prog = GraphicsProgram(Shader("main", b"DXBC" + bytes(28)), Shader("main", b"DXBC" + bytes(28)), target="directx")
-        with patch("mlir_gpu.viewer._directx_run") as mock_run:
+        with patch("mlir_gpu.viewer.sys.platform", "win32"), patch("mlir_gpu.viewer._directx_run") as mock_run:
             mock_run.return_value = json.dumps({"device": "Microsoft Basic Render Driver", "width": 64, "height": 48})
             with tempfile.TemporaryDirectory() as tmp:
                 readback_file = Path(tmp) / "readback.rgba"

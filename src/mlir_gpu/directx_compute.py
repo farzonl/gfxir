@@ -1,4 +1,4 @@
-"""Persistent DirectX 12 compute runtime implementing the compute_runtime contract on Windows."""
+"""Persistent DirectX 12 compute on Windows and via Nacelle on Linux/macOS."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from .compute_runtime import (
     _validate_non_negative_int,
     _validate_positive_int,
 )
-from .viewer import ComputeProgram, _validate_provider, load_compute_program
+from .viewer import ComputeProgram, ViewerError, _check_nacelle_device, _require_directx_platform, _validate_provider, load_compute_program
 
 _D3D12_MAX_GRID_DIM = 65535
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -36,7 +36,21 @@ class _GfxDx12BufferBinding(ctypes.Structure):
 
 
 def _find_or_build_bridge_dll() -> Path:
-    """Locate prebuilt mlir-gpu-directx-compute.dll or compile it from source."""
+    """Locate the native bridge, or compile it from source on Windows."""
+    if sys.platform != "win32":
+        suffix = ".dylib" if sys.platform == "darwin" else ".so"
+        directories = [
+            Path(os.environ["GPU_TOOLS_BIN"]) if "GPU_TOOLS_BIN" in os.environ else _REPO_ROOT / ".tools" / "bin",
+            _REPO_ROOT / "build" / "native",
+        ]
+        for directory in directories:
+            library = directory / f"mlir-gpu-directx-compute{suffix}"
+            if library.is_file():
+                return library
+        raise PersistentComputeError(
+            "Nacelle compute bridge not found. Build and install native helpers with "
+            "-DNACELLE_ROOT=<extracted release SDK>, or set GPU_TOOLS_BIN to their directory."
+        )
     candidates: list[Path] = []
     tools_env = os.environ.get("GPU_TOOLS_BIN")
     if tools_env:
@@ -166,7 +180,7 @@ def _load_bridge() -> ctypes.CDLL:
         lib = ctypes.CDLL(str(dll_path))
     except OSError as exc:
         raise PersistentComputeError(
-            f"Failed to load DirectX 12 compute bridge DLL '{dll_path}': {exc}"
+            f"Failed to load DirectX 12 compute bridge library '{dll_path}': {exc}"
         ) from exc
 
     lib.gfx_dx12_create_device.argtypes = [
@@ -520,8 +534,10 @@ class DirectXComputeContext(ComputeContext):
         validation: bool = False,
         provider: str | None = None,
     ) -> None:
-        if sys.platform != "win32":
-            raise PersistentComputeError("Native DirectX 12 compute execution requires Windows.")
+        try:
+            _require_directx_platform(provider)
+        except ViewerError as exc:
+            raise PersistentComputeError(str(exc)) from exc
 
         explicit_warp = provider == "warp"
         if provider is None and os.environ.get("MLIR_GPU_TEST_WARP") == "1":
@@ -549,6 +565,11 @@ class DirectXComputeContext(ComputeContext):
         self._device_name = raw_name.decode("utf-8", errors="replace") if raw_name else "DirectX 12"
         self._is_software = bool(self._lib.gfx_dx12_device_is_software(ctypes.c_void_p(self._handle)))
         is_warp_name = "basic render driver" in self._device_name.lower()
+        try:
+            _check_nacelle_device(provider, self._device_name)
+        except ViewerError as exc:
+            self.close()
+            raise PersistentComputeError(str(exc)) from exc
 
         if (explicit_warp or provider == "warp") and not (self._is_software or is_warp_name):
             self.close()
@@ -563,7 +584,7 @@ class DirectXComputeContext(ComputeContext):
                 "Accidental hardware/driver fallback rejected."
             )
 
-        self._provider = "warp" if (self._is_software or is_warp_name) else "hardware"
+        self._provider = "nacelle" if provider == "nacelle" else ("warp" if (self._is_software or is_warp_name) else "hardware")
 
     @property
     def target(self) -> str:

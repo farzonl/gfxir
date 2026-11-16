@@ -874,8 +874,19 @@ class _DirectXWindowBackend:
 
     OVERLAY_BUF_ID = 0
 
-    def __init__(self, glfw_mod: Any, window: Any, fb_w: int, fb_h: int, shaders: Dict[str, Path]) -> None:
-        lib = ctypes.CDLL(str(_build_directx_bridge_dll()))
+    def __init__(self, glfw_mod: Any, window: Any, fb_w: int, fb_h: int, shaders: Dict[str, Path],
+                 *, provider: Optional[str] = None) -> None:
+        if provider == "nacelle":
+            suffix = ".dylib" if sys.platform == "darwin" else ".so"
+            directory = Path(os.environ.get("GPU_TOOLS_BIN", _REPO_ROOT / ".tools" / "bin"))
+            library = directory / f"minigfx-nacelle{suffix}"
+            if not library.is_file():
+                raise RuntimeError(
+                    f"MiniGfx Nacelle bridge not found: {library}. Rebuild and install with -DNACELLE_ROOT=<SDK>."
+                )
+        else:
+            library = _build_directx_bridge_dll()
+        lib = ctypes.CDLL(str(library))
         lib.mgfx_dx12_create.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
         lib.mgfx_dx12_create.restype = ctypes.c_void_p
         lib.mgfx_dx12_last_error.argtypes = [ctypes.c_void_p]
@@ -909,12 +920,14 @@ class _DirectXWindowBackend:
         lib.mgfx_dx12_destroy.restype = None
 
         self._lib = lib
-        hwnd = glfw_mod.get_win32_window(window)
-        enable_val = 1 if os.environ.get("MLIR_GPU_TEST_VALIDATION", "").strip().lower() in ("1", "true", "yes") else 0
+        hwnd = None if provider == "nacelle" else glfw_mod.get_win32_window(window)
+        enable_val = 1 if provider != "nacelle" and os.environ.get("MLIR_GPU_TEST_VALIDATION", "").strip().lower() in ("1", "true", "yes") else 0
         use_warp = 1 if (
             os.environ.get("MLIR_GPU_DIRECTX_PROVIDER", "").strip().lower() == "warp"
             or os.environ.get("MINIGFX_DIRECTX_WARP", "").strip().lower() in ("1", "true", "yes")
         ) else 0
+        if provider == "nacelle":
+            use_warp = 0
 
         err_buf = ctypes.create_string_buffer(1024)
         self._ctx = lib.mgfx_dx12_create(ctypes.c_void_p(hwnd), fb_w, fb_h, enable_val, use_warp, err_buf, len(err_buf))
@@ -1072,6 +1085,9 @@ class _DirectXWindowBackend:
             if rc != 0:
                 raise RuntimeError(f"DirectX 12 HUD draw failed: {self._last_error_str()}")
 
+        self._finish_frame(fb_w, fb_h)
+
+    def _finish_frame(self, fb_w: int, fb_h: int) -> None:
         if self._capture_requested:
             self._capture_requested = False
             cap_buf = ctypes.create_string_buffer(fb_w * fb_h * 4)
@@ -1087,16 +1103,103 @@ class _DirectXWindowBackend:
             self._ctx = None
 
 
+class _MetalPixelPresenter:
+    def __init__(self, glfw_mod: Any, window: Any, width: int, height: int) -> None:
+        self._lib = ctypes.CDLL(str(_build_metal_bridge_dylib()))
+        self._lib.mgfx_metal_create_presenter.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t,
+        ]
+        self._lib.mgfx_metal_create_presenter.restype = ctypes.c_void_p
+        self._lib.mgfx_metal_present_rgba.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+        ]
+        self._lib.mgfx_metal_present_rgba.restype = ctypes.c_int
+        self._lib.mgfx_metal_last_error.argtypes = [ctypes.c_void_p]
+        self._lib.mgfx_metal_last_error.restype = ctypes.c_char_p
+        self._lib.mgfx_metal_destroy.argtypes = [ctypes.c_void_p]
+        self._lib.mgfx_metal_destroy.restype = None
+        error = ctypes.create_string_buffer(1024)
+        self._ctx = self._lib.mgfx_metal_create_presenter(
+            ctypes.c_void_p(glfw_mod.get_cocoa_window(window)), width, height, error, len(error),
+        )
+        if not self._ctx:
+            raise RuntimeError(f"Metal pixel presenter initialization failed: {error.value.decode('utf-8', errors='replace')}")
+
+    def present_pixels(self, width: int, height: int, rgba: bytes) -> None:
+        rc = self._lib.mgfx_metal_present_rgba(self._ctx, rgba, len(rgba), width, height)
+        if rc < 0:
+            error = self._lib.mgfx_metal_last_error(self._ctx)
+            raise RuntimeError(f"Metal pixel presentation failed: {error.decode('utf-8', errors='replace')}")
+
+    def destroy(self) -> None:
+        if self._ctx:
+            self._lib.mgfx_metal_destroy(self._ctx)
+            self._ctx = None
+
+
+class _NacelleWindowBackend(_DirectXWindowBackend):
+    """Render DXIL in Nacelle; use the platform backend only to display its RGBA output."""
+
+    def __init__(self, glfw_mod: Any, window: Any, fb_w: int, fb_h: int, shaders: Dict[str, Path]) -> None:
+        self._presenter = None
+        self._pixels = ctypes.create_string_buffer(0)
+        try:
+            super().__init__(glfw_mod, window, fb_w, fb_h, shaders, provider="nacelle")
+            self._lib.mgfx_dx12_copy_frame.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32,
+            ]
+            self._lib.mgfx_dx12_copy_frame.restype = ctypes.c_int
+            self._presenter = (
+                _MetalPixelPresenter(glfw_mod, window, fb_w, fb_h) if sys.platform == "darwin" else
+                _VulkanWindowBackend(glfw_mod, window, fb_w, fb_h, {}, pixels_only=True)
+            )
+        except Exception:
+            self.destroy()
+            raise
+
+    def _finish_frame(self, fb_w: int, fb_h: int) -> None:
+        if self._lib.mgfx_dx12_end_frame(self._ctx) != 0:
+            raise RuntimeError(f"Nacelle end_frame failed: {self._last_error_str()}")
+        size = fb_w * fb_h * 4
+        if len(self._pixels) != size:
+            self._pixels = ctypes.create_string_buffer(size)
+        if self._lib.mgfx_dx12_copy_frame(self._ctx, self._pixels, size, fb_w, fb_h) != 0:
+            raise RuntimeError(f"Nacelle front-buffer readback failed: {self._last_error_str()}")
+        rgba = self._pixels.raw
+        if self._capture_requested:
+            self._capture_requested = False
+            self.last_captured_frame = (fb_w, fb_h, rgba)
+        self._presenter.present_pixels(fb_w, fb_h, rgba)
+
+    def destroy(self) -> None:
+        try:
+            if self._presenter is not None:
+                self._presenter.destroy()
+                self._presenter = None
+        finally:
+            super().destroy()
+
+
 class _VulkanWindowBackend:
     """Pure-Python Vulkan GPU presenter driving a GLFW window."""
 
-    def __init__(self, glfw_mod: Any, window: Any, fb_w: int, fb_h: int, shaders: Dict[str, Path]) -> None:
+    def __init__(self, glfw_mod: Any, window: Any, fb_w: int, fb_h: int, shaders: Dict[str, Path],
+                 *, pixels_only: bool = False) -> None:
+        self.vk = None
+        try:
+            self._initialize(glfw_mod, window, fb_w, fb_h, shaders, pixels_only=pixels_only)
+        except Exception:
+            self.destroy()
+            raise
+
+    def _initialize(self, glfw_mod: Any, window: Any, fb_w: int, fb_h: int, shaders: Dict[str, Path],
+                    *, pixels_only: bool) -> None:
         import vulkan as vk
 
         self.vk = vk
         self.glfw = glfw_mod
         self.window = window
-        self.shaders = {k: p.read_bytes() for k, p in shaders.items()}
+        self._pixels_only = pixels_only
         self._cleanup_callbacks: List[Any] = []
         self._swapchain_cleanup: List[Any] = []
         self._mesh_buffers: Dict[int, Tuple[Any, Any, Any, int]] = {}
@@ -1104,6 +1207,7 @@ class _VulkanWindowBackend:
         self._sampler_cache: Dict[Tuple[str, str, str, str], Any] = {}
         self._textured_draw_sets: Dict[Tuple[int, int, Tuple[str, str, str, str]], Any] = {}
         self._hud_buffer: Optional[Tuple[Any, Any, Any, int]] = None
+        self.shaders = {k: p.read_bytes() for k, p in shaders.items()}
 
         req_exts = list(glfw_mod.get_required_instance_extensions() or [])
         avail_exts = {e.extensionName for e in vk.vkEnumerateInstanceExtensionProperties(None)}
@@ -1193,6 +1297,11 @@ class _VulkanWindowBackend:
             ),
         )[0]
 
+        if pixels_only:
+            self._create_sync_objects()
+            self._create_swapchain_and_pipelines(fb_w, fb_h)
+            return
+
         self.desc_set_layout = vk.vkCreateDescriptorSetLayout(
             self.device,
             vk.VkDescriptorSetLayoutCreateInfo(
@@ -1263,6 +1372,11 @@ class _VulkanWindowBackend:
         )
         self._cleanup_callbacks.append(lambda: vk.vkDestroyDescriptorPool(self.device, self.desc_pool, None))
 
+        self._create_sync_objects()
+        self._create_swapchain_and_pipelines(fb_w, fb_h)
+
+    def _create_sync_objects(self) -> None:
+        vk = self.vk
         self.img_avail = vk.vkCreateSemaphore(self.device, vk.VkSemaphoreCreateInfo(), None)
         self.render_done = vk.vkCreateSemaphore(self.device, vk.VkSemaphoreCreateInfo(), None)
         self.fence = vk.vkCreateFence(
@@ -1271,8 +1385,6 @@ class _VulkanWindowBackend:
         self._cleanup_callbacks.append(lambda: vk.vkDestroySemaphore(self.device, self.img_avail, None))
         self._cleanup_callbacks.append(lambda: vk.vkDestroySemaphore(self.device, self.render_done, None))
         self._cleanup_callbacks.append(lambda: vk.vkDestroyFence(self.device, self.fence, None))
-
-        self._create_swapchain_and_pipelines(fb_w, fb_h)
 
     def _find_mem_type(self, type_bits: int, req_flags: int) -> int:
         for i in range(self.mem_props.memoryTypeCount):
@@ -1346,6 +1458,12 @@ class _VulkanWindowBackend:
             if f.format in (vk.VK_FORMAT_B8G8R8A8_UNORM, vk.VK_FORMAT_R8G8B8A8_UNORM):
                 color_fmt, color_space = f.format, f.colorSpace
                 break
+        if self._pixels_only:
+            if color_fmt not in (vk.VK_FORMAT_R8G8B8A8_UNORM, vk.VK_FORMAT_B8G8R8A8_UNORM):
+                raise RuntimeError("Vulkan pixel presentation requires an RGBA8 or BGRA8 UNORM surface.")
+            if not (caps.supportedUsageFlags & vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT):
+                raise RuntimeError("Vulkan surface does not support transfer-destination pixel presentation.")
+            self._pixel_bgra = color_fmt == vk.VK_FORMAT_B8G8R8A8_UNORM
 
         if caps.currentExtent.width != 0xFFFFFFFF:
             w, h = caps.currentExtent.width, caps.currentExtent.height
@@ -1372,7 +1490,7 @@ class _VulkanWindowBackend:
                 imageColorSpace=color_space,
                 imageExtent=vk.VkExtent2D(width=w, height=h),
                 imageArrayLayers=1,
-                imageUsage=vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                imageUsage=vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT if self._pixels_only else vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                 imageSharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
                 preTransform=caps.currentTransform,
                 compositeAlpha=vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
@@ -1383,6 +1501,29 @@ class _VulkanWindowBackend:
         )
         self._swapchain_cleanup.append(lambda: destroy_sc(self.device, self.swapchain, None))
         sc_images = get_sc_imgs(self.device, self.swapchain)
+
+        if self._pixels_only:
+            self._pixel_images = sc_images
+            self._pixel_staging = vk.vkCreateBuffer(self.device, vk.VkBufferCreateInfo(
+                size=w * h * 4, usage=vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+            ), None)
+            requirements = vk.vkGetBufferMemoryRequirements(self.device, self._pixel_staging)
+            try:
+                self._pixel_memory = vk.vkAllocateMemory(self.device, vk.VkMemoryAllocateInfo(
+                    allocationSize=requirements.size,
+                    memoryTypeIndex=self._find_mem_type(
+                        requirements.memoryTypeBits,
+                        vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                    ),
+                ), None)
+            except Exception:
+                vk.vkDestroyBuffer(self.device, self._pixel_staging, None)
+                raise
+            self._swapchain_cleanup.append(lambda: vk.vkFreeMemory(self.device, self._pixel_memory, None))
+            self._swapchain_cleanup.append(lambda: vk.vkDestroyBuffer(self.device, self._pixel_staging, None))
+            vk.vkBindBufferMemory(self.device, self._pixel_staging, self._pixel_memory, 0)
+            return
 
         # Depth attachment image (D32_SFLOAT)
         depth_fmt = vk.VK_FORMAT_D32_SFLOAT
@@ -2150,13 +2291,91 @@ class _VulkanWindowBackend:
             self._destroy_swapchain()
             self._create_swapchain_and_pipelines(fb_w, fb_h)
 
+    def present_pixels(self, width: int, height: int, rgba: bytes) -> None:
+        vk = self.vk
+        if not self._pixels_only or width <= 0 or height <= 0 or len(rgba) != width * height * 4:
+            raise ValueError("Invalid RGBA frame for the Vulkan pixel presenter.")
+        if (width, height) != (self.sc_w, self.sc_h):
+            self._destroy_swapchain()
+            self._create_swapchain_and_pipelines(width, height)
+        if (width, height) != (self.sc_w, self.sc_h):
+            raise RuntimeError("Nacelle frame size does not match the Vulkan surface extent.")
+        vk.vkWaitForFences(self.device, 1, [self.fence], vk.VK_TRUE, 0xFFFFFFFFFFFFFFFF)
+        acquire = vk.vkGetDeviceProcAddr(self.device, "vkAcquireNextImageKHR")
+        image_index = vk.ffi.new("uint32_t*")
+        recreate = False
+        try:
+            acquire(self.device, self.swapchain, 0xFFFFFFFFFFFFFFFF, self.img_avail, vk.VK_NULL_HANDLE, image_index)
+        except vk.VkErrorOutOfDateKhr:
+            self._destroy_swapchain()
+            self._create_swapchain_and_pipelines(width, height)
+            return
+        except vk.VkSuboptimalKhr:
+            recreate = True
+        index = image_index[0]
+        payload = rgba
+        if self._pixel_bgra:
+            pixels = bytearray(rgba)
+            pixels[0::4], pixels[2::4] = rgba[2::4], rgba[0::4]
+            payload = bytes(pixels)
+        mapped = vk.vkMapMemory(self.device, self._pixel_memory, 0, len(payload), 0)
+        vk.ffi.memmove(mapped, payload, len(payload))
+        vk.vkUnmapMemory(self.device, self._pixel_memory)
+        vk.vkResetCommandBuffer(self.cmd_buf, 0)
+        vk.vkBeginCommandBuffer(self.cmd_buf, vk.VkCommandBufferBeginInfo())
+        image = self._pixel_images[index]
+        subresource = vk.VkImageSubresourceRange(
+            aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, levelCount=1, layerCount=1,
+        )
+        vk.vkCmdPipelineBarrier(
+            self.cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, None, 0, None, 1, [vk.VkImageMemoryBarrier(
+                oldLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED, newLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED, dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                dstAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT, image=image, subresourceRange=subresource,
+            )],
+        )
+        vk.vkCmdCopyBufferToImage(
+            self.cmd_buf, self._pixel_staging, image, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, [vk.VkBufferImageCopy(
+                imageSubresource=vk.VkImageSubresourceLayers(
+                    aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, layerCount=1,
+                ), imageExtent=vk.VkExtent3D(width, height, 1),
+            )],
+        )
+        vk.vkCmdPipelineBarrier(
+            self.cmd_buf, vk.VK_PIPELINE_STAGE_TRANSFER_BIT, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0, 0, None, 0, None, 1, [vk.VkImageMemoryBarrier(
+                oldLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, newLayout=vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED, dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT, image=image, subresourceRange=subresource,
+            )],
+        )
+        vk.vkEndCommandBuffer(self.cmd_buf)
+        vk.vkResetFences(self.device, 1, [self.fence])
+        vk.vkQueueSubmit(self.queue, 1, [vk.VkSubmitInfo(
+            pWaitSemaphores=[self.img_avail], pWaitDstStageMask=[vk.VK_PIPELINE_STAGE_TRANSFER_BIT],
+            pCommandBuffers=[self.cmd_buf], pSignalSemaphores=[self.render_done],
+        )], self.fence)
+        present = vk.vkGetDeviceProcAddr(self.device, "vkQueuePresentKHR")
+        try:
+            present(self.queue, vk.VkPresentInfoKHR(
+                pWaitSemaphores=[self.render_done], pSwapchains=[self.swapchain], pImageIndices=[index],
+            ))
+        except (vk.VkErrorOutOfDateKhr, vk.VkSuboptimalKhr):
+            recreate = True
+        vk.vkQueueWaitIdle(self.queue)
+        if recreate:
+            self._destroy_swapchain()
+            self._create_swapchain_and_pipelines(width, height)
+
     def destroy(self) -> None:
         vk = getattr(self, "vk", None)
         if vk is None:
             return
         if hasattr(self, "device"):
             vk.vkDeviceWaitIdle(self.device)
-        self._destroy_swapchain()
+            self._destroy_swapchain()
         if self._hud_buffer is not None:
             buf, mem, _, _ = self._hud_buffer
             vk.vkDestroyBuffer(self.device, buf, None)
@@ -2187,7 +2406,11 @@ class _VulkanWindowBackend:
 class InteractiveWindow:
     """GLFW window + GPU presenter wiring interactive input & rendering to ModelViewerApp."""
 
-    def __init__(self, target: str, width: int, height: int, title: str = "MiniGfx ModelViewer") -> None:
+    def __init__(self, target: str, width: int, height: int, title: str = "MiniGfx ModelViewer",
+                 *, provider: Optional[str] = None) -> None:
+        if provider is not None:
+            if provider != "nacelle" or target != "directx" or sys.platform not in ("linux", "darwin"):
+                raise ValueError("MiniGfx's Nacelle provider requires target='directx' on Linux or macOS.")
         import glfw
 
         if not glfw.init():
@@ -2223,7 +2446,9 @@ class InteractiveWindow:
                 shaders[f"hdr_{label}_fs"] = linear_shaders[f"{label}_fs"]
                 shaders[f"compare_{label}_fs"] = comparison_shaders[f"{label}_fs"]
             shaders.update(post_vs=linear_shaders["post_vs"], post_fs=linear_shaders["post_fs"])
-            if target == "directx":
+            if provider == "nacelle":
+                self.backend = _NacelleWindowBackend(glfw, self.window, fb_w, fb_h, shaders)
+            elif target == "directx":
                 if sys.platform != "win32":
                     raise RuntimeError("DirectX 12 window backend is only supported on Windows.")
                 self.backend: Any = _DirectXWindowBackend(glfw, self.window, fb_w, fb_h, shaders)
