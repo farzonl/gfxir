@@ -99,6 +99,8 @@ def build_hud_overlay_vertices(
     fb_width: int,
     fb_height: int,
     pixel_scale: int = 2,
+    *,
+    split_view: bool = False,
 ) -> Tuple[bytes, int]:
     """Build 2D clip-space triangle vertices (pos vec4 + color vec4) for bitmap HUD text."""
     if fb_width <= 0 or fb_height <= 0 or not lines:
@@ -126,6 +128,12 @@ def build_hud_overlay_vertices(
     quads: List[Tuple[float, float, float, float, float, float, float, float]] = []
     # Translucent dark slate backdrop panel
     quads.append((float(box_x0), float(box_y0), float(box_x1), float(box_y1), 0.04, 0.05, 0.09, 0.80))
+    if split_view and box_y1 + pad < fb_height:
+        center_x = fb_width / 2.0
+        quads.append((
+            center_x - s, float(box_y1 + pad), center_x + s, float(fb_height),
+            0.95, 0.80, 0.40, 0.95,
+        ))
 
     cur_y = start_y
     for text, color in lines:
@@ -175,7 +183,7 @@ def build_hud_overlay_vertices(
     return bytes(buf), vert_count
 
 
-def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
+def compile_minigfx_shaders(target_name: str, *, hdr: bool = False, comparison: bool = False) -> Dict[str, Path]:
     """Compile embedded MiniGfx Python shaders via GfxIR to native GPU binaries (.dxil, .metallib, or .spv)."""
     _ensure_toolchain_paths()
     from mlir_gpu.ast_frontend import ASTLowering
@@ -192,6 +200,7 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
         _node,
         fragment,
         sample_texture,
+        select,
         u32,
         vec2,
         vec3,
@@ -202,7 +211,7 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
     target = Target(target_name)
     ext = "spv" if target == Target.VULKAN else ("dxil" if target == Target.DIRECTX else "metallib")
 
-    cache_key_src = f"minigfx_window_shaders_v3_{target_name}"
+    cache_key_src = f"minigfx_window_shaders_v5_{target_name}_{hdr}_{comparison}"
     digest = hashlib.sha256(cache_key_src.encode("utf-8")).hexdigest()[:12]
     cache_dir = _REPO_ROOT / "build" / "minigfx_cache" / f"shaders_{target_name}_{digest}"
 
@@ -214,6 +223,8 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
         "overlay_vs": cache_dir / f"overlay_vs.{ext}",
         "overlay_fs": cache_dir / f"overlay_fs.{ext}",
     }
+    if hdr:
+        expected.update(post_vs=cache_dir / f"post_vs.{ext}", post_fs=cache_dir / f"post_fs.{ext}")
     if all(p.is_file() and p.stat().st_size > 0 for p in expected.values()):
         return expected
 
@@ -231,7 +242,7 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
         clip_pos = cam.view_proj * world_pos
         return Vertex(
             clip_pos,
-            varyings={"normal": world_norm, "world_pos": world_pos.xyz, "uv": vec2(p.w, n.w)},
+            varyings={"normal": world_norm, "world_pos": world_pos.xyz, "uv": vec2(p.w, n.w), "clip_x": clip_pos.x},
         )
 
     @fragment
@@ -239,6 +250,7 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
         normal: Value,
         world_pos: Value,
         uv: Value,
+        clip_x: Value,
         cam: CameraParams,
         mat: MaterialParams,
         light: LightParams,
@@ -265,8 +277,12 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
         rim = mat.albedo.xyz * fresnel * (light.ambient * 2.0 + 0.08)
 
         hdr = ambient + diffuse + specular + rim
+        if linear_output and not comparison:
+            return vec4(hdr, mat.albedo.w)
         ldr = sm.clamp((hdr * (hdr * 2.51 + 0.03)) / (hdr * (hdr * 2.43 + 0.59) + 0.14), 0.0, 1.0)
         srgb = sm.pow(ldr, 1.0 / 2.2)
+        if comparison:
+            return select(clip_x < 0.0, vec4(srgb, mat.albedo.w), vec4(hdr, mat.albedo.w))
         return vec4(srgb, mat.albedo.w)
 
     @fragment
@@ -274,6 +290,7 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
         normal: Value,
         world_pos: Value,
         uv: Value,
+        clip_x: Value,
         albedo_tex: Texture2D[1],
         albedo_sampler: Sampler[2],
         cam: CameraParams,
@@ -304,14 +321,22 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
         rim = base_color.xyz * fresnel * (light.ambient * 2.0 + 0.08)
 
         hdr = ambient + diffuse + specular + rim
+        if linear_output and not comparison:
+            return vec4(hdr, base_color.w)
         ldr = sm.clamp((hdr * (hdr * 2.51 + 0.03)) / (hdr * (hdr * 2.43 + 0.59) + 0.14), 0.0, 1.0)
         srgb = sm.pow(ldr, 1.0 / 2.2)
+        if comparison:
+            return select(clip_x < 0.0, vec4(srgb, base_color.w), vec4(hdr, base_color.w))
         return vec4(srgb, base_color.w)
 
     @fragment
-    def _normal_fs(normal: Value, world_pos: Value, uv: Value) -> Value:
+    def _normal_fs(normal: Value, world_pos: Value, uv: Value, clip_x: Value) -> Value:
         n = sm.normalize(normal)
         rgb = sm.clamp(n * 0.5 + 0.5, 0.0, 1.0)
+        if comparison:
+            return select(clip_x < 0.0, vec4(sm.pow(rgb, 1.0 / 2.2), 1.0), vec4(rgb, 1.0))
+        if linear_output:
+            return vec4(rgb, 1.0)
         return vec4(sm.pow(rgb, 1.0 / 2.2), 1.0)
 
     def _overlay_vs(vertex_index: u32, verts: Buffer[Type.VEC4, "read_only"]) -> Vertex:
@@ -323,6 +348,7 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
     def _overlay_fs(color: Value) -> Value:
         return color
 
+    linear_output = hdr
     cam_blk = CameraParams.as_parameter_block("cam")
     obj_blk = ObjectParams.as_parameter_block("obj")
     mat_blk = MaterialParams.as_parameter_block("mat")
@@ -388,6 +414,13 @@ def compile_minigfx_shaders(target_name: str) -> Dict[str, Path]:
         ("overlay_vs", overlay_vs_stage, None),
         ("overlay_fs", overlay_fs_stage, None),
     ]
+    if hdr:
+        from examples.minigfx.hdr import hdr_post
+        from mlir_gpu.graphics import fullscreen_uv_vertex
+
+        post_vs = fullscreen_uv_vertex.trace()
+        post_fs = hdr_post.trace(tuple(io for io in post_vs.output_interface if io.builtin is None))
+        jobs.extend([("post_vs", post_vs, None), ("post_fs", post_fs, None)])
     for label, stg, params in jobs:
         sub = cache_dir / f"_build_{label}"
         if sub.exists():
@@ -469,6 +502,7 @@ class _MetalWindowBackend:
             ctypes.c_char_p,
             ctypes.c_int,
             ctypes.c_int,
+            ctypes.c_int,
         ]
         lib.mgfx_metal_create_pipeline.restype = ctypes.c_int
 
@@ -498,6 +532,7 @@ class _MetalWindowBackend:
             ctypes.c_float,
             ctypes.c_float,
             ctypes.c_float,
+            ctypes.c_int,
         ]
         lib.mgfx_metal_begin_frame.restype = ctypes.c_int
 
@@ -528,6 +563,8 @@ class _MetalWindowBackend:
 
         lib.mgfx_metal_end_frame.argtypes = [ctypes.c_void_p]
         lib.mgfx_metal_end_frame.restype = ctypes.c_int
+        lib.mgfx_metal_tonemap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+        lib.mgfx_metal_tonemap.restype = ctypes.c_int
 
         lib.mgfx_metal_destroy.argtypes = [ctypes.c_void_p]
         lib.mgfx_metal_destroy.restype = None
@@ -550,6 +587,7 @@ class _MetalWindowBackend:
             b"_pbr_fs",
             1,
             0,
+            0,
         )
         self.pipe_textured_pbr = lib.mgfx_metal_create_pipeline(
             self._ctx,
@@ -558,6 +596,7 @@ class _MetalWindowBackend:
             str(shaders["textured_pbr_fs"]).encode("utf-8"),
             b"_textured_pbr_fs",
             1,
+            0,
             0,
         )
         self.pipe_normal = lib.mgfx_metal_create_pipeline(
@@ -568,6 +607,7 @@ class _MetalWindowBackend:
             b"_normal_fs",
             1,
             0,
+            0,
         )
         self.pipe_overlay = lib.mgfx_metal_create_pipeline(
             self._ctx,
@@ -577,8 +617,27 @@ class _MetalWindowBackend:
             b"_overlay_fs",
             0,
             1,
+            0,
         )
-        if min(self.pipe_pbr, self.pipe_textured_pbr, self.pipe_normal, self.pipe_overlay) < 0:
+        self.hdr_pipelines = {}
+        for label, entry in (("pbr", "_pbr_fs"), ("textured_pbr", "_textured_pbr_fs"), ("normal", "_normal_fs")):
+            self.hdr_pipelines[label] = lib.mgfx_metal_create_pipeline(
+                self._ctx, str(shaders["mesh_vs"]).encode(), b"_mesh_vs",
+                str(shaders[f"hdr_{label}_fs"]).encode(), entry.encode(), 1, 0, 1,
+            )
+        self.comparison_pipelines = {
+            label: lib.mgfx_metal_create_pipeline(
+                self._ctx, str(shaders["mesh_vs"]).encode(), b"_mesh_vs",
+                str(shaders[f"compare_{label}_fs"]).encode(), entry.encode(), 1, 0, 1,
+            )
+            for label, entry in (("pbr", "_pbr_fs"), ("textured_pbr", "_textured_pbr_fs"), ("normal", "_normal_fs"))
+        }
+        self.pipe_post = lib.mgfx_metal_create_pipeline(
+            self._ctx, str(shaders["post_vs"]).encode(), b"fullscreen_uv_vertex",
+            str(shaders["post_fs"]).encode(), b"hdr_post", 0, 0, 0,
+        )
+        if min(self.pipe_pbr, self.pipe_textured_pbr, self.pipe_normal, self.pipe_overlay,
+               self.pipe_post, *self.hdr_pipelines.values(), *self.comparison_pipelines.values()) < 0:
             err = lib.mgfx_metal_last_error(self._ctx)
             msg = err.decode("utf-8", errors="replace") if err else "unknown pipeline error"
             self.destroy()
@@ -644,16 +703,21 @@ class _MetalWindowBackend:
         draws: Sequence[Tuple[Any, ...]],
         hud_bytes: bytes,
         hud_vert_count: int,
+        *,
+        hdr: bool = False,
+        exposure: float = 1.0,
+        comparison: bool = False,
     ) -> None:
         if not self._ctx:
             return
-        rc = self._lib.mgfx_metal_begin_frame(self._ctx, fb_w, fb_h, 0.035, 0.04, 0.065, 1.0)
+        rc = self._lib.mgfx_metal_begin_frame(self._ctx, fb_w, fb_h, 0.035, 0.04, 0.065, 1.0, int(hdr))
         if rc == 1:
             return  # Window minimized
         if rc != 0:
             err = self._lib.mgfx_metal_last_error(self._ctx)
             raise RuntimeError(f"Metal begin_frame failed: {err.decode('utf-8', errors='replace') if err else rc}")
 
+        hdr_pipelines = self.comparison_pipelines if comparison else self.hdr_pipelines
         for draw_item in draws:
             mesh, obj_bytes, mat_bytes, is_normal_debug = draw_item[:4]
             tex = draw_item[4] if len(draw_item) > 4 else None
@@ -665,7 +729,7 @@ class _MetalWindowBackend:
             if is_normal_debug:
                 self._lib.mgfx_metal_draw(
                     self._ctx,
-                    self.pipe_normal,
+                    hdr_pipelines["normal"] if hdr else self.pipe_normal,
                     buf_id,
                     vcount,
                     vs_consts,
@@ -678,7 +742,7 @@ class _MetalWindowBackend:
                 tex_id = self._ensure_texture_sampler(tex, samp)
                 self._lib.mgfx_metal_draw_textured(
                     self._ctx,
-                    self.pipe_textured_pbr,
+                    hdr_pipelines["textured_pbr"] if hdr else self.pipe_textured_pbr,
                     buf_id,
                     vcount,
                     vs_consts,
@@ -691,7 +755,7 @@ class _MetalWindowBackend:
                 fs_consts = cam_bytes + mat_bytes + light_bytes
                 self._lib.mgfx_metal_draw(
                     self._ctx,
-                    self.pipe_pbr,
+                    hdr_pipelines["pbr"] if hdr else self.pipe_pbr,
                     buf_id,
                     vcount,
                     vs_consts,
@@ -699,6 +763,12 @@ class _MetalWindowBackend:
                     fs_consts,
                     len(fs_consts),
                 )
+
+        if hdr:
+            constants = struct.pack("<4f", exposure, float(comparison), 0.0, 0.0)
+            if self._lib.mgfx_metal_tonemap(self._ctx, self.pipe_post, constants, len(constants)) != 0:
+                err = self._lib.mgfx_metal_last_error(self._ctx)
+                raise RuntimeError(f"Metal HDR post pass failed: {err.decode() if err else 'unknown error'}")
 
         if hud_vert_count > 0 and hud_bytes:
             self._lib.mgfx_metal_upload_buffer(self._ctx, self.OVERLAY_BUF_ID, hud_bytes, len(hud_bytes))
@@ -812,7 +882,7 @@ class _DirectXWindowBackend:
         lib.mgfx_dx12_last_error.restype = ctypes.c_char_p
         lib.mgfx_dx12_device_name.argtypes = [ctypes.c_void_p]
         lib.mgfx_dx12_device_name.restype = ctypes.c_char_p
-        lib.mgfx_dx12_create_pipeline.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        lib.mgfx_dx12_create_pipeline.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         lib.mgfx_dx12_create_pipeline.restype = ctypes.c_int
         lib.mgfx_dx12_upload_buffer.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
         lib.mgfx_dx12_upload_buffer.restype = ctypes.c_int
@@ -821,7 +891,7 @@ class _DirectXWindowBackend:
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
         lib.mgfx_dx12_upload_texture_sampler.restype = ctypes.c_int
-        lib.mgfx_dx12_begin_frame.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float]
+        lib.mgfx_dx12_begin_frame.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_int]
         lib.mgfx_dx12_begin_frame.restype = ctypes.c_int
         lib.mgfx_dx12_draw.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
@@ -831,6 +901,8 @@ class _DirectXWindowBackend:
         lib.mgfx_dx12_draw.restype = ctypes.c_int
         lib.mgfx_dx12_end_frame.argtypes = [ctypes.c_void_p]
         lib.mgfx_dx12_end_frame.restype = ctypes.c_int
+        lib.mgfx_dx12_tonemap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+        lib.mgfx_dx12_tonemap.restype = ctypes.c_int
         lib.mgfx_dx12_end_frame_capture.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
         lib.mgfx_dx12_end_frame_capture.restype = ctypes.c_int
         lib.mgfx_dx12_destroy.argtypes = [ctypes.c_void_p]
@@ -853,13 +925,27 @@ class _DirectXWindowBackend:
         self.device_name = dev_raw.decode("utf-8", errors="replace") if dev_raw else "DirectX 12"
 
         vs_mesh = str(shaders["mesh_vs"]).encode("utf-8")
-        self.pipe_pbr = lib.mgfx_dx12_create_pipeline(self._ctx, vs_mesh, str(shaders["pbr_fs"]).encode("utf-8"), 1, 0)
-        self.pipe_textured_pbr = lib.mgfx_dx12_create_pipeline(self._ctx, vs_mesh, str(shaders["textured_pbr_fs"]).encode("utf-8"), 1, 0)
-        self.pipe_normal = lib.mgfx_dx12_create_pipeline(self._ctx, vs_mesh, str(shaders["normal_fs"]).encode("utf-8"), 1, 0)
+        self.pipe_pbr = lib.mgfx_dx12_create_pipeline(self._ctx, vs_mesh, str(shaders["pbr_fs"]).encode("utf-8"), 1, 0, 0)
+        self.pipe_textured_pbr = lib.mgfx_dx12_create_pipeline(self._ctx, vs_mesh, str(shaders["textured_pbr_fs"]).encode("utf-8"), 1, 0, 0)
+        self.pipe_normal = lib.mgfx_dx12_create_pipeline(self._ctx, vs_mesh, str(shaders["normal_fs"]).encode("utf-8"), 1, 0, 0)
         self.pipe_overlay = lib.mgfx_dx12_create_pipeline(
-            self._ctx, str(shaders["overlay_vs"]).encode("utf-8"), str(shaders["overlay_fs"]).encode("utf-8"), 0, 1
+            self._ctx, str(shaders["overlay_vs"]).encode("utf-8"), str(shaders["overlay_fs"]).encode("utf-8"), 0, 1, 0
         )
-        if min(self.pipe_pbr, self.pipe_textured_pbr, self.pipe_normal, self.pipe_overlay) < 0:
+        self.hdr_pipelines = {
+            label: lib.mgfx_dx12_create_pipeline(
+                self._ctx, vs_mesh, str(shaders[f"hdr_{label}_fs"]).encode(), 1, 0, 1,
+            ) for label in ("pbr", "textured_pbr", "normal")
+        }
+        self.comparison_pipelines = {
+            label: lib.mgfx_dx12_create_pipeline(
+                self._ctx, vs_mesh, str(shaders[f"compare_{label}_fs"]).encode(), 1, 0, 1,
+            ) for label in ("pbr", "textured_pbr", "normal")
+        }
+        self.pipe_post = lib.mgfx_dx12_create_pipeline(
+            self._ctx, str(shaders["post_vs"]).encode(), str(shaders["post_fs"]).encode(), 0, 0, 0,
+        )
+        if min(self.pipe_pbr, self.pipe_textured_pbr, self.pipe_normal, self.pipe_overlay,
+               self.pipe_post, *self.hdr_pipelines.values(), *self.comparison_pipelines.values()) < 0:
             msg = self._last_error_str()
             self.destroy()
             raise RuntimeError(f"DirectX 12 pipeline creation failed: {msg}")
@@ -930,10 +1016,15 @@ class _DirectXWindowBackend:
         draws: Sequence[Tuple[Any, ...]],
         hud_bytes: bytes,
         hud_vert_count: int,
+        *,
+        hdr: bool = False,
+        exposure: float = 1.0,
+        comparison: bool = False,
     ) -> None:
         if not self._ctx:
             return
         prepared: List[Tuple[int, int, int, bytes, bytes, int]] = []
+        hdr_pipelines = self.comparison_pipelines if comparison else self.hdr_pipelines
         for draw_item in draws:
             mesh, obj_bytes, mat_bytes, is_normal_debug = draw_item[:4]
             tex = draw_item[4] if len(draw_item) > 4 else None
@@ -942,18 +1033,18 @@ class _DirectXWindowBackend:
             if vcount == 0:
                 continue
             if is_normal_debug:
-                prepared.append((self.pipe_normal, buf_id, vcount, obj_bytes, mat_bytes, -1))
+                prepared.append((hdr_pipelines["normal"] if hdr else self.pipe_normal, buf_id, vcount, obj_bytes, mat_bytes, -1))
             elif tex is not None:
                 tex_id = self._ensure_texture_sampler(tex, samp)
-                prepared.append((self.pipe_textured_pbr, buf_id, vcount, obj_bytes, mat_bytes, tex_id))
+                prepared.append((hdr_pipelines["textured_pbr"] if hdr else self.pipe_textured_pbr, buf_id, vcount, obj_bytes, mat_bytes, tex_id))
             else:
-                prepared.append((self.pipe_pbr, buf_id, vcount, obj_bytes, mat_bytes, -1))
+                prepared.append((hdr_pipelines["pbr"] if hdr else self.pipe_pbr, buf_id, vcount, obj_bytes, mat_bytes, -1))
 
         if hud_vert_count > 0 and hud_bytes:
             if self._lib.mgfx_dx12_upload_buffer(self._ctx, self.OVERLAY_BUF_ID, hud_bytes, len(hud_bytes)) != 0:
                 raise RuntimeError(f"DirectX 12 HUD buffer upload failed: {self._last_error_str()}")
 
-        rc = self._lib.mgfx_dx12_begin_frame(self._ctx, fb_w, fb_h, 0.035, 0.04, 0.065, 1.0)
+        rc = self._lib.mgfx_dx12_begin_frame(self._ctx, fb_w, fb_h, 0.035, 0.04, 0.065, 1.0, int(hdr))
         if rc == 1:
             return
         if rc != 0:
@@ -967,6 +1058,11 @@ class _DirectXWindowBackend:
             )
             if rc != 0:
                 raise RuntimeError(f"DirectX 12 draw failed: {self._last_error_str()}")
+
+        if hdr:
+            constants = struct.pack("<4f", exposure, float(comparison), 0.0, 0.0)
+            if self._lib.mgfx_dx12_tonemap(self._ctx, self.pipe_post, constants, len(constants)) != 0:
+                raise RuntimeError(f"DirectX 12 HDR post pass failed: {self._last_error_str()}")
 
         if hud_vert_count > 0 and hud_bytes:
             rc = self._lib.mgfx_dx12_draw(
@@ -1142,6 +1238,15 @@ class _VulkanWindowBackend:
         self._cleanup_callbacks.append(
             lambda: vk.vkDestroyDescriptorSetLayout(self.device, self.desc_set_layout_textured, None)
         )
+        self.desc_set_layout_post = vk.vkCreateDescriptorSetLayout(
+            self.device, vk.VkDescriptorSetLayoutCreateInfo(pBindings=[
+                vk.VkDescriptorSetLayoutBinding(binding=0, descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                               descriptorCount=1, stageFlags=vk.VK_SHADER_STAGE_FRAGMENT_BIT),
+                vk.VkDescriptorSetLayoutBinding(binding=1, descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLER,
+                                               descriptorCount=1, stageFlags=vk.VK_SHADER_STAGE_FRAGMENT_BIT),
+            ]), None,
+        )
+        self._cleanup_callbacks.append(lambda: vk.vkDestroyDescriptorSetLayout(self.device, self.desc_set_layout_post, None))
 
         self.desc_pool = vk.vkCreateDescriptorPool(
             self.device,
@@ -1378,6 +1483,72 @@ class _VulkanWindowBackend:
             None,
         )
         self._swapchain_cleanup.append(lambda: vk.vkDestroyRenderPass(self.device, self.render_pass, None))
+        hdr_fmt = vk.VK_FORMAT_R32G32B32A32_SFLOAT
+        features = vk.vkGetPhysicalDeviceFormatProperties(self.physical, hdr_fmt).optimalTilingFeatures
+        required = vk.VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | vk.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+        if features & required != required:
+            raise RuntimeError("Vulkan device does not support a sampled RGBA32F HDR render target")
+        hdr_image = vk.vkCreateImage(self.device, vk.VkImageCreateInfo(
+            imageType=vk.VK_IMAGE_TYPE_2D, format=hdr_fmt, extent=vk.VkExtent3D(w, h, 1),
+            mipLevels=1, arrayLayers=1, samples=vk.VK_SAMPLE_COUNT_1_BIT, tiling=vk.VK_IMAGE_TILING_OPTIMAL,
+            usage=vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.VK_IMAGE_USAGE_SAMPLED_BIT,
+            sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE, initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+        ), None)
+        hdr_mem = None
+
+        def destroy_hdr_image():
+            vk.vkDestroyImage(self.device, hdr_image, None)
+            if hdr_mem is not None:
+                vk.vkFreeMemory(self.device, hdr_mem, None)
+
+        self._swapchain_cleanup.append(destroy_hdr_image)
+        req = vk.vkGetImageMemoryRequirements(self.device, hdr_image)
+        hdr_mem = vk.vkAllocateMemory(self.device, vk.VkMemoryAllocateInfo(
+            allocationSize=req.size,
+            memoryTypeIndex=self._find_mem_type(req.memoryTypeBits, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+        ), None)
+        vk.vkBindImageMemory(self.device, hdr_image, hdr_mem, 0)
+        hdr_view = vk.vkCreateImageView(self.device, vk.VkImageViewCreateInfo(
+            image=hdr_image, viewType=vk.VK_IMAGE_VIEW_TYPE_2D, format=hdr_fmt,
+            subresourceRange=vk.VkImageSubresourceRange(aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, levelCount=1, layerCount=1),
+        ), None)
+        self._swapchain_cleanup.append(lambda: vk.vkDestroyImageView(self.device, hdr_view, None))
+        self.hdr_render_pass = vk.vkCreateRenderPass(self.device, vk.VkRenderPassCreateInfo(
+            pAttachments=[
+                vk.VkAttachmentDescription(
+                    format=hdr_fmt, samples=vk.VK_SAMPLE_COUNT_1_BIT,
+                    loadOp=vk.VK_ATTACHMENT_LOAD_OP_CLEAR, storeOp=vk.VK_ATTACHMENT_STORE_OP_STORE,
+                    stencilLoadOp=vk.VK_ATTACHMENT_LOAD_OP_DONT_CARE, stencilStoreOp=vk.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                    initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED, finalLayout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                ), rp_attachments[1],
+            ],
+            pSubpasses=rp_subpasses,
+            pDependencies=[*rp_deps, vk.VkSubpassDependency(
+                srcSubpass=0, dstSubpass=vk.VK_SUBPASS_EXTERNAL,
+                srcStageMask=vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                dstStageMask=vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                srcAccessMask=vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, dstAccessMask=vk.VK_ACCESS_SHADER_READ_BIT,
+            )],
+        ), None)
+        self._swapchain_cleanup.append(lambda: vk.vkDestroyRenderPass(self.device, self.hdr_render_pass, None))
+        self.hdr_framebuffer = vk.vkCreateFramebuffer(self.device, vk.VkFramebufferCreateInfo(
+            renderPass=self.hdr_render_pass, pAttachments=[hdr_view, depth_view], width=w, height=h, layers=1,
+        ), None)
+        self._swapchain_cleanup.append(lambda: vk.vkDestroyFramebuffer(self.device, self.hdr_framebuffer, None))
+        post_sampler, _ = self._ensure_sampler(Sampler(
+            min_filter="nearest", mag_filter="nearest", address_mode_u="clamp_to_edge", address_mode_v="clamp_to_edge",
+        ))
+        self.post_set = vk.vkAllocateDescriptorSets(self.device, vk.VkDescriptorSetAllocateInfo(
+            descriptorPool=self.desc_pool, pSetLayouts=[self.desc_set_layout_post],
+        ))[0]
+        self._swapchain_cleanup.append(lambda: vk.vkFreeDescriptorSets(self.device, self.desc_pool, 1, [self.post_set]))
+        vk.vkUpdateDescriptorSets(self.device, 2, [
+            vk.VkWriteDescriptorSet(dstSet=self.post_set, dstBinding=0, descriptorCount=1,
+                descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                pImageInfo=[vk.VkDescriptorImageInfo(imageView=hdr_view, imageLayout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)]),
+            vk.VkWriteDescriptorSet(dstSet=self.post_set, dstBinding=1, descriptorCount=1,
+                descriptorType=vk.VK_DESCRIPTOR_TYPE_SAMPLER, pImageInfo=[vk.VkDescriptorImageInfo(sampler=post_sampler)]),
+        ], 0, None)
 
         self.framebuffers = []
         for img in sc_images:
@@ -1448,8 +1619,13 @@ class _VulkanWindowBackend:
             None,
         )
         self._swapchain_cleanup.append(lambda: vk.vkDestroyPipelineLayout(self.device, self.layout_overlay, None))
+        self.layout_post = vk.vkCreatePipelineLayout(self.device, vk.VkPipelineLayoutCreateInfo(
+            pSetLayouts=[self.desc_set_layout_post],
+            pPushConstantRanges=[vk.VkPushConstantRange(stageFlags=vk.VK_SHADER_STAGE_FRAGMENT_BIT, offset=0, size=16)],
+        ), None)
+        self._swapchain_cleanup.append(lambda: vk.vkDestroyPipelineLayout(self.device, self.layout_post, None))
 
-        def _make_pipe(vs_key: str, vs_ep: str, fs_key: str, fs_ep: str, layout: Any, depth_on: bool, blend_on: bool):
+        def _make_pipe(vs_key: str, vs_ep: str, fs_key: str, fs_ep: str, layout: Any, depth_on: bool, blend_on: bool, render_pass=None):
             vs_mod = vk.vkCreateShaderModule(
                 self.device,
                 vk.VkShaderModuleCreateInfo(codeSize=len(self.shaders[vs_key]), pCode=self.shaders[vs_key]),
@@ -1516,7 +1692,7 @@ class _VulkanWindowBackend:
                     pDepthStencilState=ds_state,
                     pColorBlendState=blend_state,
                     layout=layout,
-                    renderPass=self.render_pass,
+                    renderPass=render_pass or self.render_pass,
                     subpass=0,
                 )
             ]
@@ -1536,6 +1712,19 @@ class _VulkanWindowBackend:
         )
         self.pipe_normal = _make_pipe("mesh_vs", "_mesh_vs", "normal_fs", "_normal_fs", self.layout_mesh, True, False)
         self.pipe_overlay = _make_pipe("overlay_vs", "_overlay_vs", "overlay_fs", "_overlay_fs", self.layout_overlay, False, True)
+        self.hdr_pipelines = {
+            label: _make_pipe("mesh_vs", "_mesh_vs", f"hdr_{label}_fs", entry,
+                             self.layout_mesh_textured if label == "textured_pbr" else self.layout_mesh,
+                             True, False, self.hdr_render_pass)
+            for label, entry in (("pbr", "_pbr_fs"), ("textured_pbr", "_textured_pbr_fs"), ("normal", "_normal_fs"))
+        }
+        self.comparison_pipelines = {
+            label: _make_pipe("mesh_vs", "_mesh_vs", f"compare_{label}_fs", entry,
+                             self.layout_mesh_textured if label == "textured_pbr" else self.layout_mesh,
+                             True, False, self.hdr_render_pass)
+            for label, entry in (("pbr", "_pbr_fs"), ("textured_pbr", "_textured_pbr_fs"), ("normal", "_normal_fs"))
+        }
+        self.pipe_post = _make_pipe("post_vs", "fullscreen_uv_vertex", "post_fs", "hdr_post", self.layout_post, False, False)
 
     def _ensure_mesh(self, mesh: Mesh) -> Tuple[Any, int]:
         key = id(mesh)
@@ -1841,6 +2030,10 @@ class _VulkanWindowBackend:
         draws: Sequence[Tuple[Any, ...]],
         hud_bytes: bytes,
         hud_vert_count: int,
+        *,
+        hdr: bool = False,
+        exposure: float = 1.0,
+        comparison: bool = False,
     ) -> None:
         vk = self.vk
         if fb_w <= 0 or fb_h <= 0:
@@ -1869,25 +2062,27 @@ class _VulkanWindowBackend:
         vk.vkCmdBeginRenderPass(
             self.cmd_buf,
             vk.VkRenderPassBeginInfo(
-                renderPass=self.render_pass,
-                framebuffer=self.framebuffers[img_idx],
+                renderPass=self.hdr_render_pass if hdr else self.render_pass,
+                framebuffer=self.hdr_framebuffer if hdr else self.framebuffers[img_idx],
                 renderArea=vk.VkRect2D(offset=vk.VkOffset2D(0, 0), extent=vk.VkExtent2D(self.sc_w, self.sc_h)),
                 pClearValues=[clear_color, clear_depth],
             ),
             vk.VK_SUBPASS_CONTENTS_INLINE,
         )
 
+        hdr_pipelines = self.comparison_pipelines if comparison else self.hdr_pipelines
         for draw_item in draws:
             mesh, obj_bytes, mat_bytes, is_normal_debug = draw_item[:4]
             tex = draw_item[4] if len(draw_item) > 4 else None
             samp = draw_item[5] if len(draw_item) > 5 else None
             if not is_normal_debug and tex is not None:
                 dset, vcount = self._ensure_textured_mesh_set(mesh, tex, samp)
-                active_pipe = self.pipe_textured_pbr
+                active_pipe = hdr_pipelines["textured_pbr"] if hdr else self.pipe_textured_pbr
                 active_layout = self.layout_mesh_textured
             else:
                 dset, vcount = self._ensure_mesh(mesh)
-                active_pipe = self.pipe_normal if is_normal_debug else self.pipe_pbr
+                active_pipe = (hdr_pipelines["normal" if is_normal_debug else "pbr"] if hdr
+                               else self.pipe_normal if is_normal_debug else self.pipe_pbr)
                 active_layout = self.layout_mesh
             if vcount == 0 or dset is None:
                 continue
@@ -1909,6 +2104,19 @@ class _VulkanWindowBackend:
                 vk.ffi.from_buffer(pc),
             )
             vk.vkCmdDraw(self.cmd_buf, vcount, 1, 0, 0)
+
+        if hdr:
+            vk.vkCmdEndRenderPass(self.cmd_buf)
+            vk.vkCmdBeginRenderPass(self.cmd_buf, vk.VkRenderPassBeginInfo(
+                renderPass=self.render_pass, framebuffer=self.framebuffers[img_idx],
+                renderArea=vk.VkRect2D(offset=vk.VkOffset2D(0, 0), extent=vk.VkExtent2D(self.sc_w, self.sc_h)),
+                pClearValues=[clear_color, clear_depth],
+            ), vk.VK_SUBPASS_CONTENTS_INLINE)
+            vk.vkCmdBindPipeline(self.cmd_buf, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipe_post)
+            vk.vkCmdBindDescriptorSets(self.cmd_buf, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, self.layout_post, 0, 1, [self.post_set], 0, None)
+            constants = struct.pack("<4f", exposure, float(comparison), 0.0, 0.0)
+            vk.vkCmdPushConstants(self.cmd_buf, self.layout_post, vk.VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, vk.ffi.from_buffer(constants))
+            vk.vkCmdDraw(self.cmd_buf, 3, 1, 0, 0)
 
         if hud_vert_count > 0 and hud_bytes:
             hud_dset = self._update_hud(hud_bytes)
@@ -2008,18 +2216,22 @@ class InteractiveWindow:
         fb_w, fb_h = glfw.get_framebuffer_size(self.window)
 
         try:
+            shaders = compile_minigfx_shaders(target)
+            linear_shaders = compile_minigfx_shaders(target, hdr=True)
+            comparison_shaders = compile_minigfx_shaders(target, hdr=True, comparison=True)
+            for label in ("pbr", "textured_pbr", "normal"):
+                shaders[f"hdr_{label}_fs"] = linear_shaders[f"{label}_fs"]
+                shaders[f"compare_{label}_fs"] = comparison_shaders[f"{label}_fs"]
+            shaders.update(post_vs=linear_shaders["post_vs"], post_fs=linear_shaders["post_fs"])
             if target == "directx":
                 if sys.platform != "win32":
                     raise RuntimeError("DirectX 12 window backend is only supported on Windows.")
-                shaders = compile_minigfx_shaders("directx")
                 self.backend: Any = _DirectXWindowBackend(glfw, self.window, fb_w, fb_h, shaders)
             elif target == "metal":
                 if sys.platform != "darwin":
                     raise RuntimeError("Metal window backend is only supported on macOS.")
-                shaders = compile_minigfx_shaders("metal")
                 self.backend = _MetalWindowBackend(glfw, self.window, fb_w, fb_h, shaders)
             elif target == "vulkan":
-                shaders = compile_minigfx_shaders("vulkan")
                 self.backend = _VulkanWindowBackend(glfw, self.window, fb_w, fb_h, shaders)
             else:
                 raise RuntimeError(
@@ -2044,9 +2256,14 @@ class InteractiveWindow:
             glfw.KEY_2: "2",
             glfw.KEY_3: "3",
             glfw.KEY_M: "m",
+            glfw.KEY_N: "n",
             glfw.KEY_SPACE: " ",
             glfw.KEY_Q: "q",
             glfw.KEY_ESCAPE: "escape",
+            glfw.KEY_H: "h",
+            glfw.KEY_C: "c",
+            glfw.KEY_LEFT_BRACKET: "[",
+            glfw.KEY_RIGHT_BRACKET: "]",
         }
         mapped = key_map.get(key)
         if mapped is not None:
@@ -2155,18 +2372,37 @@ class InteractiveWindow:
             else f"FPS: {app.fps:.1f} | Backend: {self.target} | Mat: {mat_mode}"
         )
         sun_state = "ON" if getattr(app, "animate_light", True) else "PAUSED"
-        hud_text_2 = f"[1] METAL  [2] DIELECTRIC  [3] NORMALS  [SPACE] SUN:{sun_state}  [DRAG/SCROLL] CAM  [ESC] QUIT"
+        renderer = app.renderer
+        hdr_state = "COMPARE" if renderer.hdr and renderer.comparison else "ON" if renderer.hdr else "OFF"
+        comparison_active = renderer.hdr and renderer.comparison
+        compare_state = "ON" if comparison_active else "OFF"
+        hud_text_2 = f"[H] HDR:{hdr_state}  [C] COMPARE:{compare_state}  [[]/[]] EXP:{renderer.exposure:g}  [1/2/3] MAT  [SPACE] SUN:{sun_state}  [ESC] QUIT"
+        hud_lines = [
+            (hud_text_1, (0.92, 0.96, 1.0, 1.0)),
+            (hud_text_2, (0.95, 0.80, 0.40, 0.95)),
+        ]
+        model_paths = getattr(app, "model_paths", [])
+        if len(model_paths) > 1:
+            model_name = Path(model_paths[app._model_index]).name
+            hud_lines.append((
+                f"[N] NEXT MODEL  |  MODEL {app._model_index + 1}/{len(model_paths)}: {model_name}",
+                (0.95, 0.80, 0.40, 0.95),
+            ))
+        if comparison_active:
+            hud_lines.append((
+                "COMPARE: LEFT = HDR OFF | RIGHT = HDR ON + EXPOSURE",
+                (0.95, 0.80, 0.40, 0.95),
+            ))
         hud_bytes, hud_vcount = build_hud_overlay_vertices(
-            [
-                (hud_text_1, (0.92, 0.96, 1.0, 1.0)),
-                (hud_text_2, (0.95, 0.80, 0.40, 0.95)),
-            ],
+            hud_lines,
             fb_w,
             fb_h,
             pixel_scale=2 * dpi_scale,
+            split_view=comparison_active,
         )
 
-        self.backend.render(fb_w, fb_h, cam_bytes, gpu_light_bytes, draws, hud_bytes, hud_vcount)
+        self.backend.render(fb_w, fb_h, cam_bytes, gpu_light_bytes, draws, hud_bytes, hud_vcount,
+                            hdr=renderer.hdr, exposure=renderer.exposure, comparison=renderer.comparison)
 
         if app.frame_count % 15 == 0:
             self.glfw.set_window_title(

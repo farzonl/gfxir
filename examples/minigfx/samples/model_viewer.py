@@ -38,6 +38,7 @@ from examples.minigfx.material import (
     ObjectParams,
     material_fragment_shader,
     material_vertex_shader,
+    linear_pbr_fragment,
 )
 from examples.minigfx.math import Mat4x4, Vec2, Vec3, Vec4
 from examples.minigfx.obj_loader import load_obj, load_obj_from_string
@@ -90,7 +91,9 @@ from mlir_gpu.viewer import (
     load_program,
     render_offscreen,
     write_png,
+    with_post_process,
 )
+from examples.minigfx.hdr import display_to_scene, make_post_pipeline, validate_exposure
 
 
 @gfx_struct(layout="vertex")
@@ -125,6 +128,7 @@ def overlay_vertex_shader(vert: ModelVertex, params: OverlayParams) -> GpuVertex
         clip_pos,
         varyings={
             "uv": vert.uv,
+            "clip_x": clip_pos.x,
         },
     )
 
@@ -134,6 +138,35 @@ def overlay_fragment_shader(uv: Type.VEC2, params: OverlayParams) -> vec4:
     """Embedded overlay fragment shader with procedural glyph cell shaping."""
     edge = select((uv.x > 0.08) & (uv.x < 0.92) & (uv.y > 0.08) & (uv.y < 0.92), 1.0, 0.0)
     return select(edge > 0.5, params.text_color, params.bg_color)
+
+
+def make_hdr_overlay_shader(exposure, comparison=False):
+    overlay_fragment = overlay_fragment_shader.function
+
+    @fragment
+    def overlay_hdr_fragment(uv: Type.VEC2, clip_x: Type.F32, params: OverlayParams):
+        color = overlay_fragment(uv, params)
+        hdr_color = display_to_scene(color, exposure)
+        if comparison:
+            return select(clip_x < 0.0, color, hdr_color)
+        return hdr_color
+
+    return overlay_hdr_fragment
+
+
+def make_comparison_fragment():
+    ldr_fragment = material_fragment_shader.function
+    hdr_fragment = linear_pbr_fragment.function
+
+    @fragment
+    def comparison_fragment(normal: Type.VEC3, world_pos: Type.VEC3, uv: Type.VEC2,
+                            cam: CameraParams, mat: MaterialParams, light: LightParams):
+        clip_pos = cam.view_proj * vec4(world_pos, 1.0)
+        ldr = ldr_fragment(normal, world_pos, uv, cam, mat, light)
+        hdr = hdr_fragment(normal, world_pos, uv, cam, mat, light)
+        return select(clip_pos.x < 0.0, ldr, hdr)
+
+    return comparison_fragment
 
 
 # Compact embedded 42-vertex, 80-face geodesic sphere model for zero-dependency showcase
@@ -277,6 +310,10 @@ class ModelViewerApp(App):
         super().__init__(args)
 
         self.model_path: Optional[str] = getattr(args, "model", None)
+        self.model_paths: List[str] = list(getattr(args, "models", None) or (
+            [self.model_path] if self.model_path is not None else []
+        ))
+        self._model_index: int = 0
         self._pipeline_dir: Optional[tempfile.TemporaryDirectory] = None
 
         # 1. Define materials palette
@@ -305,24 +342,16 @@ class ModelViewerApp(App):
 
         # 2. Load 3D model geometry
         model_mesh: Optional[Mesh] = None
-        if self.model_path is not None:
-            if not self.model_path.strip():
-                raise ValueError("Model path cannot be empty")
-            if os.path.isfile(self.model_path):
-                model_mesh = load_obj(self.model_path, smooth_normals=True)
-                if model_mesh is None or len(model_mesh.vertices) == 0:
-                    raise ValueError(f"Invalid OBJ model: no valid geometry found in {self.model_path}")
-            elif "\n" in self.model_path:
-                model_mesh = load_obj_from_string(self.model_path, smooth_normals=True)
-                if model_mesh is None or len(model_mesh.vertices) == 0:
-                    raise ValueError("Invalid OBJ model: string contains no valid geometry")
-            else:
-                raise FileNotFoundError(f"Model file not found: {self.model_path}")
+        if self.model_paths:
+            self._model_meshes = [self._load_model(path) for path in self.model_paths]
+            self.model_path = self.model_paths[0]
+            model_mesh = self._model_meshes[0]
         else:
             try:
                 model_mesh = load_obj_from_string(DEFAULT_MODEL_OBJ, smooth_normals=True)
             except (ValueError, OSError):
                 model_mesh = create_sphere(radius=1.0, subdivisions=16)
+            self._model_meshes = [model_mesh]
 
         # 3. Assemble scene graph hierarchy
         self.scene = Scene(name="model_viewer_scene")
@@ -417,6 +446,9 @@ class ModelViewerApp(App):
             width=self.width,
             height=self.height,
             offscreen=self.offscreen,
+            hdr=getattr(args, "hdr", False) or getattr(args, "hdr_comparison", False),
+            exposure=getattr(args, "exposure", 1.0),
+            comparison=getattr(args, "hdr_comparison", False),
         )
 
         # Pre-register material pipeline configurations in ForwardRenderer
@@ -437,11 +469,18 @@ class ModelViewerApp(App):
         """Construct the CLI argument parser for ModelViewerApp."""
         parser = super().build_parser()
         parser.description = "ModelViewer interactive showcase application for MiniGfx"
-        parser.add_argument(
+        models = parser.add_mutually_exclusive_group()
+        models.add_argument(
             "--model",
             type=str,
             default=None,
             help="Path to Wavefront OBJ 3D model file (default: embedded procedural model)",
+        )
+        models.add_argument(
+            "--models",
+            nargs="+",
+            metavar="OBJ",
+            help="OBJ files to preload and cycle through with N (starts with the first)",
         )
         parser.add_argument(
             "--output",
@@ -449,6 +488,9 @@ class ModelViewerApp(App):
             default=None,
             help="Path to output PNG image file when running offscreen",
         )
+        parser.add_argument("--hdr", action="store_true", help="Render linear HDR through a separate ACES post pass")
+        parser.add_argument("--exposure", type=validate_exposure, default=1.0, help="HDR exposure multiplier (0.01 to 64)")
+        parser.add_argument("--hdr-comparison", action="store_true", help="Compare HDR-off rendering on the left with HDR plus exposure on the right")
         return parser
 
     @property
@@ -479,6 +521,28 @@ class ModelViewerApp(App):
             setattr(self.model_node, "pipeline_id", self.current_material_name)
         return self.current_material_name
 
+    @staticmethod
+    def _load_model(path: str) -> Mesh:
+        if not path.strip():
+            raise ValueError("Model path cannot be empty")
+        if os.path.isfile(path):
+            mesh = load_obj(path, smooth_normals=True)
+        elif "\n" in path:
+            mesh = load_obj_from_string(path, smooth_normals=True)
+        else:
+            raise FileNotFoundError(f"Model file not found: {path}")
+        if not mesh.vertices or not mesh.indices:
+            raise ValueError(f"Invalid OBJ model: no valid geometry found in {path}")
+        return mesh
+
+    def cycle_model(self) -> Optional[str]:
+        """Switch meshes without changing scene, camera, or material state."""
+        self._model_index = (self._model_index + 1) % len(self._model_meshes)
+        self.model_node.mesh = self._model_meshes[self._model_index]
+        if self.model_paths:
+            self.model_path = self.model_paths[self._model_index]
+        return self.model_path
+
     def toggle_light_animation(self) -> bool:
         """Toggle orbiting animation of the directional light."""
         self.animate_light = not self.animate_light
@@ -504,7 +568,7 @@ class ModelViewerApp(App):
         self.handle_mouse_scroll(delta)
 
     def handle_key_press(self, key: Union[str, int]) -> None:
-        """Handle keyboard events for material presets, light animation toggle, and termination."""
+        """Handle keyboard events for models, materials, lighting, and termination."""
         raw_k = str(key).lower()
         k = raw_k.strip()
         if raw_k == " " or k in ("space", "key_space"):
@@ -517,6 +581,17 @@ class ModelViewerApp(App):
             self.set_material("normal_debug")
         elif k in ("m", "key_m"):
             self.cycle_material()
+        elif k in ("n", "key_n"):
+            self.cycle_model()
+        elif k in ("h", "key_h"):
+            self.renderer.hdr = not self.renderer.hdr
+        elif k in ("c", "key_c"):
+            self.renderer.comparison = not self.renderer.comparison
+            self.renderer.hdr = True
+        elif k in ("[", "key_left_bracket"):
+            self.renderer.exposure = max(0.01, self.renderer.exposure / 2.0)
+        elif k in ("]", "key_right_bracket"):
+            self.renderer.exposure = min(64.0, self.renderer.exposure * 2.0)
         elif k in ("q", "escape", "key_q", "key_escape"):
             self.stop()
 
@@ -535,13 +610,16 @@ class ModelViewerApp(App):
         if not hasattr(self, "_pipeline_dir") or self._pipeline_dir is None:
             self._pipeline_dir = tempfile.TemporaryDirectory(prefix="minigfx_viewer_")
 
-        out_dir = Path(self._pipeline_dir.name) / f"{target_name}_pipeline"
+        settings = (target_name, self.renderer.hdr, self.renderer.exposure, self.renderer.comparison)
+        suffix = f"_hdr_{self.renderer.exposure}_{int(self.renderer.comparison)}" if self.renderer.hdr else ""
+        out_dir = Path(self._pipeline_dir.name) / f"{target_name}_pipeline{suffix}"
         pbr_dir = out_dir / "pbr_forward"
         overlay_dir = out_dir / "overlay"
         manifest_file = pbr_dir / "pipeline.json"
 
         if manifest_file.exists() and (overlay_dir / "pipeline.json").exists():
             self.compiled_manifest = str(manifest_file)
+            self._pipeline_settings = settings
             pipe_record = self.renderer.get_or_create_pipeline(self.current_material_name)
             pipe_record.gpu_pipeline = str(manifest_file)
             return manifest_file
@@ -552,7 +630,8 @@ class ModelViewerApp(App):
         # 1. Primary 3D Scene PBR Pipeline (depth test & depth write enabled)
         pbr_gpu_pipe = GpuPipeline(
             model_vertex_shader,
-            material_fragment_shader,
+            (make_comparison_fragment() if self.renderer.comparison else linear_pbr_fragment)
+            if self.renderer.hdr else material_fragment_shader,
             depth_stencil=DepthStencil(
                 format="d32_sfloat",
                 depth_test_enable=True,
@@ -567,7 +646,8 @@ class ModelViewerApp(App):
         # 2. Dedicated 2D Overlay Pipeline (depth test & depth write disabled)
         overlay_gpu_pipe = GpuPipeline(
             overlay_vertex_shader,
-            overlay_fragment_shader,
+            make_hdr_overlay_shader(self.renderer.exposure, self.renderer.comparison)
+            if self.renderer.hdr else overlay_fragment_shader,
             depth_stencil=DepthStencil(
                 format="d32_sfloat",
                 depth_test_enable=False,
@@ -578,8 +658,12 @@ class ModelViewerApp(App):
         overlay_manifest_path = compile_pipeline(overlay_gpu_pipe, target_enum, overlay_dir)
         if overlay_manifest_path is None or not Path(overlay_manifest_path).exists():
             raise RuntimeError(f"Overlay pipeline compilation failed for target {target_name}")
+        if self.renderer.hdr:
+            compile_pipeline(make_post_pipeline(self.renderer.exposure, self.renderer.comparison),
+                             target_enum, out_dir / "post")
 
         self.compiled_manifest = str(pbr_manifest_path)
+        self._pipeline_settings = settings
         pipe_record = self.renderer.get_or_create_pipeline(self.current_material_name)
         pipe_record.gpu_pipeline = str(pbr_manifest_path)
         return Path(pbr_manifest_path)
@@ -638,7 +722,9 @@ class ModelViewerApp(App):
 
     def render_offscreen_frame(self) -> RenderedImage:
         """Render scene into RenderedImage using genuine GPU execution via mlir_gpu.viewer."""
-        if self.compiled_manifest is None or not Path(self.compiled_manifest).exists():
+        settings = (self.target, self.renderer.hdr, self.renderer.exposure, self.renderer.comparison)
+        if (self.compiled_manifest is None or not Path(self.compiled_manifest).exists()
+                or getattr(self, "_pipeline_settings", settings) != settings):
             self.compile_embedded_pipeline()
 
         pbr_manifest_path = Path(self.compiled_manifest)
@@ -811,6 +897,8 @@ class ModelViewerApp(App):
             vertex_buffer=bytes(consolidated_vb),
             index_buffer=bytes(consolidated_ib),
         )
+        if self.renderer.hdr:
+            program = with_post_process(program, load_program(out_dir / "post" / "pipeline.json"))
 
         image = render_offscreen(
             program,

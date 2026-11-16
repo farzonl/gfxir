@@ -58,6 +58,9 @@ class ForwardRenderer:
         width: int = 1280,
         height: int = 720,
         offscreen: bool = False,
+        hdr: bool = False,
+        exposure: float = 1.0,
+        comparison: bool = False,
         **kwargs: Any,
     ) -> None:
         try:
@@ -71,10 +74,23 @@ class ForwardRenderer:
         self.width: int = int(width)
         self.height: int = int(height)
         self.offscreen: bool = bool(offscreen)
+        self.hdr = bool(hdr)
+        self.exposure = exposure
+        self.comparison = bool(comparison)
         self.pipelines: dict[str, Pipeline] = {}
         self.frame_constants: bytes = b""
         self.light_constants: bytes = b""
         self.last_commands: List[DrawCommand] = []
+
+    @property
+    def exposure(self) -> float:
+        return self._exposure
+
+    @exposure.setter
+    def exposure(self, value: float) -> None:
+        from .hdr import validate_exposure
+
+        self._exposure = validate_exposure(value)
 
     def get_or_create_pipeline(
         self,

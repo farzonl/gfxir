@@ -195,6 +195,18 @@ Load custom 3D models via the `--model` parameter:
 python3 -m examples.minigfx.samples.model_viewer --target metal --model path/to/model.obj
 ```
 
+To switch between the three downloaded OBJ files, activate the repository's
+virtual environment and pass a model list. Press **N** to advance, wrapping
+back to the first model. All meshes are preloaded; switching preserves the
+camera, material, and lighting settings. The on-screen HUD shows `[N] NEXT MODEL`
+along with the current model's filename and position in the list.
+
+```bash
+source .venv/bin/activate
+PYTHONPATH=src python -m examples.minigfx.samples.model_viewer --target metal \
+  --models build/african_head.obj build/diablo3_pose.obj build/monkey.obj
+```
+
 ### 3.3 CLI Command-Line Arguments
 
 The package entry point launches the same ModelViewer sample:
@@ -233,6 +245,7 @@ The application host accepts the following empirically verified CLI arguments:
 | `--height HEIGHT` | Integer ($H > 0$) | `720` | Framebuffer and window height in pixels. |
 | `--offscreen` | Flag | `False` | Renders headlessly to offscreen buffers without opening an OS window. |
 | `--model MODEL` | File Path | Embedded procedural model | Loads a custom Wavefront OBJ file for display. |
+| `--models OBJ [OBJ ...]` | File Paths | `None` | Preloads models for keyboard cycling; mutually exclusive with `--model`. |
 | `--output OUTPUT` | File Path | `None` | Writes the offscreen rendered frame to a PNG file. |
 
 ### 3.4 Interactive Controls
@@ -248,8 +261,17 @@ The application host accepts the following empirically verified CLI arguments:
 | `1` | **Metallic Preset** | Configures high metallic (1.0), low roughness (0.2) reflective material. |
 | `2` | **Dielectric Preset** | Configures non-metallic (0.0), medium roughness (0.5) diffuse material. |
 | `3` | **Normal Debug Mode** | Maps interpolated surface normal vectors directly to RGB color channels. |
+| `N` | **Next Model** | Cycles through `--models` in order, wrapping to the first. |
+| `C` | **Toggle HDR Comparison** | Enables HDR and toggles a labeled split view: HDR-off rendering on the left, HDR with exposure on the right. |
+| `[` / `]` | **Adjust HDR Exposure** | Halves / doubles exposure; in comparison mode only the right half changes. |
 | `Space` | **Toggle Sunlight Orbit** | Starts or pauses the dynamic orbiting animation of the directional sun light. |
 | `Q` / `Esc` | **Quit Application** | Gracefully cleans up GPU resources and terminates the application. |
+
+Comparison mode shows a center divider and an explicit `COMPARE:ON` HUD status.
+The left half uses the regular HDR-off material output and bypasses the HDR post
+pass; the right half uses linear HDR with exposure and ACES tonemapping.
+At exposure 1, materials can look similar because regular rendering already uses
+ACES. Press `]` to increase exposure and see only the right half change.
 
 ---
 

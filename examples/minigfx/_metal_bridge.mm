@@ -42,6 +42,8 @@ struct MgfxMetalContext {
     id<MTLDepthStencilState> depthEnabledState = nil;
     id<MTLDepthStencilState> depthDisabledState = nil;
     id<MTLTexture> depthTexture = nil;
+    MgfxTextureSamplerEntry sceneColor;
+    bool hdrActive = false;
     int depthWidth = 0;
     int depthHeight = 0;
 
@@ -173,7 +175,8 @@ int mgfx_metal_create_pipeline(
     const char* fs_metallib_path,
     const char* fs_entry,
     int depth_enabled,
-    int alpha_blend
+    int alpha_blend,
+    int hdr_target
 ) {
     @autoreleasepool {
         if (!handle) return -1;
@@ -205,7 +208,7 @@ int mgfx_metal_create_pipeline(
         desc.vertexFunction = vsFn;
         desc.fragmentFunction = fsFn;
         desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-        desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        desc.colorAttachments[0].pixelFormat = hdr_target ? MTLPixelFormatRGBA32Float : MTLPixelFormatBGRA8Unorm;
         desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
         if (alpha_blend) {
@@ -297,13 +300,15 @@ int mgfx_metal_begin_frame(
     float clear_r,
     float clear_g,
     float clear_b,
-    float clear_a
+    float clear_a,
+    int hdr_enabled
 ) {
     @autoreleasepool {
         if (!handle) return -1;
         auto* ctx = static_cast<MgfxMetalContext*>(handle);
         int w = std::max(1, fb_width);
         int h = std::max(1, fb_height);
+        ctx->hdrActive = hdr_enabled != 0;
 
         if (ctx->window) {
             CGFloat scale = [ctx->window backingScaleFactor];
@@ -344,8 +349,37 @@ int mgfx_metal_begin_frame(
             return -1;
         }
 
+        if (ctx->hdrActive && (!ctx->sceneColor.texture || ctx->sceneColor.texture.width != w ||
+                              ctx->sceneColor.texture.height != h)) {
+            MTLTextureDescriptor* desc = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:w height:h mipmapped:NO];
+            desc.textureType = MTLTextureType2DArray;
+            desc.storageMode = MTLStorageModePrivate;
+            desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            auto& scene = ctx->sceneColor;
+            scene.texture = [ctx->device newTextureWithDescriptor:desc];
+            MTLSamplerDescriptor* sampler = [MTLSamplerDescriptor new];
+            sampler.minFilter = MTLSamplerMinMagFilterNearest;
+            sampler.magFilter = MTLSamplerMinMagFilterNearest;
+            sampler.sAddressMode = MTLSamplerAddressModeClampToEdge;
+            sampler.tAddressMode = MTLSamplerAddressModeClampToEdge;
+            sampler.supportArgumentBuffers = YES;
+            scene.sampler = [ctx->device newSamplerStateWithDescriptor:sampler];
+            scene.srvTable = [ctx->device newBufferWithLength:sizeof(IRDescriptorTableEntry)
+                                                    options:MTLResourceStorageModeShared];
+            scene.samplerTable = [ctx->device newBufferWithLength:sizeof(IRDescriptorTableEntry)
+                                                        options:MTLResourceStorageModeShared];
+            if (!scene.texture || !scene.sampler || !scene.srvTable || !scene.samplerTable) {
+                setError(ctx, @"Cannot allocate Metal HDR target and descriptors");
+                return -1;
+            }
+            IRDescriptorTableSetTexture(static_cast<IRDescriptorTableEntry*>(scene.srvTable.contents),
+                                        scene.texture, 0.0f, 0);
+            IRDescriptorTableSetSampler(static_cast<IRDescriptorTableEntry*>(scene.samplerTable.contents),
+                                        scene.sampler, 0.0f);
+        }
         MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-        pass.colorAttachments[0].texture = drawable.texture;
+        pass.colorAttachments[0].texture = ctx->hdrActive ? ctx->sceneColor.texture : drawable.texture;
         pass.colorAttachments[0].loadAction = MTLLoadActionClear;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         pass.colorAttachments[0].clearColor = MTLClearColorMake(clear_r, clear_g, clear_b, clear_a);
@@ -408,6 +442,7 @@ int mgfx_metal_upload_texture_sampler(
             texture2DDescriptorWithPixelFormat:fmt width:w height:h mipmapped:NO];
         texDesc.storageMode = MTLStorageModePrivate;
         texDesc.usage = MTLTextureUsageShaderRead;
+        texDesc.textureType = MTLTextureType2DArray;
         id<MTLTexture> tex = [ctx->device newTextureWithDescriptor:texDesc];
         if (!tex) {
             setError(ctx, @"Failed to allocate Metal 2D texture");
@@ -603,6 +638,53 @@ int mgfx_metal_draw(
         [enc useResource:buf.dataBuffer usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
 
         IRRuntimeDrawPrimitives(enc, MTLPrimitiveTypeTriangle, uint64_t{0}, static_cast<uint64_t>(vertex_count));
+        return 0;
+    }
+}
+
+int mgfx_metal_tonemap(void* handle, int pipeline_id, const void* constants, size_t size) {
+    @autoreleasepool {
+        if (!handle) return -1;
+        auto* ctx = static_cast<MgfxMetalContext*>(handle);
+        if (!ctx->hdrActive || !ctx->currentEncoder || size != 16 || !constants ||
+            pipeline_id < 0 || static_cast<size_t>(pipeline_id) >= ctx->pipelines.size()) {
+            setError(ctx, @"Invalid Metal HDR post pass");
+            return -1;
+        }
+        [ctx->currentEncoder endEncoding];
+        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = ctx->currentDrawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.depthAttachment.texture = ctx->depthTexture;
+        pass.depthAttachment.loadAction = MTLLoadActionDontCare;
+        pass.depthAttachment.storeAction = MTLStoreActionDontCare;
+        ctx->currentEncoder = [ctx->currentCommandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (!ctx->currentEncoder) {
+            setError(ctx, @"Cannot create Metal HDR post encoder");
+            return -1;
+        }
+        auto& scene = ctx->sceneColor;
+        const auto& pipe = ctx->pipelines[pipeline_id];
+        id<MTLRenderCommandEncoder> enc = ctx->currentEncoder;
+        [enc setRenderPipelineState:pipe.state];
+        [enc setDepthStencilState:ctx->depthDisabledState];
+        [enc setCullMode:MTLCullModeNone];
+        [enc setViewport:(MTLViewport){0, 0, static_cast<double>(scene.texture.width),
+                                      static_cast<double>(scene.texture.height), 0, 1}];
+        size_t srvOff = pipe.fragmentPointerOffsets.empty() ? size : pipe.fragmentPointerOffsets[0];
+        size_t sampOff = pipe.fragmentPointerOffsets.size() < 2 ? srvOff + 8 : pipe.fragmentPointerOffsets[1];
+        std::vector<uint8_t> args(std::max(size, sampOff + 8), 0);
+        std::memcpy(args.data(), constants, size);
+        uint64_t srvAddr = scene.srvTable.gpuAddress, sampAddr = scene.samplerTable.gpuAddress;
+        std::memcpy(args.data() + srvOff, &srvAddr, 8);
+        std::memcpy(args.data() + sampOff, &sampAddr, 8);
+        [enc setFragmentBytes:args.data() length:args.size() atIndex:kIRArgumentBufferBindPoint];
+        [enc useResource:scene.texture usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+        [enc useResource:scene.srvTable usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+        [enc useResource:scene.samplerTable usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+        IRRuntimeDrawPrimitives(enc, MTLPrimitiveTypeTriangle, uint64_t{0}, uint64_t{3});
+        ctx->hdrActive = false;
         return 0;
     }
 }
