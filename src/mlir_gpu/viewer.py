@@ -1084,6 +1084,8 @@ def _native_run(arguments: list[str], capture: bool, backend: str, environment: 
     if result.returncode:
         diagnostics = (result.stderr or result.stdout or "").strip() if capture else "See native renderer diagnostics above."
         raise ViewerError(f"Native {backend} preview failed ({result.returncode}): {diagnostics}")
+    if capture and result.stderr:
+        sys.stderr.write(result.stderr)
     return result.stdout or ""
 
 
