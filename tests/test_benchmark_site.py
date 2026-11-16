@@ -250,6 +250,12 @@ class TestBenchmarkSiteBuilder(unittest.TestCase):
         self.assertEqual(merged["overallGeomeanMs"]["gfxir-directx-nacelle"], 3.2)
         self.assertEqual(merged["target"], "vulkan, directx")
 
+    def test_site_legend_renders_accessible_backend_toggles(self) -> None:
+        html = (ROOT / "pages" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('class="legend-toggle"', html)
+        self.assertIn("aria-pressed=", html)
+        self.assertIn("hiddenBackends", html)
+
 
 if __name__ == "__main__":
     unittest.main()

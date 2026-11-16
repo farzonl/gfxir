@@ -296,7 +296,7 @@
     .legend {
       display: flex;
       flex-wrap: wrap;
-      gap: 0.95rem;
+      gap: 0.55rem;
       font-size: 0.86rem;
       color: var(--text);
     }
@@ -305,6 +305,33 @@
       display: inline-flex;
       align-items: center;
       gap: 0.4rem;
+    }
+
+    .legend-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      min-block-size: 28px;
+      padding: 0.2rem 0.6rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      line-height: 1.2;
+      cursor: pointer;
+      transition: opacity 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+    }
+
+    .legend-toggle:hover {
+      border-color: var(--accent);
+    }
+
+    .legend-toggle[aria-pressed="false"] {
+      opacity: 0.48;
+      background: transparent;
+      text-decoration: line-through;
     }
 
     .swatch {
@@ -656,7 +683,7 @@
     <section class="card" aria-labelledby="historyTitle">
       <div class="panel-header">
         <h2 class="panel-title" id="historyTitle">Historical Trend Over Commits (lower is better)</h2>
-        <div class="legend" id="historyLegend"></div>
+        <div class="legend" id="historyLegend" role="group" aria-label="Toggle execution environments"></div>
       </div>
       <div class="canvas-wrap" id="historyWrap">
         <canvas id="historyCanvas" aria-label="Interactive line chart of benchmark metric across commits"></canvas>
@@ -668,7 +695,7 @@
       <div class="panel-header">
         <h2 class="panel-title" id="suiteChartTitle">Selected Commit Suite Comparison (lower is better)</h2>
         <div class="controls-row">
-          <div class="legend" id="suiteLegend"></div>
+          <div class="legend" id="suiteLegend" role="group" aria-label="Toggle execution environments"></div>
           <select id="sortSelect" class="meta-pill" aria-label="Sort benchmarks">
             <option value="default:asc">Sort: Suite Order</option>
             <option value="medianMs:asc">Sort: Median (ms) ↑</option>
@@ -871,6 +898,7 @@
     let barPage = 1;
     let tablePage = 1;
     let pageSize = 12;
+    const hiddenBackends = new Set();
 
     const textCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
@@ -896,9 +924,10 @@
 
     function renderLegend(el, backends) {
       if (!el) return;
-      el.innerHTML = backends.map((b, i) =>
-        `<span class="legend-item"><span class="swatch" style="background: ${cssColorForBackend(b, i)}"></span>${esc(b)}</span>`
-      ).join("");
+      el.innerHTML = backends.map((b, i) => {
+        const visible = !hiddenBackends.has(b);
+        return `<button type="button" class="legend-toggle" data-backend="${esc(b)}" aria-pressed="${visible}"><span class="swatch" style="background: ${cssColorForBackend(b, i)}"></span><span>${esc(b)}</span></button>`;
+      }).join("");
     }
 
     function populateScopeSelector() {
@@ -1016,6 +1045,7 @@
       const startIdx = Math.max(0, benchHistory.length - winCount);
 
       const backends = getActiveBackends();
+      const visibleBackends = backends.filter(b => !hiddenBackends.has(b));
       renderLegend(document.getElementById("historyLegend"), backends);
 
       const rawParsed = [];
@@ -1044,13 +1074,16 @@
 
       ctx.clearRect(0, 0, W, H);
 
-      const allVals = parsed.flatMap(p => Object.values(p.vals)).filter(v => v > 0);
+      const allVals = parsed.flatMap(p => visibleBackends.map(b => p.vals[b])).filter(v => v > 0);
       if (!allVals.length) {
         ctx.font = `13px ${fontMono}`;
         ctx.fillStyle = mutedCol;
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        ctx.fillText("No data recorded for this benchmark & metric in the selected window.", W / 2, H / 2);
+        const emptyMsg = visibleBackends.length
+          ? "No data recorded for this benchmark & metric in the selected window."
+          : "All execution environments are hidden. Click a legend button above to show one.";
+        ctx.fillText(emptyMsg, W / 2, H / 2);
         canvas._xs = [];
         return;
       }
@@ -1094,6 +1127,7 @@
       }
 
       backends.forEach((backend, bIdx) => {
+        if (hiddenBackends.has(backend)) return;
         const col = resolvedColorForBackend(backend, bIdx);
         const pts = [];
         parsed.forEach((p, localIdx) => {
@@ -1159,7 +1193,7 @@
 
         const metric = document.getElementById("metricSelect")?.value || "medianMs";
         const unit = metricUnit(metric);
-        const backends = getActiveBackends();
+        const backends = getActiveBackends().filter(b => !hiddenBackends.has(b));
         const lines = backends.map((b, bIdx) => {
           const v = nearest.p.vals[b];
           const col = resolvedColorForBackend(b, bIdx);
@@ -1211,10 +1245,13 @@
       const activeField = ["compileMs", "coldMs", "medianMs", "minMs", "p95Ms", "peakRssMb"].includes(sortField)
         ? sortField
         : metric;
+      const showNp = !hiddenBackends.has("numpy-cpu-f32");
       const suiteVal = (s) => {
         const vals = [
-          s.np && s.np.ran ? Number(s.np[activeField] || 0) : null,
-          ...s.gfxs.map(g => (g && g.ran ? Number(g[activeField] || 0) : null))
+          showNp && s.np && s.np.ran ? Number(s.np[activeField] || 0) : null,
+          ...s.gfxs
+            .filter(g => g && g.ran && !hiddenBackends.has(g.backend))
+            .map(g => Number(g[activeField] || 0))
         ].filter(v => v !== null && v > 0);
         return vals.length ? Math.min(...vals) : (sortDir === "asc" ? Infinity : -Infinity);
       };
@@ -1243,8 +1280,16 @@
         return;
       }
 
+      const showNp = !hiddenBackends.has("numpy-cpu-f32");
+      const visibleGpuBackends = gpuBackends.filter(b => !hiddenBackends.has(b));
+      const visibleCount = (showNp ? 1 : 0) + visibleGpuBackends.length;
+      if (!visibleCount) {
+        container.innerHTML = '<div class="empty-msg">All execution environments are hidden. Click a legend button above to show one.</div>';
+        return;
+      }
+
       const unit = metricUnit(metric);
-      const barsPerSuite = 1 + Math.max(1, gpuBackends.length);
+      const barsPerSuite = visibleCount;
       const barH = 14, barGap = 4;
       const rowH = Math.max(54, 18 + barsPerSuite * (barH + barGap));
       const W = 1100, padL = 230, padR = 110, padT = 12, padB = 18;
@@ -1252,8 +1297,10 @@
       const maxVal = Math.max(
         1e-6,
         ...pageSuites.flatMap(s => [
-          s.np && s.np.ran ? Number(s.np[metric] || 0) : 0,
-          ...s.gfxs.map(g => (g && g.ran ? Number(g[metric] || 0) : 0))
+          showNp && s.np && s.np.ran ? Number(s.np[metric] || 0) : 0,
+          ...s.gfxs
+            .filter(g => g && g.ran && !hiddenBackends.has(g.backend))
+            .map(g => Number(g[metric] || 0))
         ])
       );
       const plotW = W - padL - padR;
@@ -1261,7 +1308,7 @@
       let rows = "";
       pageSuites.forEach((s, i) => {
         const y = padT + i * rowH;
-        const npVal = s.np && s.np.ran ? Number(s.np[metric] || 0) : null;
+        const npVal = showNp && s.np && s.np.ran ? Number(s.np[metric] || 0) : null;
         const npW = npVal !== null ? Math.max(3, (npVal / maxVal) * plotW) : 0;
 
         rows += `<text x="${padL - 12}" y="${y + 20}" text-anchor="end" fill="currentColor" font-size="12.5" font-weight="600">${esc(s.benchName)}</text>`;
@@ -1271,7 +1318,8 @@
           rows += `<text x="${padL + npW + 8}" y="${offsetY + 11}" fill="var(--muted)" font-size="11.5">${fmtVal(npVal, metric)} ${unit}</text>`;
           offsetY += barH + barGap;
         }
-        gpuBackends.forEach((bName, bIdx) => {
+        visibleGpuBackends.forEach((bName) => {
+          const bIdx = gpuBackends.indexOf(bName);
           const g = s.gfxs.find(x => x.backend === bName);
           const gfxVal = g && g.ran ? Number(g[metric] || 0) : null;
           if (gfxVal !== null) {
@@ -1551,6 +1599,17 @@
       }
 
       attachHistoryInteraction();
+      const onLegendClick = (e) => {
+        const btn = e.target.closest("button[data-backend]");
+        if (!btn) return;
+        const backend = btn.dataset.backend;
+        if (!backend) return;
+        if (hiddenBackends.has(backend)) hiddenBackends.delete(backend);
+        else hiddenBackends.add(backend);
+        renderRun(benchHistory[selectedIndex]);
+      };
+      document.getElementById("historyLegend")?.addEventListener("click", onLegendClick);
+      document.getElementById("suiteLegend")?.addEventListener("click", onLegendClick);
       new ResizeObserver(() => drawHistoryChart()).observe(document.getElementById("historyWrap"));
     }
 
