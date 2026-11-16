@@ -3293,6 +3293,41 @@ def _metal_compute_session(
     if program.target not in ("directx", "metal"):
         raise ViewerError("Metal compute execution requires DirectX or Metal artifacts.")
 
+    if program.metal_root_descriptors and not program.textures and not program.samplers:
+        from .metal_compute import MetalComputeContext
+
+        with MetalComputeContext(validation=validation) as ctx:
+            pipe = ctx.compile_pipeline(program, toolchain=toolchain)
+
+            def run_root_desc(
+                *,
+                buffers: Mapping[str, bytes | bytearray | memoryview | int] | None = None,
+                textures: Mapping[str, TextureData] | None = None,
+                samplers: Mapping[str, SamplerDesc] | None = None,
+                parameters: Mapping[str, object] | bytes | bytearray | memoryview | None = None,
+                grid: tuple[int, int, int] | None = None,
+            ) -> ComputeDispatchResult:
+                active_grid, packed_params, prepared, _, _ = _prepare_compute_inputs(
+                    program, buffers, parameters, grid, textures=textures, samplers=samplers
+                )
+                buf_handles: dict[str, Any] = {}
+                readback_names: list[str] = []
+                try:
+                    for buf_meta, size_bytes, payload in prepared:
+                        name = buf_meta["name"]
+                        buf_handles[name] = ctx.create_buffer(size_bytes, initial_data=payload)
+                        if buf_meta.get("access") != "read_only":
+                            readback_names.append(name)
+                    pipe.dispatch(buf_handles, parameters=packed_params, grid=active_grid)
+                    out_buffers = {name: buf_handles[name].download() for name in readback_names}
+                    return ComputeDispatchResult(buffers=out_buffers, device=ctx.device_name)
+                finally:
+                    for handle in buf_handles.values():
+                        handle.close()
+
+            yield run_root_desc
+            return
+
     tools = toolchain or _preview_toolchain()
     viewer_exe = tools.find("mlir-gpu-metal-view")
 
