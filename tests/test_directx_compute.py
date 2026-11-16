@@ -117,6 +117,21 @@ class _FakeBridgeLib:
 class TestDirectXComputeValidation(unittest.TestCase):
     """Host-only contract, lifetime, ownership, and error-propagation tests."""
 
+    def test_nacelle_provider_identity_and_mismatch(self) -> None:
+        for platform in ("linux", "darwin"):
+            for name in ("Nacelle", "Microsoft Basic Render Driver"):
+                fake = _FakeBridgeLib(device_name=name)
+                with self.subTest(platform=platform, name=name), \
+                     mock.patch("mlir_gpu.directx_compute.sys.platform", platform), \
+                     mock.patch("mlir_gpu.directx_compute._load_bridge", return_value=fake):
+                    if name != "Nacelle":
+                        with self.assertRaisesRegex(PersistentComputeError, "fallback rejected"):
+                            DirectXComputeContext(provider="nacelle")
+                    else:
+                        with DirectXComputeContext(provider="nacelle") as context:
+                            self.assertEqual(context.provider, "nacelle")
+                            self.assertTrue(context.is_software)
+
     def test_non_windows_rejected_without_cpu_fallback(self) -> None:
         with mock.patch("mlir_gpu.directx_compute.sys.platform", "linux"):
             with self.assertRaises(PersistentComputeError) as ctx:
@@ -257,11 +272,12 @@ _DispatchParams = ParameterBlock(
 
 
 @unittest.skipUnless(
-    sys.platform == "win32" and os.environ.get("MLIR_GPU_TEST_DIRECTX") == "1",
-    "Opt-in Windows DirectX 12 live test (set MLIR_GPU_TEST_DIRECTX=1)",
+    (sys.platform == "win32" and os.environ.get("MLIR_GPU_TEST_DIRECTX") == "1")
+    or os.environ.get("MLIR_GPU_TEST_NACELLE") == "1",
+    "Opt-in DirectX live test (set MLIR_GPU_TEST_DIRECTX=1 or MLIR_GPU_TEST_NACELLE=1)",
 )
 class TestDirectXComputeLive(unittest.TestCase):
-    """Live Windows DirectX 12 persistent compute execution tests."""
+    """Live DirectX 12 persistent compute execution tests."""
 
     def _compile_dxil_program(self, pipeline_obj: ComputePipeline, work_dir: Path, name: str) -> ComputeProgram:
         manifest = compile_pipeline(
@@ -310,8 +326,11 @@ class TestDirectXComputeLive(unittest.TestCase):
 
         expected = [((a * b + bias) * scale + c) for a, b, c in zip(a_vals, b_vals, c_vals)]
 
-        requested_provider = "warp" if os.environ.get("MLIR_GPU_TEST_WARP") == "1" else None
-        validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1"
+        requested_provider = (
+            "nacelle" if os.environ.get("MLIR_GPU_TEST_NACELLE") == "1" else
+            "warp" if os.environ.get("MLIR_GPU_TEST_WARP") == "1" else None
+        )
+        validation = os.environ.get("MLIR_GPU_TEST_VALIDATION") == "1" and requested_provider != "nacelle"
 
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
@@ -324,8 +343,8 @@ class TestDirectXComputeLive(unittest.TestCase):
                     f"[DirectXComputeLive] provider={ctx.provider} "
                     f"is_software={ctx.is_software} device={ctx.device_name!r}"
                 )
-                if requested_provider == "warp":
-                    self.assertEqual(ctx.provider, "warp")
+                if requested_provider in ("warp", "nacelle"):
+                    self.assertEqual(ctx.provider, requested_provider)
                     self.assertTrue(ctx.is_software)
 
                 nbytes = length * 4

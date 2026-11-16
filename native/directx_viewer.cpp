@@ -1,8 +1,14 @@
+#ifdef GFX_NACELLE
+#include "nacelle_compat.h"
+#include <codecvt>
+#include <locale>
+#else
 #include <windows.h>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -65,6 +71,7 @@ static std::vector<char> shader(const std::wstring& path) {
     return bytes;
 }
 
+#ifndef GFX_NACELLE
 static std::string deviceName(const wchar_t* text) {
     int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
     if (!size) throw std::runtime_error("Cannot encode the device name");
@@ -73,8 +80,12 @@ static std::string deviceName(const wchar_t* text) {
         throw std::runtime_error("Cannot encode the device name");
     return std::string(result.data());
 }
+#endif
 
 struct Event {
+#ifdef GFX_NACELLE
+    HANDLE handle = nullptr;
+#else
     HANDLE handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     Event() {
         if (!handle) throw std::runtime_error("Cannot create GPU completion event");
@@ -82,21 +93,37 @@ struct Event {
     ~Event() { CloseHandle(handle); }
     Event(const Event&) = delete;
     Event& operator=(const Event&) = delete;
+#endif
 };
 
 struct SelectedDevice {
+#ifndef GFX_NACELLE
     ComPtr<IDXGIFactory6> factory;
     ComPtr<IDXGIAdapter1> adapter;
     ComPtr<ID3D12Device> device;
     DXGI_ADAPTER_DESC1 description{};
+#else
+    ComPtr<ID3D12Device> device;
+#endif
     std::string name;
 };
 
+#ifndef GFX_NACELLE
 static bool isSoftwareAdapter(const DXGI_ADAPTER_DESC1& desc) {
     return (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || desc.VendorId == 0x1414;
 }
+#endif
 
 static SelectedDevice createDirectXDevice(bool warp, bool validation) {
+#ifdef GFX_NACELLE
+    if (warp) throw std::runtime_error("WARP is not available in the Nacelle runtime");
+    checkNacelleValidation(validation);
+    SelectedDevice result;
+    check(NacelleCreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&result.device)),
+          "NacelleCreateDevice");
+    result.name = "Nacelle";
+    return result;
+#else
     if (validation) {
         ComPtr<ID3D12Debug1> debug;
         check(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)),
@@ -156,6 +183,7 @@ static SelectedDevice createDirectXDevice(bool warp, bool validation) {
         if (!result.device) throw std::runtime_error("No DirectX 12 GPU supporting Shader Model 6.6 is available");
     }
     return result;
+#endif
 }
 
 static std::string queryFeatureLevel(ID3D12Device* device) {
@@ -943,11 +971,13 @@ static void runComputeDispatch(const std::wstring& computePath, const std::wstri
     Event completion;
     check(queue->Signal(fence.Get(), 1), "Signal compute fence");
     check(fence->SetEventOnCompletion(1, completion.handle), "SetEventOnCompletion");
+#ifndef GFX_NACELLE
     DWORD waitStatus = WaitForSingleObject(completion.handle, 30000);
     if (waitStatus != WAIT_OBJECT_0) {
         check(dev.device->GetDeviceRemovedReason(), "GPU device removed");
         throw std::runtime_error("Compute GPU completion wait failed or timed out");
     }
+#endif
     check(dev.device->GetDeviceRemovedReason(), "GPU device removed");
     checkValidationQueue(diagnostics.Get());
 
@@ -985,9 +1015,11 @@ static void reportDeviceCapabilities(bool warp, bool validation) {
     std::string shaderModelDot = shaderModel;
     underscore = shaderModelDot.find('_');
     if (underscore != std::string::npos) shaderModelDot[underscore] = '.';
-    bool isSoftware = isSoftwareAdapter(dev.description) || warp;
-
     CapabilitiesReport report{
+#ifdef GFX_NACELLE
+        "nacelle", dev.name, dev.name, dev.name,
+        0, 0, 0, 0, 0, 0, 0, 0, true, true,
+#else
         warp ? "warp" : "hardware",
         dev.name,
         dev.name,
@@ -1000,8 +1032,9 @@ static void reportDeviceCapabilities(bool warp, bool validation) {
         static_cast<uint64_t>(dev.description.DedicatedVideoMemory),
         static_cast<uint64_t>(dev.description.DedicatedSystemMemory),
         static_cast<uint64_t>(dev.description.SharedSystemMemory),
-        isSoftware,
-        isSoftware,
+        isSoftwareAdapter(dev.description) || warp,
+        isSoftwareAdapter(dev.description) || warp,
+#endif
         featureLevelDot,
         featureLevel,
         shaderModel,
@@ -1144,7 +1177,9 @@ static ComPtr<ID3D12Resource> createBuffer(ID3D12Device* dev, const void* data, 
     return buffer;
 }
 class Renderer {
+#ifndef GFX_NACELLE
     ComPtr<IDXGIFactory6> factory;
+#endif
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12InfoQueue> diagnostics;
     ComPtr<ID3D12CommandQueue> queue;
@@ -1224,11 +1259,13 @@ class Renderer {
     void wait() {
         check(queue->Signal(fence.Get(), ++fenceValue), "Signal");
         check(fence->SetEventOnCompletion(fenceValue, completion.handle), "SetEventOnCompletion");
+#ifndef GFX_NACELLE
         DWORD status = WaitForSingleObject(completion.handle, 30000);
         if (status != WAIT_OBJECT_0) {
             check(device->GetDeviceRemovedReason(), "GPU device removed");
             throw std::runtime_error("GPU completion wait failed or timed out");
         }
+#endif
         check(device->GetDeviceRemovedReason(), "GPU device removed");
         validationErrors();
     }
@@ -1471,12 +1508,16 @@ public:
           started(std::chrono::steady_clock::now()) {
         colorFormat = renderFormat;
         if (shared) {
+#ifndef GFX_NACELLE
             factory = shared->factory;
+#endif
             device = shared->device;
             name = shared->name;
         } else {
             auto dev = createDirectXDevice(warp, validation);
+#ifndef GFX_NACELLE
             factory = std::move(dev.factory);
+#endif
             device = std::move(dev.device);
             name = std::move(dev.name);
         }
@@ -1893,6 +1934,7 @@ public:
         std::cout << glz::write_json(ReadbackReport{name, width, height}).value_or("{}") << "\n";
     }
 
+#ifndef GFX_NACELLE
     void window(HWND window, UINT width, UINT height, UINT limit) {
         DXGI_SWAP_CHAIN_DESC1 description{};
         description.Width = width;
@@ -1965,8 +2007,10 @@ public:
         wait();
         std::cout << "Presented " << frames << " DirectX 12 frames.\n";
     }
+#endif
 };
 
+#ifndef GFX_NACELLE
 static LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == WM_CLOSE || (message == WM_KEYDOWN && wparam == VK_ESCAPE)) {
         PostQuitMessage(0);
@@ -1979,6 +2023,7 @@ struct Window {
     HWND handle = nullptr;
     ~Window() { if (handle) DestroyWindow(handle); }
 };
+#endif
 
 int wmain(int argc, wchar_t** argv) {
     try {
@@ -2092,6 +2137,9 @@ int wmain(int argc, wchar_t** argv) {
         if (options.count(L"--readback")) {
             renderer.readback(width, height, options.at(L"--readback"));
         } else {
+#ifdef GFX_NACELLE
+            throw std::runtime_error("Nacelle supports headless execution only; use --readback");
+#else
             HINSTANCE instance = GetModuleHandleW(nullptr);
             WNDCLASSW description{};
             description.lpfnWndProc = windowProcedure;
@@ -2109,6 +2157,7 @@ int wmain(int argc, wchar_t** argv) {
             if (!window.handle) throw std::runtime_error("Cannot create DirectX preview window");
             ShowWindow(window.handle, SW_SHOW);
             renderer.window(window.handle, width, height, frames);
+#endif
         }
     } catch (const std::exception& error) {
         std::cerr << "mlir-gpu-directx-view: " << error.what() << "\n";
@@ -2116,3 +2165,19 @@ int wmain(int argc, wchar_t** argv) {
     }
     return 0;
 }
+
+#ifdef GFX_NACELLE
+int main(int argc, char** argv) {
+    try {
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+        std::vector<std::wstring> values;
+        for (int i = 0; i < argc; ++i) values.push_back(converter.from_bytes(argv[i]));
+        std::vector<wchar_t*> arguments;
+        for (auto& value : values) arguments.push_back(value.data());
+        return wmain(argc, arguments.data());
+    } catch (const std::exception& error) {
+        std::cerr << "mlir-gpu-directx-view: " << error.what() << "\n";
+        return 1;
+    }
+}
+#endif

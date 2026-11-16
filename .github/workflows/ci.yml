@@ -46,7 +46,9 @@ jobs:
             libvulkan1 \
             mesa-vulkan-drivers \
             vulkan-validationlayers \
-            libglfw3
+            libglfw3 \
+            xvfb \
+            xauth
 
       - name: Ensure Ninja is installed (macOS)
         if: runner.os == 'macOS'
@@ -101,6 +103,17 @@ jobs:
         with:
           path: .sdk
           key: gpu-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0-msc1.1
+
+      - name: Cache Nacelle release SDK
+        id: cache-nacelle
+        uses: actions/cache@v4
+        with:
+          path: .sdk/nacelle
+          key: nacelle-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/setup_nacelle.py') }}
+
+      - name: Install pinned Nacelle release binaries
+        if: steps.cache-nacelle.outputs.cache-hit != 'true'
+        run: python3 tools/setup_nacelle.py
 
       - name: Cache compiled gfx compiler & LLVM runtime binaries
         id: cache-compiler-binaries
@@ -164,7 +177,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .tools/bin
-          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm', 'native/directx_viewer.cpp') }}
+          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm', 'native/directx_viewer.cpp', 'native/directx_compute_bridge.cpp', 'native/nacelle_compat.h', 'examples/minigfx/_directx_bridge.cpp', 'tools/setup_nacelle.py') }}
 
       - name: Build native helper binaries
         if: steps.cache-native-tools.outputs.cache-hit != 'true'
@@ -178,6 +191,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/.sdk" \
             -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.tools" \
+            -DNACELLE_ROOT="$GITHUB_WORKSPACE/.sdk/nacelle" \
             "${EXTRA_ARGS[@]}"
           cmake --build build/native
           cmake --install build/native
@@ -187,9 +201,15 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .tools/bin
-          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm', 'native/directx_viewer.cpp') }}
+          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm', 'native/directx_viewer.cpp', 'native/directx_compute_bridge.cpp', 'native/nacelle_compat.h', 'examples/minigfx/_directx_bridge.cpp', 'tools/setup_nacelle.py') }}
 
-      - name: Run unit, compiler integration, and Vulkan rendering tests (Linux)
+      - name: Report Nacelle DirectX capabilities
+        env:
+          PYTHONPATH: "${{ github.workspace }}/src"
+          GPU_TOOLS_BIN: "${{ github.workspace }}/.tools/bin"
+        run: python3 -m mlir_gpu.viewer --provider nacelle --report-capabilities
+
+      - name: Run unit, compiler, Vulkan, and Nacelle DirectX tests (Linux)
         if: runner.os == 'Linux'
         run: |
           export PYTHONPATH="$GITHUB_WORKSPACE/src"
@@ -198,10 +218,11 @@ jobs:
           export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/.sdk/lib:${LD_LIBRARY_PATH:-}"
           export MLIR_GPU_TEST_VULKAN=1
           export MLIR_GPU_TEST_VALIDATION=1
+          export MLIR_GPU_TEST_NACELLE=1
           lit -sv tests/lit
           python3 -m unittest discover -s tests -v
 
-      - name: Run full test suite including Vulkan and Metal (macOS)
+      - name: Run full test suite including Vulkan, Metal, and Nacelle DirectX (macOS)
         if: runner.os == 'macOS'
         run: |
           export PYTHONPATH="$GITHUB_WORKSPACE/src"
@@ -213,6 +234,7 @@ jobs:
           export VK_ADD_LAYER_PATH="$GITHUB_WORKSPACE/.sdk/share/vulkan/explicit_layer.d"
           export MLIR_GPU_TEST_VULKAN=1
           export MLIR_GPU_TEST_VALIDATION=1
+          export MLIR_GPU_TEST_NACELLE=1
           if swift -e 'import Metal; guard let d = MTLCreateSystemDefaultDevice(), d.argumentBuffersSupport == .tier2 else { exit(1) }' 2>/dev/null; then
             echo "Metal Argument Buffers Tier 2 device detected; enabling MLIR_GPU_TEST_METAL=1"
             export MLIR_GPU_TEST_METAL=1
@@ -221,6 +243,16 @@ jobs:
           fi
           lit -sv tests/lit
           python3 -m unittest discover -s tests -v
+
+      - name: Run live MiniGfx Nacelle GLFW tests (Linux)
+        if: runner.os == 'Linux'
+        env:
+          PYTHONPATH: "${{ github.workspace }}/src:${{ github.workspace }}/tests"
+          LLVM_BIN: "${{ github.workspace }}/.toolchains/llvm-build/bin"
+          GPU_TOOLS_BIN: "${{ github.workspace }}/.tools/bin"
+          MLIR_GPU_TEST_NACELLE: "1"
+          MLIR_GPU_TEST_WINDOW: "1"
+        run: xvfb-run -a python3 -m unittest test_nacelle.NacelleWindowTests -v
 
   test-windows-warp:
     name: Windows WARP Offscreen Execution

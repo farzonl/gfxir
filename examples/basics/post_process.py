@@ -163,6 +163,7 @@ def make_post(view="split", exposure=1.5):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", choices=("vulkan", "directx", "metal"), default="vulkan")
+    parser.add_argument("--provider", choices=("nacelle",), help="Execute DirectX DXIL on the CPU using Nacelle.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--output", type=Path, help="Save a still instead of opening an animated window.")
     mode.add_argument("--frames", type=int, default=0, help="Window frame limit; 0 runs until closed.")
@@ -175,6 +176,8 @@ def main():
     args = parser.parse_args()
     if not 0.0 < args.exposure <= 100.0:
         parser.error("--exposure must be finite and between 0 (exclusive) and 100.")
+    if args.provider == "nacelle" and (args.target != "directx" or args.output is None or args.validation):
+        parser.error("--provider nacelle requires --target directx and --output, without --validation.")
     tools = Toolchain()
     with tempfile.TemporaryDirectory(prefix="gfx-post-example-") as tmp:
         directory = Path(tmp)
@@ -187,7 +190,10 @@ def main():
               if args.view == "split" else f"View: {args.view.upper()}.")
         if args.output is not None:
             time = 2.0 if args.time is None else args.time
-            image = render_offscreen(program, args.width, args.height, validation=args.validation, time=time)
+            provider_kwargs = {"provider": args.provider} if args.provider is not None else {}
+            image = render_offscreen(
+                program, args.width, args.height, validation=args.validation, time=time, **provider_kwargs,
+            )
             write_png(args.output, image)
             print(f"Rendered emissive tunnel on {image.device}: {args.output}")
         else:

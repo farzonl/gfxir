@@ -1106,7 +1106,7 @@ def _metal_run(arguments: list[str], validation: bool, capture: bool) -> str:
     return _native_run(arguments, capture, "Metal", environment)
 
 
-VALID_PROVIDERS = {"hardware", "warp", "lavapipe", "swiftshader"}
+VALID_PROVIDERS = {"hardware", "warp", "lavapipe", "swiftshader", "nacelle"}
 
 
 def _validate_provider(provider: str | None, backend: str) -> None:
@@ -1118,11 +1118,11 @@ def _validate_provider(provider: str | None, backend: str) -> None:
         )
     if backend == "directx" and provider in ("lavapipe", "swiftshader"):
         raise ValueError(
-            f"Provider '{provider}' is not supported by the DirectX 12 backend. Use 'hardware' or 'warp'."
+            f"Provider '{provider}' is not supported by the DirectX 12 backend. Use 'hardware', 'warp', or 'nacelle'."
         )
-    if backend == "vulkan" and provider == "warp":
+    if backend == "vulkan" and provider in ("warp", "nacelle"):
         raise ValueError(
-            "Provider 'warp' is not supported by the Vulkan backend. Use 'lavapipe', 'swiftshader', or 'hardware'."
+            f"Provider '{provider}' is not supported by the Vulkan backend. Use 'lavapipe', 'swiftshader', or 'hardware'."
         )
     if backend == "metal":
         raise ValueError(f"Provider '{provider}' is not supported by the Metal backend.")
@@ -1174,10 +1174,21 @@ def _preview_toolchain() -> Toolchain:
     return Toolchain(tools_bin=Path(directory) if directory else None)
 
 
+def _require_directx_platform(provider: str | None) -> None:
+    if provider == "nacelle":
+        if sys.platform not in ("linux", "darwin"):
+            raise ViewerError("The Nacelle provider requires Linux or macOS.")
+    elif sys.platform != "win32":
+        raise ViewerError("Native DirectX 12 execution requires Windows or provider='nacelle' on Linux/macOS.")
+
+
+def _check_nacelle_device(provider: str | None, device: str) -> None:
+    if provider == "nacelle" and device != "Nacelle":
+        raise ViewerError("Requested provider 'nacelle' but returned device is not Nacelle. Driver fallback rejected.")
+
+
 @contextmanager
 def _directx_shaders(program: GraphicsProgram, toolchain: Toolchain, *, render_target=None):
-    if sys.platform != "win32":
-        raise ViewerError("Native DirectX 12 preview requires Windows.")
     if program.target != "directx":
         raise ViewerError("The DirectX 12 viewer requires DirectX artifacts.")
     _frame_parameters(program.parameters)
@@ -1251,6 +1262,7 @@ def _directx_offscreen_renderer(
     if provider is None and os.environ.get("MLIR_GPU_TEST_WARP") == "1":
         provider = "warp"
     _validate_provider(provider, "directx")
+    _require_directx_platform(provider)
     with _directx_shaders(program, toolchain or _preview_toolchain()) as (directory, arguments):
         output = directory / "readback.rgba"
         warp_args = ["--warp"] if provider == "warp" else []
@@ -1261,6 +1273,7 @@ def _directx_offscreen_renderer(
                 validation, True,
             )
             image = _readback_result(text, output, width, height, "DirectX 12")
+            _check_nacelle_device(provider, image.device)
             if explicit_warp and "basic render driver" not in image.device.lower():
                 raise ViewerError(
                     "Requested provider 'warp' but returned device is not a software adapter. "
@@ -1303,6 +1316,9 @@ def show_directx_window(
     program = _with_resource_overrides(program, buffers=buffers, textures=textures, samplers=samplers)
     _dimensions(width, height)
     _validate_provider(provider, "directx")
+    if provider == "nacelle":
+        raise ViewerError("Nacelle supports headless execution only; use --output or --video.")
+    _require_directx_platform(provider)
     if type(frames) is not int or frames < 0:
         raise ViewerError("Frame count must be a nonnegative integer (0 means until closed).")
     timing = ["--time", str(_time_value(time))] if time is not None else []
@@ -2684,7 +2700,7 @@ def _offscreen_renderer(
     program = _with_resource_overrides(program, buffers=buffers, textures=textures, samplers=samplers)
     _dimensions(width, height)
     _frame_parameters(program.parameters)
-    if program.target == "directx" and sys.platform != "darwin":
+    if program.target == "directx" and (sys.platform != "darwin" or provider == "nacelle"):
         kwargs = {"provider": provider} if provider is not None else {}
         with _directx_offscreen_renderer(program, width, height, validation, **kwargs) as render:
             yield render
@@ -3227,8 +3243,7 @@ def _directx_compute_session(
     provider: str | None = None,
     toolchain: Toolchain | None = None,
 ):
-    if sys.platform != "win32":
-        raise ViewerError("Native DirectX 12 compute execution requires Windows.")
+    _require_directx_platform(provider)
     if program.target != "directx":
         raise ViewerError("DirectX 12 compute execution requires DirectX DXIL artifacts.")
     explicit_warp = provider == "warp"
@@ -3273,6 +3288,7 @@ def _directx_compute_session(
                     True,
                 )
                 device, outputs = _read_native_compute_outputs(text, expected_outputs, "DirectX 12")
+                _check_nacelle_device(provider, device)
                 if explicit_warp and "basic render driver" not in device.lower():
                     raise ViewerError(
                         "Requested provider 'warp' but returned device is not a software adapter. "
@@ -3414,7 +3430,7 @@ def compute_session(
         with _vulkan_compute_session(loaded, validation=validation, provider=provider) as run:
             yield run
         return
-    if loaded.target == "directx" and sys.platform != "darwin":
+    if loaded.target == "directx" and (sys.platform != "darwin" or provider == "nacelle"):
         with _directx_compute_session(
             loaded, validation=validation, provider=provider, toolchain=toolchain
         ) as run:
@@ -3522,7 +3538,7 @@ def export_mp4(program: GraphicsProgram, path: Path, width: int = 640, height: i
     if program.target not in ("vulkan", "directx", "metal"):
         raise ViewerError("MP4 export requires Vulkan, DirectX, or Metal artifacts.")
     _validate_provider(provider, program.target)
-    if program.target == "directx" and sys.platform not in ("win32", "darwin"):
+    if program.target == "directx" and sys.platform not in ("win32", "darwin") and provider != "nacelle":
         raise ViewerError(
             "Native DirectX 12 MP4 export requires Windows; "
             "use Vulkan or DXIL-to-Metal on macOS for video export."
@@ -3558,7 +3574,7 @@ def export_mp4(program: GraphicsProgram, path: Path, width: int = 640, height: i
             try:
                 renderer = (
                     _offscreen_renderer if program.target == "vulkan" else
-                    _directx_offscreen_renderer if program.target == "directx" and sys.platform != "darwin" else
+                    _directx_offscreen_renderer if program.target == "directx" and (sys.platform != "darwin" or provider == "nacelle") else
                     _metal_offscreen_renderer
                 )
                 renderer_kwargs = {"provider": provider} if provider is not None else {}
@@ -3854,8 +3870,7 @@ def get_device_capabilities(
             }
 
     if backend == "directx":
-        if sys.platform != "win32":
-            raise ViewerError("Native DirectX 12 preview requires Windows.")
+        _require_directx_platform(provider)
         if provider is None and os.environ.get("MLIR_GPU_TEST_WARP") == "1":
             provider = "warp"
         tc = toolchain or _preview_toolchain()
@@ -3876,6 +3891,7 @@ def get_device_capabilities(
             raise ViewerError(f"Invalid JSON returned by DirectX 12 capability query: {result.stdout}") from error
 
         device_name = str(data.get("device_name") or data.get("adapter_name", ""))
+        _check_nacelle_device(provider, device_name)
         is_software = (
             bool(data.get("is_software"))
             or bool(data.get("software_adapter"))
@@ -3928,7 +3944,7 @@ def get_device_capabilities(
         ret_dx = {
             "target": "directx",
             "backend": "directx",
-            "provider": "warp" if is_software else "hardware",
+            "provider": "nacelle" if provider == "nacelle" else ("warp" if is_software else "hardware"),
             "device_name": device_name,
             "adapter_name": device_name,
             "vendor_id": int(data.get("vendor_id", 0)),
@@ -4160,8 +4176,8 @@ def main() -> int:
     parser.add_argument("--index-buffer", type=Path, default=None, help="Path to binary index buffer data")
     parser.add_argument("--width", type=int, default=800)
     parser.add_argument("--height", type=int, default=600)
-    parser.add_argument("--provider", choices=["hardware", "warp", "lavapipe", "swiftshader"],
-                        help="Explicitly select rendering provider (hardware, warp, lavapipe, swiftshader)")
+    parser.add_argument("--provider", choices=sorted(VALID_PROVIDERS),
+                        help="Explicitly select hardware, warp, lavapipe, swiftshader, or headless nacelle")
     parser.add_argument("--report-capabilities", action="store_true",
                         help="Report device capabilities as JSON and exit")
     mode = parser.add_mutually_exclusive_group()
@@ -4177,7 +4193,7 @@ def main() -> int:
         parser.error("--duration and --fps require --video")
     if args.manifest is None:
         if args.report_capabilities:
-            backend = "vulkan" if args.provider in ("lavapipe", "swiftshader") else ("directx" if sys.platform == "win32" else "vulkan")
+            backend = "directx" if args.provider == "nacelle" or (sys.platform == "win32" and args.provider not in ("lavapipe", "swiftshader")) else "vulkan"
             caps = get_device_capabilities(backend=backend, provider=args.provider)
             print(json.dumps(caps, indent=2))
             return 0
@@ -4207,7 +4223,7 @@ def main() -> int:
                 raise ViewerError(f"Output already exists; choose a new PNG path: {args.output}")
             render = (
                 render_offscreen if program.target == "vulkan" else
-                render_directx_offscreen if program.target == "directx" and sys.platform != "darwin" else
+                render_directx_offscreen if program.target == "directx" and (sys.platform != "darwin" or args.provider == "nacelle") else
                 render_metal_offscreen
             )
             image = render(program, args.width, args.height, args.validation, **provider_kwargs, **timing)
@@ -4216,7 +4232,7 @@ def main() -> int:
         elif program.target == "vulkan":
             count = show_window(program, args.width, args.height, args.frames, args.validation, **provider_kwargs, **timing)
             print(f"Presented {count} Vulkan frames.")
-        elif program.target == "directx" and sys.platform != "darwin":
+        elif program.target == "directx" and (sys.platform != "darwin" or args.provider == "nacelle"):
             show_directx_window(program, args.width, args.height, args.frames, args.validation, **provider_kwargs, **timing)
         else:
             if args.provider is not None:

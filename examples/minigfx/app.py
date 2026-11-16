@@ -51,6 +51,7 @@ class App:
             args = self.parse_args([])
         self.args: argparse.Namespace = args
         self.target: str = getattr(args, "target", get_default_target())
+        self.provider: Optional[str] = getattr(args, "provider", None)
         self.frames: Optional[int] = getattr(args, "frames", None)
         self.width: int = getattr(args, "width", 1280)
         self.height: int = getattr(args, "height", 720)
@@ -81,6 +82,10 @@ class App:
             help="Number of frames to render before exiting (default: continuous loop)",
         )
         parser.add_argument(
+            "--provider", choices=["nacelle"], default=None,
+            help="Execute DirectX DXIL using Nacelle on Linux/macOS, including live GLFW presentation.",
+        )
+        parser.add_argument(
             "--width",
             type=_positive_int,
             default=1280,
@@ -103,7 +108,14 @@ class App:
     @classmethod
     def parse_args(cls, args: Optional[Sequence[str]] = None) -> argparse.Namespace:
         """Parse CLI arguments into a namespace."""
-        return cls.build_parser().parse_args(args)
+        parser = cls.build_parser()
+        parsed = parser.parse_args(args)
+        if parsed.provider == "nacelle":
+            if parsed.target != "directx":
+                parser.error("--provider nacelle requires --target directx")
+            if sys.platform not in ("linux", "darwin"):
+                parser.error("--provider nacelle requires Linux or macOS")
+        return parsed
 
     def startup(self) -> None:
         """Lifecycle hook invoked once before entering the main frame loop."""

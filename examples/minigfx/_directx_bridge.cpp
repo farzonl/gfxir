@@ -11,11 +11,17 @@
 #define _UNICODE
 #endif
 
+#ifdef GFX_NACELLE
+#include "nacelle_compat.h"
+#define MGFX_EXPORT __attribute__((visibility("default")))
+#else
 #include <windows.h>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#define MGFX_EXPORT __declspec(dllexport)
+#endif
 
 #include <algorithm>
 #include <array>
@@ -45,6 +51,7 @@ constexpr UINT kMaxSamplerDescriptors = 512;
 struct WinEvent {
     HANDLE handle = nullptr;
 
+#ifndef GFX_NACELLE
     WinEvent() : handle(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
     ~WinEvent() {
         if (handle != nullptr) {
@@ -63,6 +70,7 @@ struct WinEvent {
         }
         return *this;
     }
+#endif
 };
 
 struct RootConstantSlot {
@@ -98,15 +106,21 @@ struct MgfxPipelineEntry {
 };
 
 struct MgfxDirectXContext {
+#ifndef GFX_NACELLE
     HWND hwnd = nullptr;
     ComPtr<IDXGIFactory6> factory;
     ComPtr<IDXGIAdapter1> adapter;
+#endif
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12InfoQueue> infoQueue;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> cmdList;
+#ifdef GFX_NACELLE
+    ComPtr<INacelleSwapChain> swapchain;
+#else
     ComPtr<IDXGISwapChain3> swapchain;
+#endif
 
     ComPtr<ID3D12DescriptorHeap> rtvHeap;
     ComPtr<ID3D12DescriptorHeap> dsvHeap;
@@ -141,6 +155,7 @@ struct MgfxDirectXContext {
     std::string lastError;
 };
 
+#ifndef GFX_NACELLE
 std::wstring utf8ToWide(std::string_view text) {
     if (text.empty()) {
         return {};
@@ -168,6 +183,7 @@ std::string wideToUtf8(const wchar_t* text) {
     WideCharToMultiByte(CP_UTF8, 0, text, -1, result.data(), needed - 1, nullptr, nullptr);
     return result;
 }
+#endif
 
 void setError(MgfxDirectXContext* ctx, std::string_view message, HRESULT hr = S_OK) {
     if (ctx == nullptr) {
@@ -208,7 +224,7 @@ bool collectValidationErrors(MgfxDirectXContext* ctx) {
 }
 
 bool waitForGpu(MgfxDirectXContext* ctx) {
-    if (ctx == nullptr || !ctx->queue || !ctx->fence || ctx->fenceEvent.handle == nullptr) {
+    if (ctx == nullptr || !ctx->queue || !ctx->fence) {
         return false;
     }
     UINT64 signalVal = ++ctx->fenceValue;
@@ -223,12 +239,14 @@ bool waitForGpu(MgfxDirectXContext* ctx) {
             setError(ctx, "Failed to set D3D12 fence completion event", hr);
             return false;
         }
+#ifndef GFX_NACELLE
         DWORD waitRes = WaitForSingleObject(ctx->fenceEvent.handle, 30000);
         if (waitRes != WAIT_OBJECT_0) {
             HRESULT removed = ctx->device ? ctx->device->GetDeviceRemovedReason() : E_FAIL;
             setError(ctx, "Timed out waiting for DirectX 12 GPU fence", removed);
             return false;
         }
+#endif
     }
     if (ctx->device) {
         HRESULT removed = ctx->device->GetDeviceRemovedReason();
@@ -240,9 +258,11 @@ bool waitForGpu(MgfxDirectXContext* ctx) {
     return collectValidationErrors(ctx);
 }
 
+#ifndef GFX_NACELLE
 bool isSoftwareAdapter(const DXGI_ADAPTER_DESC1& desc) {
     return (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || desc.VendorId == 0x1414;
 }
+#endif
 
 bool createSwapchainTargets(MgfxDirectXContext* ctx, int width, int height) {
     int w = std::max(1, width);
@@ -329,7 +349,11 @@ bool resizeSwapchain(MgfxDirectXContext* ctx, int width, int height) {
 }
 
 bool readBinaryFile(std::string_view utf8Path, std::vector<std::byte>& outBytes) {
+#ifdef GFX_NACELLE
+    std::filesystem::path filePath(utf8Path);
+#else
     std::filesystem::path filePath(utf8ToWide(utf8Path));
+#endif
     std::ifstream input(filePath, std::ios::binary | std::ios::ate);
     if (!input) {
         return false;
@@ -501,7 +525,7 @@ int finishFrameInternal(MgfxDirectXContext* ctx, std::span<std::byte> captureOut
 
 extern "C" {
 
-__declspec(dllexport) void* mgfx_dx12_create(
+MGFX_EXPORT void* mgfx_dx12_create(
     void* win32_hwnd,
     int fb_width,
     int fb_height,
@@ -518,12 +542,24 @@ __declspec(dllexport) void* mgfx_dx12_create(
         }
     };
 
+    auto ctx = std::make_unique<MgfxDirectXContext>();
+#ifdef GFX_NACELLE
+    if (enable_validation || use_warp) {
+        writeErr("Nacelle does not support D3D12 validation or the WARP provider");
+        return nullptr;
+    }
+    HRESULT hr = NacelleCreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&ctx->device));
+    if (FAILED(hr)) {
+        writeErr("NacelleCreateDevice failed");
+        return nullptr;
+    }
+    ctx->deviceNameStr = "Nacelle";
+#else
     if (win32_hwnd == nullptr) {
         writeErr("Null Win32 HWND handle from GLFW");
         return nullptr;
     }
 
-    auto ctx = std::make_unique<MgfxDirectXContext>();
     ctx->hwnd = static_cast<HWND>(win32_hwnd);
     if (ctx->fenceEvent.handle == nullptr) {
         writeErr("Failed to create Win32 GPU completion event");
@@ -609,6 +645,7 @@ __declspec(dllexport) void* mgfx_dx12_create(
     if (enable_validation != 0) {
         ctx->device.As(&ctx->infoQueue);
     }
+#endif
 
     D3D12_COMMAND_QUEUE_DESC qDesc{};
     qDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -684,6 +721,14 @@ __declspec(dllexport) void* mgfx_dx12_create(
 
     int initW = std::max(1, fb_width);
     int initH = std::max(1, fb_height);
+#ifdef GFX_NACELLE
+    hr = NacelleCreateSwapChain(ctx->queue.Get(), initW, initH, kSwapchainBufferCount,
+                               DXGI_FORMAT_R8G8B8A8_UNORM, nullptr, nullptr, &ctx->swapchain);
+    if (FAILED(hr)) {
+        writeErr("NacelleCreateSwapChain failed");
+        return nullptr;
+    }
+#else
     DXGI_SWAP_CHAIN_DESC1 scDesc{};
     scDesc.Width = static_cast<UINT>(initW);
     scDesc.Height = static_cast<UINT>(initH);
@@ -715,6 +760,7 @@ __declspec(dllexport) void* mgfx_dx12_create(
         (colorSpaceSupport & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0) {
         ctx->swapchain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
     }
+#endif
 
     if (!createSwapchainTargets(ctx.get(), initW, initH)) {
         writeErr(ctx->lastError);
@@ -724,7 +770,7 @@ __declspec(dllexport) void* mgfx_dx12_create(
     return ctx.release();
 }
 
-__declspec(dllexport) const char* mgfx_dx12_last_error(void* handle) {
+MGFX_EXPORT const char* mgfx_dx12_last_error(void* handle) {
     if (handle == nullptr) {
         return "Null DirectX 12 context";
     }
@@ -732,7 +778,7 @@ __declspec(dllexport) const char* mgfx_dx12_last_error(void* handle) {
     return ctx->lastError.c_str();
 }
 
-__declspec(dllexport) const char* mgfx_dx12_device_name(void* handle) {
+MGFX_EXPORT const char* mgfx_dx12_device_name(void* handle) {
     if (handle == nullptr) {
         return "DirectX 12";
     }
@@ -740,7 +786,7 @@ __declspec(dllexport) const char* mgfx_dx12_device_name(void* handle) {
     return ctx->deviceNameStr.c_str();
 }
 
-__declspec(dllexport) int mgfx_dx12_create_pipeline(
+MGFX_EXPORT int mgfx_dx12_create_pipeline(
     void* handle,
     const char* vs_dxil_path,
     const char* ps_dxil_path,
@@ -997,7 +1043,7 @@ __declspec(dllexport) int mgfx_dx12_create_pipeline(
     return idOut;
 }
 
-__declspec(dllexport) int mgfx_dx12_upload_buffer(
+MGFX_EXPORT int mgfx_dx12_upload_buffer(
     void* handle,
     int buf_id,
     const void* data,
@@ -1081,7 +1127,7 @@ __declspec(dllexport) int mgfx_dx12_upload_buffer(
     return 0;
 }
 
-__declspec(dllexport) int mgfx_dx12_upload_texture_sampler(
+MGFX_EXPORT int mgfx_dx12_upload_texture_sampler(
     void* handle,
     int tex_id,
     int width,
@@ -1276,7 +1322,7 @@ __declspec(dllexport) int mgfx_dx12_upload_texture_sampler(
     return 0;
 }
 
-__declspec(dllexport) int mgfx_dx12_begin_frame(
+MGFX_EXPORT int mgfx_dx12_begin_frame(
     void* handle,
     int fb_width,
     int fb_height,
@@ -1290,71 +1336,73 @@ __declspec(dllexport) int mgfx_dx12_begin_frame(
         return -1;
     }
     auto* ctx = static_cast<MgfxDirectXContext*>(handle);
-    if (fb_width <= 0 || fb_height <= 0 || (ctx->hwnd != nullptr && IsIconic(ctx->hwnd) != 0)) {
+    if (fb_width <= 0 || fb_height <= 0) {
         return 1; // Minimized; skip frame gracefully
     }
+#ifndef GFX_NACELLE
+    if (ctx->hwnd != nullptr && IsIconic(ctx->hwnd) != 0) return 1;
+#endif
 
     if (fb_width != ctx->scWidth || fb_height != ctx->scHeight) {
         if (!resizeSwapchain(ctx, fb_width, fb_height)) {
             return -1;
         }
-        ctx->hdrActive = hdr_enabled != 0;
-        if (ctx->hdrActive) {
-            auto& scene = ctx->textureSamplers[-2];
-            if (!scene.texture || scene.texture->GetDesc().Width != static_cast<UINT64>(fb_width) ||
-                scene.texture->GetDesc().Height != static_cast<UINT>(fb_height)) {
-                if (scene.srvSlot == UINT_MAX) {
-                    if (ctx->nextSrvSlot >= kMaxSrvDescriptors || ctx->nextSamplerSlot >= kMaxSamplerDescriptors) {
-                        setError(ctx, "No descriptor slots available for HDR target");
-                        return -1;
-                    }
-                    scene.srvSlot = ctx->nextSrvSlot++;
-                    scene.samplerSlot = ctx->nextSamplerSlot++;
-                }
-                D3D12_HEAP_PROPERTIES heap{};
-                heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-                D3D12_RESOURCE_DESC desc{};
-                desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-                desc.Width = fb_width;
-                desc.Height = fb_height;
-                desc.DepthOrArraySize = 1;
-                desc.MipLevels = 1;
-                desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-                desc.SampleDesc.Count = 1;
-                desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-                scene.texture.Reset();
-                HRESULT hr = ctx->device->CreateCommittedResource(
-                    &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    nullptr, IID_PPV_ARGS(&scene.texture));
-                if (FAILED(hr)) {
-                    setError(ctx, "Cannot allocate DX12 HDR render target", hr);
+    }
+    ctx->hdrActive = hdr_enabled != 0;
+    if (ctx->hdrActive) {
+        auto &scene = ctx->textureSamplers[-2];
+        if (!scene.texture || scene.texture->GetDesc().Width != static_cast<UINT64>(fb_width) ||
+            scene.texture->GetDesc().Height != static_cast<UINT>(fb_height)) {
+            if (scene.srvSlot == UINT_MAX) {
+                if (ctx->nextSrvSlot >= kMaxSrvDescriptors || ctx->nextSamplerSlot >= kMaxSamplerDescriptors) {
+                    setError(ctx, "No descriptor slots available for HDR target");
                     return -1;
                 }
-                auto rtv = ctx->rtvHeap->GetCPUDescriptorHandleForHeapStart();
-                rtv.ptr += static_cast<SIZE_T>(kSwapchainBufferCount) * ctx->rtvIncrement;
-                ctx->device->CreateRenderTargetView(scene.texture.Get(), nullptr, rtv);
-                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-                srv.Format = desc.Format;
-                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                srv.Texture2D.MipLevels = 1;
-                auto srvHandle = ctx->srvHeap->GetCPUDescriptorHandleForHeapStart();
-                srvHandle.ptr += static_cast<SIZE_T>(scene.srvSlot) * ctx->srvIncrement;
-                ctx->device->CreateShaderResourceView(scene.texture.Get(), &srv, srvHandle);
-                D3D12_SAMPLER_DESC sampler{};
-                sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-                sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-                sampler.MaxLOD = D3D12_FLOAT32_MAX;
-                sampler.MaxAnisotropy = 1;
-                sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-                auto samplerHandle = ctx->samplerHeap->GetCPUDescriptorHandleForHeapStart();
-                samplerHandle.ptr += static_cast<SIZE_T>(scene.samplerSlot) * ctx->samplerIncrement;
-                ctx->device->CreateSampler(&sampler, samplerHandle);
-                ctx->hdrReadable = false;
+                scene.srvSlot = ctx->nextSrvSlot++;
+                scene.samplerSlot = ctx->nextSamplerSlot++;
             }
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.Width = fb_width;
+            desc.Height = fb_height;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            desc.SampleDesc.Count = 1;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            scene.texture.Reset();
+            HRESULT hr = ctx->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                              D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                              IID_PPV_ARGS(&scene.texture));
+            if (FAILED(hr)) {
+                setError(ctx, "Cannot allocate DX12 HDR render target", hr);
+                return -1;
+            }
+            auto rtv = ctx->rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            rtv.ptr += static_cast<SIZE_T>(kSwapchainBufferCount) * ctx->rtvIncrement;
+            ctx->device->CreateRenderTargetView(scene.texture.Get(), nullptr, rtv);
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = desc.Format;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            auto srvHandle = ctx->srvHeap->GetCPUDescriptorHandleForHeapStart();
+            srvHandle.ptr += static_cast<SIZE_T>(scene.srvSlot) * ctx->srvIncrement;
+            ctx->device->CreateShaderResourceView(scene.texture.Get(), &srv, srvHandle);
+            D3D12_SAMPLER_DESC sampler{};
+            sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+            sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            sampler.MaxLOD = D3D12_FLOAT32_MAX;
+            sampler.MaxAnisotropy = 1;
+            sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            auto samplerHandle = ctx->samplerHeap->GetCPUDescriptorHandleForHeapStart();
+            samplerHandle.ptr += static_cast<SIZE_T>(scene.samplerSlot) * ctx->samplerIncrement;
+            ctx->device->CreateSampler(&sampler, samplerHandle);
+            ctx->hdrReadable = false;
         }
     }
-
     ctx->currentBackBuffer = ctx->swapchain->GetCurrentBackBufferIndex();
     HRESULT hr = ctx->allocator->Reset();
     if (FAILED(hr)) {
@@ -1406,7 +1454,7 @@ __declspec(dllexport) int mgfx_dx12_begin_frame(
     return 0;
 }
 
-__declspec(dllexport) int mgfx_dx12_draw(
+MGFX_EXPORT int mgfx_dx12_draw(
     void* handle,
     int pipeline_id,
     int buf_id,
@@ -1518,7 +1566,7 @@ __declspec(dllexport) int mgfx_dx12_draw(
     return 0;
 }
 
-__declspec(dllexport) int mgfx_dx12_tonemap(void* handle, int pipeline_id, const void* constants, size_t size) {
+MGFX_EXPORT int mgfx_dx12_tonemap(void* handle, int pipeline_id, const void* constants, size_t size) {
     if (!handle) return -1;
     auto* ctx = static_cast<MgfxDirectXContext*>(handle);
     if (!ctx->frameActive || !ctx->hdrActive || !constants || size != 16) {
@@ -1537,11 +1585,11 @@ __declspec(dllexport) int mgfx_dx12_tonemap(void* handle, int pipeline_id, const
     return mgfx_dx12_draw(handle, pipeline_id, -1, 3, constants, size, nullptr, 0, nullptr, 0, nullptr, 0, -2);
 }
 
-__declspec(dllexport) int mgfx_dx12_end_frame(void* handle) {
+MGFX_EXPORT int mgfx_dx12_end_frame(void* handle) {
     return finishFrameInternal(static_cast<MgfxDirectXContext*>(handle), {});
 }
 
-__declspec(dllexport) int mgfx_dx12_end_frame_capture(
+MGFX_EXPORT int mgfx_dx12_end_frame_capture(
     void* handle,
     void* out_rgba,
     size_t byte_size
@@ -1553,7 +1601,28 @@ __declspec(dllexport) int mgfx_dx12_end_frame_capture(
     return finishFrameInternal(static_cast<MgfxDirectXContext*>(handle), outSpan);
 }
 
-__declspec(dllexport) void mgfx_dx12_destroy(void* handle) {
+#ifdef GFX_NACELLE
+MGFX_EXPORT int mgfx_dx12_copy_frame(void* handle, void* out_rgba, size_t byte_size,
+                                    uint32_t width, uint32_t height) {
+    if (!handle) return -1;
+    auto* ctx = static_cast<MgfxDirectXContext*>(handle);
+    const void* pixels = nullptr;
+    uint32_t actualWidth = 0, actualHeight = 0, rowPitch = 0;
+    HRESULT hr = ctx->swapchain->MapFrontBufferPtr(&pixels, &actualWidth, &actualHeight, &rowPitch);
+    if (FAILED(hr) || !pixels || actualWidth != width || actualHeight != height ||
+        !out_rgba || byte_size != static_cast<size_t>(width) * height * 4 || rowPitch < width * 4) {
+        setError(ctx, "Invalid Nacelle front-buffer readback", hr);
+        return -1;
+    }
+    for (uint32_t row = 0; row < height; ++row)
+        std::memcpy(static_cast<std::byte*>(out_rgba) + static_cast<size_t>(row) * width * 4,
+                    static_cast<const std::byte*>(pixels) + static_cast<size_t>(row) * rowPitch,
+                    static_cast<size_t>(width) * 4);
+    return 0;
+}
+#endif
+
+MGFX_EXPORT void mgfx_dx12_destroy(void* handle) {
     if (handle == nullptr) {
         return;
     }

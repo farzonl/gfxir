@@ -737,6 +737,7 @@ class ModelViewerApp(App):
                 target=self.target,
                 width=self.width,
                 height=self.height,
+                **({"provider": self.provider} if self.provider is not None else {}),
             )
             self._window.bind_app(self)
 
@@ -981,6 +982,7 @@ class ModelViewerApp(App):
             width=self.width,
             height=self.height,
             time=self.elapsed_time,
+            **({"provider": self.provider} if self.provider is not None else {}),
         )
         if not isinstance(image, RenderedImage):
             raise RuntimeError(f"render_offscreen returned unexpected type {type(image)}, expected RenderedImage")
