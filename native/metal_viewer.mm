@@ -301,6 +301,7 @@ static MetalStageResources loadStageResources(id<MTLDevice> device, id<MTLComman
                 texture2DDescriptorWithPixelFormat:pixelFmt width:entry.width height:entry.height mipmapped:NO];
             texDesc.storageMode = MTLStorageModePrivate;
             texDesc.usage = MTLTextureUsageShaderRead;
+            texDesc.textureType = MTLTextureType2DArray;
             entry.texture = [device newTextureWithDescriptor:texDesc];
             if (!entry.texture) throw failure(@"Cannot allocate Metal 2D texture");
 
@@ -542,7 +543,6 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
 @property(nonatomic, strong) GraphicsRenderer* postRenderer;
 @property(nonatomic, copy) NSString* postResourcesPath;
 @property(nonatomic, strong) id<MTLTexture> sceneColor;
-@property(nonatomic, strong) id<MTLFence> postFence;
 @property(nonatomic) double frameTime;
 - (instancetype)initWithVertex:(NSString*)vertex vertexEntry:(NSString*)vertexEntry
                        fragment:(NSString*)fragment fragmentEntry:(NSString*)fragmentEntry
@@ -570,8 +570,6 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
                         fragment:(ReflectedArgBufferLayout)fragmentLayout;
 - (void)encode:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass;
 - (void)encodeScene:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass;
-- (void)encodeScene:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass
-        signalFence:(id<MTLFence>)signalFence waitFence:(id<MTLFence>)waitFence;
 @end
 
 @implementation GraphicsRenderer
@@ -768,6 +766,7 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
             texture2DDescriptorWithPixelFormat:self.colorFormat width:output.width height:output.height mipmapped:NO];
         desc.storageMode = MTLStorageModePrivate;
         desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        desc.textureType = MTLTextureType2DArray;
         self.sceneColor = [self.device newTextureWithDescriptor:desc];
         if (!self.sceneColor) throw failure(@"Cannot allocate sampled offscreen render target");
         [self.postRenderer loadResourcesFromPath:self.postResourcesPath renderTarget:self.sceneColor];
@@ -776,26 +775,16 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
     scenePass.colorAttachments[0].texture = self.sceneColor;
     scenePass.colorAttachments[0].storeAction = MTLStoreActionStore;
     self.postRenderer.frameTime = self.frameTime;
-    if (!self.postFence) {
-        self.postFence = [self.device newFence];
-        if (!self.postFence) throw failure(@"Cannot allocate scene-to-post synchronization fence");
-    }
-    [self encodeScene:command pass:scenePass signalFence:self.postFence waitFence:nil];
+    [self encodeScene:command pass:scenePass];
     MTLRenderPassDescriptor* postPass = [pass copy];
     postPass.depthAttachment.texture = nil;
     postPass.stencilAttachment.texture = nil;
-    [self.postRenderer encodeScene:command pass:postPass signalFence:nil waitFence:self.postFence];
+    [self.postRenderer encodeScene:command pass:postPass];
 }
 
 - (void)encodeScene:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass {
-    [self encodeScene:command pass:pass signalFence:nil waitFence:nil];
-}
-
-- (void)encodeScene:(id<MTLCommandBuffer>)command pass:(MTLRenderPassDescriptor*)pass
-        signalFence:(id<MTLFence>)signalFence waitFence:(id<MTLFence>)waitFence {
     id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
     if (!encoder) throw failure(@"Cannot create a Metal render encoder");
-    if (waitFence) [encoder waitForFence:waitFence beforeStages:MTLRenderStageFragment];
     if (self.depthState) {
         [encoder setDepthStencilState:self.depthState];
     }
@@ -1011,7 +1000,6 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
             }
         }
     }
-    if (signalFence) [encoder updateFence:signalFence afterStages:MTLRenderStageFragment];
     [encoder endEncoding];
 }
 

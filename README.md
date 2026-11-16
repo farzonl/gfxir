@@ -214,6 +214,8 @@ Vulkan, native DX12, and converted Metal execute both passes on the same device
 without intermediate CPU readback. PNG, MP4, and viewer windows use this path;
 window resize recreates the intermediate target at drawable-pixel dimensions.
 Single-pass programs are unchanged.
+Converted Metal binds single-layer array textures, matching the converter 1.x/2.x
+ABI; newer converters are explicitly configured to use the same texture types.
 
 See [the runnable HDR/post example](examples/basics/post_process.py):
 
