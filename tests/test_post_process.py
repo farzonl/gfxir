@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from mlir_gpu import (
-    DepthStencil, Draw, FrameParameters, Pipeline, Sampler, Target, Texture2D, compile_pipeline,
+    DepthStencil, Draw, FrameParameters, Pipeline, Sampler, SamplerDesc, Target, Texture2D, TextureData, compile_pipeline,
     fragment, fullscreen_uv_vertex, load_texture, sample_texture, vec4,
 )
 from mlir_gpu.viewer import (
@@ -171,6 +171,27 @@ class PostProcessGpuTests(unittest.TestCase):
                 program = with_post_process(load_program(scene_path), load_program(post_path), format="rgba32_sfloat")
                 kwargs = {"toolchain": TOOLS} if render is not render_offscreen else {}
                 self._assert_pixels(render(program, 11, 7, validation=True, time=1.5, **kwargs), 1.5)
+
+    def test_post_shader_reads_uploaded_hdr_texture(self):
+        width, height, time = 11, 7, 1.5
+        texture = TextureData.from_rgba_f32(width, height, [
+            (4 * (x + 0.5) / width + time, 2 * (y + 0.5) / height, 2.0, 0.75)
+            for y in range(height) for x in range(width)
+        ])
+        sampler = SamplerDesc(
+            min_filter="nearest", mag_filter="nearest",
+            address_mode_u="clamp_to_edge", address_mode_v="clamp_to_edge",
+        )
+        for target, render in self._backends():
+            for shader in (post_fragment, post_load_fragment):
+                with self.subTest(target=target, shader=shader), tempfile.TemporaryDirectory() as tmp:
+                    path = compile_pipeline(Pipeline(fullscreen_uv_vertex, shader), target, Path(tmp) / "post", TOOLS)
+                    program = load_program(
+                        path, textures={"scene_color": texture},
+                        samplers={"scene_sampler": sampler} if shader is post_fragment else {},
+                    )
+                    kwargs = {"toolchain": TOOLS} if render is not render_offscreen else {}
+                    self._assert_pixels(render(program, width, height, validation=True, time=time, **kwargs), time)
 
     def test_emissive_demo_hdr_highlights_differ_from_clipped_ldr(self):
         from examples.basics.post_process import make_post, make_scene
