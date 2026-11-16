@@ -647,6 +647,8 @@ def _cpu_textured_fragment(
     cam: Any = None,
     mat: Any = None,
     light: Any = None,
+    *,
+    hdr: bool = False,
 ) -> Vec4:
     c = cam if cam is not None else CameraParams()
     raw_mat = mat if mat is not None else MaterialParams()
@@ -671,7 +673,7 @@ def _cpu_textured_fragment(
         effective_mat = base_params
     l = light if light is not None else LightParams()
     lit = evaluate_lighting(normal, c.eye_pos - _to_vec3(world_pos), l, effective_mat)
-    final = tonemap_and_gamma(Vec3(*lit))
+    final = Vec3(*lit) if hdr else tonemap_and_gamma(Vec3(*lit))
     return Vec4(final.x, final.y, final.z, effective_mat.albedo.w)
 
 
@@ -683,29 +685,38 @@ if vertex is not None and fragment is not None:
         clip_pos = cam.view_proj * world_pos
         return Vertex(clip_pos, varyings={"normal": vec3(0.0, 1.0, 0.0), "world_pos": world_pos.xyz, "uv": vec2(0.0, 0.0)})
 
-    def _gpu_lighting(normal: Value, world_pos: Value, uv: Value, cam: CameraParams, mat: MaterialParams, light: LightParams) -> Value:
+    def _gpu_lighting(normal: Value, world_pos: Value, cam: CameraParams, mat: MaterialParams, light: LightParams, albedo: Value) -> Value:
         n, l = sm.normalize(normal), sm.normalize(light.direction)
         n_dot_l = sm.clamp(sm.dot(n, l), 0.0, 1.0)
-        diffuse = mat.albedo.xyz * n_dot_l * light.intensity * (1.0 - mat.metallic)
-        ambient = mat.albedo.xyz * (light.ambient + mat.ambient)
+        diffuse = albedo.xyz * n_dot_l * light.intensity * (1.0 - mat.metallic)
+        ambient = albedo.xyz * (light.ambient + mat.ambient)
         v = sm.normalize(cam.eye_pos - world_pos)
         h = sm.normalize(l + v)
         n_dot_h = sm.clamp(sm.dot(n, h), 0.0, 1.0)
         specular = sm.pow(n_dot_h, 2.0 / (mat.roughness * mat.roughness + 0.001)) * light.intensity
         hdr = ambient + diffuse + vec3(specular, specular, specular)
-        return vec4(hdr, mat.albedo.w)
+        return vec4(hdr, albedo.w)
 
     @fragment
     def _gpu_linear_fragment(normal: Value, world_pos: Value, uv: Value, cam: CameraParams, mat: MaterialParams, light: LightParams) -> Value:
-        return _gpu_lighting(normal, world_pos, uv, cam, mat, light)
+        return _gpu_lighting(normal, world_pos, cam, mat, light, mat.albedo)
 
     @fragment
     def _gpu_fragment(normal: Value, world_pos: Value, uv: Value, cam: CameraParams, mat: MaterialParams, light: LightParams) -> Value:
-        color = _gpu_lighting(normal, world_pos, uv, cam, mat, light)
+        color = _gpu_lighting(normal, world_pos, cam, mat, light, mat.albedo)
         hdr = color.xyz
         ldr = sm.clamp((hdr * (hdr * 2.51 + 0.03)) / (hdr * (hdr * 2.43 + 0.59) + 0.14), 0.0, 1.0)
         srgb = sm.pow(ldr, 1.0 / 2.2)
         return vec4(srgb, mat.albedo.w)
+
+    @fragment
+    def _gpu_linear_textured_fragment(
+        normal: Value, world_pos: Value, uv: Value,
+        albedo_tex: GpuTexture2D, albedo_sampler: GpuSampler,
+        cam: CameraParams, mat: MaterialParams, light: LightParams,
+    ) -> Value:
+        albedo = mat.albedo * sample_texture(albedo_tex, albedo_sampler, uv)
+        return _gpu_lighting(normal, world_pos, cam, mat, light, albedo)
 
     @fragment
     def _gpu_textured_fragment(
@@ -720,15 +731,7 @@ if vertex is not None and fragment is not None:
     ) -> Value:
         texel = sample_texture(albedo_tex, albedo_sampler, uv)
         base_albedo = mat.albedo * texel
-        n, l = sm.normalize(normal), sm.normalize(light.direction)
-        n_dot_l = sm.clamp(sm.dot(n, l), 0.0, 1.0)
-        diffuse = base_albedo.xyz * n_dot_l * light.intensity * (1.0 - mat.metallic)
-        ambient = base_albedo.xyz * (light.ambient + mat.ambient)
-        v = sm.normalize(cam.eye_pos - world_pos)
-        h = sm.normalize(l + v)
-        n_dot_h = sm.clamp(sm.dot(n, h), 0.0, 1.0)
-        specular = sm.pow(n_dot_h, 2.0 / (mat.roughness * mat.roughness + 0.001)) * light.intensity
-        hdr = ambient + diffuse + vec3(specular, specular, specular)
+        hdr = _gpu_lighting(normal, world_pos, cam, mat, light, base_albedo).xyz
         ldr = sm.clamp((hdr * (hdr * 2.51 + 0.03)) / (hdr * (hdr * 2.43 + 0.59) + 0.14), 0.0, 1.0)
         srgb = sm.pow(ldr, 1.0 / 2.2)
         return vec4(srgb, base_albedo.w)
@@ -739,6 +742,9 @@ if vertex is not None and fragment is not None:
         _gpu_linear_fragment, "fragment", lambda *args, **kwargs: _cpu_fragment(*args, **kwargs, hdr=True),
     )
     textured_pbr_fragment = ShaderFunction(_gpu_textured_fragment, "fragment", _cpu_textured_fragment)
+    linear_textured_pbr_fragment = ShaderFunction(
+        _gpu_linear_textured_fragment, "fragment", lambda *args, **kwargs: _cpu_textured_fragment(*args, **kwargs, hdr=True),
+    )
 else:
     pbr_vertex = ShaderFunction(_cpu_vertex, "vertex", _cpu_vertex)
     pbr_fragment = ShaderFunction(_cpu_fragment, "fragment", _cpu_fragment)
@@ -746,6 +752,9 @@ else:
         _cpu_fragment, "fragment", lambda *args, **kwargs: _cpu_fragment(*args, **kwargs, hdr=True),
     )
     textured_pbr_fragment = ShaderFunction(_cpu_textured_fragment, "fragment", _cpu_textured_fragment)
+    linear_textured_pbr_fragment = ShaderFunction(
+        _cpu_textured_fragment, "fragment", lambda *args, **kwargs: _cpu_textured_fragment(*args, **kwargs, hdr=True),
+    )
 
 material_vertex_shader, material_fragment_shader = pbr_vertex, pbr_fragment
 default_vs, default_ps = pbr_vertex, pbr_fragment
@@ -754,5 +763,5 @@ __all__ = [
     "CameraParams", "LightParams", "Material", "MaterialParams", "ObjectParams", "Sampler",
     "ShaderFunction", "Texture", "default_ps", "default_vs", "evaluate_diffuse_lighting",
     "evaluate_lighting", "evaluate_specular", "material_fragment_shader", "material_vertex_shader",
-    "pbr_fragment", "pbr_vertex", "textured_pbr_fragment", "linear_pbr_fragment",
+    "pbr_fragment", "pbr_vertex", "textured_pbr_fragment", "linear_pbr_fragment", "linear_textured_pbr_fragment",
 ]
