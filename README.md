@@ -201,13 +201,9 @@ may declare samplers. The render target is bound automatically: do not supply
 maps on the post program override these defaults. Linear filtering requires
 device support for the chosen target format.
 
-The default target format is `rgba16_sfloat`, preserving HDR values above 1.0
+The default target format is `rgba32_sfloat`, preserving HDR values above 1.0
 until the post shader maps them to the final RGBA8/BGRA8 UNORM output.
-`format="rgba32_sfloat"` supports higher precision on compatible devices;
-Metal sampling of this format requires `supports32BitFloatFiltering`, and
-unsupported devices fail explicitly instead of returning black samples.
-`load_texture` can read it without a sampler. `format="rgba8_unorm"` is also
-supported for LDR effects. The source scene keeps
+`format="rgba8_unorm"` is also supported for LDR effects. The source scene keeps
 its existing draws, depth attachment, constants, and resources. The post pass
 is one non-indexed, bufferless triangle without depth or storage buffers.
 Nested post passes, mip chains, MSAA, and multiple color attachments are not
