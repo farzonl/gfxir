@@ -5,7 +5,19 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from typing import Optional, Sequence
+from typing import Optional, Protocol, Sequence
+
+
+class AppWindow(Protocol):
+    """Window adapter owned by an App, created during startup."""
+
+    def poll_and_sync(self, app: App) -> bool:
+        """Process events and resize the app; return False on window close."""
+        ...
+
+    def close(self) -> None:
+        """Release the presenter and OS window."""
+        ...
 
 
 def get_default_target() -> str:
@@ -50,6 +62,7 @@ class App:
         self.dt: float = 0.0
         self.fps: float = 0.0
         self._last_time: float = 0.0
+        self._window: Optional[AppWindow] = None
 
     @classmethod
     def build_parser(cls) -> argparse.ArgumentParser:
@@ -103,6 +116,25 @@ class App:
 
     def cleanup(self) -> None:
         """Lifecycle hook invoked on exit or exception to release engine resources."""
+        self._close_window()
+
+    def resize(self, width: int, height: int) -> None:
+        """Update drawable pixel dimensions; override to resize camera/render resources."""
+        if width <= 0 or height <= 0:
+            raise ValueError("Drawable dimensions must be positive.")
+        self.width, self.height = width, height
+
+    def poll_events(self) -> bool:
+        """Process the attached window before updating or rendering a frame."""
+        if self._window is not None and not self._window.poll_and_sync(self):
+            self.stop()
+            return False
+        return True
+
+    def _close_window(self) -> None:
+        if self._window is not None:
+            window, self._window = self._window, None
+            window.close()
 
     def stop(self) -> None:
         """Signal the main loop to terminate after the current frame."""
@@ -111,11 +143,13 @@ class App:
     def run(self) -> int:
         """Execute application lifecycle: startup -> loop(update, render) -> cleanup."""
         try:
-            self.startup()
             self.is_running = True
+            self.startup()
             self._last_time = time.perf_counter()
             while self.is_running:
                 if self.frames is not None and self.frame_count >= self.frames:
+                    break
+                if not self.poll_events() or not self.is_running:
                     break
                 now = time.perf_counter()
                 dt = max(now - self._last_time, 0.0)
@@ -133,7 +167,10 @@ class App:
             return 0
         finally:
             self.is_running = False
-            self.cleanup()
+            try:
+                self.cleanup()
+            finally:
+                self._close_window()
 
 
 def main(args: Optional[Sequence[str]] = None) -> int:

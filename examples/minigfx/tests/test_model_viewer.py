@@ -25,6 +25,12 @@ from mlir_gpu.viewer import RenderedImage, ViewerError
 class TestModelViewerApp(unittest.TestCase):
     """Behavioral test suite for ModelViewerApp interactive sample scene."""
 
+    def test_drawable_resize_updates_camera_projection(self) -> None:
+        app = ModelViewerApp(ModelViewerApp.parse_args(["--offscreen", "--frames", "0"]))
+        app.resize(1600, 900)
+        self.assertEqual((app.width, app.height), (1600, 900))
+        self.assertAlmostEqual(app.camera.aspect, 1600.0 / 900.0)
+
     def test_scene_graph_hierarchy_initialization(self) -> None:
         """Verifies scene hierarchy contains central model, ground plane, light marker, and satellite."""
         args = ModelViewerApp.parse_args(["--offscreen", "--frames", "0"])

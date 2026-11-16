@@ -2080,18 +2080,20 @@ class InteractiveWindow:
             self._app_ref.handle_mouse_scroll(yoffset)
 
     def poll_and_sync(self, app: Any) -> bool:
-        """Poll OS events and update camera aspect ratio. Returns False if window should close."""
+        """Poll events, pause minimized windows, and synchronize drawable dimensions."""
         if self.window is None:
             return False
         self.glfw.poll_events()
-        if self.glfw.window_should_close(self.window):
-            app.stop()
-            return False
-        fb_w, fb_h = self.glfw.get_framebuffer_size(self.window)
-        if fb_w > 0 and fb_h > 0:
-            app.width, app.height = fb_w, fb_h
-            app.camera.aspect = float(fb_w) / float(fb_h)
-        return True
+        while True:
+            if self.glfw.window_should_close(self.window) or not app.is_running:
+                app.stop()
+                return False
+            fb_w, fb_h = self.glfw.get_framebuffer_size(self.window)
+            if fb_w > 0 and fb_h > 0:
+                if (app.width, app.height) != (fb_w, fb_h):
+                    app.resize(fb_w, fb_h)
+                return True
+            self.glfw.wait_events_timeout(0.1)
 
     def present_frame(self, app: Any, commands: Sequence[Any]) -> None:
         """Submit recorded scene DrawCommands and HUD overlay to the GPU swapchain."""
@@ -2173,12 +2175,16 @@ class InteractiveWindow:
             )
 
     def close(self) -> None:
-        if getattr(self, "backend", None) is not None:
-            try:
-                self.backend.destroy()
-            finally:
-                self.backend = None
-        if getattr(self, "window", None) is not None:
-            self.glfw.destroy_window(self.window)
-            self.window = None
-            self.glfw.terminate()
+        try:
+            if getattr(self, "backend", None) is not None:
+                try:
+                    self.backend.destroy()
+                finally:
+                    self.backend = None
+        finally:
+            if getattr(self, "window", None) is not None:
+                try:
+                    self.glfw.destroy_window(self.window)
+                finally:
+                    self.window = None
+                    self.glfw.terminate()

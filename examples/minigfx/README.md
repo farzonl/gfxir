@@ -197,6 +197,32 @@ python3 -m examples.minigfx.samples.model_viewer --target metal --model path/to/
 
 ### 3.3 CLI Command-Line Arguments
 
+The package entry point launches the same ModelViewer sample:
+
+```bash
+PYTHONPATH=src python3 -m examples.minigfx --target metal --frames 60
+```
+
+For a custom application, subclass `examples.minigfx.app.App`, override
+`startup`, `update(dt)`, `render`, and `cleanup`, and run
+`MyApp(MyApp.parse_args()).run()`. The base host is CPU-only until startup
+attaches a window adapter to `self._window`; it does not create a renderer or
+compile shaders. An adapter implements `poll_and_sync(app)` and `close()`.
+The host polls before each frame and stops before update/render on window close.
+Adapters report positive drawable pixel sizes through `app.resize(width, height)`;
+override that hook and call `super().resize(...)` to resize camera/render resources.
+The existing `InteractiveWindow` is the ModelViewer GPU presenter and waits for
+events while minimized, without counting unpresented frames.
+
+Timing uses `time.perf_counter()` and exposes `dt`, `elapsed_time`, `fps`, and
+`frame_count`. `stop()` during startup skips the loop; during update/render it
+finishes the current frame. Cleanup runs even on startup or frame errors, and
+the host closes its attached window even if a cleanup override fails or omits
+`super()`. Backend and application errors propagate to the caller.
+`--frames 0` performs startup and cleanup without any frames; omitting
+`--frames` runs until stopped. The sample retains its fixed 60 Hz offscreen
+timing for deterministic images.
+
 The application host accepts the following empirically verified CLI arguments:
 
 | Flag | Type | Default | Description |
