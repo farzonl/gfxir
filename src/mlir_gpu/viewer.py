@@ -454,11 +454,19 @@ def load_program(
         multi_buf_bindings: list[dict] = []
         multi_tex_bindings: list[dict] = []
         multi_samp_bindings: list[dict] = []
-        if isinstance(first_pipe.interface, dict) and set(first_pipe.interface) == {"vertex", "fragment"}:
-            try:
-                multi_buf_bindings, multi_tex_bindings, multi_samp_bindings = reflect_pipeline_resources(first_pipe.interface)
-            except ValueError as error:
-                raise ViewerError(f"Invalid graphics resource interface in multi-draw manifest: {error}") from error
+        resource_interface = {stage: {key: [] for key in ("buffers", "textures", "samplers")}
+                              for stage in ("vertex", "fragment")}
+        for pipe in pipelines.values():
+            if isinstance(pipe.interface, dict) and set(pipe.interface) == {"vertex", "fragment"}:
+                for stage, resources in resource_interface.items():
+                    for key, bindings in resources.items():
+                        for binding in pipe.interface[stage].get(key, []) or []:
+                            if binding not in bindings:
+                                bindings.append(binding)
+        try:
+            multi_buf_bindings, multi_tex_bindings, multi_samp_bindings = reflect_pipeline_resources(resource_interface)
+        except ValueError as error:
+            raise ViewerError(f"Invalid graphics resource interface in multi-draw manifest: {error}") from error
         if buffers is not None or textures is not None or samplers is not None:
             _validate_resource_maps(
                 multi_buf_bindings,

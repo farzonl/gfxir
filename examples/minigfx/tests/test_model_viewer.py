@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 from examples.minigfx.app import App
 from examples.minigfx.camera import Camera, CameraParams, OrbitController
-from examples.minigfx.material import LightParams, MaterialParams
+from examples.minigfx.material import LightParams, Material, MaterialParams
 from examples.minigfx.math import Mat4x4, Quat, Vec2, Vec3, Vec4
 from examples.minigfx.samples.model_viewer import ModelViewerApp, ModelVertex, model_vertex_shader
 from mlir_gpu.viewer import RenderedImage, ViewerError
@@ -25,6 +25,81 @@ from mlir_gpu.viewer import RenderedImage, ViewerError
 
 class TestModelViewerApp(unittest.TestCase):
     """Behavioral test suite for ModelViewerApp interactive sample scene."""
+
+    def test_tga_texture_loading_and_material_switching(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "diffuse.tga"
+            image = Image.new("RGBA", (2, 2))
+            pixels = [(255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 255, 255), (255, 255, 255, 255)]
+            image.putdata(pixels)
+            image.save(path)
+            app = ModelViewerApp(ModelViewerApp.parse_args([
+                "--albedo-texture", str(path), "--texture-filter", "nearest",
+                "--texture-wrap", "clamp_to_edge",
+            ]))
+            texture = app.model_node.material.albedo_texture
+            self.assertEqual((texture.width, texture.height), (2, 2))
+            self.assertEqual(texture.data, bytes(channel for pixel in pixels[2:] + pixels[:2] for channel in pixel))
+            for name in ("metallic", "dielectric"):
+                app.set_material(name)
+                mat = app.model_node.material
+                self.assertIsInstance(mat, Material)
+                self.assertIs(mat.albedo_texture, texture)
+                self.assertEqual(tuple(mat.albedo), (1.0, 1.0, 1.0, 1.0))
+                self.assertEqual((mat.sampler.mag_filter, mat.sampler.min_filter), ("nearest", "nearest"))
+                self.assertEqual((mat.sampler.address_mode_u, mat.sampler.address_mode_v),
+                                 ("clamp_to_edge", "clamp_to_edge"))
+                commands = app.renderer.render_frame(app.camera, app.light_params, app.scene)
+                command = next(cmd for cmd in commands if cmd.node is app.model_node)
+                self.assertIs(command.textures["albedo_tex"], texture)
+            app.set_material("normal_debug")
+            self.assertIsInstance(app.model_node.material, MaterialParams)
+            self.assertIsInstance(app.ground_node.material, MaterialParams)
+
+    def test_texture_errors_are_not_silently_ignored(self) -> None:
+        from PIL import UnidentifiedImageError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "missing.tga"
+            args = ModelViewerApp.parse_args(["--albedo-texture", str(path)])
+            with self.assertRaises(FileNotFoundError):
+                ModelViewerApp(args)
+            path.write_bytes(b"not an image")
+            with self.assertRaises(UnidentifiedImageError):
+                ModelViewerApp(args)
+
+    def test_textured_offscreen_pipeline_and_hdr_resource_routing(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "diffuse.tga"
+            Image.new("RGBA", (2, 2), (255, 0, 0, 255)).save(path)
+            for hdr_args in ([], ["--hdr"], ["--hdr-comparison"]):
+                with self.subTest(hdr_args=hdr_args):
+                    app = ModelViewerApp(ModelViewerApp.parse_args([
+                        "--target", "vulkan", "--albedo-texture", str(path),
+                        "--offscreen", "--width", "64", "--height", "64", *hdr_args,
+                    ]))
+                    try:
+                        with patch("examples.minigfx.samples.model_viewer.render_offscreen") as render:
+                            render.return_value = RenderedImage(64, 64, b"\x00" * (64 * 64 * 4), "test")
+                            app.render_offscreen_frame()
+                        program = render.call_args.args[0]
+                        if hdr_args:
+                            self.assertIsNotNone(program.post_process)
+                        self.assertEqual(program.textures["albedo_tex"].data, b"\xff\x00\x00\xff" * 4)
+                        self.assertEqual(program.samplers["albedo_sampler"].mag_filter, "linear")
+                        manifest = json.loads(
+                            (Path(app.compiled_manifest).parent.parent / "multi_manifest.json").read_text()
+                        )
+                        textured_draws = [draw for draw in manifest["draws"] if draw["pipeline"] == "textured_pbr"]
+                        self.assertEqual(len(textured_draws), 1)
+                        self.assertEqual(textured_draws[0]["index_count"], len(app.model_node.mesh.indices))
+                        self.assertTrue(any(draw["pipeline"] == "pbr_forward" for draw in manifest["draws"]))
+                    finally:
+                        app.cleanup()
 
     def test_drawable_resize_updates_camera_projection(self) -> None:
         app = ModelViewerApp(ModelViewerApp.parse_args(["--offscreen", "--frames", "0"]))

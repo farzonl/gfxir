@@ -34,11 +34,16 @@ from examples.minigfx.debug import (
 )
 from examples.minigfx.material import (
     LightParams,
+    Material,
     MaterialParams,
     ObjectParams,
+    Sampler,
+    Texture,
     material_fragment_shader,
     material_vertex_shader,
     linear_pbr_fragment,
+    linear_textured_pbr_fragment,
+    textured_pbr_fragment,
 )
 from examples.minigfx.math import Mat4x4, Vec2, Vec3, Vec4
 from examples.minigfx.obj_loader import load_obj, load_obj_from_string
@@ -77,6 +82,8 @@ from mlir_gpu.compiler import (
 from mlir_gpu.frontend import (
     DepthStencil,
     Pipeline as GpuPipeline,
+    Sampler as GpuSampler,
+    Texture2D,
     Type,
     Vertex as GpuVertex,
     fragment,
@@ -164,6 +171,22 @@ def make_comparison_fragment():
         clip_pos = cam.view_proj * vec4(world_pos, 1.0)
         ldr = ldr_fragment(normal, world_pos, uv, cam, mat, light)
         hdr = hdr_fragment(normal, world_pos, uv, cam, mat, light)
+        return select(clip_pos.x < 0.0, ldr, hdr)
+
+    return comparison_fragment
+
+
+def make_textured_comparison_fragment():
+    ldr_fragment = textured_pbr_fragment.function
+    hdr_fragment = linear_textured_pbr_fragment.function
+
+    @fragment
+    def comparison_fragment(normal: Type.VEC3, world_pos: Type.VEC3, uv: Type.VEC2,
+                            albedo_tex: Texture2D, albedo_sampler: GpuSampler,
+                            cam: CameraParams, mat: MaterialParams, light: LightParams):
+        clip_pos = cam.view_proj * vec4(world_pos, 1.0)
+        ldr = ldr_fragment(normal, world_pos, uv, albedo_tex, albedo_sampler, cam, mat, light)
+        hdr = hdr_fragment(normal, world_pos, uv, albedo_tex, albedo_sampler, cam, mat, light)
         return select(clip_pos.x < 0.0, ldr, hdr)
 
     return comparison_fragment
@@ -317,7 +340,7 @@ class ModelViewerApp(App):
         self._pipeline_dir: Optional[tempfile.TemporaryDirectory] = None
 
         # 1. Define materials palette
-        self.materials: Dict[str, MaterialParams] = {
+        self.materials: Dict[str, Union[MaterialParams, Material]] = {
             "metallic": MaterialParams(
                 albedo=Vec4(0.95, 0.78, 0.35, 1.0),
                 roughness=0.15,
@@ -339,6 +362,29 @@ class ModelViewerApp(App):
         }
         self.material_names: List[str] = ["metallic", "dielectric", "normal_debug"]
         self._material_index: int = 0
+        self.albedo_texture: Optional[Texture] = None
+        texture_path = getattr(args, "albedo_texture", None)
+        if texture_path is not None:
+            try:
+                from PIL import Image
+            except ImportError as error:
+                raise RuntimeError("Image textures require Pillow; install mlir-gpu[viewer] or Pillow") from error
+            with Image.open(texture_path) as image:
+                rgba = image.convert("RGBA").transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+                self.albedo_texture = Texture.from_rgba8(rgba.width, rgba.height, rgba.tobytes())
+            sampler = Sampler(
+                mag_filter=getattr(args, "texture_filter", "linear"),
+                min_filter=getattr(args, "texture_filter", "linear"),
+                address_mode_u=getattr(args, "texture_wrap", "repeat"),
+                address_mode_v=getattr(args, "texture_wrap", "repeat"),
+            )
+            for name in ("metallic", "dielectric"):
+                params = self.materials[name]
+                self.materials[name] = Material(
+                    albedo=Vec4(1.0, 1.0, 1.0, 1.0),
+                    roughness=params.roughness, metallic=params.metallic, ambient=params.ambient,
+                    albedo_texture=self.albedo_texture, sampler=sampler,
+                )
 
         # 2. Load 3D model geometry
         model_mesh: Optional[Mesh] = None
@@ -482,6 +528,9 @@ class ModelViewerApp(App):
             metavar="OBJ",
             help="OBJ files to preload and cycle through with N (starts with the first)",
         )
+        parser.add_argument("--albedo-texture", type=Path, help="Albedo image for the central model (requires Pillow and mesh UVs)")
+        parser.add_argument("--texture-filter", choices=("nearest", "linear"), default="linear", help="Albedo texture filtering (default: linear)")
+        parser.add_argument("--texture-wrap", choices=("repeat", "clamp_to_edge", "mirror_repeat"), default="repeat", help="Albedo texture U/V addressing (default: repeat)")
         parser.add_argument(
             "--output",
             type=str,
@@ -643,6 +692,15 @@ class ModelViewerApp(App):
         if pbr_manifest_path is None or not Path(pbr_manifest_path).exists():
             raise RuntimeError(f"PBR pipeline compilation failed for target {target_name}")
 
+        if self.albedo_texture is not None:
+            textured_fragment = (
+                make_textured_comparison_fragment() if self.renderer.comparison else linear_textured_pbr_fragment
+            ) if self.renderer.hdr else textured_pbr_fragment
+            compile_pipeline(
+                GpuPipeline(model_vertex_shader, textured_fragment, depth_stencil=pbr_gpu_pipe.depth_stencil),
+                target_enum, out_dir / "textured_pbr",
+            )
+
         # 2. Dedicated 2D Overlay Pipeline (depth test & depth write disabled)
         overlay_gpu_pipe = GpuPipeline(
             overlay_vertex_shader,
@@ -774,7 +832,7 @@ class ModelViewerApp(App):
 
             draw_calls.append(
                 DrawCall(
-                    pipeline="pbr_forward",
+                    pipeline="textured_pbr" if getattr(mat, "is_textured", False) else "pbr_forward",
                     type="indexed",
                     topology="triangle-list",
                     index_count=len(indices),
@@ -890,12 +948,30 @@ class ModelViewerApp(App):
         }
 
         multi_manifest_path = out_dir / "multi_manifest.json"
+        textures, samplers = {}, {}
+        if self.albedo_texture is not None:
+            textured_data = json.loads((out_dir / "textured_pbr" / "pipeline.json").read_text())
+            multi_manifest["pipelines"]["textured_pbr"] = {
+                key: textured_data[key]
+                for key in ("entries", "parameters", "interface", "depth_stencil", "input_layout")
+                if key in textured_data
+            }
+            multi_manifest["pipelines"]["textured_pbr"]["entries"] = [
+                {**entry, "binary": f"textured_pbr/{entry['binary']}"}
+                for entry in textured_data["entries"]
+            ]
+            textured_material = self.materials["metallic"]
+            if not isinstance(textured_material, Material):
+                raise TypeError("The textured metallic preset must be a Material")
+            textures, samplers = textured_material.gpu_resources()
         multi_manifest_path.write_text(json.dumps(multi_manifest, indent=2))
 
         program = load_program(
             multi_manifest_path,
             vertex_buffer=bytes(consolidated_vb),
             index_buffer=bytes(consolidated_ib),
+            textures=textures,
+            samplers=samplers,
         )
         if self.renderer.hdr:
             program = with_post_process(program, load_program(out_dir / "post" / "pipeline.json"))

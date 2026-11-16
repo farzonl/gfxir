@@ -195,6 +195,51 @@ Load custom 3D models via the `--model` parameter:
 python3 -m examples.minigfx.samples.model_viewer --target metal --model path/to/model.obj
 ```
 
+#### Image Textures
+
+Use `--albedo-texture` to apply a local image to the central model, using its
+OBJ texture coordinates (`vt`). PNG, JPEG, and TGA images are supported through
+Pillow (`pip install -e '.[viewer]'`). For example, with a matching African head
+diffuse texture downloaded locally:
+
+```bash
+PYTHONPATH=src python -m examples.minigfx --target metal \
+  --model build/african_head.obj --albedo-texture build/african_head_diffuse.tga \
+  --texture-filter linear --texture-wrap clamp_to_edge
+```
+
+For the Diablo pose model and its matching diffuse map:
+
+```bash
+PYTHONPATH=src python -m examples.minigfx --target metal \
+  --model build/diablo3_pose.obj --albedo-texture build/diablo3_pose_diffuse.tga \
+  --texture-wrap clamp_to_edge
+```
+
+Pass the image file, not a GitHub `blob` page URL. Images are flipped vertically
+on loading to match OBJ's bottom-left UV origin. The OBJ must have UVs matching
+the image; OBJ material libraries, normal maps, specular maps, and glow maps
+are not loaded automatically. Without a
+texture, the existing material presets are unchanged. With a texture, metallic
+and dielectric presets use a white albedo multiplier to preserve image colors;
+normal-debug mode stays untextured. The same image is retained when cycling
+models with **N**, so each model needs compatible UVs. Textures work in interactive
+and offscreen modes, including `--hdr` and `--hdr-comparison`.
+
+To save a textured frame, append `--frames 1 --output build/textured-head.png`.
+Replace `--target metal` with `vulkan` or `directx` for those backends.
+
+Custom MiniGfx applications can bind resources directly:
+
+```python
+from examples.minigfx import Material, Sampler, Texture
+
+node.material = Material(
+    albedo_texture=Texture.checkerboard(),
+    sampler=Sampler.nearest(),
+)
+```
+
 To switch between the three downloaded OBJ files, activate the repository's
 virtual environment and pass a model list. Press **N** to advance, wrapping
 back to the first model. All meshes are preloaded; switching preserves the
@@ -246,6 +291,9 @@ The application host accepts the following empirically verified CLI arguments:
 | `--offscreen` | Flag | `False` | Renders headlessly to offscreen buffers without opening an OS window. |
 | `--model MODEL` | File Path | Embedded procedural model | Loads a custom Wavefront OBJ file for display. |
 | `--models OBJ [OBJ ...]` | File Paths | `None` | Preloads models for keyboard cycling; mutually exclusive with `--model`. |
+| `--albedo-texture IMAGE` | File Path | `None` | Applies a local image (including TGA) to the central model's UVs; requires Pillow. |
+| `--texture-filter` | `nearest`, `linear` | `linear` | Sets albedo texture minification and magnification filtering. |
+| `--texture-wrap` | `repeat`, `clamp_to_edge`, `mirror_repeat` | `repeat` | Sets albedo texture addressing on both U and V axes. |
 | `--output OUTPUT` | File Path | `None` | Writes the offscreen rendered frame to a PNG file. |
 
 ### 3.4 Interactive Controls
@@ -366,7 +414,7 @@ To provide a rigorous, transparent comparison:
 ### 5.2 Explicit Scope Differences (What MiniGfx Omits)
 
 Directly alongside these numbers, the following scope differences must be explicitly noted:
-- **Texture Sampling & Compression**: MiniEngine includes DDS file parsing, BC texture decompression, mipmap generation, and texture descriptor heap managers (`TextureManager.cpp/.h`). MiniGfx uses procedural PBR-lite materials without texture sampler bindings.
+- **Texture Sampling & Compression**: MiniEngine includes DDS file parsing, BC texture decompression, mipmap generation, and texture descriptor heap managers (`TextureManager.cpp/.h`). MiniGfx supports 2D RGBA albedo textures and configurable sampler bindings across its backends, but not BC compression or mipmap generation.
 - **Dynamic Cascaded Shadow Maps**: MiniEngine implements cascaded directional shadow maps with percentage-closer filtering (PCF) and variance shadow maps (`ShadowCamera.cpp`, `ShadowMappingCS.hlsl`). MiniGfx implements direct directional lighting without shadow depth passes.
 - **Multi-Pass Compute Post-Processing**: MiniEngine features compute-based Temporal Anti-Aliasing (TAA), bloom, depth of field (DoF), and motion blur (`PostEffects.cpp/.h`, `ToneMapCS.hlsl`, `BloomExtractCS.hlsl`). MiniGfx inlines ACES tonemapping directly into the forward fragment shader, eliminating multi-pass compute pipelines, intermediate HDR buffers, and resource transition barriers.
 - **Multithreaded Command Recording**: MiniEngine supports parallel command list generation across CPU threads (`CommandContext.cpp/.h`). MiniGfx generates draw commands single-threaded.
