@@ -1253,10 +1253,20 @@ def _readback_result(text: str, output: Path, width: int, height: int, backend: 
     return RenderedImage(width, height, rgba, report["device"])
 
 
+def _read_exact(stream, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = stream.read(size - len(chunks))
+        if not chunk:
+            break
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
 @contextmanager
 def _directx_offscreen_renderer(
     program: GraphicsProgram, width: int, height: int, validation: bool, toolchain: Toolchain | None = None,
-    provider: str | None = None,
+    provider: str | None = None, *, stream: bool | None = None,
 ):
     _dimensions(width, height)
     explicit_warp = provider == "warp"
@@ -1264,9 +1274,90 @@ def _directx_offscreen_renderer(
         provider = "warp"
     _validate_provider(provider, "directx")
     _require_directx_platform(provider)
+    use_stream = (provider == "nacelle") if stream is None else stream
     with _directx_shaders(program, toolchain or _preview_toolchain()) as (directory, arguments):
-        output = directory / "readback.rgba"
         warp_args = ["--warp"] if provider == "warp" else []
+        if use_stream:
+            cmd = [
+                os.fspath(a)
+                for a in [
+                    *arguments,
+                    *warp_args,
+                    *(["--validation"] if validation else []),
+                    "--width",
+                    str(width),
+                    "--height",
+                    str(height),
+                    "--stream",
+                ]
+            ]
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+                header = proc.stdout.readline()
+                if not header:
+                    err = proc.stderr.read().decode("utf-8", errors="replace").strip()
+                    code = proc.wait()
+                    raise ViewerError(f"Native DirectX 12 stream failed ({code}): {err}")
+                try:
+                    report = json.loads(header.decode("utf-8"))
+                except json.JSONDecodeError as error:
+                    raise ViewerError(f"The native DirectX 12 renderer returned an invalid stream header: {error}") from error
+                if (
+                    not isinstance(report, dict)
+                    or type(report.get("width")) is not int
+                    or type(report.get("height")) is not int
+                    or report["width"] != width
+                    or report["height"] != height
+                    or not isinstance(report.get("device"), str)
+                    or not report["device"]
+                ):
+                    raise ViewerError("The native DirectX 12 renderer returned an invalid render report.")
+                device_name = report["device"]
+                _check_nacelle_device(provider, device_name)
+                frame_bytes = width * height * 4
+
+                def render(elapsed: float) -> RenderedImage:
+                    try:
+                        proc.stdin.write(f"{_time_value(elapsed)}\n".encode("ascii"))
+                        proc.stdin.flush()
+                    except BrokenPipeError as error:
+                        err = proc.stderr.read().decode("utf-8", errors="replace").strip()
+                        raise ViewerError(f"Native DirectX 12 stream terminated unexpectedly: {err}") from error
+                    rgba = _read_exact(proc.stdout, frame_bytes)
+                    if len(rgba) != frame_bytes:
+                        err = proc.stderr.read().decode("utf-8", errors="replace").strip()
+                        raise ViewerError(f"DirectX 12 RGBA stream readback size mismatch: {err}")
+                    return RenderedImage(width, height, rgba, device_name)
+
+                yield render
+            finally:
+                try:
+                    if proc.stdin and not proc.stdin.closed:
+                        proc.stdin.write(b"quit\n")
+                        proc.stdin.flush()
+                        proc.stdin.close()
+                except OSError:
+                    pass
+                for pipe in (proc.stdout, proc.stderr):
+                    try:
+                        if pipe and not pipe.closed:
+                            pipe.close()
+                    except OSError:
+                        pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            return
+
+        output = directory / "readback.rgba"
         def render(elapsed: float) -> RenderedImage:
             timing = ["--time", str(_time_value(elapsed))]
             text = _directx_run(
@@ -1301,7 +1392,7 @@ def render_directx_offscreen(
     program = _with_resource_overrides(program, buffers=buffers, textures=textures, samplers=samplers)
     elapsed = _time_value(time)
     kwargs = {"provider": provider} if provider is not None else {}
-    with _directx_offscreen_renderer(program, width, height, validation, toolchain, **kwargs) as render:
+    with _directx_offscreen_renderer(program, width, height, validation, toolchain, stream=False, **kwargs) as render:
         return render(elapsed)
 
 
@@ -3852,7 +3943,8 @@ def _show_vulkan_window(program, width, height, frames, validation, time, provid
         if not glfw.vulkan_supported():
             raise ViewerError("GLFW cannot find a Vulkan loader and driver.")
         glfw.window_hint(glfw.CLIENT_API, glfw.NO_API)
-        window = glfw.create_window(width, height, f"mlir-gpu | {label} | Esc to close", None, None)
+        base_title = f"mlir-gpu | {label} | Esc to close"
+        window = glfw.create_window(width, height, base_title, None, None)
         if not window:
             raise ViewerError(f"GLFW window creation failed: {glfw.get_error()}.")
         resources.callback(glfw.destroy_window, window)
@@ -3862,6 +3954,8 @@ def _show_vulkan_window(program, width, height, frames, validation, time, provid
         started = clock.monotonic()
         vk = gpu.vk
         presented = 0
+        fps_frames = 0
+        fps_window_start = started
         announced = False
         while not glfw.window_should_close(window) and (frames == 0 or presented < frames):
             glfw.poll_events()
@@ -3921,16 +4015,27 @@ def _show_vulkan_window(program, width, height, frames, validation, time, provid
                         pWaitSemaphores=[acquired], pWaitDstStageMask=[wait_stage],
                         pCommandBuffers=[commands[image_index]], pSignalSemaphores=[finished[image_index]],
                     )], vk.VK_NULL_HANDLE)
+                    frame_presented = False
                     try:
                         gpu.device_function("vkQueuePresentKHR")(gpu.queue, vk.VkPresentInfoKHR(
                             pWaitSemaphores=[finished[image_index]], pSwapchains=[swapchain], pImageIndices=[image_index],
                         ))
                         presented += 1
+                        frame_presented = True
                     except vk.VkSuboptimalKhr:
                         presented += 1
+                        frame_presented = True
                         recreate = True
                     except vk.VkErrorOutOfDateKhr:
                         recreate = True
+                    if frame_presented:
+                        fps_frames += 1
+                        now = clock.monotonic()
+                        fps_elapsed = now - fps_window_start
+                        if fps_elapsed >= 0.5:
+                            glfw.set_window_title(window, f"{base_title} | {fps_frames / fps_elapsed:.1f} FPS")
+                            fps_frames = 0
+                            fps_window_start = now
                     # A single frame in flight keeps this preview's resource lifetime simple.
                     vk.vkQueueWaitIdle(gpu.queue)
         return presented

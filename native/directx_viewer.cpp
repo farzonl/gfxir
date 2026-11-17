@@ -1877,7 +1877,15 @@ public:
         }
     }
 
-    void readback(UINT width, UINT height, const std::wstring& path) {
+    struct OffscreenTarget {
+        ComPtr<ID3D12Resource> target;
+        ComPtr<ID3D12Resource> buffer;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        UINT64 size = 0;
+    };
+
+    OffscreenTarget createOffscreenTarget(UINT width, UINT height) {
+        OffscreenTarget out;
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC texture{};
@@ -1888,50 +1896,79 @@ public:
         texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         texture.SampleDesc.Count = 1;
         texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        ComPtr<ID3D12Resource> target, buffer;
         check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture,
-            D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&target)), "Create offscreen target");
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-        UINT64 size = 0;
-        device->GetCopyableFootprints(&texture, 0, 1, 0, &footprint, nullptr, nullptr, &size);
+            D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&out.target)), "Create offscreen target");
+        device->GetCopyableFootprints(&texture, 0, 1, 0, &out.footprint, nullptr, nullptr, &out.size);
         heap.Type = D3D12_HEAP_TYPE_READBACK;
         D3D12_RESOURCE_DESC storage{};
         storage.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        storage.Width = size;
+        storage.Width = out.size;
         storage.Height = storage.DepthOrArraySize = storage.MipLevels = 1;
         storage.SampleDesc.Count = 1;
         storage.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &storage,
-            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)), "Create readback buffer");
-        double elapsed = hasFixedTime ? fixedTime : 0.0;
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&out.buffer)), "Create readback buffer");
+        return out;
+    }
+
+    void renderOffscreenFrame(OffscreenTarget& offscreen, UINT width, UINT height, double elapsed,
+                              bool needsRenderTargetBarrier, std::vector<char>& rgba) {
         begin();
-        draw(target.Get(), width, height, elapsed);
-        barrier(target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (needsRenderTargetBarrier) {
+            barrier(offscreen.target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+        draw(offscreen.target.Get(), width, height, elapsed);
+        barrier(offscreen.target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
-        source.pResource = target.Get();
+        source.pResource = offscreen.target.Get();
         source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        destination.pResource = buffer.Get();
+        destination.pResource = offscreen.buffer.Get();
         destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        destination.PlacedFootprint = footprint;
+        destination.PlacedFootprint = offscreen.footprint;
         commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
         submit();
-        std::vector<char> rgba(static_cast<size_t>(width) * height * 4);
+        rgba.resize(static_cast<size_t>(width) * height * 4);
         void* mapped = nullptr;
-        D3D12_RANGE range{0, static_cast<SIZE_T>(size)};
-        check(buffer->Map(0, &range, &mapped), "Map readback");
+        D3D12_RANGE range{0, static_cast<SIZE_T>(offscreen.size)};
+        check(offscreen.buffer->Map(0, &range, &mapped), "Map readback");
         for (UINT row = 0; row < height; ++row)
             std::memcpy(rgba.data() + static_cast<size_t>(row) * width * 4,
-                        static_cast<char*>(mapped) + footprint.Offset +
-                            static_cast<size_t>(row) * footprint.Footprint.RowPitch,
+                        static_cast<char*>(mapped) + offscreen.footprint.Offset +
+                            static_cast<size_t>(row) * offscreen.footprint.Footprint.RowPitch,
                         static_cast<size_t>(width) * 4);
         D3D12_RANGE written{0, 0};
-        buffer->Unmap(0, &written);
+        offscreen.buffer->Unmap(0, &written);
+    }
+
+    void readback(UINT width, UINT height, const std::wstring& path) {
+        OffscreenTarget offscreen = createOffscreenTarget(width, height);
+        std::vector<char> rgba;
+        double elapsed = hasFixedTime ? fixedTime : 0.0;
+        renderOffscreenFrame(offscreen, width, height, elapsed, false, rgba);
         std::ofstream output(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
         if (!output) throw std::runtime_error("Cannot open RGBA readback output");
         output.write(rgba.data(), rgba.size());
         output.close();
         if (!output) throw std::runtime_error("Cannot write RGBA readback output");
         std::cout << glz::write_json(ReadbackReport{name, width, height}).value_or("{}") << "\n";
+    }
+
+    void stream(UINT width, UINT height) {
+        OffscreenTarget offscreen = createOffscreenTarget(width, height);
+        std::cout << glz::write_json(ReadbackReport{name, width, height}).value_or("{}") << "\n" << std::flush;
+        std::vector<char> rgba;
+        bool firstFrame = true;
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            if (line == "quit") break;
+            if (line.empty()) continue;
+            double elapsed = hasFixedTime ? fixedTime : std::stod(line);
+            renderOffscreenFrame(offscreen, width, height, elapsed, !firstFrame, rgba);
+            firstFrame = false;
+            std::cout.write(rgba.data(), rgba.size());
+            std::cout.flush();
+            if (!std::cout) break;
+        }
     }
 
 #ifndef GFX_NACELLE
@@ -2031,6 +2068,7 @@ int wmain(int argc, wchar_t** argv) {
         bool validation = false;
         bool warp = false;
         bool reportCapabilities = false;
+        bool stream = false;
         DepthSettings depthSettings;
         for (int index = 1; index < argc; ++index) {
             std::wstring key = argv[index];
@@ -2047,6 +2085,11 @@ int wmain(int argc, wchar_t** argv) {
             if (key == L"--report-capabilities") {
                 if (reportCapabilities) throw std::runtime_error("Missing or duplicate native viewer argument");
                 reportCapabilities = true;
+                continue;
+            }
+            if (key == L"--stream") {
+                if (stream) throw std::runtime_error("Missing or duplicate native viewer argument");
+                stream = true;
                 continue;
             }
             if (key == L"-frames") key = L"--frames";
@@ -2097,6 +2140,8 @@ int wmain(int argc, wchar_t** argv) {
             throw std::runtime_error("Dimensions must be positive; vertex count must be a positive multiple of three");
         if (options.count(L"--readback") && options.count(L"--frames"))
             throw std::runtime_error("--readback and --frames are mutually exclusive");
+        if (stream && (options.count(L"--readback") || options.count(L"--frames")))
+            throw std::runtime_error("--stream cannot be combined with --readback or --frames");
 
         bool hasTime = options.count(L"--time") != 0;
         double fixedTime = hasTime ? seconds(options.at(L"--time")) : 0.0;
@@ -2134,7 +2179,9 @@ int wmain(int argc, wchar_t** argv) {
             throw std::runtime_error("--color-format requires --post-spec");
         if (options.count(L"--post-spec"))
             renderer.setPostProcess(options.at(L"--post-spec"), validation);
-        if (options.count(L"--readback")) {
+        if (stream) {
+            renderer.stream(width, height);
+        } else if (options.count(L"--readback")) {
             renderer.readback(width, height, options.at(L"--readback"));
         } else {
 #ifdef GFX_NACELLE
