@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 from pathlib import Path
 import struct
@@ -58,6 +59,7 @@ class _FakeBridgeLib:
         self._device_name = device_name.encode("utf-8")
         self._next_handle = 100
         self._buffers: dict[int, int] = {}
+        self._buffer_data: dict[int, bytearray] = {}
         self._pipelines: set[int] = set()
         self.dispatches = 0
 
@@ -84,19 +86,34 @@ class _FakeBridgeLib:
         val = int(getattr(size_bytes, "value", size_bytes))
         h = self._alloc_handle()
         self._buffers[h] = val
+        self._buffer_data[h] = bytearray(val)
         return h
 
     def gfx_dx12_buffer_size(self, buf):
         return self._buffers.get(int(buf), 0)
 
     def gfx_dx12_upload_buffer(self, dev, buf, data, size_bytes, offset):
+        h = int(getattr(buf, "value", buf))
+        n = int(getattr(size_bytes, "value", size_bytes))
+        off = int(getattr(offset, "value", offset))
+        ptr = int(getattr(data, "value", data) or 0)
+        if h in self._buffer_data and n > 0 and ptr:
+            self._buffer_data[h][off : off + n] = ctypes.string_at(ptr, n)
         return 0
 
     def gfx_dx12_download_buffer(self, dev, buf, out_data, size_bytes, offset):
+        h = int(getattr(buf, "value", buf))
+        n = int(getattr(size_bytes, "value", size_bytes))
+        off = int(getattr(offset, "value", offset))
+        ptr = int(getattr(out_data, "value", out_data) or 0)
+        if h in self._buffer_data and n > 0 and ptr:
+            ctypes.memmove(ptr, bytes(self._buffer_data[h][off : off + n]), n)
         return 0
 
     def gfx_dx12_destroy_buffer(self, buf):
-        self._buffers.pop(int(getattr(buf, "value", buf)), None)
+        h = int(getattr(buf, "value", buf))
+        self._buffers.pop(h, None)
+        self._buffer_data.pop(h, None)
 
     def gfx_dx12_create_pipeline(self, dev, dxil, dxil_size):
         h = self._alloc_handle()
@@ -259,6 +276,32 @@ class TestDirectXComputeValidation(unittest.TestCase):
                 with self.assertRaises(PersistentComputeError):
                     ctx.compile_pipeline(_dummy_program(target="vulkan"))
             self.assertTrue(ctx.closed)
+
+    def test_download_into_direct_and_validation(self) -> None:
+        fake = _FakeBridgeLib()
+        with mock.patch("mlir_gpu.directx_compute.sys.platform", "win32"), mock.patch(
+            "mlir_gpu.directx_compute._load_bridge", return_value=fake
+        ):
+            with DirectXComputeContext(provider="warp") as ctx:
+                buf = ctx.create_buffer(8, initial_data=b"\x01\x02\x03\x04\x05\x06\x07\x08")
+                dst = bytearray(8)
+                self.assertEqual(buf.download_into(dst), 8)
+                self.assertEqual(bytes(dst), b"\x01\x02\x03\x04\x05\x06\x07\x08")
+
+                sliced = bytearray(4)
+                self.assertEqual(buf.download_into(memoryview(sliced), size_bytes=4, offset=2), 4)
+                self.assertEqual(bytes(sliced), b"\x03\x04\x05\x06")
+
+                strided = bytearray(8)
+                strided_view = memoryview(strided)[::2]
+                self.assertEqual(buf.download_into(strided_view, size_bytes=4, offset=4), 4)
+                self.assertEqual(bytes(strided_view), b"\x05\x06\x07\x08")
+
+                with self.assertRaises(PersistentComputeError):
+                    buf.download_into(memoryview(b"12345678"))
+                with self.assertRaises(PersistentComputeError):
+                    buf.download_into(bytearray(4))
+                buf.close()
 
 
 _DispatchParams = ParameterBlock(
