@@ -348,6 +348,58 @@ class DirectXBuffer(PersistentBuffer):
             )
         return bytes(out_arr)
 
+    def download_into(
+        self,
+        dst: bytearray | memoryview,
+        size_bytes: int | None = None,
+        offset: int = 0,
+    ) -> int:
+        buf_handle = self._ensure_open()
+        dev_handle = self._context._ensure_open()
+        _validate_non_negative_int(offset, "download offset")
+        if offset > self._size_bytes:
+            raise PersistentComputeError(
+                f"Download offset {offset} exceeds buffer size {self._size_bytes}."
+            )
+        read_size = (
+            (self._size_bytes - offset)
+            if size_bytes is None
+            else _validate_non_negative_int(size_bytes, "download size_bytes")
+        )
+        if offset + read_size > self._size_bytes:
+            raise PersistentComputeError(
+                f"Download range [{offset}, {offset + read_size}) exceeds buffer size {self._size_bytes}."
+            )
+        dst_view = memoryview(dst)
+        if dst_view.format != "B":
+            dst_view = dst_view.cast("B")
+        if dst_view.readonly:
+            raise PersistentComputeError("download_into destination buffer must be writable.")
+        if len(dst_view) < read_size:
+            raise PersistentComputeError(
+                f"download_into destination buffer ({len(dst_view)} bytes) is smaller than {read_size} bytes."
+            )
+        if read_size == 0:
+            self._context.synchronize()
+            return 0
+        if dst_view.c_contiguous:
+            c_dst = (ctypes.c_ubyte * read_size).from_buffer(dst_view[:read_size])
+            rc = self._context._lib.gfx_dx12_download_buffer(
+                ctypes.c_void_p(dev_handle),
+                ctypes.c_void_p(buf_handle),
+                ctypes.cast(c_dst, ctypes.c_void_p),
+                ctypes.c_uint64(read_size),
+                ctypes.c_uint64(offset),
+            )
+            if rc != 0:
+                raise PersistentComputeError(
+                    f"DirectX 12 buffer download failed: {self._context._last_error()}"
+                )
+            return read_size
+        raw = self.download(size_bytes=read_size, offset=offset)
+        dst_view[:read_size] = raw
+        return read_size
+
     def close(self) -> None:
         if not self._closed:
             self._closed = True
