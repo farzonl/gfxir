@@ -231,14 +231,26 @@ class GfxArray:
         if self._size == 0:
             return out
         expected_bytes = self._size * self._dtype.itemsize
-        out.frombytes(b"\x00" * expected_bytes)
-        self.download_into(out)
+        buf = bytearray(expected_bytes)
+        self.download_into(buf)
+        out.frombytes(buf)
         if sys.byteorder != "little":
             out.byteswap()
         return out
 
     def tomemoryview(self) -> memoryview:
         """Synchronize and return a typed memoryview over the downloaded array without float boxing."""
+        self._ensure_open()
+        if sys.byteorder == "little":
+            if self._size == 0:
+                mv = memoryview(_stdlib_array.array(self._dtype.struct_code))
+            else:
+                buf = bytearray(self._size * self._dtype.itemsize)
+                self.download_into(buf)
+                mv = memoryview(buf).cast(self._dtype.struct_code)
+            if self.ndim == 2:
+                return mv.cast("B").cast(self._dtype.struct_code, shape=self._shape)
+            return mv
         arr = self.toarray()
         mv = memoryview(arr)
         if self.ndim == 2:
