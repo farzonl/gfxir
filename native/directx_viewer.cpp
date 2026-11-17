@@ -1912,7 +1912,7 @@ public:
     }
 
     void renderOffscreenFrame(OffscreenTarget& offscreen, UINT width, UINT height, double elapsed,
-                              bool needsRenderTargetBarrier, std::vector<char>& rgba) {
+                              bool needsRenderTargetBarrier, bool bgra, std::vector<char>& rgba) {
         begin();
         if (needsRenderTargetBarrier) {
             barrier(offscreen.target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1931,11 +1931,22 @@ public:
         void* mapped = nullptr;
         D3D12_RANGE range{0, static_cast<SIZE_T>(offscreen.size)};
         check(offscreen.buffer->Map(0, &range, &mapped), "Map readback");
-        for (UINT row = 0; row < height; ++row)
-            std::memcpy(rgba.data() + static_cast<size_t>(row) * width * 4,
-                        static_cast<char*>(mapped) + offscreen.footprint.Offset +
-                            static_cast<size_t>(row) * offscreen.footprint.Footprint.RowPitch,
-                        static_cast<size_t>(width) * 4);
+        for (UINT row = 0; row < height; ++row) {
+            const char* src = static_cast<char*>(mapped) + offscreen.footprint.Offset +
+                              static_cast<size_t>(row) * offscreen.footprint.Footprint.RowPitch;
+            char* dst = rgba.data() + static_cast<size_t>(row) * width * 4;
+            if (!bgra) {
+                std::memcpy(dst, src, static_cast<size_t>(width) * 4);
+            } else {
+                for (UINT col = 0; col < width; ++col) {
+                    const size_t offset = static_cast<size_t>(col) * 4;
+                    dst[offset + 0] = src[offset + 2];
+                    dst[offset + 1] = src[offset + 1];
+                    dst[offset + 2] = src[offset + 0];
+                    dst[offset + 3] = src[offset + 3];
+                }
+            }
+        }
         D3D12_RANGE written{0, 0};
         offscreen.buffer->Unmap(0, &written);
     }
@@ -1944,7 +1955,7 @@ public:
         OffscreenTarget offscreen = createOffscreenTarget(width, height);
         std::vector<char> rgba;
         double elapsed = hasFixedTime ? fixedTime : 0.0;
-        renderOffscreenFrame(offscreen, width, height, elapsed, false, rgba);
+        renderOffscreenFrame(offscreen, width, height, elapsed, false, false, rgba);
         std::ofstream output(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
         if (!output) throw std::runtime_error("Cannot open RGBA readback output");
         output.write(rgba.data(), rgba.size());
@@ -1953,7 +1964,7 @@ public:
         std::cout << glz::write_json(ReadbackReport{name, width, height}).value_or("{}") << "\n";
     }
 
-    void stream(UINT width, UINT height) {
+    void stream(UINT width, UINT height, bool bgra = false) {
         OffscreenTarget offscreen = createOffscreenTarget(width, height);
         std::cout << glz::write_json(ReadbackReport{name, width, height}).value_or("{}") << "\n" << std::flush;
         std::vector<char> rgba;
@@ -1963,7 +1974,7 @@ public:
             if (line == "quit") break;
             if (line.empty()) continue;
             double elapsed = hasFixedTime ? fixedTime : std::stod(line);
-            renderOffscreenFrame(offscreen, width, height, elapsed, !firstFrame, rgba);
+            renderOffscreenFrame(offscreen, width, height, elapsed, !firstFrame, bgra, rgba);
             firstFrame = false;
             std::cout.write(rgba.data(), rgba.size());
             std::cout.flush();
@@ -2069,6 +2080,7 @@ int wmain(int argc, wchar_t** argv) {
         bool warp = false;
         bool reportCapabilities = false;
         bool stream = false;
+        bool streamBgra = false;
         DepthSettings depthSettings;
         for (int index = 1; index < argc; ++index) {
             std::wstring key = argv[index];
@@ -2090,6 +2102,12 @@ int wmain(int argc, wchar_t** argv) {
             if (key == L"--stream") {
                 if (stream) throw std::runtime_error("Missing or duplicate native viewer argument");
                 stream = true;
+                continue;
+            }
+            if (key == L"--stream-bgra") {
+                if (streamBgra) throw std::runtime_error("Missing or duplicate native viewer argument");
+                stream = true;
+                streamBgra = true;
                 continue;
             }
             if (key == L"-frames") key = L"--frames";
@@ -2180,7 +2198,7 @@ int wmain(int argc, wchar_t** argv) {
         if (options.count(L"--post-spec"))
             renderer.setPostProcess(options.at(L"--post-spec"), validation);
         if (stream) {
-            renderer.stream(width, height);
+            renderer.stream(width, height, streamBgra);
         } else if (options.count(L"--readback")) {
             renderer.readback(width, height, options.at(L"--readback"));
         } else {

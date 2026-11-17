@@ -177,6 +177,7 @@ class RenderedImage:
     height: int
     rgba: bytes
     device: str
+    bgra: bool = False
 
 
 def _validate_resource_maps(
@@ -1253,20 +1254,10 @@ def _readback_result(text: str, output: Path, width: int, height: int, backend: 
     return RenderedImage(width, height, rgba, report["device"])
 
 
-def _read_exact(stream, size: int) -> bytes:
-    chunks = bytearray()
-    while len(chunks) < size:
-        chunk = stream.read(size - len(chunks))
-        if not chunk:
-            break
-        chunks.extend(chunk)
-    return bytes(chunks)
-
-
 @contextmanager
 def _directx_offscreen_renderer(
     program: GraphicsProgram, width: int, height: int, validation: bool, toolchain: Toolchain | None = None,
-    provider: str | None = None, *, stream: bool | None = None,
+    provider: str | None = None, *, stream: bool | None = None, bgra: bool = False,
 ):
     _dimensions(width, height)
     explicit_warp = provider == "warp"
@@ -1278,6 +1269,7 @@ def _directx_offscreen_renderer(
     with _directx_shaders(program, toolchain or _preview_toolchain()) as (directory, arguments):
         warp_args = ["--warp"] if provider == "warp" else []
         if use_stream:
+            stream_flag = "--stream-bgra" if bgra else "--stream"
             cmd = [
                 os.fspath(a)
                 for a in [
@@ -1288,7 +1280,7 @@ def _directx_offscreen_renderer(
                     str(width),
                     "--height",
                     str(height),
-                    "--stream",
+                    stream_flag,
                 ]
             ]
             proc = subprocess.Popen(
@@ -1329,11 +1321,11 @@ def _directx_offscreen_renderer(
                     except BrokenPipeError as error:
                         err = proc.stderr.read().decode("utf-8", errors="replace").strip()
                         raise ViewerError(f"Native DirectX 12 stream terminated unexpectedly: {err}") from error
-                    rgba = _read_exact(proc.stdout, frame_bytes)
+                    rgba = proc.stdout.read(frame_bytes)
                     if len(rgba) != frame_bytes:
                         err = proc.stderr.read().decode("utf-8", errors="replace").strip()
                         raise ViewerError(f"DirectX 12 RGBA stream readback size mismatch: {err}")
-                    return RenderedImage(width, height, rgba, device_name)
+                    return RenderedImage(width, height, rgba, device_name, bgra=bgra)
 
                 yield render
             finally:
@@ -1418,11 +1410,13 @@ def show_directx_window(
         if validation:
             raise ViewerError("Nacelle does not provide D3D12 validation; omit --validation.")
 
-        def renderer(frame_width, frame_height):
+        def renderer(frame_width, frame_height, *, bgra=False):
+            kwargs = {"bgra": True} if bgra else {}
             return _directx_offscreen_renderer(
-                program, frame_width, frame_height, False, toolchain, provider="nacelle",
+                program, frame_width, frame_height, False, toolchain, provider="nacelle", **kwargs,
             )
 
+        renderer._supports_bgra = True
         count = _show_vulkan_window(program, width, height, frames, False, time, renderer=renderer)
         print(f"Presented {count} Nacelle frames.")
         return
@@ -3794,7 +3788,7 @@ def _pixel_commands(gpu, resources, images, format, width, height, render):
         if (image.width, image.height) != (width, height) or len(image.rgba) != size:
             raise ViewerError("Nacelle RGBA frame does not match the Vulkan surface extent.")
         rgba = image.rgba
-        if format == vk.VK_FORMAT_B8G8R8A8_UNORM:
+        if format == vk.VK_FORMAT_B8G8R8A8_UNORM and not getattr(image, "bgra", False):
             pixels = bytearray(rgba)
             pixels[0::4], pixels[2::4] = rgba[2::4], rgba[0::4]
             rgba = bytes(pixels)
@@ -3870,7 +3864,8 @@ def _swapchain(gpu, resources, program, width, height, *, renderer=None):
     resources.callback(gpu.device_function("vkDestroySwapchainKHR"), gpu.device, swapchain, None)
     images = gpu.device_function("vkGetSwapchainImagesKHR")(gpu.device, swapchain)
     if renderer is not None:
-        render = resources.enter_context(renderer(width, height))
+        render_kwargs = {"bgra": True} if (format == vk.VK_FORMAT_B8G8R8A8_UNORM and getattr(renderer, "_supports_bgra", False)) else {}
+        render = resources.enter_context(renderer(width, height, **render_kwargs))
         commands, record_frame = _pixel_commands(gpu, resources, images, format, width, height, render)
         acquired, finished = _swapchain_sync(gpu, resources, len(commands))
         return swapchain, commands, acquired, finished, record_frame
@@ -3943,6 +3938,8 @@ def _show_vulkan_window(program, width, height, frames, validation, time, provid
         if not glfw.vulkan_supported():
             raise ViewerError("GLFW cannot find a Vulkan loader and driver.")
         glfw.window_hint(glfw.CLIENT_API, glfw.NO_API)
+        if renderer is not None and hasattr(glfw, "SCALE_FRAMEBUFFER"):
+            glfw.window_hint(glfw.SCALE_FRAMEBUFFER, glfw.FALSE)
         base_title = f"mlir-gpu | {label} | Esc to close"
         window = glfw.create_window(width, height, base_title, None, None)
         if not window:
@@ -4000,9 +3997,10 @@ def _show_vulkan_window(program, width, height, frames, validation, time, provid
                         record_frame(image_index, elapsed)
                     else:
                         pending = executor.submit(record_frame, image_index, elapsed)
+                        pending.add_done_callback(lambda _fut: glfw.post_empty_event())
                         try:
                             while not pending.done():
-                                glfw.wait_events_timeout(0.01)
+                                glfw.wait_events_timeout(0.1)
                                 if glfw.get_key(window, glfw.KEY_ESCAPE) == glfw.PRESS:
                                     glfw.set_window_should_close(window, True)
                         finally:
