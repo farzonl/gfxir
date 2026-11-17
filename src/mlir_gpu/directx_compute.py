@@ -17,7 +17,9 @@ from .compute_runtime import (
     PersistentBuffer,
     PersistentComputeError,
     PersistentPipeline,
+    _BoundedBufferPool,
     _pack_dispatch_parameters,
+    _resolve_pool_max_bytes,
     _validate_non_negative_int,
     _validate_positive_int,
 )
@@ -352,8 +354,9 @@ class DirectXBuffer(PersistentBuffer):
             self._context._buffers.discard(self)
             handle = self._handle
             self._handle = None
+            self._context._pool.on_live_free(self._size_bytes)
             if handle is not None and self._context._lib is not None:
-                self._context._lib.gfx_dx12_destroy_buffer(ctypes.c_void_p(handle))
+                self._context._return_buffer_to_pool(self._size_bytes, handle)
 
     def __del__(self) -> None:
         try:
@@ -533,6 +536,7 @@ class DirectXComputeContext(ComputeContext):
         *,
         validation: bool = False,
         provider: str | None = None,
+        pool_max_bytes: int | None = None,
     ) -> None:
         try:
             _require_directx_platform(provider)
@@ -560,6 +564,7 @@ class DirectXComputeContext(ComputeContext):
         self._closed = False
         self._buffers: weakref.WeakSet[DirectXBuffer] = weakref.WeakSet()
         self._pipelines: weakref.WeakSet[DirectXPipeline] = weakref.WeakSet()
+        self._pool = _BoundedBufferPool(max_bytes=_resolve_pool_max_bytes(pool_max_bytes))
 
         raw_name = self._lib.gfx_dx12_device_name(ctypes.c_void_p(self._handle))
         self._device_name = raw_name.decode("utf-8", errors="replace") if raw_name else "DirectX 12"
@@ -617,13 +622,46 @@ class DirectXComputeContext(ComputeContext):
         raw = self._lib.gfx_dx12_last_error(ctypes.c_void_p(self._handle))
         return raw.decode("utf-8", errors="replace") if raw else "unknown DirectX 12 error"
 
+    def _destroy_dx12_buffer(self, handle: int) -> None:
+        if self._lib is not None:
+            self._lib.gfx_dx12_destroy_buffer(ctypes.c_void_p(handle))
+
+    def _return_buffer_to_pool(self, size_bytes: int, handle: int) -> None:
+        if self._closed:
+            self._destroy_dx12_buffer(handle)
+            return
+        self._pool.release(size_bytes, handle, self._destroy_dx12_buffer)
+
     def create_buffer(
         self,
         size_bytes: int,
         initial_data: bytes | bytearray | memoryview | None = None,
+        *,
+        zero_init: bool = True,
     ) -> DirectXBuffer:
         dev_handle = self._ensure_open()
         validated = _validate_positive_int(size_bytes, "size_bytes")
+
+        pooled_handle = self._pool.acquire(validated)
+        if pooled_handle is not None:
+            buf = DirectXBuffer(self, int(pooled_handle), validated)
+            self._pool.on_live_alloc(validated)
+            try:
+                if initial_data is not None:
+                    buf.upload(initial_data)
+                    if zero_init and len(initial_data) < validated:
+                        buf.upload(b"\x00" * (validated - len(initial_data)), offset=len(initial_data))
+                elif zero_init:
+                    buf.upload(b"\x00" * validated)
+            except Exception:
+                buf._closed = True
+                buf._handle = None
+                self._pool.on_live_free(validated)
+                self._destroy_dx12_buffer(int(pooled_handle))
+                raise
+            self._buffers.add(buf)
+            return buf
+
         buf_handle = self._lib.gfx_dx12_create_buffer(
             ctypes.c_void_p(dev_handle), ctypes.c_uint64(validated)
         )
@@ -631,6 +669,8 @@ class DirectXComputeContext(ComputeContext):
             raise PersistentComputeError(
                 f"DirectX 12 buffer allocation failed: {self._last_error()}"
             )
+        self._pool.record_allocation()
+        self._pool.on_live_alloc(validated)
         buf = DirectXBuffer(self, int(buf_handle), validated)
         self._buffers.add(buf)
         if initial_data is not None:
@@ -675,6 +715,18 @@ class DirectXComputeContext(ComputeContext):
         self._pipelines.add(pipe)
         return pipe
 
+    @property
+    def stats(self) -> dict[str, int]:
+        return self._pool.stats()
+
+    def reset_stats(self) -> None:
+        self._pool.reset_counters()
+
+    def release_pool(self) -> int:
+        if self._closed:
+            return 0
+        return self._pool.clear(self._destroy_dx12_buffer)
+
     def synchronize(self) -> None:
         self._ensure_open()
 
@@ -694,6 +746,10 @@ class DirectXComputeContext(ComputeContext):
                 errors.append(exc)
         self._buffers.clear()
         self._pipelines.clear()
+        try:
+            self._pool.clear(self._destroy_dx12_buffer)
+        except BaseException as exc:
+            errors.append(exc)
         self._closed = True
         handle = self._handle
         self._handle = None
