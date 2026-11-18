@@ -510,6 +510,9 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
 @interface GraphicsRenderer : NSObject <MTKViewDelegate, NSWindowDelegate>
 {
     std::chrono::steady_clock::time_point _started;
+    std::chrono::steady_clock::time_point _fpsWindowStart;
+    NSUInteger _fpsFrames;
+    BOOL _hasFpsWindowStart;
     ReflectedArgBufferLayout _vertexArgLayout;
     ReflectedArgBufferLayout _fragmentArgLayout;
     std::map<std::string, ReflectedArgBufferLayout> _pipelineVertexArgLayouts;
@@ -1018,6 +1021,20 @@ static std::vector<uint8_t> packTopLevelArgBuffer(const uint8_t* rootConstantDat
             if (command.status == MTLCommandBufferStatusError)
                 throw failure(@"Metal rendering failed", command.error);
             self.frames += 1;
+            _fpsFrames += 1;
+            auto now = std::chrono::steady_clock::now();
+            if (!_hasFpsWindowStart) {
+                _fpsWindowStart = now;
+                _hasFpsWindowStart = YES;
+            } else {
+                double fpsElapsed = std::chrono::duration<double>(now - _fpsWindowStart).count();
+                if (fpsElapsed >= 0.5) {
+                    double fps = static_cast<double>(_fpsFrames) / fpsElapsed;
+                    view.window.title = [NSString stringWithFormat:@"mlir-gpu | DXIL to Metal | Esc to close | %.1f FPS", fps];
+                    _fpsFrames = 0;
+                    _fpsWindowStart = now;
+                }
+            }
             if (self.limit && self.frames >= self.limit) stopPreview();
         } catch (const std::exception& error) {
             std::cerr << "mlir-gpu-metal-view: " << error.what() << "\n";
