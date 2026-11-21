@@ -61,7 +61,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .sdk
-          key: gpu-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0-msc1.1
+          key: gpu-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0-msc4.0b3
 
       - name: Install DirectXShaderCompiler SDK (Linux)
         if: runner.os == 'Linux' && steps.cache-gpu-sdk.outputs.cache-hit != 'true'
@@ -90,20 +90,23 @@ jobs:
           cp -a /tmp/vulkansdk/macOS/share/vulkan/explicit_layer.d .sdk/share/vulkan/
           rm -rf /tmp/vulkansdk /tmp/vulkansdk-installer /tmp/vulkansdk.zip
 
-          git clone --depth 1 https://github.com/MethanePowered/MetalShaderConverterBinary.git /tmp/msc
-          cp -a /tmp/msc/include/metal_irconverter_runtime .sdk/include/
-          unzip -q /tmp/msc/binaries/MacOS.zip -d /tmp/msc-bins
-          cp -a /tmp/msc-bins/bin/metal-shaderconverter .sdk/bin/
+          # Metal Shader Converter 4.0 beta 3 (.pkg)
+          curl -fsSL "https://drive.usercontent.google.com/download?id=1JJ9KhEtHPKfBN6yuXVL8QikTxsqTDA0B&export=download&confirm=t" \
+            -o /tmp/msc.pkg
+          pkgutil --expand-full /tmp/msc.pkg /tmp/msc-expanded
+          MSC_USR="/tmp/msc-expanded/MetalShaderConverter.pkg/Payload/usr/local"
+          cp -a "${MSC_USR}/bin/"* .sdk/bin/
+          cp -a "${MSC_USR}/lib/"* .sdk/lib/
+          cp -a "${MSC_USR}/include/"* .sdk/include/
           chmod +x .sdk/bin/metal-shaderconverter
-          cp -a /tmp/msc-bins/lib/libmetalirconverter* .sdk/lib/
-          rm -rf /tmp/msc /tmp/msc-bins
+          rm -rf /tmp/msc.pkg /tmp/msc-expanded
 
       - name: Save GPU SDK dependencies cache
         if: steps.cache-gpu-sdk.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: .sdk
-          key: gpu-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0-msc1.1
+          key: gpu-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0-msc4.0b3
 
       - name: Cache Nacelle release SDK
         id: cache-nacelle
