@@ -181,7 +181,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .tools/bin
-          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm', 'native/directx_viewer.cpp', 'native/directx_compute_bridge.cpp', 'native/nacelle_compat.h', 'examples/minigfx/_directx_bridge.cpp', 'tools/setup_nacelle.py') }}
+          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-msc4.0b3-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm', 'native/directx_viewer.cpp', 'native/directx_compute_bridge.cpp', 'native/nacelle_compat.h', 'examples/minigfx/_directx_bridge.cpp', 'tools/setup_nacelle.py') }}
 
       - name: Build native helper binaries
         if: steps.cache-native-tools.outputs.cache-hit != 'true'
@@ -205,7 +205,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .tools/bin
-          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm', 'native/directx_viewer.cpp', 'native/directx_compute_bridge.cpp', 'native/nacelle_compat.h', 'examples/minigfx/_directx_bridge.cpp', 'tools/setup_nacelle.py') }}
+          key: native-tools-bins-${{ runner.os }}-${{ runner.arch }}-msc4.0b3-${{ hashFiles('CMakeLists.txt', 'native/dxil_tool.cpp', 'native/metal_viewer.mm', 'native/directx_viewer.cpp', 'native/directx_compute_bridge.cpp', 'native/nacelle_compat.h', 'examples/minigfx/_directx_bridge.cpp', 'tools/setup_nacelle.py') }}
 
       - name: Report Nacelle DirectX capabilities
         env:
