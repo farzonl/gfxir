@@ -4,7 +4,6 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
-import re
 import sys
 import tempfile
 import unittest
@@ -50,48 +49,38 @@ def _post_program():
     )
 
 
-def _metal_ci_validation_skip_reason():
-    if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
+def _metal_device_name() -> str:
+    return _run([
+        "swift", "-e", 'import Metal; print(MTLCreateSystemDefaultDevice()?.name ?? "")',
+    ]).strip()
+
+
+def _metal_shader_validation_skip_reason():
+    if sys.platform != "darwin":
         return None
-    version_text = _run([TOOLS.find("metal-shaderconverter"), "--version"])
-    version = re.search(r"metal-irconverter version:\s*(\d+)\.(\d+)", version_text)
-    if version is None:
-        raise RuntimeError(f"Cannot identify Metal Shader Converter version: {version_text.strip()}")
-    if tuple(map(int, version.groups())) < (3, 0):
+    device_name = _metal_device_name()
+    if "paravirtual" in device_name.lower():
         return (
-            f"Metal Shader Converter {version.group(1)}.{version.group(2)} on macOS CI: "
-            "validated Metal texture tests require the locally verified converter >= 3.0. "
-            "Unvalidated Metal rendering remains tested."
+            f"{device_name} on macOS: Metal shader validation produces black texture reads "
+            "for converted argument-buffer textures. Unvalidated Metal rendering remains tested."
         )
     return None
 
 
 class PostProcessValidationTests(unittest.TestCase):
-    def test_metal_ci_validation_gate_is_version_and_environment_specific(self):
+    def test_metal_shader_validation_gate_is_device_and_platform_specific(self):
         cases = (
-            ("darwin", "true", "1.1.0", True),
-            ("darwin", "true", "2.0.0", True),
-            ("darwin", "true", "3.0.0", False),
-            ("darwin", "true", "4.0.0", False),
-            ("darwin", "", "1.1.0", False),
-            ("linux", "true", "1.1.0", False),
+            ("darwin", "Apple Paravirtual device", True),
+            ("darwin", "Apple M3 Max", False),
+            ("darwin", "", False),
+            ("linux", "Apple Paravirtual device", False),
         )
-        for platform, actions, version, skipped in cases:
-            with self.subTest(platform=platform, actions=actions, version=version), \
+        for platform, device_name, skipped in cases:
+            with self.subTest(platform=platform, device_name=device_name), \
                  patch("test_post_process.sys.platform", platform), \
-                 patch.dict(os.environ, GITHUB_ACTIONS=actions), \
-                 patch.object(type(TOOLS), "find", return_value="converter"), \
-                 patch("test_post_process._run", return_value=f"metal-irconverter version: {version}") as run:
-                self.assertEqual(_metal_ci_validation_skip_reason() is not None, skipped)
-                self.assertEqual(run.called, platform == "darwin" and actions == "true")
-
-    def test_unknown_metal_converter_version_does_not_silently_skip(self):
-        with patch("test_post_process.sys.platform", "darwin"), \
-             patch.dict(os.environ, GITHUB_ACTIONS="true"), \
-             patch.object(type(TOOLS), "find", return_value="converter"), \
-             patch("test_post_process._run", return_value="unexpected version output"):
-            with self.assertRaisesRegex(RuntimeError, "Cannot identify"):
-                _metal_ci_validation_skip_reason()
+                 patch("test_post_process._metal_device_name", return_value=device_name) as query:
+                self.assertEqual(_metal_shader_validation_skip_reason() is not None, skipped)
+                self.assertEqual(query.called, platform == "darwin")
 
     def test_invalid_passes_rejected(self):
         p = _post_program()
@@ -152,7 +141,7 @@ class PostProcessGpuTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.metal_validation_skip_reason = (
-            _metal_ci_validation_skip_reason() if os.environ.get("MLIR_GPU_TEST_METAL") == "1" else None
+            _metal_shader_validation_skip_reason() if os.environ.get("MLIR_GPU_TEST_METAL") == "1" else None
         )
 
     def _require_metal_validation(self, render):
